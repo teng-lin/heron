@@ -108,6 +108,25 @@ fn unique_session_ids_construct_independently() {
 }
 
 #[test]
+fn session_error_surfaces_vault_failures_via_typed_variant() {
+    // Phase 36: heron-cli now depends on heron-vault. Spot-check the
+    // typed conversion so a future refactor doesn't silently break
+    // the From impl that downstream `?` operators rely on.
+    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no");
+    let vault_err = heron_vault::VaultError::Io(io_err);
+    let session_err: SessionError = vault_err.into();
+    assert!(matches!(session_err, SessionError::Vault(_)));
+}
+
+#[test]
+fn session_error_surfaces_encode_failures_via_typed_variant() {
+    let io_err = std::io::Error::other("other");
+    let enc_err = heron_vault::EncodeError::Io(io_err);
+    let session_err: SessionError = enc_err.into();
+    assert!(matches!(session_err, SessionError::Encode(_)));
+}
+
+#[test]
 fn cache_path_overrides_via_env_path() {
     // Verifies the orchestrator uses the cache_dir from config and
     // doesn't reach out to a hardcoded location. A future regression
