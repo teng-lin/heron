@@ -17,6 +17,10 @@ use heron_types::{Event, SessionClock, SessionId, SpeakerEvent};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+pub mod aligner;
+
+pub use aligner::{ATTRIBUTION_GAP_THRESHOLD, Aligner, CONFIDENCE_FLOOR, DEFAULT_EVENT_LAG};
+
 #[derive(Debug, Error)]
 pub enum AxError {
     #[error("not yet implemented (arrives weeks 6–7 per §9)")]
