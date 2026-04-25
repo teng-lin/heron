@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use heron_types::{Channel, SessionId, Turn};
 #[cfg(target_vendor = "apple")]
 use heron_types::SpeakerSource;
+use heron_types::{Channel, SessionId, Turn};
 use thiserror::Error;
 
 pub mod partial_writer;
@@ -202,9 +202,9 @@ impl SttBackend for WhisperKitBackend {
                 on_progress(1.0);
                 Ok(())
             }
-            Err(WkError::ModelMissing) => Err(SttError::ModelMissing(
-                self.model_dir.display().to_string(),
-            )),
+            Err(WkError::ModelMissing) => {
+                Err(SttError::ModelMissing(self.model_dir.display().to_string()))
+            }
             Err(WkError::NotYetImplemented) => Err(SttError::NotYetImplemented),
             Err(other) => Err(SttError::Failed(format!("whisperkit init: {other}"))),
         }
@@ -250,9 +250,8 @@ impl SttBackend for WhisperKitBackend {
             if line.trim().is_empty() {
                 continue;
             }
-            let segment: WhisperKitSegment = serde_json::from_str(line).map_err(|e| {
-                SttError::Failed(format!("invalid segment json from bridge: {e}"))
-            })?;
+            let segment: WhisperKitSegment = serde_json::from_str(line)
+                .map_err(|e| SttError::Failed(format!("invalid segment json from bridge: {e}")))?;
             let turn = Turn {
                 t0: segment.start,
                 t1: segment.end,
@@ -440,11 +439,10 @@ mod tests {
         // CI machine that loses Apple Silicon would surface the drift.
         let wk = build_backend("whisperkit").expect("wk");
         let sh = build_backend("sherpa").expect("sh");
-        let expected_wk = cfg!(target_vendor = "apple")
-            && {
-                let p = RealPlatform;
-                p.is_apple_silicon() && p.is_macos_14_plus()
-            };
+        let expected_wk = cfg!(target_vendor = "apple") && {
+            let p = RealPlatform;
+            p.is_apple_silicon() && p.is_macos_14_plus()
+        };
         assert_eq!(wk.is_available(), expected_wk);
         assert!(sh.is_available());
     }

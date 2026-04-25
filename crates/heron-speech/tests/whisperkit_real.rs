@@ -89,10 +89,7 @@ async fn whisperkit_real_smoke() {
     let progress_capture = Arc::clone(&progress);
     backend
         .ensure_model(Box::new(move |p| {
-            progress_capture
-                .lock()
-                .expect("progress lock")
-                .push(p);
+            progress_capture.lock().expect("progress lock").push(p);
         }))
         .await
         .expect("ensure_model");
