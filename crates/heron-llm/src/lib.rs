@@ -15,6 +15,9 @@ use heron_types::{ActionItem, Attendee, Cost, MeetingType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod cost;
+pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
+
 /// Convenience alias so the public surface doesn't leak `String` for
 /// tag fields. Not a newtype yet; v1.1 may tighten.
 pub type Tag = String;
