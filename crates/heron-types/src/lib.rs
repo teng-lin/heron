@@ -14,10 +14,15 @@ use serde::{Deserialize, Serialize};
 
 pub mod clock;
 pub mod recording;
+pub mod recovery;
 
 pub use clock::SessionClock;
 pub use recording::{
     ARM_COOLDOWN, IdleReason, RecordingFsm, RecordingState, SummaryOutcome, TransitionError,
+};
+pub use recovery::{
+    RecoveryError, STATE_FILE_NAME, STATE_VERSION, SessionPhase, SessionStateRecord,
+    discover_unfinished, read_state, write_state,
 };
 
 pub type SessionId = uuid::Uuid;
