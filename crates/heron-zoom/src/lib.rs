@@ -169,7 +169,7 @@ impl AxBackend for AxObserverBackend {
     async fn start(
         &self,
         _session_id: SessionId,
-        _clock: SessionClock,
+        clock: SessionClock,
         out: mpsc::Sender<SpeakerEvent>,
         _events: mpsc::Sender<Event>,
     ) -> Result<AxHandle, AxError> {
@@ -208,7 +208,17 @@ impl AxBackend for AxObserverBackend {
                 }
                 match ax_poll() {
                     Ok(Some(line)) => match serde_json::from_str::<SpeakerEvent>(&line) {
-                        Ok(ev) => {
+                        Ok(mut ev) => {
+                            // The Swift bridge emits `t = 0.0` because
+                            // it has no session-clock reference (per
+                            // ZoomAxHelper.swift); stamp the receive
+                            // time here so SpeakerEvent.t lands in
+                            // session-secs as the aligner expects.
+                            // Worst-case skew is the polling cadence
+                            // (~250ms in the bridge + 50ms here),
+                            // well inside the aligner's 350ms default
+                            // event_lag prior.
+                            ev.t = clock.wall_to_session_secs(std::time::SystemTime::now());
                             // `blocking_send` is the right primitive
                             // here: we're on a blocking thread and
                             // out's bounded channel must apply

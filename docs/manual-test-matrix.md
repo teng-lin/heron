@@ -23,6 +23,7 @@ Schema: `# | Section | Test name | Owner | When | Pass criterion | Artifact loca
 | 12 | §15.5 | review UI playback | engineer | week 13 | edit one turn's text, save, re-open — text is preserved; playback synchronizes to the JSONL timestamps | `fixtures/manual-validation/review-ui/<date>.mov` |
 | 13 | §17 | personal dogfood | engineer | week 15 | author runs heron on every meeting for the week; bug list ≤ 5 P1; no data loss | `docs/dogfood-log.md` |
 | 14 | §18 | exec dogfood + ship gate | exec-friend + author | week 16 | exec uses heron unaided for 5 client calls; quality promise met (§1 plan.md); ship-criteria §18.2 all green | `docs/dogfood-log.md` |
+| 15 | §3.3 | AX speaker-indicator triple spike | engineer | pre-week-15 | characterize the `(role, subrole, identifier)` triple for the active-speaker tile, OR document that no stable triple exists and update `ZoomAxHelper.swift` accordingly. **Run 2026-04-25, outcome: no AX-readable speaker indicator in Zoom 7.0.0; bridge pivoted to mute-state attribution per `fixtures/zoom/spike-triple/README.md`.** | `fixtures/zoom/spike-triple/` |
 
 ## Status legend
 
