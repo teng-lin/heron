@@ -51,8 +51,17 @@ the developer's machine becomes more capable.
 | Test | Prereq | Skip when |
 |---|---|---|
 | `live_anthropic_summarize_returns_non_empty` | `ANTHROPIC_API_KEY` env var | unset or empty |
-| `live_claude_cli_summarize_returns_non_empty` | `claude` on `PATH` **and** `claude --version` exits 0 | binary missing or unauthenticated |
-| `live_codex_cli_summarize_returns_non_empty` | `codex` on `PATH` **and** `codex --version` exits 0 | binary missing or unauthenticated |
+| `live_claude_cli_summarize_returns_non_empty` | `claude` on `PATH`, `claude --version` exits 0, **and** the actual `summarize` call succeeds | binary missing, `--version` fails, or `summarize` returns an error (e.g. sandbox session perms, expired auth) |
+| `live_codex_cli_summarize_returns_non_empty` | `codex` on `PATH`, `codex --version` exits 0, **and** the actual `summarize` call succeeds | binary missing, `--version` fails, or `summarize` returns an error (e.g. `~/.codex/sessions` permission denied, expired auth) |
+
+The Anthropic test is stricter: once `ANTHROPIC_API_KEY` is set the
+test will fail loudly on any error from the live API, since a bad
+key or network problem is a real signal the user opted in to. The
+CLI tests are more forgiving because `--version` cannot detect every
+"installed but not usable" state — when the actual `summarize` call
+fails we log a skip line with the error and return green. Unit tests
+in `crates/heron-llm/src/{claude_code,codex}.rs` cover the
+error-mapping contract; this harness only owns the happy path.
 
 ### Running
 
