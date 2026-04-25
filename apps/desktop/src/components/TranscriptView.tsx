@@ -11,13 +11,15 @@
  * - the speaker name + the run's start clock
  * - the joined text
  *
- * For PR-γ this is read-only — edits happen in the TipTap editor
- * above. PR-γ′ (audio playback) will wire each row's clock to a
- * seek into the recording.
+ * For PR-γ this was read-only. PR-ε (phase 67) adds an optional
+ * `onSeek` callback — when provided, the row's clock becomes a
+ * keyboard-focusable button that seeks the playback bar to that
+ * timestamp. The grouping logic itself is unchanged.
  */
 
 import {
   groupBySpeaker,
+  parseClockToSeconds,
   parseTranscriptLines,
   speakerColor,
   speakerInitial,
@@ -27,9 +29,21 @@ interface TranscriptViewProps {
   /** Raw markdown body. We re-parse on every change rather than
    * caching — the document is small (~hundreds of lines max). */
   markdown: string;
+  /**
+   * Optional click-to-seek callback. When omitted (PR-γ behavior),
+   * the clock renders as plain text. When provided (PR-ε), the clock
+   * renders as a focusable button and clicking it calls
+   * `onSeek(seconds)` so the parent can move the audio playhead.
+   *
+   * Receives the timestamp in seconds, parsed via
+   * [`parseClockToSeconds`] from the row's leading clock string.
+   * Malformed clocks (regex didn't match) are treated as
+   * unclickable — the parent never sees a `NaN`.
+   */
+  onSeek?: (seconds: number) => void;
 }
 
-export function TranscriptView({ markdown }: TranscriptViewProps) {
+export function TranscriptView({ markdown, onSeek }: TranscriptViewProps) {
   const segments = parseTranscriptLines(markdown);
   if (segments.length === 0) {
     return (
@@ -44,6 +58,7 @@ export function TranscriptView({ markdown }: TranscriptViewProps) {
       {groups.map((g, i) => {
         const color = speakerColor(g.speaker);
         const initial = speakerInitial(g.speaker);
+        const seekSeconds = onSeek ? parseClockToSeconds(g.startTime) : null;
         return (
           <div
             key={`${g.speaker}-${g.startTime}-${i}`}
@@ -61,7 +76,19 @@ export function TranscriptView({ markdown }: TranscriptViewProps) {
                 <span className="font-semibold text-foreground">
                   {g.speaker}
                 </span>
-                <span>{g.startTime}</span>
+                {onSeek && seekSeconds !== null ? (
+                  <button
+                    type="button"
+                    onClick={() => onSeek(seekSeconds)}
+                    className="font-mono tabular-nums hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-sm"
+                    title={`Jump to ${g.startTime}`}
+                    aria-label={`Jump audio playback to ${g.startTime}`}
+                  >
+                    {g.startTime}
+                  </button>
+                ) : (
+                  <span className="font-mono tabular-nums">{g.startTime}</span>
+                )}
               </div>
               <p className="text-sm whitespace-pre-wrap">{g.combinedText}</p>
             </div>
