@@ -223,3 +223,220 @@ async fn run_pipeline_with_stub_backends_writes_markdown_note() {
     assert!(transcript_body.contains("hello from mic"));
     assert!(transcript_body.contains("hello from tap"));
 }
+
+/// Stub LLM that fails every call. Pins `pipeline::run_pipeline`'s
+/// summarize-error branch: when the summarizer errors, the pipeline
+/// must still write a transcript-only fallback note rather than
+/// aborting the session.
+struct StubLlmFailing;
+
+#[async_trait]
+impl Summarizer for StubLlmFailing {
+    async fn summarize(&self, _input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
+        Err(LlmError::Backend("stub: summarizer is unhappy".into()))
+    }
+}
+
+#[tokio::test]
+async fn run_pipeline_with_failing_llm_writes_fallback_note() {
+    // Pipeline's contract per §4.1: an LLM hiccup is non-fatal — we
+    // still write a transcript-only note so the user has the raw
+    // turns. This test exercises the `summarize → Err` branch and
+    // the `fallback_body` rendering path.
+    let tmp = TempDir::new().expect("tmpdir");
+    let session_id = SessionId::from_u128(0x0193_1f00_face_d00d);
+    let cache_dir = tmp.path().join("cache");
+    let vault_root = tmp.path().join("vault");
+    let session_dir = cache_dir.join("sessions").join(session_id.to_string());
+
+    write_silent_wav(&session_dir.join("mic.wav"), 0.5);
+    write_silent_wav(&session_dir.join("tap.wav"), 0.5);
+
+    let cfg = SessionConfig {
+        session_id,
+        target_bundle_id: "us.zoom.xos".into(),
+        cache_dir,
+        vault_root: vault_root.clone(),
+        stt_backend_name: "sherpa".into(),
+        llm_preference: heron_llm::Preference::Auto,
+    };
+    let backends: Backends = (
+        Box::new(StubStt),
+        Box::new(StubAx),
+        Box::new(StubLlmFailing),
+    );
+    let mut orch = Orchestrator::with_test_backends(cfg, backends);
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = stop_tx.send(());
+    });
+
+    let outcome = orch.run(stop_rx).await.expect("run");
+    assert_eq!(outcome.final_state, RecordingState::Idle);
+
+    // Note must still exist and contain the fallback body, not the
+    // (would-be) LLM summary.
+    let note_path = outcome.note_path.expect("note path returned");
+    let body = std::fs::read_to_string(&note_path).expect("read note");
+    assert!(
+        body.contains("Transcript (no summary)"),
+        "fallback body must render when LLM fails"
+    );
+    // Both stub turns survive into the fallback transcript.
+    assert!(body.contains("hello from mic"));
+    assert!(body.contains("hello from tap"));
+    // The (no summarizer) cost line should be present in frontmatter
+    // — pins the `MeetingType::Other` / zero-cost defaults branch.
+    assert!(body.contains("(no summarizer)"));
+}
+
+/// Stub STT that emits zero turns. Pins the empty-transcript branch:
+/// the pipeline must finalize cleanly even when both channels
+/// produce no audio (silent meeting, or upstream STT skipped).
+struct StubSttEmpty;
+
+#[async_trait]
+impl SttBackend for StubSttEmpty {
+    async fn ensure_model(&self, _on_progress: ProgressFn) -> Result<(), SttError> {
+        Ok(())
+    }
+    async fn transcribe(
+        &self,
+        _wav_path: &Path,
+        _channel: Channel,
+        _session_id: SessionId,
+        partial_jsonl_path: &Path,
+        _on_turn: TurnFn,
+    ) -> Result<TranscribeSummary, SttError> {
+        // Open + finalize the partial writer immediately so the
+        // 0-segment-but-valid-artifact contract from §3.5 holds.
+        let writer = PartialWriter::create(partial_jsonl_path.to_path_buf())
+            .map_err(|e| SttError::Failed(format!("partial writer: {e}")))?;
+        writer
+            .finalize()
+            .map_err(|e| SttError::Failed(format!("partial finalize: {e}")))?;
+        Ok(TranscribeSummary {
+            turns: 0,
+            low_confidence_turns: 0,
+            model: "stub-empty".to_owned(),
+            elapsed_secs: 0.001,
+        })
+    }
+    fn name(&self) -> &'static str {
+        "stub-empty-stt"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn run_pipeline_with_empty_stt_finalizes_to_idle_with_note() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let session_id = SessionId::from_u128(0x0193_1f00_5111_1111);
+    let cache_dir = tmp.path().join("cache");
+    let vault_root = tmp.path().join("vault");
+    let session_dir = cache_dir.join("sessions").join(session_id.to_string());
+
+    write_silent_wav(&session_dir.join("mic.wav"), 0.5);
+    write_silent_wav(&session_dir.join("tap.wav"), 0.5);
+
+    let cfg = SessionConfig {
+        session_id,
+        target_bundle_id: "us.zoom.xos".into(),
+        cache_dir,
+        vault_root: vault_root.clone(),
+        stt_backend_name: "sherpa".into(),
+        llm_preference: heron_llm::Preference::Auto,
+    };
+    let llm_seen = Arc::new(Mutex::new(None));
+    let llm = StubLlm {
+        seen_transcript: Arc::clone(&llm_seen),
+    };
+    let backends: Backends = (Box::new(StubSttEmpty), Box::new(StubAx), Box::new(llm));
+    let mut orch = Orchestrator::with_test_backends(cfg, backends);
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = stop_tx.send(());
+    });
+
+    let outcome = orch.run(stop_rx).await.expect("run");
+    assert_eq!(outcome.final_state, RecordingState::Idle);
+
+    // The transcript file under <vault>/transcripts/ exists but is
+    // empty (zero JSONL lines). The orchestrator must not skip the
+    // write — downstream consumers rely on the path being present.
+    let transcript_path = vault_root
+        .join("transcripts")
+        .join(format!("{session_id}.jsonl"));
+    assert!(
+        transcript_path.exists(),
+        "transcript file must exist even when empty"
+    );
+    let transcript_body = std::fs::read_to_string(&transcript_path).expect("read transcript");
+    assert!(
+        transcript_body.is_empty() || transcript_body.lines().count() == 0,
+        "transcript must be empty when STT emits zero turns, got {transcript_body:?}"
+    );
+
+    // Note still writes (LLM runs over empty transcript and returns
+    // the canned StubLlm body). Pins that the orchestrator doesn't
+    // shortcut to a transcript-only fallback when the transcript is
+    // empty but the LLM is healthy.
+    assert!(outcome.note_path.is_some());
+    let note_path = outcome.note_path.expect("note path");
+    let body = std::fs::read_to_string(&note_path).expect("read note");
+    assert!(body.contains("A short, generated summary."));
+}
+
+#[tokio::test]
+async fn run_pipeline_with_missing_wavs_finalizes_with_note() {
+    // No WAVs seeded — `run_stt` graceful-skips both channels
+    // (`if !wav.exists()` branch in pipeline.rs), `encode_to_m4a`
+    // fails because the source files don't exist (or the m4a-verify
+    // step rejects the resulting empty file), and the cache is
+    // retained per the §12.3 "ringbuffer survives an aborted
+    // session" contract. Pipeline must still finalize to Idle with
+    // a note rendered against the (empty) transcript so the user
+    // has *something* in their vault.
+    let tmp = TempDir::new().expect("tmpdir");
+    let session_id = SessionId::from_u128(0x0193_1f00_dead_5555);
+    let cache_dir = tmp.path().join("cache");
+    let vault_root = tmp.path().join("vault");
+
+    let cfg = SessionConfig {
+        session_id,
+        target_bundle_id: "us.zoom.xos".into(),
+        cache_dir: cache_dir.clone(),
+        vault_root: vault_root.clone(),
+        stt_backend_name: "sherpa".into(),
+        llm_preference: heron_llm::Preference::Auto,
+    };
+    let (backends, _seen) = build_backends();
+    let mut orch = Orchestrator::with_test_backends(cfg, backends);
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = stop_tx.send(());
+    });
+
+    let outcome = orch.run(stop_rx).await.expect("run");
+    assert_eq!(outcome.final_state, RecordingState::Idle);
+    assert!(
+        outcome.note_path.is_some(),
+        "note must write even with no audio"
+    );
+
+    // The session cache directory must still exist — m4a-verify
+    // failure routes us through the retain-cache branch.
+    let session_dir = cache_dir.join("sessions").join(session_id.to_string());
+    assert!(
+        session_dir.exists(),
+        "ringbuffer cache must be retained on encode/verify failure"
+    );
+}

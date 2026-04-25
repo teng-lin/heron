@@ -277,6 +277,49 @@ mod tests {
         }
     }
 
+    /// Multiple frames on the same channel append rather than
+    /// overwrite. Pins the lazy-open-then-append shape: the writer
+    /// is opened on the first frame and reused for all subsequent
+    /// frames on the same channel. Without this, a long session
+    /// would silently truncate to the last-frame's samples.
+    #[test]
+    fn multi_frame_append_preserves_total_sample_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = SessionId::nil();
+        let mut writers = PerChannelWavWriters::new(dir.path(), session).expect("create writers");
+
+        // 3 frames of 480 samples each = 1440 samples total = 30 ms
+        // at 48 kHz. Mirrors the broadcast cadence of three back-to-
+        // back APM frames.
+        for i in 0..3 {
+            let samples: Vec<f32> = (0..480).map(|s| ((i * 480 + s) as f32) * 1e-4).collect();
+            writers
+                .write_frame(&frame(Channel::Mic, samples))
+                .expect("write");
+        }
+
+        let paths = writers.finalize().expect("finalize");
+        let mic_path = paths.get(&Channel::Mic).expect("mic path");
+        let mut reader = WavReader::open(mic_path).expect("open mic.wav");
+        assert_eq!(
+            reader.duration(),
+            1440,
+            "all three frames must concatenate, not overwrite"
+        );
+
+        // Spot-check frame boundaries: the first sample of frame 1
+        // (i=1, s=0) was 480 * 1e-4 = 0.048 — survives the round-trip.
+        let read: Vec<f32> = reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .expect("samples decode");
+        assert!(
+            (read[480] - 0.048).abs() < 1e-5,
+            "frame-2 boundary sample preserved: expected ~0.048, got {}",
+            read[480]
+        );
+    }
+
     /// Mixed write: one channel with frames, one channel silent. The
     /// silent channel still gets an empty WAV; the live channel keeps
     /// its samples. This is the exact shape of a tap-only session
