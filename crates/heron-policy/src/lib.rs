@@ -20,9 +20,11 @@ use tokio::sync::broadcast;
 
 pub mod filter;
 pub mod queue;
+pub mod validate;
 pub use filter::{PolicyDecision, evaluate};
 pub use heron_types::prefixed_id::IdParseError;
 pub use queue::{CancelOutcome, EnqueueOutcome, QueuedUtterance, SpeechQueue};
+pub use validate::{ValidationError, validate};
 
 // ── identity ──────────────────────────────────────────────────────────
 
