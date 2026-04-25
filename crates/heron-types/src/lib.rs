@@ -21,8 +21,8 @@ pub use recording::{
     ARM_COOLDOWN, IdleReason, RecordingFsm, RecordingState, SummaryOutcome, TransitionError,
 };
 pub use recovery::{
-    RecoveryError, STATE_FILE_NAME, STATE_VERSION, SessionPhase, SessionStateRecord,
-    discover_unfinished, read_state, write_state,
+    MAX_STATE_FILE_BYTES, RecoveryError, STATE_FILE_NAME, STATE_VERSION, SessionPhase,
+    SessionStateRecord, discover_unfinished, read_state, write_state,
 };
 
 pub type SessionId = uuid::Uuid;

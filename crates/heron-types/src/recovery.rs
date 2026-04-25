@@ -202,9 +202,12 @@ pub fn read_state(cache_dir: &Path) -> Result<Option<SessionStateRecord>, Recove
         });
     }
 
-    let mut buf = String::with_capacity(len.min(MAX_STATE_FILE_BYTES) as usize);
+    let mut buf = Vec::with_capacity(len.min(MAX_STATE_FILE_BYTES) as usize);
+    // Read raw bytes so non-UTF-8 input surfaces as a parse error
+    // (corrupt JSON), not as `Io(InvalidData)` — the file is
+    // semantically "garbled record" rather than "io failed".
     f.take(MAX_STATE_FILE_BYTES + 1)
-        .read_to_string(&mut buf)
+        .read_to_end(&mut buf)
         .map_err(RecoveryError::Io)?;
     if buf.len() as u64 > MAX_STATE_FILE_BYTES {
         return Err(RecoveryError::TooLarge {
@@ -221,13 +224,13 @@ pub fn read_state(cache_dir: &Path) -> Result<Option<SessionStateRecord>, Recove
         state_version: u32,
     }
     let peek: VersionPeek =
-        serde_json::from_str(&buf).map_err(|source| parse_err(&path, source))?;
+        serde_json::from_slice(&buf).map_err(|source| parse_err(&path, source))?;
     if peek.state_version > STATE_VERSION {
         return Ok(None);
     }
 
     let rec: SessionStateRecord =
-        serde_json::from_str(&buf).map_err(|source| parse_err(&path, source))?;
+        serde_json::from_slice(&buf).map_err(|source| parse_err(&path, source))?;
     Ok(Some(rec))
 }
 
@@ -347,6 +350,21 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RecoveryError> {
     }
     fs::rename(&temp, path)?;
     cleanup.commit();
+    // fsync the parent directory so the rename itself is durable.
+    // APFS journals rename so this is defensive on macOS, but the
+    // moment heron lands on Linux v2 (ext4 / NFS-mounted homes) the
+    // rename can be lost in a power-cut without a directory fsync.
+    // Best-effort on platforms where opening a directory for fsync
+    // isn't supported (Windows; we just skip).
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent) {
+            // Errors fsyncing the parent dir are surfaced —
+            // durability is the whole point of the atomic-write
+            // path; a silent miss defeats the contract.
+            dir.sync_all()?;
+        }
+    }
     Ok(())
 }
 
@@ -421,6 +439,23 @@ mod tests {
         assert!(matches!(err, RecoveryError::Parse { .. }));
     }
 
+    #[test]
+    fn read_maps_non_utf8_bytes_to_parse_not_io() {
+        // Per CodeRabbit: a state.json containing invalid UTF-8 is a
+        // garbled record, not an I/O failure. Surface it as Parse so
+        // discover_unfinished's filter (which silently skips Parse)
+        // treats it like any other corrupt record.
+        let dir = tmpdir();
+        let path = dir.path().join(STATE_FILE_NAME);
+        // Bytes 0xff 0xfe are not valid UTF-8 in any position.
+        std::fs::write(&path, [0xff, 0xfe, b'{', b'}']).expect("write");
+        let err = read_state(dir.path()).expect_err("non-utf8 should error");
+        assert!(
+            matches!(err, RecoveryError::Parse { .. }),
+            "expected Parse, got {err:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_write_sets_user_only_permissions() {
@@ -437,10 +472,13 @@ mod tests {
     }
 
     #[test]
-    fn write_overwrites_atomically_without_partial_state() {
+    fn write_replaces_previous_record() {
         // Two writes in sequence: the second must replace the first
-        // without ever leaving an empty or half-written state.json on
-        // disk that a concurrent reader could observe.
+        // and the new value must round-trip via read_state. Atomicity
+        // (no concurrent reader observing a half-write) is implicit
+        // in the rename-based protocol but isn't asserted here —
+        // that's the harder property `cleanup_test` files would
+        // need a fork+SIGKILL harness to verify, deferred.
         let dir = tmpdir();
         let mut rec = rec_at(dir.path().to_path_buf(), SessionPhase::Armed, 0);
         write_state(&rec).expect("v1");
