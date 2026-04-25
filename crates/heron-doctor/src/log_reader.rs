@@ -16,7 +16,7 @@
 //! malicious or accidentally-huge log file can't OOM the process.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -83,33 +83,48 @@ pub struct SessionSummaryFields {
 /// emits other levels into the same file). A missing file resolves
 /// to an empty Vec — first-run state is "no logs yet."
 ///
-/// Streaming via [`BufReader::lines`]: we never hold more than one
-/// line in memory at a time, and lines longer than [`MAX_LINE_LEN`]
-/// are skipped before deserialization. A multi-GB log file is safe
-/// to point this at.
+/// Streaming + **bounded read**: we read up to [`MAX_LINE_LEN`] + 1
+/// bytes per attempted line via [`BufRead::take`]. A line whose
+/// length exceeds the cap is consumed up to the next newline and
+/// discarded *without* allocating the full content, so a multi-GB
+/// pathological line cannot OOM the process. We never hold more than
+/// `MAX_LINE_LEN + 1` bytes in memory at a time.
 ///
 /// Lines whose `log_version` is not 1 are still parsed (forwards
-/// compat), but the count of mismatched versions is reported via
-/// [`UnknownVersionCount`] so the caller can surface a warning.
+/// compat); the caller uses [`count_unknown_versions`] to surface a
+/// stderr warning.
 pub fn read_session_summaries(path: &Path) -> Result<Vec<SessionSummaryRecord>, LogReadError> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(LogReadError::Io(e)),
     };
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut out = Vec::new();
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            // A read error mid-file (e.g. the file got truncated)
-            // surfaces as an IO error; let the caller decide.
-            Err(e) => return Err(LogReadError::Io(e)),
-        };
-        if line.is_empty() || line.len() > MAX_LINE_LEN {
+    loop {
+        let mut buf = Vec::with_capacity(256);
+        // Read up to MAX_LINE_LEN + 1 bytes so we can detect
+        // overflow. `take` adapts the reader for this single read.
+        let limit = (MAX_LINE_LEN as u64) + 1;
+        let bytes_read = (&mut reader).take(limit).read_until(b'\n', &mut buf)?;
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        // Strip trailing \n if present.
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.len() > MAX_LINE_LEN {
+            // Over-long line: drain the rest of it (up to the next \n)
+            // without keeping bytes around, then move on. This bounds
+            // memory at MAX_LINE_LEN + 1 even for adversarial input.
+            consume_until_newline(&mut reader)?;
             continue;
         }
-        let Ok(record) = serde_json::from_str::<SessionSummaryRecord>(&line) else {
+        if buf.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<SessionSummaryRecord>(&buf) else {
             continue;
         };
         if record.fields.as_ref().and_then(|f| f.kind.as_deref()) == Some("session_summary") {
@@ -119,14 +134,31 @@ pub fn read_session_summaries(path: &Path) -> Result<Vec<SessionSummaryRecord>, 
     Ok(out)
 }
 
-/// Count records whose `log_version` is not 1. The CLI uses this to
-/// emit a one-line stderr warning so a future schema bump doesn't
-/// silently mis-report.
+/// Read and discard bytes from `reader` up to and including the next
+/// newline. Used to skip the tail of an over-long line without
+/// allocating its contents.
+fn consume_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(()); // EOF
+        }
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let consume = pos + 1;
+            reader.consume(consume);
+            return Ok(());
+        }
+        let len = buf.len();
+        reader.consume(len);
+    }
+}
+
+/// Count records whose `log_version` is anything other than 1.
+/// `0` is included (it means "field absent in source line" per the
+/// `#[serde(default)]` on `SessionSummaryRecord::log_version`); a 0
+/// indicates a legacy or non-heron line that snuck through.
 pub fn count_unknown_versions(records: &[SessionSummaryRecord]) -> usize {
-    records
-        .iter()
-        .filter(|r| r.log_version != 0 && r.log_version != 1)
-        .count()
+    records.iter().filter(|r| r.log_version != 1).count()
 }
 
 #[cfg(test)]

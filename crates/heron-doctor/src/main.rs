@@ -60,16 +60,18 @@ enum Cmd {
 
 /// Resolves to `$HOME/Library/Logs/heron/<YYYY-MM-DD>.log` using
 /// today's local date. Falls back to `./<date>.log` if `HOME` isn't
-/// set (CI sandboxes, minimal containers) — the CLI prints a sensible
-/// error from `read_session_summaries` either way.
+/// set or is empty (CI sandboxes, minimal containers).
 fn default_log_path() -> PathBuf {
     let date = Local::now().format("%Y-%m-%d").to_string();
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join("Library")
-        .join("Logs")
-        .join("heron")
-        .join(format!("{date}.log"))
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Logs")
+            .join("heron")
+            .join(format!("{date}.log"))
+    } else {
+        PathBuf::from(format!("{date}.log"))
+    }
 }
 
 fn warn_on_unknown_versions(records: &[SessionSummaryRecord]) {
