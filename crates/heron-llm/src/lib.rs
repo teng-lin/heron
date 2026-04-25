@@ -17,12 +17,14 @@ use thiserror::Error;
 
 pub mod anthropic;
 pub mod claude_code;
+pub mod codex;
 mod content;
 pub mod cost;
 pub mod transcript;
 
 pub use anthropic::{AnthropicClient, AnthropicClientConfig};
 pub use claude_code::{ClaudeCodeClient, ClaudeCodeClientConfig};
+pub use codex::{CodexClient, CodexClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
 
 /// Convenience alias so the public surface doesn't leak `String` for
@@ -138,7 +140,7 @@ pub fn build_summarizer(backend: Backend) -> Box<dyn Summarizer> {
             // binary actually goes missing.
             Box::new(ClaudeCodeClient::new(ClaudeCodeClientConfig::default()))
         }
-        Backend::CodexCli => Box::new(stub::CodexStub),
+        Backend::CodexCli => Box::new(CodexClient::new(CodexClientConfig::default())),
     }
 }
 
@@ -221,22 +223,9 @@ mod stub {
     /// `ANTHROPIC_API_KEY` is missing — the orchestrator can still
     /// build, the failure surfaces at first summarize call.
     pub struct AnthropicStub;
-    /// Returned by `build_summarizer(CodexCli)` until phase 39 lands
-    /// the real subprocess wiring.
-    pub struct CodexStub;
 
     #[async_trait]
     impl Summarizer for AnthropicStub {
-        async fn summarize(
-            &self,
-            _input: SummarizerInput<'_>,
-        ) -> Result<SummarizerOutput, LlmError> {
-            Err(LlmError::NotYetImplemented)
-        }
-    }
-
-    #[async_trait]
-    impl Summarizer for CodexStub {
         async fn summarize(
             &self,
             _input: SummarizerInput<'_>,
@@ -351,12 +340,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_cli_backend_still_stubs() {
-        // CodexCli stays a stub until phase 39 lands the real
-        // subprocess wiring.
-        let s = build_summarizer(Backend::CodexCli);
+    async fn codex_cli_backend_attempts_real_spawn() {
+        // CodexCli now wires a real CodexClient. Without `codex` on
+        // PATH (CI runners don't have it), the call surfaces a
+        // Backend variant rather than NotYetImplemented. Mirror the
+        // ClaudeCodeCli test by pointing at a known-missing binary
+        // for determinism.
+        use crate::codex::CodexClientConfig;
+        let cfg = CodexClientConfig {
+            binary: std::path::PathBuf::from("/nonexistent/codex-binary"),
+            timeout: std::time::Duration::from_secs(2),
+            ..CodexClientConfig::default()
+        };
+        let client: Box<dyn Summarizer> = Box::new(crate::CodexClient::new(cfg));
         let path = PathBuf::from("/tmp/x.jsonl");
-        let result = s
+        let result = client
             .summarize(SummarizerInput {
                 transcript: &path,
                 meeting_type: MeetingType::Client,
@@ -364,7 +362,10 @@ mod tests {
                 existing_attendees: None,
             })
             .await;
-        assert!(matches!(result, Err(LlmError::NotYetImplemented)));
+        match result {
+            Err(LlmError::Backend(_)) => {}
+            other => panic!("expected Backend, got {other:?}"),
+        }
     }
 
     #[tokio::test]
