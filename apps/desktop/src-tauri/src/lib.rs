@@ -8,9 +8,22 @@
 //!   gains a `run()` async path),
 //! - one demonstrative `heron_status` command that returns the
 //!   FSM state + a few orchestrator-side flags so the frontend
-//!   has something concrete to render before week 11.
+//!   has something concrete to render before week 11,
+//! - the §15.2 asset-protocol resolver + §15.4 diagnostics +
+//!   §16.1 settings persistence backends so the review UI and
+//!   Settings pane can land in week 13/14 against stable Rust.
+
+pub mod asset_protocol;
+pub mod diagnostics;
+pub mod settings;
+
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
+pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
+pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HeronStatus {
@@ -36,6 +49,56 @@ fn heron_status() -> HeronStatus {
     }
 }
 
+/// Tauri command: resolve `heron://recording/<id>` to a concrete asset.
+///
+/// Errors map to `String` so they reach the frontend without the
+/// frontend needing the `AssetError` type — the UI distinguishes the
+/// "missing" / "partial" cases by inspecting the message.
+#[tauri::command]
+fn heron_resolve_recording(
+    session_id: String,
+    m4a_candidate: String,
+    cache_root: String,
+) -> Result<AssetSource, String> {
+    resolve_recording_uri(
+        &session_id,
+        Path::new(&m4a_candidate),
+        Path::new(&cache_root),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Tauri command: read `heron_session.json` and return the diagnostics
+/// view.
+#[tauri::command]
+fn heron_diagnostics(session_log_path: String) -> Result<DiagnosticsView, String> {
+    read_diagnostics(Path::new(&session_log_path)).map_err(|e| e.to_string())
+}
+
+/// Tauri command: load user settings.
+#[tauri::command]
+fn heron_read_settings(settings_path: String) -> Result<Settings, String> {
+    read_settings(Path::new(&settings_path)).map_err(|e| e.to_string())
+}
+
+/// Tauri command: persist user settings.
+#[tauri::command]
+fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(), String> {
+    write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
+}
+
+/// Default settings location: `~/Library/Preferences/com.heronnote.heron/settings.json`.
+/// Pure helper so tests can stub it out — the real Tauri shell calls
+/// this once at startup and threads the path through commands.
+pub fn default_settings_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    PathBuf::from(home)
+        .join("Library")
+        .join("Preferences")
+        .join("com.heronnote.heron")
+        .join("settings.json")
+}
+
 /// Entry point used by `main.rs` and (eventually) by Tauri's mobile
 /// build target. The function name + `#[cfg_attr(...)]` line below
 /// are required by Tauri 2's mobile entry point glue.
@@ -54,7 +117,26 @@ pub fn run() {
             let _ = app;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![heron_status])
+        .invoke_handler(tauri::generate_handler![
+            heron_status,
+            heron_resolve_recording,
+            heron_diagnostics,
+            heron_read_settings,
+            heron_write_settings,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_path_lands_under_library_preferences() {
+        let p = default_settings_path();
+        // The HOME-driven prefix changes per machine, but the tail of
+        // the path is stable and what we actually care about.
+        assert!(p.ends_with("Library/Preferences/com.heronnote.heron/settings.json"));
+    }
 }
