@@ -8,6 +8,9 @@
  * - `/home` — dashboard with the `heron_status` smoke test.
  * - `/review/:sessionId` — review UI stub.
  * - `/settings` — settings form stub.
+ * - `*` — anything else falls back to `/`. Without this, navigating
+ *   to a typo or stale link renders a blank screen rather than
+ *   landing back at the onboarding redirect.
  */
 
 import { Navigate, Route, Routes } from "react-router-dom";
@@ -25,6 +28,7 @@ export default function App() {
       <Route path="/onboarding" element={<Onboarding />} />
       <Route path="/review/:sessionId" element={<Review />} />
       <Route path="/settings" element={<Settings />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }

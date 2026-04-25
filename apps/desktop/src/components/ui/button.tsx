@@ -13,9 +13,12 @@
  *   driven by `class-variance-authority` — `cva` is overkill for a
  *   single component. PR-δ promotes the pattern to `cva` if the
  *   variant matrix grows.
+ * - React 19 lets function components accept `ref` as a regular prop,
+ *   so this component skips `forwardRef` entirely (deprecated in 19,
+ *   slated for removal in a future release).
  */
 
-import * as React from "react";
+import type * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 
 import { cn } from "../../lib/cn";
@@ -54,20 +57,30 @@ export interface ButtonProps
    * Useful for wrapping `<Link>` or `<a>` without nesting.
    */
   asChild?: boolean;
+  ref?: React.Ref<HTMLButtonElement>;
 }
 
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  function Button(
-    { className, variant = "default", size = "default", asChild = false, ...props },
-    ref,
-  ) {
-    const Comp = asChild ? Slot : "button";
-    return (
-      <Comp
-        ref={ref}
-        className={cn(baseClasses, variants[variant], sizes[size], className)}
-        {...props}
-      />
-    );
-  },
-);
+export function Button({
+  className,
+  variant = "default",
+  size = "default",
+  asChild = false,
+  type,
+  ref,
+  ...props
+}: ButtonProps) {
+  const Comp = asChild ? Slot : "button";
+  // Bare `<button>` defaults to `type="submit"` inside a form, which
+  // would silently submit any future Settings form on click. Default
+  // to `"button"` when rendering an actual button element; let `Slot`
+  // pass through whatever the child element wants.
+  const resolvedType = asChild ? type : (type ?? "button");
+  return (
+    <Comp
+      ref={ref}
+      type={resolvedType}
+      className={cn(baseClasses, variants[variant], sizes[size], className)}
+      {...props}
+    />
+  );
+}

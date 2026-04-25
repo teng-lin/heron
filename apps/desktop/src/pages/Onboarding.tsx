@@ -3,7 +3,7 @@
  *
  * The five-step Test-button flow lands in a follow-up PR. This stub
  * exists so the route is reachable and so PR-α's typed-invoke surface
- * is exercised by `npm run build`.
+ * is exercised by `bun run build`.
  */
 
 import { Link } from "react-router-dom";
@@ -15,7 +15,9 @@ export default function Onboarding() {
       <p className="text-muted-foreground">
         Five-step Test-button walkthrough — wired up in a follow-up PR.
       </p>
-      <Link to="/" className="underline">
+      {/* `/` redirects to this same route, so back-links go to `/home`
+          (the dashboard) until first-run detection lands in PR-δ. */}
+      <Link to="/home" className="underline">
         Back to home
       </Link>
     </main>

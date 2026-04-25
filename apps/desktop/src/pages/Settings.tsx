@@ -15,7 +15,7 @@ export default function Settings() {
         STT / LLM backend pickers, vault root, hotkey, and the rest of
         the §16.1 form ship in PR-δ.
       </p>
-      <Link to="/" className="underline">
+      <Link to="/home" className="underline">
         Back to home
       </Link>
     </main>

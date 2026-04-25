@@ -94,9 +94,19 @@ export type TestOutcome =
  * Commands that take no arguments map to `Record<string, never>` so
  * callers can pass `undefined` (or omit the second `invoke` argument).
  *
- * Tauri v2 converts JS arg-object keys from camelCase to snake_case
- * before they reach the Rust handler, so the keys here are camelCase
- * (`sessionId`) and pair with snake_case Rust parameters (`session_id`).
+ * Tauri v2 renames *top-level* command argument keys from camelCase
+ * (JS) to snake_case (Rust), so `args` keys here are camelCase
+ * (`sessionId`) and pair with snake_case Rust parameters
+ * (`session_id`). The rename does **not** recurse into nested
+ * payloads: the `settings: Settings` body of `heron_write_settings`
+ * is forwarded to serde verbatim, which is why `Settings` (and the
+ * other nested types — `AssetSource`, `TestOutcome`,
+ * `DiagnosticsView`) keep snake_case keys to match the Rust struct's
+ * default field naming. If a future Rust change adds
+ * `#[serde(rename_all = "...")]` to one of those types, the matching
+ * TS field names here must move in lockstep — TS will not notice the
+ * wire-shape drift.
+ *
  * Return values come back exactly as the Rust side serialized them
  * (snake_case fields like `fsm_state` and `session_id`).
  */

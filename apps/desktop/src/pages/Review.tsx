@@ -19,7 +19,7 @@ export default function Review() {
       <p className="text-muted-foreground">
         Transcript + diagnostics tabs ship in PR-γ.
       </p>
-      <Link to="/" className="underline">
+      <Link to="/home" className="underline">
         Back to home
       </Link>
     </main>
