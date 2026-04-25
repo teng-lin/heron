@@ -7,25 +7,34 @@ import Foundation
 
 private let store = EKEventStore()
 
+// Mutable container the detached Task writes through. Swift 6 strict
+// concurrency rejects capturing a `var Int32` in a `Task.detached`
+// closure; the class reference is captured immutably and the field
+// is mutated, which is fine because the semaphore enforces
+// happens-before with the reading thread.
+private final class Int32Box: @unchecked Sendable {
+    var value: Int32 = 0
+}
+
 // Returns 1 if the user grants full calendar access, 0 if denied or
 // the request errors. Synchronous to keep the Rust side ergonomic;
 // blocks the caller's thread on a semaphore. The continuation runs on
 // a detached task so it cannot deadlock the caller.
 @_cdecl("ek_request_access")
 public func ek_request_access() -> Int32 {
-    var result: Int32 = 0
+    let result = Int32Box()
     let sem = DispatchSemaphore(value: 0)
     Task.detached {
         do {
             let granted = try await store.requestFullAccessToEvents()
-            result = granted ? 1 : 0
+            result.value = granted ? 1 : 0
         } catch {
-            result = 0
+            result.value = 0
         }
         sem.signal()
     }
     sem.wait()
-    return result
+    return result.value
 }
 
 // Reads calendar events between [start_unix, end_unix] (Unix
