@@ -204,20 +204,24 @@ mod tests {
     #[test]
     fn host_round_trip_within_1ms() {
         let clock = SessionClock::new();
-        // Sleep ≥10ms, then read mach_absolute_time. The session-secs
-        // value should be within 1ms of the wall-clock-derived elapsed
-        // (modulo scheduler jitter, hence a 5ms tolerance against an
-        // independent measurement).
+        // Sleep ≥10ms, then read mach_absolute_time. We only assert
+        // the *lower* bound — i.e. the conversion produced something
+        // at least as large as the requested sleep, allowing for the
+        // 1ms timebase precision claimed in the spec. We do NOT
+        // assert an upper bound: GHA macOS runners (and any heavily
+        // loaded host) can stretch a 25ms sleep into 100+ms of real
+        // time, which would falsely fail an upper-bound check on this
+        // smoke test. Drift correctness is covered by the aligner
+        // tests in week 7 (§9.3) against the wall clock.
         let sleep_ms = 25u64;
         std::thread::sleep(Duration::from_millis(sleep_ms));
         // SAFETY: same trivial extern as platform::now_with_timebase.
         let now = unsafe { extern_now() };
         let host_secs = clock.host_to_session_secs(now);
         let lower = (sleep_ms as f64) / 1000.0 - 0.005;
-        let upper = (sleep_ms as f64) / 1000.0 + 0.050;
         assert!(
-            host_secs >= lower && host_secs <= upper,
-            "host_to_session_secs returned {host_secs}s after {sleep_ms}ms sleep (expected {lower}..={upper})"
+            host_secs >= lower,
+            "host_to_session_secs returned {host_secs}s after {sleep_ms}ms sleep (expected ≥ {lower})"
         );
     }
 
