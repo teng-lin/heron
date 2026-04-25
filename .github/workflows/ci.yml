@@ -29,7 +29,6 @@ jobs:
           args: >-
             --no-progress
             --exclude-path .git
-            --exclude-mail
             --accept 200,201,204,206,429
             README.md
             'docs/**/*.md'
