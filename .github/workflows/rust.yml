@@ -103,8 +103,45 @@ jobs:
       - name: install webrtc-audio-processing build deps (meson + ninja)
         run: brew install meson ninja
 
+      # `sherpa-rs-sys`'s build script downloads onnxruntime + sherpa-onnx
+      # dylibs into `~/Library/Caches/sherpa-rs/<target>/<sha>/<dist>/lib/`
+      # and hard-links them into `target/<profile>/deps/`. The test binary
+      # references `@rpath/libonnxruntime.1.17.1.dylib`, but cargo doesn't
+      # set an rpath into `target/debug/deps/`, so dyld relies on its
+      # default fallback search list. When `Swatinem/rust-cache@v2`
+      # restores `target/`, the dylibs hard-linked into `target/debug/deps/`
+      # are not always re-materialised (they live across two separate
+      # `cache-directories` archives, so cross-archive hardlinks can't be
+      # preserved). On cache hit the sherpa-rs-sys build script's
+      # fingerprint is fresh, so it never re-runs the copy loop in its
+      # `build.rs`, leaving `target/debug/deps/libonnxruntime.*.dylib`
+      # missing — the dyld error we keep hitting on CI.
+      #
+      # Build first to populate the cache directory, then point dyld at
+      # both `target/debug/deps` (in case the build script *did* run) and
+      # the cache dir (the always-present source of truth).
+      - name: cargo build (workspace + tests)
+        run: cargo build --workspace --tests
+
       - name: cargo test
-        run: cargo test --workspace
+        run: |
+          set -euo pipefail
+          roots=()
+          for root in "$HOME/Library/Caches/sherpa-rs" target/debug; do
+            [ -d "$root" ] && roots+=("$root")
+          done
+          dirs=""
+          if [ "${#roots[@]}" -gt 0 ]; then
+            dirs=$(find "${roots[@]}" -maxdepth 6 -name 'libonnxruntime*.dylib' \
+              -exec dirname {} \; 2>/dev/null | sort -u | paste -sd ':' -)
+          fi
+          if [ -z "$dirs" ]; then
+            echo "::error::no libonnxruntime*.dylib found under sherpa-rs cache or target/debug" >&2
+            exit 1
+          fi
+          echo "dyld fallback dirs: $dirs"
+          DYLD_FALLBACK_LIBRARY_PATH="${dirs}:${DYLD_FALLBACK_LIBRARY_PATH:-}" \
+            cargo test --workspace
 
       - name: cargo build --release
         run: cargo build --workspace --release
