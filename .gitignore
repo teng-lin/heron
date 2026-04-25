@@ -28,6 +28,6 @@ settings.local.toml
 *.swo
 
 # Local vault / recordings (never commit user data)
-heron-vault/
-recordings/
-transcripts/
+/heron-vault/
+/recordings/
+/transcripts/
