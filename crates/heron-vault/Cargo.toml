@@ -18,5 +18,9 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
+[[bin]]
+name = "validate-vault"
+path = "src/bin/validate-vault.rs"
+
 [dev-dependencies]
 tempfile = "3"

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use heron_cli::session;
+use heron_cli::synthesize::{SynthOptions, synthesize_fixture};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,6 +49,25 @@ enum Commands {
     /// Verify that an m4a archival encode matches its source
     /// recording (used by the §12.3 ringbuffer purge logic).
     VerifyM4a(VerifyM4aArgs),
+    /// Write a stub fixture directory (silent PCM + canned events)
+    /// for offline regression of the aligner / STT / partial writer
+    /// without committing real recordings to the repo.
+    Synthesize(SynthesizeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SynthesizeArgs {
+    /// Output directory. Refuses to overwrite a non-empty dir.
+    out: PathBuf,
+    /// Length of each `.wav` in seconds (max 300).
+    #[arg(long, default_value_t = 30)]
+    duration_secs: u32,
+    /// Number of AX speaker events to spread across the duration.
+    #[arg(long, default_value_t = 6)]
+    ax_events: u32,
+    /// Number of ground-truth turns to emit.
+    #[arg(long, default_value_t = 6)]
+    turns: u32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -178,7 +198,20 @@ fn main() -> Result<()> {
         Commands::Summarize(args) => cmd_summarize(args, cli.vault),
         Commands::Status => cmd_status(cli.vault),
         Commands::VerifyM4a(args) => cmd_verify_m4a(args),
+        Commands::Synthesize(args) => cmd_synthesize(args),
     }
+}
+
+fn cmd_synthesize(args: SynthesizeArgs) -> Result<()> {
+    tracing::info!(?args, "synthesize requested");
+    let opts = SynthOptions {
+        duration_secs: args.duration_secs,
+        ax_events: args.ax_events,
+        turns: args.turns,
+    };
+    synthesize_fixture(&args.out, &opts).map_err(|e| anyhow::anyhow!("synthesize: {e}"))?;
+    println!("wrote stub fixture to {}", args.out.display());
+    Ok(())
 }
 
 fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
