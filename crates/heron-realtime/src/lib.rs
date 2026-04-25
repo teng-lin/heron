@@ -21,11 +21,13 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 pub mod fallback;
+pub mod validate;
 pub use fallback::{
     BargeInStrategy, CancelStrategy, StrategyPlan, TextDeltaStrategy, ToolResultStrategy,
     plan as plan_strategies,
 };
 pub use heron_types::prefixed_id::IdParseError;
+pub use validate::{MAX_SYSTEM_PROMPT_BYTES, MAX_TOOL_COUNT, validate as validate_session};
 
 heron_types::prefixed_id! {
     /// Stripe-style prefixed UUID for one realtime session. Wire
