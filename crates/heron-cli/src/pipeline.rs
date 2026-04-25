@@ -62,16 +62,23 @@ pub async fn run_pipeline(
 ) -> Result<SessionOutcome, SessionError> {
     let (stt, ax, llm) = backends;
 
+    // Capture wall-clock at session arm so the note's filename and
+    // frontmatter `start` reflect when the meeting actually began,
+    // not when the LLM finished. Long sessions or near-midnight calls
+    // would otherwise file under the wrong day / time.
+    let started_at_wall = Utc::now();
+
     // §14.2: idle → armed → recording. State.json is persisted on each
     // edge so a SIGKILL leaves a salvage candidate for §14.3.
     fsm.on_hotkey()?;
-    persist_state(config, SessionPhase::Armed)?;
+    persist_state(config, SessionPhase::Armed, started_at_wall)?;
     fsm.on_yes()?;
-    persist_state(config, SessionPhase::Recording)?;
+    persist_state(config, SessionPhase::Recording, started_at_wall)?;
 
     let session_dir = session_cache_dir(config);
     std::fs::create_dir_all(&session_dir)?;
     let mic_wav = session_dir.join("mic.wav");
+    let mic_clean_wav = session_dir.join("mic_clean.wav");
     let tap_wav = session_dir.join("tap.wav");
 
     let started_at = std::time::Instant::now();
@@ -84,18 +91,32 @@ pub async fn run_pipeline(
         let _ = stop_rx.await;
         Vec::new()
     } else {
-        match run_capture_phase(config, &mic_wav, &tap_wav, ax.as_ref(), stop_rx).await {
+        match run_capture_phase(
+            config,
+            &mic_wav,
+            &mic_clean_wav,
+            &tap_wav,
+            ax.as_ref(),
+            stop_rx,
+        )
+        .await
+        {
             Ok(events) => events,
             Err(e) => {
                 tracing::warn!(error = %e, "audio capture failed; ending session early");
-                return finalize_aborted(fsm, config, format!("audio capture: {e}"));
+                return finalize_aborted(
+                    fsm,
+                    config,
+                    started_at_wall,
+                    format!("audio capture: {e}"),
+                );
             }
         }
     };
 
     // recording → transcribing
     fsm.on_hotkey()?;
-    persist_state(config, SessionPhase::Transcribing)?;
+    persist_state(config, SessionPhase::Transcribing, started_at_wall)?;
 
     let elapsed = started_at.elapsed();
     let duration_secs = elapsed.as_secs_f64().max(0.5);
@@ -105,10 +126,19 @@ pub async fn run_pipeline(
     // in <vault>/transcripts/<id>.jsonl.
     let mic_partial = session_dir.join("mic.partial.jsonl");
     let tap_partial = session_dir.join("tap.partial.jsonl");
+    // STT consumes the post-AEC `mic_clean.wav` per the heron-audio
+    // contract — raw `mic.wav` would re-feed any tap bleed back into
+    // the transcript. The integration test path falls back to mic.wav
+    // if mic_clean wasn't seeded (test stubs don't run AEC).
+    let stt_mic_path = if mic_clean_wav.exists() {
+        &mic_clean_wav
+    } else {
+        &mic_wav
+    };
     let mic_turns = run_stt(
         stt.as_ref(),
-        &mic_wav,
-        Channel::Mic,
+        stt_mic_path,
+        Channel::MicClean,
         config.session_id,
         &mic_partial,
     )
@@ -180,12 +210,11 @@ pub async fn run_pipeline(
 
     // transcribing → summarizing
     fsm.on_transcribe_done()?;
-    persist_state(config, SessionPhase::Summarizing)?;
+    persist_state(config, SessionPhase::Summarizing, started_at_wall)?;
 
-    let now = Utc::now();
-    let date_str = now.format("%Y-%m-%d").to_string();
-    let start_hhmm = now.format("%H%M").to_string();
-    let frontmatter_start = now.format("%H:%M").to_string();
+    let date_str = started_at_wall.format("%Y-%m-%d").to_string();
+    let start_hhmm = started_at_wall.format("%H%M").to_string();
+    let frontmatter_start = started_at_wall.format("%H:%M").to_string();
     let slug = "untitled";
 
     // LLM summarize. A failure here is non-fatal — we still write a
@@ -228,7 +257,7 @@ pub async fn run_pipeline(
     };
 
     let frontmatter = Frontmatter {
-        date: now.date_naive(),
+        date: started_at_wall.date_naive(),
         start: frontmatter_start,
         duration_min: (duration_secs / 60.0).ceil() as u32,
         company,
@@ -277,7 +306,7 @@ pub async fn run_pipeline(
         SummaryOutcome::Failed
     };
     fsm.on_summary(summary_outcome)?;
-    persist_state(config, SessionPhase::Done)?;
+    persist_state(config, SessionPhase::Done, started_at_wall)?;
 
     Ok(SessionOutcome {
         final_state: fsm.state(),
@@ -291,15 +320,16 @@ pub async fn run_pipeline(
 fn finalize_aborted(
     fsm: &mut RecordingFsm,
     config: &SessionConfig,
+    started_at_wall: chrono::DateTime<Utc>,
     reason: String,
 ) -> Result<SessionOutcome, SessionError> {
     tracing::warn!(reason = %reason, "session aborted before STT");
     fsm.on_hotkey()?;
-    persist_state(config, SessionPhase::Transcribing)?;
+    persist_state(config, SessionPhase::Transcribing, started_at_wall)?;
     fsm.on_transcribe_done()?;
-    persist_state(config, SessionPhase::Summarizing)?;
+    persist_state(config, SessionPhase::Summarizing, started_at_wall)?;
     fsm.on_summary(SummaryOutcome::Failed)?;
-    persist_state(config, SessionPhase::Done)?;
+    persist_state(config, SessionPhase::Done, started_at_wall)?;
     Ok(SessionOutcome {
         final_state: fsm.state(),
         last_idle_reason: fsm.last_idle_reason(),
@@ -313,6 +343,7 @@ fn finalize_aborted(
 async fn run_capture_phase(
     config: &SessionConfig,
     mic_wav: &Path,
+    mic_clean_wav: &Path,
     tap_wav: &Path,
     ax: &dyn heron_zoom::AxBackend,
     stop_rx: oneshot::Receiver<()>,
@@ -325,6 +356,11 @@ async fn run_capture_phase(
         capture.frames.resubscribe(),
         Channel::Mic,
         mic_wav.to_path_buf(),
+    );
+    let mic_clean_handle = spawn_wav_writer(
+        capture.frames.resubscribe(),
+        Channel::MicClean,
+        mic_clean_wav.to_path_buf(),
     );
     let tap_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
@@ -357,6 +393,9 @@ async fn run_capture_phase(
     if let Err(e) = mic_handle.await {
         tracing::warn!(error = %e, "mic WAV writer panicked");
     }
+    if let Err(e) = mic_clean_handle.await {
+        tracing::warn!(error = %e, "mic_clean WAV writer panicked");
+    }
     if let Err(e) = tap_handle.await {
         tracing::warn!(error = %e, "tap WAV writer panicked");
     }
@@ -376,15 +415,18 @@ fn session_cache_dir(config: &SessionConfig) -> PathBuf {
         .join(config.session_id.to_string())
 }
 
-fn persist_state(config: &SessionConfig, phase: SessionPhase) -> Result<(), SessionError> {
+fn persist_state(
+    config: &SessionConfig,
+    phase: SessionPhase,
+    started_at: chrono::DateTime<Utc>,
+) -> Result<(), SessionError> {
     let dir = session_cache_dir(config);
     std::fs::create_dir_all(&dir)?;
-    let now = Utc::now();
     let record = SessionStateRecord {
         state_version: heron_types::STATE_VERSION,
         session_id: config.session_id,
-        started_at: now,
-        last_updated: now,
+        started_at,
+        last_updated: Utc::now(),
         source_app: config.target_bundle_id.clone(),
         cache_dir: dir,
         phase,
