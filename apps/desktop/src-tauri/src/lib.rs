@@ -15,6 +15,7 @@
 
 pub mod asset_protocol;
 pub mod diagnostics;
+pub mod onboarding;
 pub mod settings;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +24,16 @@ use serde::Serialize;
 
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
+pub use onboarding::{
+    TestOutcome, test_accessibility, test_audio_tap, test_calendar, test_microphone,
+    test_model_download,
+};
+
+// Tauri's command-handler macro requires the function names it
+// generates wrappers for to live at the same path the macro is in;
+// we keep the underlying free functions in `onboarding` for direct
+// unit-testing, and the `#[tauri::command]` shims below thread the
+// arguments through.
 pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +98,36 @@ fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(),
     write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
 }
 
+/// Tauri command: §13.3 step 1 microphone Test button.
+#[tauri::command]
+fn heron_test_microphone() -> TestOutcome {
+    test_microphone()
+}
+
+/// Tauri command: §13.3 step 2 system-audio Test button.
+#[tauri::command]
+fn heron_test_audio_tap(target_bundle_id: String) -> TestOutcome {
+    test_audio_tap(&target_bundle_id)
+}
+
+/// Tauri command: §13.3 step 3 accessibility Test button.
+#[tauri::command]
+fn heron_test_accessibility() -> TestOutcome {
+    test_accessibility()
+}
+
+/// Tauri command: §13.3 step 4 calendar Test button.
+#[tauri::command]
+fn heron_test_calendar() -> TestOutcome {
+    test_calendar()
+}
+
+/// Tauri command: §13.3 step 5 model-download Test button.
+#[tauri::command]
+fn heron_test_model_download(progress: f32) -> TestOutcome {
+    test_model_download(progress)
+}
+
 /// Default settings location.
 ///
 /// Resolves via [`dirs::config_dir`] so the path is correct on every
@@ -129,6 +170,11 @@ pub fn run() {
             heron_diagnostics,
             heron_read_settings,
             heron_write_settings,
+            heron_test_microphone,
+            heron_test_audio_tap,
+            heron_test_accessibility,
+            heron_test_calendar,
+            heron_test_model_download,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");
