@@ -263,3 +263,61 @@ ringbuffer + IO proc patch lands and we have a synthetic Zoom-side
 fixture that produces deterministic audio (the AEC test rig in §6.3
 plays a similar role for AEC), this test gets a non-ignored
 counterpart. Until then it stays here.
+
+## Mic capture (heron-audio) real-device runbook (§6)
+
+The integration test
+`crates/heron-audio/tests/mic_capture_real.rs` exercises the real
+cpal mic-input pipeline alongside (but independent of) the process
+tap. It is `#[ignore]`d by default — it needs a real default input
+device and TCC microphone permission.
+
+**Preconditions on the test machine.**
+1. macOS 14.2 or newer (matches v0's supported floor; cpal itself
+   works on earlier versions, but the rest of `heron-audio` is
+   pinned to 14.2+).
+2. A default input device selected in System Settings → Sound →
+   Input. The internal Apple Silicon mic is fine; external USB
+   headsets and audio interfaces also work.
+3. The default input device must support 48 kHz f32 input. This is
+   the modern-Apple default; if the test fails with `Aborted: cpal
+   build_input_stream failed`, switch inputs.
+4. TCC grant:
+   - **System Settings → Privacy & Security → Microphone** — allow
+     the test runner's parent (Terminal / iTerm / VS Code).
+   - First invocation may pop the system microphone prompt; click
+     Allow then re-run.
+
+**Running the test.**
+```sh
+HERON_MIC_CAPTURE_REAL=1 \
+  cargo test -p heron-audio --test mic_capture_real -- --ignored --nocapture
+```
+
+Without `HERON_MIC_CAPTURE_REAL=1` the test prints a SKIPPED line
+and exits 0; that's the CI behavior. With the env var set:
+- Pass: at least one `Channel::Mic` `CaptureFrame` arrives within 5 s.
+- Fail (`PermissionDenied`): TCC not granted — see preconditions.
+- Fail (`Aborted: no default input device`): no input selected, or
+  Bluetooth headset disconnected mid-test. Reconnect or switch
+  inputs.
+
+**Resetting TCC** for a clean re-run (e.g. after revoking via the
+Settings UI to test the prompt path):
+```sh
+tccutil reset Microphone $(id -un)
+```
+The next test run will re-prompt.
+
+**Mic-failure-doesn't-fail-the-session policy.** Note that
+`AudioCapture::start` swallows mic failures (logs + emits
+`Event::CaptureDegraded`, returns the handle with `_mic = None`).
+This test calls `mic_capture::start_mic` directly so a TCC denial
+or device error is observable as a panicking test rather than a
+silent tap-only session.
+
+**When to promote this from `[needs-human]` to CI.** Once a CI
+runner with a virtual audio loopback (BlackHole or equivalent) is
+available, this test gets a non-ignored counterpart that pumps a
+known sine wave through the loopback and asserts on FFT energy.
+Until then it stays here.
