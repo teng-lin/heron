@@ -344,7 +344,16 @@ fn mic_callback(ctx: &mut MicCtx, interleaved: &[f32]) {
     // `interleaved.len()` is `frames * channels`. For channels == 1
     // we just clone — the explicit branch avoids the per-sample
     // division in the hot path. For channels > 1 we average across
-    // channels, which is the standard "naive but correct" downmix.
+    // channels.
+    //
+    // Trade-off: averaging is the standard "naive but correct" mixdown.
+    // It risks signal cancellation when channels are out of phase
+    // (e.g., a stereo mic pointing in opposing directions, or one
+    // channel inverted by a preamp wiring fault). For v0 every
+    // supported config (built-in mac mics, AirPods, USB headsets) is
+    // a coherent capture so this is fine; if §7.4 surfaces a real
+    // phase-cancellation case the fix is to pick a primary channel
+    // (e.g., channel 0) instead of averaging.
     let frame_count = interleaved.len() / ctx.input_channels;
     let samples: Vec<f32> = if ctx.input_channels == 1 {
         interleaved.to_vec()
