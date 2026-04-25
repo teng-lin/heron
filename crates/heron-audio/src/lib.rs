@@ -20,6 +20,8 @@ use tokio::sync::broadcast;
 
 pub mod backpressure;
 pub mod disk;
+#[cfg(target_os = "macos")]
+pub mod process_tap;
 pub mod ringbuffer;
 
 pub use backpressure::{BackpressureMonitor, SATURATION_THRESHOLD};
@@ -92,26 +94,73 @@ pub struct AudioCapture {
 impl AudioCapture {
     /// Start a capture session.
     ///
-    /// Returns immediately once the realtime taps are wired (or
-    /// errors if the target app isn't running / TCC denied). Frames
-    /// flow over [`AudioCaptureHandle::frames`] for the lifetime of
-    /// the handle; `stop()` flushes any in-flight buffers before
-    /// returning [`StopArtifacts`].
+    /// On macOS this resolves the meeting client by bundle id, builds
+    /// a Core Audio process tap, wraps it in a private aggregate
+    /// device, and returns an [`AudioCaptureHandle`] whose
+    /// `frames` / `events` receivers stay live for the lifetime of
+    /// the handle. The aggregate device's IO proc is **not yet**
+    /// wired into `frames` — that callback path arrives with the
+    /// week-3 ringbuffer integration (§7). Until then `frames` will
+    /// be silent, but the tap + aggregate device are owned by the
+    /// returned handle and released cleanly on drop.
     ///
-    /// Until the week-2 implementation lands this returns
-    /// [`AudioError::NotYetImplemented`] so the type signature is
-    /// usable from downstream crates without any audio actually
-    /// flowing.
+    /// On non-Apple platforms this returns
+    /// [`AudioError::NotYetImplemented`] — there is no Core Audio
+    /// process tap off-Apple.
     pub async fn start(
         session_id: SessionId,
         target_bundle_id: &str,
         cache_dir: &Path,
     ) -> Result<AudioCaptureHandle, AudioError> {
-        // Touch the args so clippy's unused_variables stays quiet
-        // without renaming the public API.
-        let _ = (session_id, target_bundle_id, cache_dir);
-        Err(AudioError::NotYetImplemented)
+        // Cache dir is unused until §7 (week-3 disk-spill ringbuffer);
+        // session id flows into events once the broadcast pipeline is
+        // populated. Touch them so clippy's unused_variables stays
+        // quiet without renaming the public API.
+        let _ = (session_id, cache_dir);
+
+        #[cfg(target_os = "macos")]
+        {
+            let clock = SessionClock::new();
+            let (frames_tx, frames_rx) = broadcast::channel::<CaptureFrame>(1024);
+            let (_events_tx, events_rx) = broadcast::channel::<Event>(256);
+            let pipeline = process_tap::open_tap(target_bundle_id, frames_tx.clone(), clock)?;
+            // Hold both the cidre resources (`pipeline`) and the
+            // sender end of the broadcast channels alive for the
+            // lifetime of the handle — once the sender is dropped,
+            // every receiver sees `RecvError::Closed` immediately,
+            // which would defeat the point of returning the handle.
+            Ok(AudioCaptureHandle {
+                frames: frames_rx,
+                events: events_rx,
+                clock,
+                _macos_pipeline: Some(MacosPipelineGuard {
+                    _pipeline: pipeline,
+                    _frames_tx: frames_tx,
+                    _events_tx,
+                }),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // No process tap off-Apple — Linux/Windows builds exist
+            // only so that `cargo check` works on CI runners that
+            // can't compile cidre. They never run heron in anger.
+            let _ = target_bundle_id;
+            Err(AudioError::NotYetImplemented)
+        }
     }
+}
+
+/// macOS-only owner of the cidre resources backing a live capture
+/// session. Held inside [`AudioCaptureHandle`] as an opaque private
+/// field so dropping the handle releases the tap + aggregate device
+/// + broadcast senders in the right order.
+#[cfg(target_os = "macos")]
+struct MacosPipelineGuard {
+    _pipeline: process_tap::TapPipeline,
+    _frames_tx: broadcast::Sender<CaptureFrame>,
+    _events_tx: broadcast::Sender<Event>,
 }
 
 /// Live handle to a capture session.
@@ -128,6 +177,13 @@ pub struct AudioCaptureHandle {
     pub frames: broadcast::Receiver<CaptureFrame>,
     pub events: broadcast::Receiver<Event>,
     pub clock: SessionClock,
+    /// Owns the cidre `TapPipeline` + the broadcast senders so the
+    /// receivers above stay alive for the lifetime of the handle.
+    /// `None` on non-Apple builds (where `start()` always returns
+    /// `Err(NotYetImplemented)` so a handle is never constructed
+    /// anyway).
+    #[cfg(target_os = "macos")]
+    _macos_pipeline: Option<MacosPipelineGuard>,
 }
 
 impl AudioCaptureHandle {
@@ -144,12 +200,45 @@ impl AudioCaptureHandle {
 mod tests {
     use super::*;
 
+    /// Off-Apple targets have no Core Audio, so `start` is hard-wired
+    /// to return `NotYetImplemented`. Locked down so the cfg gate in
+    /// `start()` doesn't drift.
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
-    async fn start_returns_not_yet_implemented_until_week_2() {
+    async fn start_returns_not_yet_implemented_off_apple() {
         let session = SessionId::nil();
         let cache = std::env::temp_dir();
         let result = AudioCapture::start(session, "us.zoom.xos", &cache).await;
         assert!(matches!(result, Err(AudioError::NotYetImplemented)));
+    }
+
+    /// On macOS we expect either a live handle (target app running +
+    /// TCC granted) or a recoverable error like
+    /// `ProcessNotFound` / `PermissionDenied` / `Aborted` — but
+    /// **never** `NotYetImplemented`. That regression is what catches
+    /// a future patch accidentally short-circuiting the macOS branch
+    /// back to the v0 stub.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_does_not_return_not_yet_implemented_on_macos() {
+        // Pick a bundle id that is almost certainly NOT running on a
+        // CI runner — that way we exercise the lookup path without
+        // requiring TCC. A live tap requires "system audio recording"
+        // grant, which CI doesn't have, so an error is expected; the
+        // assertion is just that it's not `NotYetImplemented`.
+        let session = SessionId::nil();
+        let cache = std::env::temp_dir();
+        let result = AudioCapture::start(session, "com.heron.no-such-app", &cache).await;
+        match result {
+            Err(AudioError::NotYetImplemented) => {
+                panic!("macOS branch must not return NotYetImplemented");
+            }
+            Err(AudioError::ProcessNotFound { .. })
+            | Err(AudioError::PermissionDenied(_))
+            | Err(AudioError::Aborted(_))
+            | Ok(_) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]

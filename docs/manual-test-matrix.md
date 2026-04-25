@@ -206,3 +206,60 @@ configured Swift Package Registry mirror) is required at *build*
 time. CI must be allowed network egress, or the resolved `.build/`
 checkout must be vendored — vendoring is out of scope for the
 scaffolding PR that introduced this section.
+
+## Process-tap real-device runbook (§6.2)
+
+The integration test
+`crates/heron-audio/tests/process_tap_real.rs` exercises the real
+Core Audio process tap against a live meeting client. It is
+`#[ignore]`d by default because it needs hardware + TCC grants that
+no CI runner has.
+
+**Preconditions on the test machine.**
+1. macOS 14.2 or newer (process tap API was added in 14.2).
+2. The target meeting app installed and running. Default bundle id
+   is `us.zoom.xos`; override via `HERON_PROCESS_TAP_BUNDLE_ID`
+   (e.g. `HERON_PROCESS_TAP_BUNDLE_ID=us.zoom.xos.ZoomClips` for the
+   helper, or `com.microsoft.teams2` for Teams).
+3. Join a Zoom meeting that is actually playing audio — the test
+   only asserts that the tap pipeline builds without TCC failure
+   today (the IO-proc → broadcast pipe lands week 3), but a real
+   meeting is what catches "tap built but produces silence" before
+   it ships.
+4. TCC grants:
+   - **System Settings → Privacy & Security → Microphone** —
+     allow the test runner's parent (Terminal / iTerm / VS Code).
+   - **Privacy & Security → System Audio Recording** (14.2+) —
+     same. If the section is missing, the laptop is < 14.2.
+   - If running from a fresh checkout, the first invocation will
+     pop the system-audio prompt; click Allow then re-run.
+
+**Running the test.**
+```sh
+HERON_PROCESS_TAP_REAL=1 \
+  cargo test -p heron-audio --test process_tap_real -- --ignored --nocapture
+```
+
+Without `HERON_PROCESS_TAP_REAL=1` the test prints a SKIPPED line
+and exits 0; that's the CI behavior. With the env var set:
+- Pass: prints "process_tap_emits_at_least_one_frame" with no
+  panic. Today this means "tap + aggregate device built without
+  TCC failure"; once the week-3 IO proc lands, it means "≥ 1
+  CaptureFrame arrived in 2 s".
+- Fail (`PermissionDenied`): TCC not granted — see preconditions.
+- Fail (`ProcessNotFound`): meeting app not running. Launch it
+  (or override bundle id) and re-run.
+
+**Resetting TCC** for a clean re-run (e.g. after revoking via the
+Settings UI to test the prompt path):
+```sh
+tccutil reset Microphone $(id -un)
+tccutil reset SystemAudioRecording $(id -un)   # 14.2+
+```
+The next test run will re-prompt.
+
+**When to promote this from `[needs-human]` to CI.** Once the §7
+ringbuffer + IO proc patch lands and we have a synthetic Zoom-side
+fixture that produces deterministic audio (the AEC test rig in §6.3
+plays a similar role for AEC), this test gets a non-ignored
+counterpart. Until then it stays here.
