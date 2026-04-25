@@ -93,10 +93,10 @@ fn truncate_for_echo(s: &str) -> String {
 ///
 /// # Reserved test prefixes
 ///
-/// `"test"` and `"other"` are used by this crate's own unit tests
-/// (see the `tests` module below). Don't pick those strings for a
-/// production ID — the wire forms would collide with the synthetic
-/// fixtures and confuse anyone debugging an audit log.
+/// `"test"`, `"other"`, and `"under_score"` are used by this crate's
+/// own unit tests (see the `tests` module below). Don't pick those
+/// strings for a production ID — the wire forms would collide with
+/// the synthetic fixtures and confuse anyone debugging an audit log.
 #[macro_export]
 macro_rules! prefixed_id {
     ($(#[$attr:meta])* $vis:vis $name:ident, $prefix:literal) => {
@@ -143,15 +143,19 @@ macro_rules! prefixed_id {
 
         impl ::serde::Serialize for $name {
             fn serialize<S: ::serde::Serializer>(&self, s: S) -> ::std::result::Result<S::Ok, S::Error> {
-                // Allocate once into a small stack-grown String. The
-                // wire form is bounded at PREFIX_LEN + 1 + 36.
-                s.serialize_str(&self.to_string())
+                // `collect_str` writes the `Display` form straight into
+                // the serializer's buffer — no intermediate `String`.
+                s.collect_str(self)
             }
         }
 
         impl<'de> ::serde::Deserialize<'de> for $name {
             fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> ::std::result::Result<Self, D::Error> {
-                let s = <String as ::serde::Deserialize>::deserialize(d)?;
+                // `Cow<'de, str>` borrows from the input buffer when the
+                // deserializer permits, falling back to owned only when
+                // the input requires escaping. Avoids the unconditional
+                // heap allocation `String::deserialize` would force.
+                let s = <::std::borrow::Cow<'de, str> as ::serde::Deserialize<'de>>::deserialize(d)?;
                 <Self as ::std::str::FromStr>::from_str(&s)
                     .map_err(::serde::de::Error::custom)
             }
@@ -163,7 +167,10 @@ macro_rules! prefixed_id {
 /// `FromStr` impls so the validation logic isn't duplicated per
 /// type.
 pub fn parse_prefixed(expected_prefix: &'static str, s: &str) -> Result<Uuid, IdParseError> {
-    let Some((prefix, rest)) = s.split_once('_') else {
+    // `rsplit_once` splits on the LAST `_`, so a prefix that itself
+    // contains underscores (e.g. `my_kind_<uuid>`) is parsed correctly.
+    // Safe because UUIDs use hex digits + `-`, never `_`.
+    let Some((prefix, rest)) = s.rsplit_once('_') else {
         return Err(IdParseError::MissingSeparator {
             input: truncate_for_echo(s),
         });
@@ -190,6 +197,10 @@ mod tests {
     // the macro itself rather than the public types.
     crate::prefixed_id!(pub TestId, "test");
     crate::prefixed_id!(pub OtherId, "other");
+    // Exercises the `rsplit_once` parse path: prefix itself contains
+    // an underscore. Splitting on the FIRST `_` would mistake the
+    // prefix for `under` and reject the input.
+    crate::prefixed_id!(pub UnderscoreId, "under_score");
 
     #[test]
     fn display_emits_prefix_underscore_uuid() {
@@ -308,6 +319,29 @@ mod tests {
             "truncation must not produce a replacement char"
         );
         assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn from_str_handles_underscore_in_prefix() {
+        // Round-trip: `under_score_<uuid>` must parse as `UnderscoreId`.
+        // `split_once('_')` would have split at the first `_` and left
+        // `score_<uuid>` as the rest — `Uuid::from_str` would reject it.
+        let original = UnderscoreId(Uuid::from_u128(0x0123_4567_89ab_4def_8000_0000_0000_0001));
+        let s = original.to_string();
+        assert_eq!(s, "under_score_01234567-89ab-4def-8000-000000000001");
+        let parsed: UnderscoreId = s
+            .parse()
+            .expect("rsplit_once must accept underscore prefix");
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn serde_handles_underscore_in_prefix() {
+        // Same forward-compat property holds across the serde path.
+        let id = UnderscoreId::now_v7();
+        let json = serde_json::to_string(&id).expect("serialize");
+        let back: UnderscoreId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, back);
     }
 
     #[test]
