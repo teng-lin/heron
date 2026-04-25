@@ -171,3 +171,38 @@ returns cleanly. Failure modes:
 - "no SpeakerEvent received in 5s": the AX triple is wrong (most
   likely cause: step 1 hasn't been run since a Zoom update). Re-run
   step 1 against the current Zoom version.
+
+## WhisperKit STT backend
+
+The real WhisperKit `SttBackend` (see `crates/heron-speech/src/lib.rs`)
+loads a CoreML-compiled Whisper model at runtime; the model itself is
+not vendored in the repo. To run the smoke test:
+
+1. **Download a model.** WhisperKit publishes pre-converted models on
+   the [argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml)
+   HuggingFace repo. See the WhisperKit README's
+   [Model Selection](https://github.com/argmaxinc/WhisperKit#model-selection)
+   section for a chooser. A reasonable default for development is
+   `openai_whisper-base.en`; for end-to-end accuracy work pick
+   `openai_whisper-large-v3-turbo` or similar. Place the unpacked
+   bundle on disk at any stable path, e.g.
+   `~/Library/Application Support/heron/models/whisperkit/openai_whisper-base.en`.
+2. **Point the env var.** Export
+   `HERON_WHISPERKIT_MODEL_DIR=<that path>`. The path is the *folder*
+   containing the `*.mlmodelc` bundles WhisperKit expects, not a
+   parent directory.
+3. **Run the test.**
+   ```sh
+   cargo test -p heron-speech --test whisperkit_real -- --nocapture
+   ```
+   When the env var is unset the test prints a notice and skips.
+
+### Build-time network requirement
+
+`swift build` for `swift/whisperkit-helper/` resolves the
+`argmaxinc/WhisperKit` Swift package (pinned at `v0.18.0`,
+commit `e2adabbe`) on first run. Network access to github.com (or a
+configured Swift Package Registry mirror) is required at *build*
+time. CI must be allowed network egress, or the resolved `.build/`
+checkout must be vendored — vendoring is out of scope for the
+scaffolding PR that introduced this section.

@@ -244,23 +244,53 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn init_stub_returns_not_yet_implemented() {
-        // The v0 Swift body always returns -1; the Rust mapping
-        // surfaces it as WkError::NotYetImplemented. This test pins
-        // the wire so a future Swift change that loses the stub
-        // contract triggers a regression.
+    fn init_against_empty_dir_returns_internal() {
+        // The Swift bridge tries to load a real WhisperKit instance
+        // from the supplied folder. An empty tempdir is a valid
+        // directory (so we don't hit `ModelMissing`) but contains no
+        // `.mlmodelc` bundles, so WhisperKit fails to initialize and
+        // we surface `Internal`. The contract this test pins is
+        // "non-Ok status reaches Rust" — the real model-load path is
+        // exercised by `tests/whisperkit_real.rs` when the env var
+        // is set.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let result = whisperkit_init(tmp.path());
-        assert!(matches!(result, Err(WkError::NotYetImplemented)));
+        assert!(
+            matches!(result, Err(WkError::Internal { .. })),
+            "expected Internal, got {result:?}"
+        );
     }
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn transcribe_stub_returns_not_yet_implemented() {
+    fn init_against_missing_dir_returns_model_missing() {
+        // A path that doesn't exist must surface as ModelMissing so
+        // the orchestrator can show the "download model" UI rather
+        // than a generic "internal error".
+        let result = whisperkit_init(Path::new("/nonexistent/wk-model-dir"));
+        assert!(
+            matches!(result, Err(WkError::ModelMissing)),
+            "expected ModelMissing, got {result:?}"
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn transcribe_without_init_returns_internal() {
+        // The v0 stub always returned NotYetImplemented; the real
+        // bridge returns Internal when no instance has been loaded.
+        // We can't easily reset the global between tests, so this
+        // test is meaningful only when run *before* any real init —
+        // `cargo test` doesn't guarantee order, but a transcribe of
+        // a non-existent wav after a successful init would also fail
+        // with Internal, so this assertion is robust to ordering.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let wav = tmp.path().join("nope.wav");
         let result = whisperkit_transcribe(&wav);
-        assert!(matches!(result, Err(WkError::NotYetImplemented)));
+        assert!(
+            matches!(result, Err(WkError::Internal { .. })),
+            "expected Internal, got {result:?}"
+        );
     }
 
     #[cfg(target_vendor = "apple")]
