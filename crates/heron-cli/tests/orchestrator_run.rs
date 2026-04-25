@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use heron_cli::session::{Backends, Orchestrator, SessionConfig};
 use heron_llm::{LlmError, Summarizer, SummarizerInput, SummarizerOutput};
 use heron_speech::{PartialWriter, ProgressFn, SttBackend, SttError, TranscribeSummary, TurnFn};
@@ -22,6 +23,7 @@ use heron_types::{
     Channel, Cost, Event, MeetingType, RecordingState, SessionClock, SessionId, SpeakerEvent,
     SpeakerSource, Turn,
 };
+use heron_vault::{CalendarError, CalendarEvent, CalendarReader};
 use heron_zoom::{AxBackend, AxError, AxHandle};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
@@ -154,12 +156,50 @@ fn write_silent_wav(path: &Path, duration_secs: f64) {
     writer.finalize().expect("finalize wav");
 }
 
+/// Calendar stub that always reports "no permission granted" — the
+/// orchestrator's denial-contract path falls through to LLM-inferred
+/// attendees + the "untitled" slug, matching the production behavior
+/// on a machine where the user skipped step 4 of onboarding.
+struct StubCalendarDenied;
+
+impl CalendarReader for StubCalendarDenied {
+    fn read_window(
+        &self,
+        _start_utc: DateTime<Utc>,
+        _end_utc: DateTime<Utc>,
+    ) -> Result<Option<Vec<CalendarEvent>>, CalendarError> {
+        Ok(None)
+    }
+}
+
+/// Calendar stub that returns one canned event covering the session
+/// window. Lets a focused test pin that the pipeline picks up the
+/// title for the slug and the attendees for the frontmatter.
+struct StubCalendarOneEvent {
+    event: CalendarEvent,
+}
+
+impl CalendarReader for StubCalendarOneEvent {
+    fn read_window(
+        &self,
+        _start_utc: DateTime<Utc>,
+        _end_utc: DateTime<Utc>,
+    ) -> Result<Option<Vec<CalendarEvent>>, CalendarError> {
+        Ok(Some(vec![self.event.clone()]))
+    }
+}
+
 fn build_backends() -> (Backends, Arc<Mutex<Option<PathBuf>>>) {
     let seen = Arc::new(Mutex::new(None));
     let llm = StubLlm {
         seen_transcript: seen.clone(),
     };
-    let backends: Backends = (Box::new(StubStt), Box::new(StubAx), Box::new(llm));
+    let backends: Backends = (
+        Box::new(StubStt),
+        Box::new(StubAx),
+        Box::new(llm),
+        Box::new(StubCalendarDenied),
+    );
     (backends, seen)
 }
 
@@ -264,6 +304,7 @@ async fn run_pipeline_with_failing_llm_writes_fallback_note() {
         Box::new(StubStt),
         Box::new(StubAx),
         Box::new(StubLlmFailing),
+        Box::new(StubCalendarDenied),
     );
     let mut orch = Orchestrator::with_test_backends(cfg, backends);
 
@@ -355,7 +396,12 @@ async fn run_pipeline_with_empty_stt_finalizes_to_idle_with_note() {
     let llm = StubLlm {
         seen_transcript: Arc::clone(&llm_seen),
     };
-    let backends: Backends = (Box::new(StubSttEmpty), Box::new(StubAx), Box::new(llm));
+    let backends: Backends = (
+        Box::new(StubSttEmpty),
+        Box::new(StubAx),
+        Box::new(llm),
+        Box::new(StubCalendarDenied),
+    );
     let mut orch = Orchestrator::with_test_backends(cfg, backends);
 
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -438,5 +484,91 @@ async fn run_pipeline_with_missing_wavs_finalizes_with_note() {
     assert!(
         session_dir.exists(),
         "ringbuffer cache must be retained on encode/verify failure"
+    );
+}
+
+#[tokio::test]
+async fn run_pipeline_uses_calendar_event_for_slug_and_attendees() {
+    // Pin the calendar wiring: when the calendar reader returns a
+    // single event covering the session window, the pipeline must
+    // (1) lift the event title into the filename slug per §3.2 and
+    // (2) override LLM-inferred attendees with the calendar-supplied
+    // attendees per §5 wks 7–8.
+    let tmp = TempDir::new().expect("tmpdir");
+    let session_id = SessionId::from_u128(0x0193_1f00_ca1e_d000);
+    let cache_dir = tmp.path().join("cache");
+    let vault_root = tmp.path().join("vault");
+    let session_dir = cache_dir.join("sessions").join(session_id.to_string());
+
+    write_silent_wav(&session_dir.join("mic.wav"), 0.5);
+    write_silent_wav(&session_dir.join("tap.wav"), 0.5);
+
+    let now_secs = Utc::now().timestamp() as f64;
+    let event = CalendarEvent {
+        title: "Acme sync".into(),
+        // ±60 s around the call so the event fully spans the session.
+        start: now_secs - 60.0,
+        end: now_secs + 600.0,
+        attendees: vec![
+            heron_vault::CalendarAttendee {
+                name: "Alice Anderson".into(),
+                email: "mailto:alice@acme.test".into(),
+            },
+            heron_vault::CalendarAttendee {
+                name: "Bob Brown".into(),
+                email: "mailto:bob@acme.test".into(),
+            },
+        ],
+    };
+
+    let cfg = SessionConfig {
+        session_id,
+        target_bundle_id: "us.zoom.xos".into(),
+        cache_dir,
+        vault_root: vault_root.clone(),
+        stt_backend_name: "sherpa".into(),
+        llm_preference: heron_llm::Preference::Auto,
+    };
+    let llm_seen = Arc::new(Mutex::new(None));
+    let llm = StubLlm {
+        seen_transcript: Arc::clone(&llm_seen),
+    };
+    let backends: Backends = (
+        Box::new(StubStt),
+        Box::new(StubAx),
+        Box::new(llm),
+        Box::new(StubCalendarOneEvent { event }),
+    );
+    let mut orch = Orchestrator::with_test_backends(cfg, backends);
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = stop_tx.send(());
+    });
+
+    let outcome = orch.run(stop_rx).await.expect("run");
+    let note_path = outcome.note_path.expect("note path returned");
+    let filename = note_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("utf-8 filename");
+    assert!(
+        filename.contains("Acme sync"),
+        "filename {filename:?} must include the calendar title"
+    );
+    assert!(
+        !filename.contains("untitled"),
+        "calendar title must replace the 'untitled' fallback"
+    );
+
+    let body = std::fs::read_to_string(&note_path).expect("read note");
+    assert!(
+        body.contains("Alice Anderson"),
+        "calendar attendee Alice must reach the frontmatter"
+    );
+    assert!(
+        body.contains("Bob Brown"),
+        "calendar attendee Bob must reach the frontmatter"
     );
 }

@@ -49,7 +49,7 @@ fn backends_resolve_cleanly_with_known_stt_name() {
     // STT + AX shape is what this test pins; the LLM-selection
     // contract is covered in heron_llm::select::tests.
     match orch.backends() {
-        Ok((stt, ax, _llm)) => {
+        Ok((stt, ax, _llm, _cal)) => {
             assert_eq!(stt.name(), "sherpa");
             assert_eq!(ax.name(), "ax-observer");
         }

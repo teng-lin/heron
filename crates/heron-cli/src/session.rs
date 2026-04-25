@@ -86,13 +86,18 @@ pub struct SessionOutcome {
     pub note_path: Option<PathBuf>,
 }
 
-/// The trait-object trio every consumer needs to drive a session.
+/// The trait-object set every consumer needs to drive a session.
 /// Type alias rather than a struct so consumers can destructure
-/// directly without a `.0/.1/.2` indexing tax.
+/// directly without an indexing tax.
+///
+/// Order: STT, AX, LLM, calendar reader. The calendar reader is the
+/// fourth slot so the integration test path can inject a stub instead
+/// of reaching out to live EventKit on the dev machine.
 pub type Backends = (
     Box<dyn heron_speech::SttBackend>,
     Box<dyn heron_zoom::AxBackend>,
     Box<dyn heron_llm::Summarizer>,
+    Box<dyn heron_vault::CalendarReader>,
 );
 
 /// Orchestrates one session from arm → record → transcribe →
@@ -232,7 +237,9 @@ impl Orchestrator {
         let ax = heron_zoom::select_ax_backend();
         let (llm, backend, reason) = heron_llm::select_summarizer(self.config.llm_preference)?;
         tracing::info!(?backend, ?reason, "LLM backend selected");
-        Ok((stt, ax, llm))
+        let calendar: Box<dyn heron_vault::CalendarReader> =
+            Box::new(heron_vault::EventKitCalendarReader);
+        Ok((stt, ax, llm, calendar))
     }
 
     pub fn state(&self) -> RecordingState {
@@ -388,7 +395,7 @@ mod tests {
         // we want to pin: when the selector DOES return a backend,
         // the STT + AX shapes are correct.
         match orch.backends() {
-            Ok((stt, ax, _llm)) => {
+            Ok((stt, ax, _llm, _cal)) => {
                 assert_eq!(stt.name(), "sherpa");
                 assert_eq!(ax.name(), "ax-observer");
             }

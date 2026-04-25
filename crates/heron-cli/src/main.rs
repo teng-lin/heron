@@ -61,6 +61,28 @@ enum Commands {
     /// errors so a launch script can branch on the code without
     /// parsing stdout.
     Salvage(SalvageArgs),
+    /// Dump the AX tree of a running app (e.g. Zoom) to stdout as
+    /// JSON. Used during the `docs/plan.md` §3.3 spike to capture the
+    /// speaker-indicator `(role, subrole, identifier)` triple — diff
+    /// two dumps (one with someone speaking, one with everyone muted)
+    /// to identify the indicator element.
+    AxDump(AxDumpArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct AxDumpArgs {
+    /// Bundle ID of the running app to walk (e.g. `us.zoom.xos`).
+    #[arg(long, default_value = "us.zoom.xos")]
+    bundle: String,
+    /// Hard cap on visited nodes. `0` uses the bridge's internal
+    /// default (4096) — large enough for a fully-populated Zoom
+    /// gallery but bounded so a pathological tree can't hang.
+    #[arg(long, default_value_t = 0)]
+    max_nodes: i32,
+    /// Optional output file. When omitted, the JSON is printed to
+    /// stdout (pipe to `jq` to filter).
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -241,11 +263,29 @@ fn dispatch(cmd: Commands, vault: Option<PathBuf>) -> Result<()> {
         Commands::Status => cmd_status(vault),
         Commands::VerifyM4a(args) => cmd_verify_m4a(args),
         Commands::Synthesize(args) => cmd_synthesize(args),
+        Commands::AxDump(args) => cmd_ax_dump(args),
         // Handled by `main` directly so it can pick its own exit
         // code; this arm is unreachable but keeps the match
         // exhaustive without a wildcard.
         Commands::Salvage(_) => unreachable!("salvage handled in main"),
     }
+}
+
+fn cmd_ax_dump(args: AxDumpArgs) -> Result<()> {
+    tracing::info!(?args, "ax-dump requested");
+    let json = heron_zoom::ax_dump_tree(&args.bundle, args.max_nodes)
+        .map_err(|e| anyhow::anyhow!("ax-dump: {e}"))?;
+    match args.out {
+        Some(path) => {
+            std::fs::write(&path, &json)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            println!("wrote AX tree dump to {}", path.display());
+        }
+        None => {
+            println!("{json}");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_salvage(args: SalvageArgs) -> i32 {
@@ -311,7 +351,7 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
     }
 
     let mut orch = session::Orchestrator::new(cfg);
-    let (stt, ax, _llm) = orch
+    let (stt, ax, _llm, _cal) = orch
         .backends()
         .map_err(|e| anyhow::anyhow!("backend wiring: {e}"))?;
     tracing::info!(stt = stt.name(), ax = ax.name(), "backends resolved");

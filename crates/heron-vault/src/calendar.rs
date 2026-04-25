@@ -190,6 +190,35 @@ pub fn calendar_read_one_shot(
     Ok(None)
 }
 
+/// Trait wrapper over [`calendar_read_one_shot`] so the orchestrator can
+/// inject a stub in tests instead of hitting the live EventKit bridge.
+///
+/// The method is synchronous because the underlying Swift bridge blocks
+/// on a `DispatchSemaphore`; callers running inside an async context
+/// must wrap calls in `tokio::task::spawn_blocking` (the orchestrator
+/// pipeline does this at the single call-site that drives the live
+/// session, so impls don't have to).
+pub trait CalendarReader: Send + Sync {
+    fn read_window(
+        &self,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Option<Vec<CalendarEvent>>, CalendarError>;
+}
+
+/// Production [`CalendarReader`]: defers to [`calendar_read_one_shot`].
+pub struct EventKitCalendarReader;
+
+impl CalendarReader for EventKitCalendarReader {
+    fn read_window(
+        &self,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Option<Vec<CalendarEvent>>, CalendarError> {
+        calendar_read_one_shot(start_utc, end_utc)
+    }
+}
+
 /// Convenience: round-trip a Unix-epoch-seconds value (as returned in
 /// [`CalendarEvent::start`] / `end`) into a UTC `DateTime`. Saturates
 /// out-of-range values to the chrono boundary rather than panicking.
