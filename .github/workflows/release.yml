@@ -1,0 +1,38 @@
+name: release
+
+# Notarization stub. Full implementation lands week 2
+# (see docs/implementation.md §6.4). This file exists now so that
+# `v0.0.0-signing-test` style tag pushes do not error out with
+# "workflow not found" once the first signing dry-run happens.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  notarize:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: placeholder
+        run: |
+          echo "release workflow stub — full notarization pipeline arrives week 2"
+          echo "tag: ${GITHUB_REF_NAME}"
+          echo "see docs/implementation.md §6.4"
+
+      # ----- week 2: uncomment and wire up per §6.4 -----
+      #
+      # - uses: tauri-apps/tauri-action@v0
+      #   env:
+      #     APPLE_API_KEY:          ${{ secrets.APPLE_API_KEY_BASE64 }}
+      #     APPLE_API_KEY_ID:       ${{ secrets.APPLE_API_KEY_ID }}
+      #     APPLE_API_ISSUER:       ${{ secrets.APPLE_API_ISSUER }}
+      #     APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      #
+      # - name: verify notarization
+      #   run: ./scripts/verify-notarization.sh "$DMG_PATH"
