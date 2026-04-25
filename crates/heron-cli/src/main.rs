@@ -317,27 +317,141 @@ fn cmd_summarize(args: SummarizeArgs, _vault: Option<PathBuf>) -> Result<()> {
     ))
 }
 
-fn cmd_status(_vault: Option<PathBuf>) -> Result<()> {
-    println!("heron CLI scaffold — orchestrator not yet wired (§13, week 11).");
+fn cmd_status(vault: Option<PathBuf>) -> Result<()> {
+    println!("heron CLI status — environment preflight");
     println!();
-    println!("crates committed:");
-    println!("  ✓ heron-types     §5.2 + §5.3 SessionClock");
+
+    // Tooling probe: ffmpeg / ffprobe presence is a §0.1 prereq.
+    println!("system tools:");
+    let ffmpeg = check_on_path("ffmpeg");
+    let ffprobe = check_on_path("ffprobe");
+    print_tool("ffmpeg", &ffmpeg);
+    print_tool("ffprobe", &ffprobe);
+
+    // Vault probe: if a vault is configured (env or flag), report
+    // whether it's readable + whether validate_vault surfaces issues.
+    println!();
+    println!("vault:");
+    match vault {
+        Some(path) => {
+            if !path.exists() {
+                println!("  ✘ {} — does not exist", path.display());
+            } else if !path.is_dir() {
+                println!("  ✘ {} — not a directory", path.display());
+            } else {
+                println!("  ✓ {}", path.display());
+                let issues = heron_vault::validate_vault(&path);
+                let warn_count = issues
+                    .iter()
+                    .filter(|i| matches!(i, heron_vault::Issue::NoBackup { .. }))
+                    .count();
+                let issue_count = issues.len() - warn_count;
+                if issue_count == 0 && warn_count == 0 {
+                    println!("    no issues");
+                } else {
+                    println!(
+                        "    {issue_count} issue(s), {warn_count} warning(s) — \
+                         run `validate-vault` for details"
+                    );
+                }
+            }
+        }
+        None => println!("  · no vault configured ($HERON_VAULT or --vault to set)"),
+    }
+
+    println!();
+    println!("crates committed (this binary):");
+    println!("  ✓ heron-types     §5.2 + §5.3 SessionClock + §14.3 recovery");
     println!("  ✓ heron-audio     §6.2 surface + §7.2 ringbuffer + §7.4 backpressure");
     println!("  ✓ heron-speech    §8.1 trait surface (stub backends)");
     println!("  ✓ heron-zoom      §9.1 AxBackend trait + §9.3 aligner");
-    println!("  ✓ heron-llm       §11.1 surface + §11.2 meeting.hbs");
-    println!("  ✓ heron-vault     §10 merge + §12 writer + §11.3 encode");
+    println!("  ✓ heron-llm       §11.1 surface + §11.2 meeting.hbs + §11.4 cost");
+    println!("  ✓ heron-vault     §10 merge + §12 writer + §11.3 encode + verify");
     println!("  ⏳ heron-session  orchestrator (next phase)");
     Ok(())
 }
 
+#[derive(Debug)]
+enum ToolStatus {
+    Present(PathBuf),
+    Missing,
+}
+
+fn check_on_path(name: &str) -> ToolStatus {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return ToolStatus::Missing;
+    };
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        // Match the executable-bit check `heron_vault::encode::is_on_path`
+        // applies. A non-executable file at PATH/ffmpeg shouldn't
+        // surface as "present" — running it would fail anyway.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = std::fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !executable {
+                continue;
+            }
+        }
+        return ToolStatus::Present(candidate);
+    }
+    ToolStatus::Missing
+}
+
+fn print_tool(name: &str, status: &ToolStatus) {
+    match status {
+        ToolStatus::Present(p) => println!("  ✓ {name} at {}", p.display()),
+        ToolStatus::Missing => println!("  ✘ {name} not on PATH (brew install ffmpeg)"),
+    }
+}
+
 fn cmd_verify_m4a(args: VerifyM4aArgs) -> Result<()> {
     tracing::info!(?args, "verify_m4a requested");
-    Err(anyhow::anyhow!(
-        "verify-m4a: heron-vault::verify_m4a is in place but heron-cli \
-         doesn't yet depend on heron-vault directly; that wiring lands \
-         alongside the orchestrator (next phase)."
-    ))
+    if !args.path.exists() {
+        return Err(anyhow::anyhow!(
+            "verify-m4a: file not found: {}",
+            args.path.display()
+        ));
+    }
+    if !args.path.is_file() {
+        return Err(anyhow::anyhow!(
+            "verify-m4a: not a regular file: {}",
+            args.path.display()
+        ));
+    }
+    if args.duration_sec <= 0.0 || !args.duration_sec.is_finite() {
+        return Err(anyhow::anyhow!(
+            "verify-m4a: --duration-sec must be a positive finite number; got {}",
+            args.duration_sec
+        ));
+    }
+    let ok = heron_vault::verify_m4a(&args.path, args.duration_sec)
+        .map_err(|e| anyhow::anyhow!("verify-m4a: {e}"))?;
+    if ok {
+        println!(
+            "verify-m4a: OK ({} matches expected duration {:.3}s within ±1%)",
+            args.path.display(),
+            args.duration_sec
+        );
+        Ok(())
+    } else {
+        // Distinct exit so a launch script can branch — but use
+        // anyhow::anyhow! since the rest of the dispatch flow
+        // collapses non-zero to exit 1; the README/§12.3 callers
+        // only need "ok or not".
+        Err(anyhow::anyhow!(
+            "verify-m4a: {} does not match expected duration {:.3}s (per §12.3 \
+             ringbuffer purge gate; ringbuffer would be retained).",
+            args.path.display(),
+            args.duration_sec
+        ))
+    }
 }
 
 fn install_tracing(verbose: u8) {

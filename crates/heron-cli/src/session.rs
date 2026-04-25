@@ -36,13 +36,10 @@ pub enum SessionError {
     Ax(#[from] heron_zoom::AxError),
     #[error("LLM failed: {0}")]
     Llm(#[from] heron_llm::LlmError),
-    // A `Vault(#[from] heron_vault::VaultError)` variant lives here
-    // once heron-cli re-adds the heron-vault dep. The dep was
-    // dropped because Cargo doesn't propagate build-script rpath
-    // directives to test binaries of dependents — heron-vault's
-    // EventKit Swift bridge made integration tests fail to load
-    // libswift_Concurrency. The orchestrator skeleton doesn't call
-    // the vault writer yet, so removing the dep is no-loss for v0.
+    #[error("vault writer failed: {0}")]
+    Vault(#[from] heron_vault::VaultError),
+    #[error("m4a encode/verify failed: {0}")]
+    Encode(#[from] heron_vault::EncodeError),
 }
 
 /// Configuration the orchestrator needs to start a session.

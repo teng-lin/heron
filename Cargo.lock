@@ -1608,6 +1608,7 @@ dependencies = [
  "heron-llm",
  "heron-speech",
  "heron-types",
+ "heron-vault",
  "heron-zoom",
  "serde",
  "serde_json",
