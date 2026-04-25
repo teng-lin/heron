@@ -61,6 +61,12 @@ heron-speech = { path = "crates/heron-speech" }
 heron-zoom = { path = "crates/heron-zoom" }
 heron-llm = { path = "crates/heron-llm" }
 heron-vault = { path = "crates/heron-vault" }
+# v2 trait sketches per docs/api-design-spec.md §13. Not yet wired
+# into heron-cli; they ship trait surfaces only until the spike.
+heron-bot = { path = "crates/heron-bot" }
+heron-bridge = { path = "crates/heron-bridge" }
+heron-policy = { path = "crates/heron-policy" }
+heron-realtime = { path = "crates/heron-realtime" }
 
 [profile.dev]
 opt-level = 1
