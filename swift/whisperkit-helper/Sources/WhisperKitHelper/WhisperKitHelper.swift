@@ -19,6 +19,12 @@ private let WK_NOT_IMPLEMENTED: Int32 = -1
 private let WK_MODEL_MISSING: Int32 = -2
 private let WK_INTERNAL: Int32 = -3
 
+/// Default WhisperKit variant downloaded by `wk_fetch_model` when the
+/// caller passes a NULL `variant`. Mirrors the Rust-side default in
+/// `whisperkit_bridge.rs::DEFAULT_WK_VARIANT`. ~1GB CoreML bundle per
+/// `docs/plan.md` week-9 onboarding step 5.
+private let WK_DEFAULT_VARIANT = "openai_whisper-small.en"
+
 // MARK: - Global instance (single-init contract)
 //
 // Rust calls `wk_init` once per process; subsequent `wk_transcribe`
@@ -81,6 +87,119 @@ public func wk_init(_ model_dir: UnsafePointer<CChar>?) -> Int32 {
     box.lock.lock()
     box.instance = instance
     box.lock.unlock()
+    return WK_OK
+}
+
+// MARK: - wk_fetch_model
+
+/// Download a WhisperKit `variant` into `dest_dir` and report the
+/// resolved model folder via `*out_model_dir`.
+///
+/// `dest_dir` is used as the HubApi `downloadBase`; WhisperKit itself
+/// writes under `<dest_dir>/models/argmaxinc/whisperkit-coreml/<variant>`
+/// (see swift-transformers HubApi.localRepoLocation). The caller wants
+/// to know the *resolved* folder so it can pass that to `wk_init`, so
+/// we hand it back as a malloc'd C string the caller frees via
+/// `wk_free_string`. The same memory contract as `wk_transcribe`.
+///
+/// `variant` may be NULL → uses `WK_DEFAULT_VARIANT`. `progress_cb`
+/// may be NULL → no progress reporting; otherwise it's invoked from
+/// the Swift Task with values in `[0.0, 1.0]`. The userdata pointer
+/// is forwarded verbatim so the Rust side can downcast back to a
+/// `Box<dyn FnMut(f32)>` thunk.
+///
+/// Returns `WK_OK`, `WK_MODEL_MISSING` for an unknown variant (the
+/// HubApi search returns zero matches), or `WK_INTERNAL` for any
+/// network / write failure.
+@_cdecl("wk_fetch_model")
+public func wk_fetch_model(
+    _ variant: UnsafePointer<CChar>?,
+    _ dest_dir: UnsafePointer<CChar>?,
+    _ progress_cb: (@convention(c) (UnsafeMutableRawPointer?, Float) -> Void)?,
+    _ progress_userdata: UnsafeMutableRawPointer?,
+    _ out_model_dir: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    func writeOut(_ s: String?) {
+        guard let out = out_model_dir else { return }
+        guard let s = s else {
+            out.pointee = nil
+            return
+        }
+        let bytes = Array(s.utf8)
+        let count = bytes.count
+        if let buf = malloc(count + 1)?.assumingMemoryBound(to: CChar.self) {
+            bytes.withUnsafeBufferPointer { bp in
+                if let base = bp.baseAddress, count > 0 {
+                    memcpy(buf, base, count)
+                }
+            }
+            buf[count] = 0
+            out.pointee = buf
+        } else {
+            out.pointee = nil
+        }
+    }
+
+    guard let dest_dir = dest_dir else {
+        writeOut(nil)
+        return WK_INTERNAL
+    }
+    let destPath = String(cString: dest_dir)
+    let variantStr: String = variant.map { String(cString: $0) } ?? WK_DEFAULT_VARIANT
+
+    let destURL = URL(fileURLWithPath: destPath, isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
+    } catch {
+        writeOut(nil)
+        return WK_INTERNAL
+    }
+
+    // Bridge async → sync via DispatchSemaphore, mirroring `wk_init`.
+    // Rust passes us through `spawn_blocking`, so blocking here is
+    // expected.
+    let sem = DispatchSemaphore(value: 0)
+    var fetchErr: Error?
+    var resolvedFolder: URL?
+
+    Task {
+        do {
+            resolvedFolder = try await WhisperKit.download(
+                variant: variantStr,
+                downloadBase: destURL,
+                progressCallback: { progress in
+                    if let cb = progress_cb {
+                        // Foundation's Progress reports 0.0…1.0 in
+                        // `fractionCompleted`. Cast to Float because
+                        // the C ABI we publish is Float-only — the
+                        // extra precision wouldn't survive the wire.
+                        cb(progress_userdata, Float(progress.fractionCompleted))
+                    }
+                }
+            )
+        } catch {
+            fetchErr = error
+        }
+        sem.signal()
+    }
+    sem.wait()
+
+    if let err = fetchErr {
+        // WhisperKit raises `WhisperError.modelsUnavailable` when the
+        // variant search returns zero matches; surface that as
+        // ModelMissing so the orchestrator distinguishes "bad variant"
+        // from "network died mid-download".
+        writeOut(nil)
+        if case WhisperError.modelsUnavailable = err {
+            return WK_MODEL_MISSING
+        }
+        return WK_INTERNAL
+    }
+    guard let resolvedFolder = resolvedFolder else {
+        writeOut(nil)
+        return WK_INTERNAL
+    }
+    writeOut(resolvedFolder.path)
     return WK_OK
 }
 

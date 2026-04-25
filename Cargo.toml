@@ -55,6 +55,11 @@ pulldown-cmark = "0.12"
 # but unused unless prompt-side ID preservation fails frequently)
 strsim = "0.11"
 
+# OS-aware cache / config / data dir lookup. Used by heron-speech to
+# place the WhisperKit model under `~/Library/Caches/heron/whisperkit/`
+# on macOS without hard-coding the platform path.
+dirs = "5"
+
 heron-types = { path = "crates/heron-types" }
 heron-audio = { path = "crates/heron-audio" }
 heron-speech = { path = "crates/heron-speech" }

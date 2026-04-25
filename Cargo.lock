@@ -1897,6 +1897,7 @@ name = "heron-speech"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dirs 5.0.1",
  "heron-types",
  "libc",
  "serde",
