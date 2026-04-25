@@ -23,9 +23,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod context;
 pub mod disclosure;
 pub mod fsm;
 pub mod ids;
+pub use context::{ContextError, MAX_CONTEXT_BYTES, render as render_context};
 pub use disclosure::{is_objection, match_objection};
 pub use fsm::{BotEvent, BotFsm, TransitionError};
 pub use ids::IdParseError;
