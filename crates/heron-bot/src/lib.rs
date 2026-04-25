@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod fsm;
+pub use fsm::{BotEvent, BotFsm, TransitionError};
+
 // ── identity ──────────────────────────────────────────────────────────
 
 /// Stripe-style prefixed UUID for a bot. Internal canonical identity
