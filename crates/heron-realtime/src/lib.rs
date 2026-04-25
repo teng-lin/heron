@@ -19,13 +19,23 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub Uuid);
+pub use heron_types::prefixed_id::IdParseError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ResponseId(pub Uuid);
+heron_types::prefixed_id! {
+    /// Stripe-style prefixed UUID for one realtime session. Wire
+    /// form `session_<uuid>`. Distinct from `heron_types::SessionId`
+    /// (which is the v1 recording-session alias) — this is the v2
+    /// realtime-LLM-session identity.
+    pub SessionId, "session"
+}
+
+heron_types::prefixed_id! {
+    /// Stripe-style prefixed UUID for one in-flight model response.
+    /// Wire form `resp_<uuid>`. Tied to a `SessionId` for the
+    /// duration of `ResponseCreated → ResponseDone`.
+    pub ResponseId, "resp"
+}
 
 /// Session-init configuration. Spec §6 + §8: persona system prompt and
 /// pre-meeting context are baked in at init; mid-session changes flow
@@ -205,4 +215,65 @@ pub struct RealtimeCapabilities {
     /// Some backends (OpenAI Realtime, Gemini Live) emit text deltas
     /// alongside audio; others (raw TTS pipelines) don't.
     pub text_deltas: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod prefix_tests {
+    //! Per-consumer wire-shape regression guards for phase-48 IDs.
+    //! The macro's own tests in `heron-types` cover codegen; these
+    //! pin that the realtime crate still gets the prefixes
+    //! documented in `docs/api-design-spec.md`.
+
+    use super::*;
+
+    #[test]
+    fn session_id_uses_session_prefix_on_the_wire() {
+        let id = SessionId::now_v7();
+        let json = serde_json::to_string(&id).expect("serialize");
+        assert!(json.starts_with(r#""session_"#), "got: {json}");
+        let back: SessionId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn response_id_uses_resp_prefix_on_the_wire() {
+        let id = ResponseId::now_v7();
+        let json = serde_json::to_string(&id).expect("serialize");
+        assert!(json.starts_with(r#""resp_"#), "got: {json}");
+        let back: ResponseId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn cross_type_misroute_session_into_response_fails_at_deserialize() {
+        let session = SessionId::now_v7();
+        let json = serde_json::to_string(&session).expect("serialize");
+        let err = serde_json::from_str::<ResponseId>(&json).expect_err("misroute");
+        let msg = err.to_string();
+        assert!(msg.contains("resp"), "missing expected prefix: {msg}");
+        assert!(msg.contains("session"), "missing actual prefix: {msg}");
+    }
+
+    #[test]
+    fn realtime_event_round_trips_with_prefixed_ids() {
+        // A `RealtimeEvent::ResponseCreated` carries both ids; pin
+        // the wire shape so a future event-payload rename surfaces
+        // here rather than at a vendor edge.
+        let event = RealtimeEvent::ResponseCreated {
+            session: SessionId::now_v7(),
+            response: ResponseId::now_v7(),
+            at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            json.contains(r#""session":"session_"#),
+            "missing session prefix: {json}"
+        );
+        assert!(
+            json.contains(r#""response":"resp_"#),
+            "missing response prefix: {json}"
+        );
+        let _back: RealtimeEvent = serde_json::from_str(&json).expect("deserialize");
+    }
 }
