@@ -99,8 +99,6 @@ fn is_empty_dir(path: &Path) -> io::Result<bool> {
 /// Write a silent 16-bit PCM WAV at 48 kHz mono. Header is built by
 /// hand so we don't depend on the `hound` crate just for synthesis.
 fn write_silent_wav(path: &Path, duration_secs: u32) -> io::Result<()> {
-    let num_samples = u32::from(SAMPLE_RATE_HZ.to_le_bytes()[0]); // unused; placeholder
-    let _ = num_samples;
     let total_samples = (SAMPLE_RATE_HZ as u64) * u64::from(duration_secs);
     let total_bytes = total_samples * 2; // 16-bit mono = 2 bytes/sample
     let mut f = fs::File::create(path)?;

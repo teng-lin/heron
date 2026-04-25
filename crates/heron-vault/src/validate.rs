@@ -32,8 +32,10 @@ use serde::Serialize;
 use crate::writer::{VaultError, read_note};
 
 /// One integrity issue. Tagged enum so the report consumer can match
-/// on `kind` rather than parse prose.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// on `kind` rather than parse prose. Derives `Ord` so the validator
+/// can sort the report deterministically without round-tripping
+/// through JSON.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Issue {
     /// `read_note` failed; frontmatter is malformed or the YAML is
@@ -55,9 +57,16 @@ pub enum Issue {
     NoBackup {
         note: PathBuf,
     },
-    /// Two notes reference the same recording or transcript path.
+    /// Two notes reference the same recording path.
     DuplicateRecording {
         recording: PathBuf,
+        notes: Vec<PathBuf>,
+    },
+    /// Two notes reference the same transcript path. Same shape as
+    /// `DuplicateRecording`; the variant split lets the consumer
+    /// surface the right copy in the UI.
+    DuplicateTranscript {
+        transcript: PathBuf,
         notes: Vec<PathBuf>,
     },
 }
@@ -75,9 +84,15 @@ impl Issue {
 ///
 /// Missing `<vault_root>/meetings/` is *not* an error — a fresh
 /// install has no meetings yet. The function returns `Ok(vec![])`.
+///
+/// `recording` and `transcript` paths in frontmatter are interpreted
+/// relative to `vault_root` when they aren't already absolute, so a
+/// note that records `recording: meetings/2026/foo.m4a` checks the
+/// right spot regardless of `cwd`.
 pub fn validate_vault(vault_root: &Path) -> Vec<Issue> {
     let mut issues = Vec::new();
     let mut recordings: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut transcripts: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
     let meetings_dir = vault_root.join("meetings");
     let entries = match std::fs::read_dir(&meetings_dir) {
@@ -102,13 +117,16 @@ pub fn validate_vault(vault_root: &Path) -> Vec<Issue> {
 
         match read_note(&path) {
             Ok((fm, _body)) => {
-                if !fm.recording.as_os_str().is_empty() && !fm.recording.exists() {
+                let recording_check = resolve_relative(vault_root, &fm.recording);
+                let transcript_check = resolve_relative(vault_root, &fm.transcript);
+
+                if !fm.recording.as_os_str().is_empty() && !recording_check.exists() {
                     issues.push(Issue::MissingRecording {
                         note: path.clone(),
                         recording: fm.recording.clone(),
                     });
                 }
-                if !fm.transcript.as_os_str().is_empty() && !fm.transcript.exists() {
+                if !fm.transcript.as_os_str().is_empty() && !transcript_check.exists() {
                     issues.push(Issue::MissingTranscript {
                         note: path.clone(),
                         transcript: fm.transcript.clone(),
@@ -116,6 +134,10 @@ pub fn validate_vault(vault_root: &Path) -> Vec<Issue> {
                 }
                 recordings
                     .entry(fm.recording.clone())
+                    .or_default()
+                    .push(path.clone());
+                transcripts
+                    .entry(fm.transcript.clone())
                     .or_default()
                     .push(path.clone());
 
@@ -138,11 +160,31 @@ pub fn validate_vault(vault_root: &Path) -> Vec<Issue> {
             issues.push(Issue::DuplicateRecording { recording, notes });
         }
     }
+    for (transcript, notes) in transcripts {
+        if notes.len() > 1 && !transcript.as_os_str().is_empty() {
+            issues.push(Issue::DuplicateTranscript { transcript, notes });
+        }
+    }
 
     // Stable order so test golden files don't churn on HashMap
-    // iteration order.
-    issues.sort_by_key(|i| serde_json::to_string(i).unwrap_or_default());
+    // iteration order. `Issue` derives `Ord`, so a direct sort is
+    // both faster and more correct than the previous
+    // serialize-and-sort-strings approach.
+    issues.sort();
     issues
+}
+
+/// If `p` is absolute, return it unchanged; otherwise resolve it
+/// against `vault_root`. This lets frontmatter store recording paths
+/// either as absolute (the v1 default; `VaultWriter` writes them this
+/// way) or as paths relative to the vault root (a common pattern in
+/// hand-edited / imported notes).
+fn resolve_relative(vault_root: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        vault_root.join(p)
+    }
 }
 
 fn bak_path_for(note: &Path) -> PathBuf {
@@ -336,5 +378,67 @@ mod tests {
         };
         let s = serde_json::to_string(&issue).expect("ser");
         assert!(s.contains(r#""kind":"no_backup""#));
+    }
+
+    #[test]
+    fn duplicate_transcript_is_flagged_separately_from_recording() {
+        // Distinct recording paths but the *same* transcript path.
+        // Earlier impl only checked recordings; now we should see a
+        // DuplicateTranscript issue but no DuplicateRecording.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let recording_a = tmp.path().join("rec-a.m4a");
+        let recording_b = tmp.path().join("rec-b.m4a");
+        let shared_tr = tmp.path().join("shared.jsonl");
+        fs::write(&recording_a, b"a").expect("seed");
+        fs::write(&recording_b, b"b").expect("seed");
+        fs::write(&shared_tr, b"{}").expect("seed");
+
+        let fm_a = fixture_frontmatter(recording_a, shared_tr.clone());
+        let fm_b = fixture_frontmatter(recording_b, shared_tr);
+        write_note(tmp.path(), "alice", fm_a);
+        write_note(tmp.path(), "bob", fm_b);
+
+        let issues = validate_vault(tmp.path());
+        let dup_tr = issues
+            .iter()
+            .filter(|i| matches!(i, Issue::DuplicateTranscript { .. }))
+            .count();
+        let dup_rec = issues
+            .iter()
+            .filter(|i| matches!(i, Issue::DuplicateRecording { .. }))
+            .count();
+        assert_eq!(dup_tr, 1, "expected one DuplicateTranscript: {issues:?}");
+        assert_eq!(dup_rec, 0);
+    }
+
+    #[test]
+    fn relative_recording_path_is_resolved_against_vault_root() {
+        // Drop a real recording at <vault>/recordings/r.m4a and a
+        // note whose frontmatter says `recording: recordings/r.m4a`.
+        // The validator must NOT flag it as missing — earlier impl
+        // checked Path::exists() relative to cwd.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let rec_dir = tmp.path().join("recordings");
+        fs::create_dir_all(&rec_dir).expect("mkdir");
+        let abs_recording = rec_dir.join("r.m4a");
+        fs::write(&abs_recording, b"r").expect("seed rec");
+
+        let abs_transcript = rec_dir.join("r.jsonl");
+        fs::write(&abs_transcript, b"{}").expect("seed tr");
+
+        // Record relative paths in the frontmatter.
+        let fm = fixture_frontmatter(
+            PathBuf::from("recordings/r.m4a"),
+            PathBuf::from("recordings/r.jsonl"),
+        );
+        write_note(tmp.path(), "rel", fm);
+        let issues = validate_vault(tmp.path());
+        assert!(
+            !issues.iter().any(|i| matches!(
+                i,
+                Issue::MissingRecording { .. } | Issue::MissingTranscript { .. }
+            )),
+            "relative path must resolve against vault root: {issues:?}"
+        );
     }
 }
