@@ -341,11 +341,12 @@ fn cmd_status(vault: Option<PathBuf>) -> Result<()> {
             } else {
                 println!("  ✓ {}", path.display());
                 let issues = heron_vault::validate_vault(&path);
-                let warn_count = issues
-                    .iter()
-                    .filter(|i| matches!(i, heron_vault::Issue::NoBackup { .. }))
-                    .count();
-                let issue_count = issues.len() - warn_count;
+                // `Issue::is_error()` is the canonical predicate so a
+                // future warning variant added to heron-vault is
+                // counted as a warning here without requiring this
+                // call site to be updated.
+                let issue_count = issues.iter().filter(|i| i.is_error()).count();
+                let warn_count = issues.len() - issue_count;
                 if issue_count == 0 && warn_count == 0 {
                     println!("    no issues");
                 } else {
@@ -383,7 +384,13 @@ fn check_on_path(name: &str) -> ToolStatus {
     };
     for dir in std::env::split_paths(&paths) {
         let candidate = dir.join(name);
-        if !candidate.is_file() {
+        // One `metadata` call per candidate covers both is-file and
+        // (on unix) the executable-bit check; previously `is_file()`
+        // and `metadata()` each called stat(2) for the same file.
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() {
             continue;
         }
         // Match the executable-bit check `heron_vault::encode::is_on_path`
@@ -392,10 +399,7 @@ fn check_on_path(name: &str) -> ToolStatus {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let executable = std::fs::metadata(&candidate)
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false);
-            if !executable {
+            if meta.permissions().mode() & 0o111 == 0 {
                 continue;
             }
         }
