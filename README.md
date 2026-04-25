@@ -2,45 +2,68 @@
 
 A private, on-device, agent-friendly AI meeting note-taker.
 
-heron records native Zoom calls without joining as a bot, transcribes
-locally, attributes speakers using each platform's accessibility tree
-(real display names, not voice clustering), and writes a markdown
-summary into an Obsidian vault. The vault folder lives inside the
-user's Dropbox / Google Drive / iCloud — heron itself never touches
+heron records native meeting calls without joining as a bot, transcribes
+locally, attributes speakers using each meeting app's own speaker
+signal — accessibility tree for native clients, WebRTC track IDs for
+browser-based ones — so it recovers real display names instead of
+voice-clustered `speaker_1` / `speaker_2` labels. Output is a markdown
+summary written into an Obsidian vault. The vault folder lives inside
+the user's Dropbox / Google Drive / iCloud — heron itself never touches
 sync.
 
 The product target is a business executive running many external
 client meetings, plus the author. Audio never leaves the device except
 to the user's chosen LLM provider for summarization.
 
-## Platforms
+## Scope
 
-heron is designed to be cross-platform: **macOS, Linux, and Windows.**
+heron is designed to be cross-platform along two axes: operating
+system and meeting app. v1 ships a focused slice of both; later
+releases fill the matrix in.
+
+### Operating systems — macOS, Windows, Linux
 
 - **v1 (initial release): macOS only.** macOS first because Core
   Audio process taps (14.2+) give clean per-app system audio without
   driver hacks, WhisperKit + Apple Neural Engine give the best local
-  STT path on Apple Silicon, and Zoom's macOS accessibility tree is
-  the cleanest path to real speaker names.
+  STT path on Apple Silicon, and native meeting apps' macOS
+  accessibility trees are the cleanest path to real speaker names.
 - **Windows (v2):** WASAPI process loopback (Windows 10 build 20348+)
   is the equivalent of Core Audio process taps; UI Automation
   replaces AXObserver.
 - **Linux (v2):** PipeWire per-app capture replaces Core Audio;
   AT-SPI replaces AXObserver. Lower priority than Windows because of
-  Zoom's smaller Linux footprint, but the architecture is identical.
+  the smaller Linux meeting footprint, but the architecture is
+  identical.
+
+### Meeting apps — Zoom, Google Meet, Microsoft Teams, Webex
+
+- **v1 (initial release): Zoom only.** Zoom ships a native macOS
+  client whose accessibility tree exposes the "currently speaking"
+  tile with the real display name — the cleanest signal for the
+  happy-path attribution the product is pitched on.
+- **Google Meet / Microsoft Teams (v1.1+):** both are browser-based,
+  so attribution comes from WebRTC track interception inside an
+  embedded WebView rather than an accessibility tree. Same per-
+  speaker timeline contract downstream, different capture mechanism
+  upstream.
+- **Webex (v1.1+):** native macOS client; the AXObserver approach
+  should port directly pending an accessibility-tree survey.
 
 The Rust crate boundaries (`heron-audio`, `heron-zoom`, `heron-speech`)
-are designed for cross-platform extensibility. v1 introduces the
-`SttBackend` and `AxBackend` traits as precedent; v2 adds an
-`AudioCapture` trait so platform support drops in via new
-implementations rather than forks.
+are designed for this kind of extension. v1 introduces the `SttBackend`
+and `AxBackend` traits as precedent; the same pattern generalizes to a
+per-meeting-app capture trait in v1.1, and v2 adds an `AudioCapture`
+trait so each new OS or meeting app drops in via new implementations
+rather than forks.
 
 ## Status
 
 Pre-implementation. The repository contains only design documents.
-v1 is planned as a 17-week solo build for macOS, Zoom-only, English-
-only. Mobile (iOS / Android), Meet / Teams, ambient session
-detection, and an MCP server are deferred to v1.1+.
+v1 is planned as a 17-week solo build: macOS only, Zoom only, English
+only. Mobile (iOS / Android), other meeting apps (Meet / Teams /
+Webex), other desktop operating systems (Windows / Linux), ambient
+session detection, and an MCP server are deferred to v1.1+.
 
 ## Documents
 
@@ -60,11 +83,12 @@ If you only read one document, read `docs/plan.md`.
 
 - **Fireflies / Otter**: join the call as a visible bot. heron does not.
 - **Granola**: invisible, but collapses remote audio to a single mixed
-  track and can only cluster speakers by voice. heron uses Zoom's
-  accessibility tree to recover real display names without ML
-  clustering in the happy path.
+  track and can only cluster speakers by voice. heron uses the
+  meeting app's own speaker signal (Zoom's accessibility tree in v1;
+  WebRTC track IDs for Meet / Teams in v1.1+) to recover real display
+  names without ML clustering in the happy path.
 - **Char / oh-my-whisper**: closer to the right shape but don't solve
-  per-speaker attribution for native Zoom.
+  per-speaker attribution for native meeting clients.
 
 ## Quality promise
 
