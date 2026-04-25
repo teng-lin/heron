@@ -4,7 +4,10 @@
 # `licenses`, and `sources` per .github/workflows/rust.yml.
 
 [graph]
-all-features = false
+# all-features = true so cargo-deny analyzes optional features
+# too; a vulnerability hiding behind a feature flag still counts
+# (per gemini PR-21 review). Trade-off: marginally slower CI run.
+all-features = true
 no-default-features = false
 targets = [
     { triple = "aarch64-apple-darwin" },
