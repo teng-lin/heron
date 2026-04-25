@@ -154,6 +154,7 @@ pub fn test_model_download(progress: f32) -> TestOutcome {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
