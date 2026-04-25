@@ -19,7 +19,9 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+pub mod filter;
 pub mod queue;
+pub use filter::{PolicyDecision, evaluate};
 pub use queue::{CancelOutcome, EnqueueOutcome, QueuedUtterance, SpeechQueue};
 
 // ── identity ──────────────────────────────────────────────────────────
@@ -175,7 +177,7 @@ pub struct PolicyProfile {
     pub escalation: EscalationMode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EscalationMode {
     None,
     Notify { destination: String },
