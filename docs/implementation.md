@@ -267,7 +267,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 
 # macOS bindings — VERSION-PINNED, see §1.3
-cidre = "=0.5.3"
+cidre = "0.15"
 cpal = "0.15"
 swift-rs = "1.0"
 security-framework = "3"
@@ -306,9 +306,17 @@ opt-level = 1
 
 ### 1.3 Dependency risk pins
 
-- `cidre`: pre-1.0; `AudioHardwareCreateProcessTap` API surface added
-  in 0.5.x and changes between point releases. **Pin exact (=0.5.3).**
-  If bumping, dedicate a half-day to re-validate.
+- `cidre`: pre-1.0; the `AudioHardwareCreateProcessTap` API surface
+  is exposed via `core_audio::TapDesc` + `core_audio::AggregateDevice`
+  and has shifted between point releases. The original plan pinned
+  `=0.5.3`, but that exact version is not published on crates.io,
+  so `crates/heron-audio/Cargo.toml` tracks the **0.15.x** line
+  (`cidre = { version = "0.15", features = ["macos_14_2"] }`,
+  macOS-only). This is the version that ships the symbols
+  `process_tap.rs` consumes (`TapDesc::with_mono_mixdown_of_processes`,
+  `core_audio::aggregate_device_keys`, `Device::create_io_proc_id_with_block`).
+  Treat any minor bump as a half-day re-validation: re-run the
+  `tests/process_tap_real.rs` runbook in `docs/manual-test-matrix.md`.
 - `webrtc-audio-processing`: known macOS arm64 build issues with
   certain `webrtc-audio-processing-sys` versions. **Build verified at
   v0.4.x in week 1**; if broken, fall back to `webrtc-audio-processing-rs`
@@ -1845,7 +1853,7 @@ Initial rows (filled in week 1):
 | Week 0.5 WhisperKit bridge fail | Flip `plan.md` §2 row 7 to "sherpa-only v1." Drop ~3 days from week 4. |
 | AEC test fails week 2 | Stop. Debug `process_reverse_stream` wiring. Do not write week-3 code until correlation < 0.15. |
 | Notarization first-cycle failure week 2 | Spend 1 day debugging; if not green by EOW, escalate to a focused 2-day work block at start of week 3. |
-| `cidre` API breaks on next point release | Stay pinned at `=0.5.3`. Re-evaluate v1.1. |
+| `cidre` API breaks on next point release | Stay on the 0.15.x line (see §1.3). Re-evaluate v1.1. |
 | `webrtc-audio-processing` arm64 build fails | Fall back to community fork; document. |
 | `tccutil reset` doesn't re-prompt TCC | Investigate week 1; may need full app re-install or stale Info.plist usage strings. Block week 11 until fixed. |
 | Polling CPU >8% week 6 | Emit `AttributionDegraded`; consider 100ms poll interval. |

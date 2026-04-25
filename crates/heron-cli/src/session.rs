@@ -187,16 +187,38 @@ mod tests {
         assert_eq!(outcome.last_idle_reason, Some(IdleReason::SummaryFailed));
     }
 
+    /// Off-Apple targets still get `NotYetImplemented` from
+    /// `AudioCapture::start` — the cidre process tap only compiles
+    /// on macOS.
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
-    async fn audio_start_returns_not_yet_implemented_today() {
+    async fn audio_start_returns_not_yet_implemented_off_apple() {
         let orch = Orchestrator::new(cfg());
         let result = orch.try_start_audio().await;
-        // Can't `{:?}`-format an Ok variant because AudioCaptureHandle
-        // doesn't impl Debug. Match shape directly.
         match result {
             Err(SessionError::Audio(heron_audio::AudioError::NotYetImplemented)) => {}
             Err(other) => panic!("expected NotYetImplemented, got {other:?}"),
             Ok(_) => panic!("expected NotYetImplemented, got Ok(_handle)"),
+        }
+    }
+
+    /// On macOS we now exercise the real Core Audio process tap path.
+    /// On a CI runner without TCC granted this surfaces as
+    /// `PermissionDenied` / `ProcessNotFound` / `Aborted`; on a dev
+    /// machine with the meeting app NOT running it surfaces as
+    /// `ProcessNotFound`. What we lock down here is that we never
+    /// regress back to `NotYetImplemented`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn audio_start_does_not_return_not_yet_implemented_on_macos() {
+        let orch = Orchestrator::new(cfg());
+        let result = orch.try_start_audio().await;
+        match result {
+            Err(SessionError::Audio(heron_audio::AudioError::NotYetImplemented)) => {
+                panic!("macOS branch must not return NotYetImplemented");
+            }
+            Err(SessionError::Audio(_)) | Ok(_) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
         }
     }
 
