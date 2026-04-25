@@ -1520,6 +1520,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "heron-doctor"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "heron-llm"
 version = "0.1.0"
 dependencies = [
