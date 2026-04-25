@@ -11,9 +11,14 @@
 pub mod calendar;
 pub mod encode;
 pub mod merge;
+pub mod purge;
 pub mod writer;
 
-pub use calendar::calendar_has_access;
+pub use calendar::{
+    CalendarAttendee, CalendarError, CalendarEvent, calendar_has_access, calendar_read_one_shot,
+    epoch_seconds_to_utc,
+};
 pub use encode::{EncodeError, encode_to_m4a, verify_m4a};
 pub use merge::{MergeInputs, MergeOutcome, merge, merge_action_items, merge_attendees};
+pub use purge::{PurgeOutcome, purge_after_verify};
 pub use writer::{VaultError, VaultWriter, atomic_write, read_note};
