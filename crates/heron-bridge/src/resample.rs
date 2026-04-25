@@ -43,9 +43,10 @@ pub const COMMON_RATES: &[u32] = &[8_000, 16_000, 24_000, 32_000, 44_100, 48_000
 /// fractional remainder. The upper index is clamped to
 /// `input.len() - 1` so the tail doesn't read out of bounds.
 ///
-/// `from_hz == 0` returns an empty `Vec` rather than panicking — a
-/// driver feeding the bridge a zero rate is a bug, but taking down
-/// the meeting on a divide-by-zero is worse than a silent frame.
+/// `from_hz == 0` or `to_hz == 0` returns an empty `Vec` rather than
+/// panicking — a driver feeding the bridge a zero rate is a bug, but
+/// taking down the meeting on a divide-by-zero is worse than a silent
+/// frame.
 ///
 /// ```
 /// use heron_bridge::resample_linear;
@@ -56,7 +57,7 @@ pub const COMMON_RATES: &[u32] = &[8_000, 16_000, 24_000, 32_000, 44_100, 48_000
 /// assert_eq!(bridge_frame.len(), 160); // 10 ms at 16 kHz
 /// ```
 pub fn resample_linear(input: &[i16], from_hz: u32, to_hz: u32) -> Vec<i16> {
-    if input.is_empty() || from_hz == 0 {
+    if input.is_empty() || from_hz == 0 || to_hz == 0 {
         return Vec::new();
     }
     if from_hz == to_hz {
@@ -79,22 +80,24 @@ pub fn resample_linear(input: &[i16], from_hz: u32, to_hz: u32) -> Vec<i16> {
         // integer: fractional floats here would drift on long buffers.
         let pos_num = i as u64 * from;
         let floor_idx = (pos_num / to) as usize;
-        let rem = (pos_num % to) as i32;
+        let rem = (pos_num % to) as i64;
 
         // Clamp the upper neighbor so the last output sample doesn't
         // index past the input. This is the standard linear-resampler
         // tail handling — the alternative (allocating a phantom sample)
         // would cost an alloc for the common case.
-        let lo = input[floor_idx.min(last_idx)] as i32;
-        let hi = input[(floor_idx + 1).min(last_idx)] as i32;
+        let lo = input[floor_idx.min(last_idx)] as i64;
+        let hi = input[(floor_idx + 1).min(last_idx)] as i64;
 
-        // i32 math so `[i16::MIN, i16::MAX]` neighbors (delta = 65_535,
-        // overflows i16) survive. Final clamp guards against any future
+        // i64 math throughout. The product `rem * (hi - lo)` overflows
+        // i32 in normal use: at to_hz = 48000 with `[i16::MIN, i16::MAX]`
+        // neighbors, `47_999 * 65_535 ≈ 3.15e9` exceeds i32::MAX
+        // (2.15e9). Final clamp into i16 guards against any future
         // change to the formula that could push the result outside
         // i16's range.
-        let to_i32 = to as i32;
-        let mixed = lo + (rem * (hi - lo)) / to_i32;
-        out.push(mixed.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        let to_i64 = to as i64;
+        let mixed = lo + (rem * (hi - lo)) / to_i64;
+        out.push(mixed.clamp(i16::MIN as i64, i16::MAX as i64) as i16);
     }
 
     out
@@ -131,6 +134,15 @@ mod tests {
     }
 
     #[test]
+    fn to_hz_zero_returns_empty_no_panic() {
+        // Symmetric to `from_hz == 0`: a driver/backend asking for
+        // 0 Hz output is a bug; degrade gracefully rather than
+        // panic on the bridge's hot path.
+        let result = resample_linear(&[1, 2, 3], 16_000, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn downsample_48k_to_16k_preserves_dc() {
         // A constant-200 input has no frequency content to alias;
         // the resampler should pass it through unchanged. ±1
@@ -163,7 +175,7 @@ mod tests {
     #[test]
     fn extrema_dont_overflow_when_clamping() {
         // `[i16::MIN, i16::MAX]` neighbors give `hi - lo == 65_535`,
-        // which overflows i16. The interpolation runs in i32 then
+        // which overflows i16. The interpolation runs in i64 then
         // clamps; pin that the upsample doesn't panic and produces
         // a monotonically increasing ramp from MIN to MAX (which is
         // what linear interpolation between those endpoints means).
@@ -177,6 +189,57 @@ mod tests {
         // Monotonic non-decreasing across the ramp.
         for pair in output.windows(2) {
             assert!(pair[1] >= pair[0], "non-monotonic: {:?}", pair);
+        }
+    }
+
+    #[test]
+    fn extrema_at_high_to_hz_does_not_overflow() {
+        // Regression for the i32 overflow in `rem * (hi - lo)`. With
+        // `to_hz = 48_000` and extrema neighbors, the product reaches
+        // `47_999 * 65_535 ≈ 3.15e9`, which exceeds i32::MAX. Earlier
+        // code in i32 panicked under overflow checks (debug) or
+        // wrapped to a corrupt sample (release). Pin in i64.
+        let input = [i16::MIN, i16::MAX];
+        let output = resample_linear(&input, 1, 48_000);
+        assert_eq!(output.len(), 96_000);
+        assert_eq!(output[0], i16::MIN);
+        // Final sample either lands on or near i16::MAX (depends on
+        // exactly where the floor lands at the tail clamp).
+        let last = *output.last().expect("non-empty");
+        assert!(last > 0, "expected positive tail near MAX, got {last}");
+        // No panics occurred — that's the load-bearing check.
+    }
+
+    #[test]
+    fn forty_four_one_to_sixteen_preserves_dc() {
+        // 44.1k → 16k is the rate pair where rounding/truncation
+        // drift surfaces (irrational ratio in audio terms). DC
+        // input has no frequency content to alias; output should
+        // be ±1 of input.
+        let input = vec![1234i16; 4_410];
+        let output = resample_linear(&input, 44_100, 16_000);
+        assert_eq!(output.len(), 1_600);
+        for s in &output {
+            assert!(
+                (s - 1_234).abs() <= 1,
+                "expected ~1234 at 44.1k→16k, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn forty_four_one_to_forty_eight_preserves_dc() {
+        // 44.1k → 48k is upsample-with-irrational-ratio. Same
+        // tolerance as above. Catches a future formula tweak that
+        // accidentally biases on upsample.
+        let input = vec![-2_000i16; 4_410];
+        let output = resample_linear(&input, 44_100, 48_000);
+        assert_eq!(output.len(), 4_800);
+        for s in &output {
+            assert!(
+                (s - (-2_000)).abs() <= 1,
+                "expected ~-2000 at 44.1k→48k, got {s}"
+            );
         }
     }
 
