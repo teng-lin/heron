@@ -36,3 +36,62 @@ Schema: `# | Section | Test name | Owner | When | Pass criterion | Artifact loca
 Every PR that introduces a `[needs-human]` test must also add a row
 here. CI does not enforce this — code review does. The row goes in
 section order.
+
+## Live LLM smoke tests (heron-llm)
+
+`crates/heron-llm/tests/live_api.rs` is a live smoke harness that
+exercises each summarizer backend against the real upstream when
+prerequisites are present, and skips cleanly otherwise. The harness
+uses **runtime skip** (early `return` with `eprintln!("skipped: …")`),
+not `#[ignore]`, so `cargo test` is always green and gets richer as
+the developer's machine becomes more capable.
+
+### Prerequisites
+
+| Test | Prereq | Skip when |
+|---|---|---|
+| `live_anthropic_summarize_returns_non_empty` | `ANTHROPIC_API_KEY` env var | unset or empty |
+| `live_claude_cli_summarize_returns_non_empty` | `claude` on `PATH`, `claude --version` exits 0, **and** the actual `summarize` call succeeds | binary missing, `--version` fails, or `summarize` returns an error (e.g. sandbox session perms, expired auth) |
+| `live_codex_cli_summarize_returns_non_empty` | `codex` on `PATH`, `codex --version` exits 0, **and** the actual `summarize` call succeeds | binary missing, `--version` fails, or `summarize` returns an error (e.g. `~/.codex/sessions` permission denied, expired auth) |
+
+The Anthropic test is stricter: once `ANTHROPIC_API_KEY` is set the
+test will fail loudly on any error from the live API, since a bad
+key or network problem is a real signal the user opted in to. The
+CLI tests are more forgiving because `--version` cannot detect every
+"installed but not usable" state — when the actual `summarize` call
+fails we log a skip line with the error and return green. Unit tests
+in `crates/heron-llm/src/{claude_code,codex}.rs` cover the
+error-mapping contract; this harness only owns the happy path.
+
+### Running
+
+```sh
+cargo test -p heron-llm --test live_api -- --nocapture
+```
+
+`--nocapture` is what surfaces the per-test `skipped: …` / `live …
+ok: …` log lines. Without it the tests still pass; you just don't see
+which path was exercised.
+
+### Cost note
+
+The Anthropic test issues a single Messages API call against the
+default model (`claude-sonnet-4-6`) with a two-line synthetic
+transcript. Real cost is on the order of a fraction of a cent per
+run (well under $0.01). The user opts in by exporting the key — the
+test will not silently spend money on a machine where the key is
+absent.
+
+The CLI tests consume the user's Claude Code / Codex subscription
+quota rather than API credits.
+
+### Verifying the skip path
+
+On a machine with no key and no CLIs:
+
+```sh
+unset ANTHROPIC_API_KEY
+PATH=/usr/bin:/bin cargo test -p heron-llm --test live_api -- --nocapture
+```
+
+All three tests should print `skipped: …` and pass.
