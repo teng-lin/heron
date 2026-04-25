@@ -194,14 +194,23 @@ pub fn calendar_read_one_shot(
 /// [`CalendarEvent::start`] / `end`) into a UTC `DateTime`. Saturates
 /// out-of-range values to the chrono boundary rather than panicking.
 pub fn epoch_seconds_to_utc(secs: f64) -> DateTime<Utc> {
-    let whole = secs.trunc() as i64;
-    let nanos = ((secs - secs.trunc()) * 1.0e9).round() as u32;
-    let saturating = if whole < 0 {
+    // Use `floor()` rather than `trunc()` so the fractional residual
+    // handed to `nanos` is always non-negative. `trunc()` rounds
+    // toward zero and would yield a negative fraction for negative
+    // timestamps, which `Utc.timestamp_opt` rejects — and the
+    // `as u32` cast would silently wrap into a huge value, giving a
+    // `DateTime` off by up to one second. chrono's `single()` already
+    // saturates on out-of-range i64 inputs, so the explicit branch
+    // here only covers the case where the f64 itself overflows i64.
+    let whole = secs.floor();
+    let nanos = ((secs - whole) * 1.0e9).round() as u32;
+    let whole_i = whole as i64;
+    let saturating = if secs < 0.0 {
         DateTime::<Utc>::MIN_UTC
     } else {
         DateTime::<Utc>::MAX_UTC
     };
-    Utc.timestamp_opt(whole, nanos)
+    Utc.timestamp_opt(whole_i, nanos)
         .single()
         .unwrap_or(saturating)
 }
@@ -241,6 +250,22 @@ mod tests {
             "round-trip drift: {} → {}",
             secs,
             back
+        );
+    }
+
+    #[test]
+    fn epoch_negative_timestamp_round_trips() {
+        // Regression: an earlier `secs.trunc() as i64` plus naive
+        // fractional residual fed `Utc.timestamp_opt` a negative
+        // `nanos` (post-`as u32` wrap), producing a DateTime ~1 s off
+        // for any sub-second negative value. `.floor()` keeps `nanos`
+        // in [0, 1e9).
+        let secs = -123.25;
+        let dt = epoch_seconds_to_utc(secs);
+        let back = dt.timestamp() as f64 + (dt.timestamp_subsec_nanos() as f64) / 1.0e9;
+        assert!(
+            (back - secs).abs() < 1e-6,
+            "negative round-trip drift: {secs} → {back}"
         );
     }
 

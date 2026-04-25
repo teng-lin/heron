@@ -67,9 +67,12 @@ impl PurgeOutcome {
 /// a previous run already purged): treated as `Purged`.
 pub fn purge_after_verify(m4a_path: &Path, expected_sec: f64, cache_dir: &Path) -> PurgeOutcome {
     match encode::verify_m4a(m4a_path, expected_sec) {
+        // m4a verified but cleanup failed: distinguish from a content
+        // verification failure so the UI can word the error correctly
+        // ("could not delete cache" vs. "archival m4a is corrupt").
         Ok(true) => match remove_cache(cache_dir) {
             Ok(()) => PurgeOutcome::Purged,
-            Err(_) => PurgeOutcome::Salvaged,
+            Err(e) => PurgeOutcome::SalvagedDueToError(EncodeError::Io(e)),
         },
         Ok(false) => PurgeOutcome::Salvaged,
         Err(e) => PurgeOutcome::SalvagedDueToError(e),
@@ -104,6 +107,20 @@ mod tests {
         let outcome = PurgeOutcome::SalvagedDueToError(err);
         assert!(!outcome.cache_purged());
         assert!(outcome.needs_salvage_banner());
+    }
+
+    #[test]
+    fn remove_cache_io_error_maps_to_salvaged_due_to_error() {
+        // Regression for a gemini PR-23 finding: when the m4a verifies
+        // but the cache directory cannot be removed, distinguish that
+        // from "m4a content failed verification" so the UI can word the
+        // resulting toast correctly.
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no perms");
+        let outcome = PurgeOutcome::SalvagedDueToError(EncodeError::Io(io_err));
+        assert!(matches!(
+            outcome,
+            PurgeOutcome::SalvagedDueToError(EncodeError::Io(_))
+        ));
     }
 
     #[test]
