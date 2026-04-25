@@ -250,8 +250,10 @@ mod tests {
         fs::write(meetings.join("stray.md"), body).expect("seed stray");
 
         let issues = validate_vault(tmp.path());
-        let warnings: Vec<_> =
-            issues.iter().filter(|i| matches!(i, Issue::NoBackup { .. })).collect();
+        let warnings: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i, Issue::NoBackup { .. }))
+            .collect();
         assert_eq!(warnings.len(), 1);
         assert!(!warnings[0].is_error(), "NoBackup must be soft");
     }
