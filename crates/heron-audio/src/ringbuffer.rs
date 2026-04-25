@@ -202,6 +202,44 @@ fn open_append(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// Enumerate sessions that have a `session.json` on disk under
+/// `cache_root/sessions/`. Used by the §14 crash-recovery scan
+/// (week 12) at app launch — the user is shown a "salvage these
+/// sessions?" list, picks which to resume.
+///
+/// Returns sessions in undefined order. Callers that need a stable
+/// order (e.g. by `started_at`) should sort the returned `Vec`.
+///
+/// Sessions whose `session.json` is corrupt are silently skipped;
+/// the recovery UI deliberately doesn't show un-parseable corpora
+/// since there's nothing the user can do about them.
+pub fn scan_recoverable_sessions(cache_root: &Path) -> Vec<RingbufferState> {
+    let sessions_dir = cache_root.join("sessions");
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(), // no sessions dir = nothing to recover
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let session_id = match SessionId::parse_str(dir_name) {
+            Ok(id) => id,
+            Err(_) => continue, // not a uuid-named directory; skip
+        };
+        if let Ok(state) = recover(session_id, cache_root) {
+            out.push(state);
+        }
+    }
+    out
+}
+
 fn write_session_json(dir: &Path, state: &RingbufferState) -> Result<(), RingbufferError> {
     let path = dir.join(SESSION_FILENAME);
     let tmp = dir.join(format!("{SESSION_FILENAME}.tmp"));
@@ -320,5 +358,53 @@ mod tests {
         // recompute from on-disk file size
         let rb2 = Ringbuffer::new(session, tmp.path()).expect("re-open");
         assert_eq!(rb2.snapshot().mic_frames, 480);
+    }
+
+    #[test]
+    fn scan_returns_empty_when_no_sessions_dir() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let states = scan_recoverable_sessions(tmp.path());
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn scan_finds_committed_session() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let session = SessionId::from_u128(0x1234_5678);
+        {
+            let mut rb = Ringbuffer::new(session, tmp.path()).expect("new");
+            rb.push(&frame(Channel::Mic, &[0.0; 100])).expect("push");
+            rb.flush().expect("flush");
+        }
+        let states = scan_recoverable_sessions(tmp.path());
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].session_id, session);
+        assert_eq!(states[0].mic_frames, 100);
+    }
+
+    #[test]
+    fn scan_skips_non_uuid_directories() {
+        let tmp = TempDir::new().expect("tmpdir");
+        std::fs::create_dir_all(tmp.path().join("sessions").join("not-a-uuid")).expect("mkdir");
+        // Add one real session alongside.
+        let session = SessionId::from_u128(0xABCD);
+        {
+            let _ = Ringbuffer::new(session, tmp.path()).expect("new");
+        }
+        let states = scan_recoverable_sessions(tmp.path());
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].session_id, session);
+    }
+
+    #[test]
+    fn scan_skips_corrupt_session_json() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let bad_id = SessionId::from_u128(0xBAD);
+        let bad_dir = tmp.path().join("sessions").join(bad_id.to_string());
+        std::fs::create_dir_all(&bad_dir).expect("mkdir");
+        std::fs::write(bad_dir.join(SESSION_FILENAME), b"{not json}").expect("write bad");
+
+        let states = scan_recoverable_sessions(tmp.path());
+        assert!(states.is_empty(), "corrupt session must not surface");
     }
 }
