@@ -87,9 +87,15 @@ const SHERPA_MODELS_RELEASE: &str = "asr-models";
 const SILERO_VAD_FILE: &str = "silero_vad.onnx";
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+/// Pinned SHA-256 of the upstream Silero VAD release artifact. Drift
+/// in the upstream blob fails the download with `ChecksumMismatch`
+/// rather than silently loading a tampered or re-cut model.
+const SILERO_VAD_SHA256: &str = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6";
 
 const WHISPER_BUNDLE_DIR: &str = "sherpa-onnx-whisper-tiny.en";
 const WHISPER_BUNDLE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2";
+const WHISPER_BUNDLE_SHA256: &str =
+    "2bd6cf965c8bb3e068ef9fa2191387ee63a9dfa2a4e37582a8109641c20005dd";
 const WHISPER_ENCODER: &str = "tiny.en-encoder.int8.onnx";
 const WHISPER_DECODER: &str = "tiny.en-decoder.int8.onnx";
 const WHISPER_TOKENS: &str = "tiny.en-tokens.txt";
@@ -164,7 +170,7 @@ impl SttBackend for SherpaBackend {
                 path = %vad_path.display(),
                 "downloading Silero VAD model",
             );
-            download_to(SILERO_VAD_URL, &vad_path)?;
+            download_to(SILERO_VAD_URL, &vad_path, SILERO_VAD_SHA256)?;
         }
         on_progress(0.4);
 
@@ -176,7 +182,11 @@ impl SttBackend for SherpaBackend {
                 path = %bundle_dir.display(),
                 "downloading Whisper tiny.en bundle",
             );
-            download_and_extract_tarball(WHISPER_BUNDLE_URL, &self.model_dir)?;
+            download_and_extract_tarball(
+                WHISPER_BUNDLE_URL,
+                WHISPER_BUNDLE_SHA256,
+                &self.model_dir,
+            )?;
             if !whisper_bundle_present(&bundle_dir) {
                 return Err(SttError::ModelMissing(format!(
                     "tarball extracted but expected files missing under {}",
@@ -382,7 +392,7 @@ fn load_mono_16k(path: &Path) -> Result<Vec<f32>, SttError> {
     let channels = spec.channels.max(1) as usize;
     let src_rate = spec.sample_rate;
 
-    let mut interleaved: Vec<f32> = match spec.sample_format {
+    let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
             .into_samples::<i32>()
             .map(|s| {
@@ -411,8 +421,7 @@ fn load_mono_16k(path: &Path) -> Result<Vec<f32>, SttError> {
             }
             mono.push(acc / channels as f32);
         }
-        interleaved = Vec::new();
-        let _ = interleaved;
+        drop(interleaved);
         mono
     };
 
@@ -486,17 +495,32 @@ fn whisper_bundle_present(bundle_dir: &Path) -> bool {
         && is_present(&bundle_dir.join(WHISPER_TOKENS))
 }
 
-/// Download `url` to `dest` atomically: write to `dest.partial`, fsync,
-/// then rename. A SIGKILL during the download leaves no `dest`, so
-/// the next `ensure_model` call cleanly restarts.
-fn download_to(url: &str, dest: &Path) -> Result<(), SttError> {
+/// Download `url` to `dest` atomically and verify SHA-256.
+///
+/// Streams to a sibling `.partial` path while feeding a SHA-256 hasher,
+/// fsyncs, checks the digest against `expected_sha256`, then renames.
+/// A SIGKILL mid-download leaves no `dest`, so the next `ensure_model`
+/// call cleanly restarts. A digest mismatch deletes the partial and
+/// returns `Failed` so a tampered or re-cut upstream artifact never
+/// becomes a cached model.
+///
+/// The temp filename appends `.partial` rather than replacing the
+/// extension, so callers passing a `dest` that already ends in
+/// `.partial` (e.g. the tarball-staging path) still get a distinct
+/// tmp path and a sound atomic rename.
+fn download_to(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), SttError> {
+    use sha2::{Digest, Sha256};
+
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(SttError::Io)?;
     }
-    let tmp = dest.with_extension("partial");
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".partial");
+    let tmp = PathBuf::from(tmp);
     let resp = ureq_get(url)?;
     let mut reader = resp;
     let mut file = File::create(&tmp).map_err(SttError::Io)?;
+    let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader
@@ -505,12 +529,31 @@ fn download_to(url: &str, dest: &Path) -> Result<(), SttError> {
         if n == 0 {
             break;
         }
+        hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(SttError::Io)?;
     }
     file.sync_all().map_err(SttError::Io)?;
     drop(file);
+
+    let actual = hex_lower(&hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        let _ = fs::remove_file(&tmp);
+        return Err(SttError::Failed(format!(
+            "SHA-256 mismatch for {url}: expected {expected_sha256}, got {actual}"
+        )));
+    }
+
     fs::rename(&tmp, dest).map_err(SttError::Io)?;
     Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    out
 }
 
 /// Download a `.tar.bz2` and extract it under `dest_dir` using the
@@ -518,10 +561,14 @@ fn download_to(url: &str, dest: &Path) -> Result<(), SttError> {
 /// all ship a `tar` that handles `bz2`, so we avoid pulling in a Rust
 /// bz2 crate (we'd otherwise have to vendor `bzip2-sys` C). The
 /// archive's top-level directory becomes the cached bundle.
-fn download_and_extract_tarball(url: &str, dest_dir: &Path) -> Result<(), SttError> {
+fn download_and_extract_tarball(
+    url: &str,
+    expected_sha256: &str,
+    dest_dir: &Path,
+) -> Result<(), SttError> {
     fs::create_dir_all(dest_dir).map_err(SttError::Io)?;
-    let archive = dest_dir.join("download.tar.bz2.partial");
-    download_to(url, &archive)?;
+    let archive = dest_dir.join("download.tar.bz2");
+    download_to(url, &archive, expected_sha256)?;
     let status = std::process::Command::new("tar")
         .arg("xjf")
         .arg(&archive)
@@ -542,8 +589,16 @@ fn download_and_extract_tarball(url: &str, dest_dir: &Path) -> Result<(), SttErr
 /// pulling `reqwest` (already in the workspace but async-by-default)
 /// onto this synchronous path; `ureq` is a transitive dep already
 /// brought in by `sherpa-rs-sys`'s `download-binaries` feature.
+///
+/// Bounded connect + read timeouts so a stalled GitHub mirror can't
+/// wedge the orchestrator's first-run model fetch indefinitely.
 fn ureq_get(url: &str) -> Result<Box<dyn Read + Send>, SttError> {
-    let resp = ureq::get(url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .get(url)
         .call()
         .map_err(|e| SttError::Failed(format!("HTTP GET {url}: {e}")))?;
     Ok(Box::new(BufReader::new(resp.into_reader())))
@@ -554,12 +609,16 @@ fn ureq_get(url: &str) -> Result<Box<dyn Read + Send>, SttError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Serializes `HERON_SHERPA_MODEL_DIR` mutations across tests so
+    /// `cargo test`'s parallel runner can't interleave a setter and a
+    /// reader on the same env var.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn from_env_uses_override_when_set() {
-        // SAFETY: tests setting / unsetting env vars must not run in
-        // parallel against another reader of the same var. No other
-        // sherpa test reads HERON_SHERPA_MODEL_DIR.
+        let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::set_var("HERON_SHERPA_MODEL_DIR", "/tmp/heron-sherpa-fixture");
         }
@@ -572,6 +631,7 @@ mod tests {
 
     #[test]
     fn from_env_default_is_under_cache_dir() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::remove_var("HERON_SHERPA_MODEL_DIR");
         }

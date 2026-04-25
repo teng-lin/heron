@@ -57,6 +57,11 @@ dirs = "5"
 # dep tree stays compact.
 ureq = "2.12"
 
+# SHA-256 verification of downloaded model artifacts. Already in the
+# transitive dep tree via reqwest; surfacing it here makes the audit
+# obvious.
+sha2 = "0.10"
+
 # HTTP / LLM
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 eventsource-stream = "0.2"
