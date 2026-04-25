@@ -374,9 +374,11 @@ mod tests {
         // (Backend variant) rather than NotYetImplemented. We point
         // at a known-missing path to make the test deterministic.
         use crate::claude_code::ClaudeCodeClientConfig;
-        let mut cfg = ClaudeCodeClientConfig::default();
-        cfg.binary = std::path::PathBuf::from("/nonexistent/claude-binary");
-        cfg.timeout = std::time::Duration::from_secs(2);
+        let cfg = ClaudeCodeClientConfig {
+            binary: std::path::PathBuf::from("/nonexistent/claude-binary"),
+            timeout: std::time::Duration::from_secs(2),
+            ..ClaudeCodeClientConfig::default()
+        };
         let client: Box<dyn Summarizer> = Box::new(crate::ClaudeCodeClient::new(cfg));
         let path = PathBuf::from("/tmp/x.jsonl");
         let result = client
