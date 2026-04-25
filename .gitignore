@@ -1,0 +1,33 @@
+.DS_Store
+
+# Rust
+target/
+Cargo.lock.user
+*.rs.bk
+
+# Tauri
+apps/*/src-tauri/target/
+apps/*/dist/
+apps/*/node_modules/
+
+# Node
+node_modules/
+.pnpm-store/
+.vite/
+
+# Secrets / local config
+.env
+.env.local
+settings.local.toml
+*.key
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local vault / recordings (never commit user data)
+heron-vault/
+recordings/
+transcripts/
