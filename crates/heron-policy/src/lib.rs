@@ -19,6 +19,9 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+pub mod queue;
+pub use queue::{CancelOutcome, EnqueueOutcome, QueuedUtterance, SpeechQueue};
+
 // ── identity ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
