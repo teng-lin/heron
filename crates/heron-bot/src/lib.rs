@@ -195,10 +195,7 @@ pub trait MeetingBotDriver: Send + Sync {
 
     /// Subscribe to state transitions for a single bot. Stream ends
     /// when the bot reaches a terminal state.
-    fn subscribe_state(
-        &self,
-        id: BotId,
-    ) -> tokio::sync::broadcast::Receiver<BotStateEvent>;
+    fn subscribe_state(&self, id: BotId) -> tokio::sync::broadcast::Receiver<BotStateEvent>;
 
     fn capabilities(&self) -> DriverCapabilities;
 }

@@ -292,7 +292,7 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         cache_dir: cache,
         vault_root,
         stt_backend_name: "sherpa".into(),
-        llm_backend: heron_llm::Backend::Anthropic,
+        llm_preference: heron_llm::Preference::Auto,
     };
     let orch = session::Orchestrator::new(cfg);
     let (stt, ax, _llm) = orch

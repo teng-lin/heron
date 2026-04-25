@@ -132,9 +132,15 @@ pub trait RealtimeBackend: Send + Sync {
 pub enum RealtimeEvent {
     /// Server VAD: human just started speaking. `heron-policy` should
     /// barge-in if the agent is mid-utterance.
-    InputSpeechStarted { session: SessionId, at: DateTime<Utc> },
+    InputSpeechStarted {
+        session: SessionId,
+        at: DateTime<Utc>,
+    },
 
-    InputSpeechStopped { session: SessionId, at: DateTime<Utc> },
+    InputSpeechStopped {
+        session: SessionId,
+        at: DateTime<Utc>,
+    },
 
     /// Partial transcript of the human's speech.
     InputTranscriptDelta {
@@ -181,7 +187,10 @@ pub enum RealtimeEvent {
         arguments: serde_json::Value,
     },
 
-    Error { session: SessionId, error: String },
+    Error {
+        session: SessionId,
+        error: String,
+    },
 }
 
 /// Spec §9. The capability matrix `heron-policy` consults.

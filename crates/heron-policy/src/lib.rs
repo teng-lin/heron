@@ -75,10 +75,16 @@ pub enum SpeechEvent {
 pub enum CancelReason {
     UserRequested,
     /// Spec §9. The `Priority::Replace` operation that displaced this.
-    Replaced { by: UtteranceId },
+    Replaced {
+        by: UtteranceId,
+    },
     /// Human spoke; barge-in fired. Speaker is the one who interrupted.
-    BargedIn { by_speaker: SpeakerId },
-    PolicyDenied { rule: String },
+    BargedIn {
+        by_speaker: SpeakerId,
+    },
+    PolicyDenied {
+        rule: String,
+    },
     Failed,
 }
 
