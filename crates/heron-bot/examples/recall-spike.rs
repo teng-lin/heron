@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
@@ -117,7 +117,7 @@ mod recall_api {
         }
 
         fn url(&self, path: &str) -> String {
-            format!("{}{}", self.base_url, path)
+            format!("{}{}", self.base_url.trim_end_matches('/'), path)
         }
 
         fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -384,7 +384,7 @@ mod recall_api {
 
     fn api_error(status: reqwest::StatusCode, path: &str, body: String) -> anyhow::Error {
         let path = path.to_string();
-        let body = truncate_owned(body, 1024);
+        let body = truncate(&body, 1024);
         match status.as_u16() {
             429 => ApiError::RateLimit { path, body }.into(),
             507 => ApiError::CapacityExhausted { path, body }.into(),
@@ -397,23 +397,19 @@ mod recall_api {
         }
     }
 
-    fn truncate(s: &str, n: usize) -> String {
+    /// Truncate a string to at most `n` bytes, snapped to a UTF-8
+    /// char boundary so we never panic on multi-byte responses
+    /// (Recall errors are typically ASCII, but we proxy them as-is).
+    pub fn truncate(s: &str, n: usize) -> String {
         if s.len() <= n {
-            s.to_string()
-        } else {
-            format!("{}…(+{} bytes)", &s[..n], s.len() - n)
+            return s.to_string();
         }
-    }
-
-    fn truncate_owned(s: String, n: usize) -> String {
-        if s.len() <= n {
-            s
-        } else {
-            let len = s.len();
-            let mut t = s;
-            t.truncate(n);
-            format!("{t}…(+{} bytes)", len - n)
+        // Walk back to the nearest char boundary at or below `n`.
+        let mut cut = n;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
         }
+        format!("{}…(+{} bytes)", &s[..cut], s.len() - cut)
     }
 
     /// Map `RECALL_REGION` → base URL. `None`/empty defaults to
@@ -497,12 +493,11 @@ use findings::{Finding, Outcome};
 // ── shared utilities ──────────────────────────────────────────────────
 
 /// Track which bot is "live" so the Ctrl-C handler can leave it
-/// gracefully. Spike-wide singleton.
+/// gracefully. Spike-wide singleton. Subcommands that create a bot
+/// MUST write to this slot **immediately** when the API returns
+/// success, before any other await — otherwise Ctrl-C can fire
+/// between create-success and registration, orphaning the bot.
 type ActiveBot = Arc<Mutex<Option<String>>>;
-
-async fn set_active_bot(slot: &ActiveBot, bot_id: Option<String>) {
-    *slot.lock().await = bot_id;
-}
 
 /// Pull (status, body) out of a `Result<ApiOk<T>, anyhow::Error>` for
 /// findings. Distinguishes our typed `ApiError` from generic
@@ -660,8 +655,10 @@ async fn main() -> Result<()> {
 }
 
 /// On Ctrl-C, attempt graceful leave for the active bot. Process
-/// exits with 130 (POSIX SIGINT convention).
+/// exits with 130 (POSIX SIGINT convention). Stderr is flushed
+/// before exit so cleanup messages aren't lost.
 fn spawn_signal_cleanup(client: recall_api::Client, active: ActiveBot) {
+    use std::io::Write as _;
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
@@ -676,6 +673,7 @@ fn spawn_signal_cleanup(client: recall_api::Client, active: ActiveBot) {
         } else {
             eprintln!("\n^C");
         }
+        let _ = std::io::stderr().flush();
         std::process::exit(130);
     });
 }
@@ -702,6 +700,13 @@ async fn cmd_join(
         })
         .await;
     let duration_ms = started.elapsed().as_millis();
+
+    // Register the bot in the active slot RIGHT NOW, before any other
+    // await. Anything between here and the previous create_bot return
+    // is a window where Ctrl-C would orphan the just-created bot.
+    if let Ok(ok) = &result {
+        *active.lock().await = Some(ok.body.id.clone());
+    }
 
     let (http_status, body, outcome) = classify(&result);
     let bot_id = result.as_ref().ok().map(|ok| ok.body.id.clone());
@@ -736,7 +741,6 @@ async fn cmd_join(
     })?;
 
     let ok = result?;
-    set_active_bot(active, Some(ok.body.id.clone())).await;
     println!("bot_id: {}", ok.body.id);
     println!("initial_state: {initial_state}");
     Ok(())
@@ -791,11 +795,15 @@ async fn cmd_listen(client: &recall_api::Client, bot_id: &str, poll_secs: u64) -
 /// Identity key for a transcript segment. Recall's documented schema
 /// has no per-segment ID, so we hash on `(participant.id, words[0]
 /// .start_timestamp.absolute)` which is stable across polls.
+///
+/// `participant.id` is normalized so an int `42` and a string `"42"`
+/// hash to the same key — Recall historically returns the field with
+/// inconsistent types across platforms (Zoom vs Meet).
 fn segment_key(seg: &Value) -> String {
     let participant = seg
         .get("participant")
         .and_then(|p| p.get("id"))
-        .map(Value::to_string)
+        .map(participant_id_to_string)
         .unwrap_or_default();
     let first_word_ts = seg
         .get("words")
@@ -807,6 +815,19 @@ fn segment_key(seg: &Value) -> String {
         .unwrap_or("")
         .to_string();
     format!("{participant}:{first_word_ts}")
+}
+
+fn participant_id_to_string(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        s.to_string()
+    } else if let Some(n) = v.as_i64() {
+        n.to_string()
+    } else if let Some(n) = v.as_u64() {
+        n.to_string()
+    } else {
+        // Fallback for objects/arrays/null: stable JSON repr.
+        v.to_string()
+    }
 }
 
 fn print_segment(seg: &Value) {
@@ -951,21 +972,26 @@ async fn cmd_disclosure_inject(
 
     println!("dispatching bot…");
     let join_started = Instant::now();
-    let dispatch = client
+    let dispatch_result = client
         .create_bot(&recall_api::CreateBotArgs {
             meeting_url,
             bot_name,
             placeholder_audio_b64: Some(&b64),
         })
-        .await?;
-    let join_ms = join_started.elapsed().as_millis();
+        .await;
+    let dispatch = dispatch_result?;
+    // Register IMMEDIATELY before any other await — Ctrl-C between
+    // create-success and registration would orphan the new bot.
     let bot_id = dispatch.body.id.clone();
-    set_active_bot(active, Some(bot_id.clone())).await;
+    *active.lock().await = Some(bot_id.clone());
+    let join_ms = join_started.elapsed().as_millis();
     println!("bot {bot_id} dispatched in {join_ms}ms");
 
     // Everything after dispatch wraps in cleanup-on-error. Recall bills
     // per bot-minute — orphaning a bot during a long meeting is a real
-    // cost leak.
+    // cost leak. Cleanup failures are surfaced via a dedicated finding
+    // (not silently swallowed) so the JSONL summary makes
+    // possibly-orphaned bots visible at audit time.
     let outcome = run_disclosure_post_join(
         client,
         &bot_id,
@@ -975,14 +1001,42 @@ async fn cmd_disclosure_inject(
         join_ms,
     )
     .await;
-    if outcome.is_err() {
-        eprintln!("disclosure-inject failed; attempting graceful leave for bot {bot_id}");
-        match client.leave_call(&bot_id).await {
-            Ok(_) => eprintln!("cleanup ok"),
-            Err(e) => eprintln!("cleanup failed: {e:#}"),
-        }
+    if let Err(orig) = &outcome {
+        eprintln!("disclosure-inject failed: {orig:#}");
+        eprintln!("attempting graceful leave for bot {bot_id}…");
+        let cleanup_started = Instant::now();
+        let cleanup_result = client.leave_call(&bot_id).await;
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+        let (cleanup_status, cleanup_body, cleanup_outcome) = classify(&cleanup_result);
+        let cleanup_notes = match &cleanup_result {
+            Ok(_) => {
+                eprintln!("cleanup ok");
+                "cleanup_ok".to_string()
+            }
+            Err(e) => {
+                eprintln!(
+                    "CLEANUP FAILED — bot {bot_id} may still be running and billing. \
+                     cleanup_error: {e:#}"
+                );
+                format!("cleanup_failed: {e:#}")
+            }
+        };
+        findings::append(&Finding {
+            timestamp: Utc::now(),
+            operation: "disclosure-inject-cleanup",
+            bot_id: Some(&bot_id),
+            duration_ms: cleanup_ms,
+            outcome: cleanup_outcome,
+            http_status: cleanup_status,
+            response_body: &cleanup_body,
+            spec_invariants_relevant: &[
+                "spec §7 (kick-out / cleanup hygiene)",
+                "spec §11 (cost-control on partial failure)",
+            ],
+            notes: cleanup_notes,
+        })?;
     }
-    set_active_bot(active, None).await;
+    *active.lock().await = None;
     outcome
 }
 
@@ -1040,7 +1094,17 @@ async fn wait_for_in_call(
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_secs);
     loop {
-        let detail = client.get_bot(bot_id).await?.body;
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => bail!("bot did not reach in_call state within {timeout_secs}s"),
+        };
+        // Bound each poll by the remaining budget so the per-request
+        // 30s reqwest timeout can't stretch the wall-clock wait beyond
+        // `--timeout-secs`.
+        let detail = match tokio::time::timeout(remaining, client.get_bot(bot_id)).await {
+            Err(_) => bail!("bot did not reach in_call state within {timeout_secs}s"),
+            Ok(r) => r?.body,
+        };
         let code = detail.current_code().unwrap_or("(none)");
         tracing::debug!(state = code, "polling");
         // Recall's documented in-call codes are bot.in_call_*; anything
@@ -1050,9 +1114,6 @@ async fn wait_for_in_call(
         }
         if detail.is_terminal() {
             bail!("bot reached terminal state {code} before in_call");
-        }
-        if Instant::now() >= deadline {
-            bail!("bot did not reach in_call state within {timeout_secs}s (last: {code})");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -1064,48 +1125,48 @@ async fn cmd_replace_test(
     audio_path: &Path,
 ) -> Result<()> {
     let b64 = read_b64(audio_path).await?;
-    println!("posting first output_audio…");
-    let first_started = Instant::now();
-    let first_result = client.output_audio(bot_id, &b64).await;
-    let first_ms = first_started.elapsed().as_millis();
+    println!("posting two output_audio calls concurrently (tokio::join!)…");
+    let started = Instant::now();
+    // Concurrent submission via tokio::join! is the honest test of
+    // Recall's behavior under contention. Sequential await would only
+    // measure "rapid sequential," missing actual queue/replace races.
+    let (first_result, second_result) = tokio::join!(
+        client.output_audio(bot_id, &b64),
+        client.output_audio(bot_id, &b64),
+    );
+    let elapsed_ms = started.elapsed().as_millis();
     let (first_status, first_body, _) = classify(&first_result);
-
-    println!("immediately posting second output_audio (no delay)…");
-    let second_started = Instant::now();
-    let second_result = client.output_audio(bot_id, &b64).await;
-    let second_ms = second_started.elapsed().as_millis();
     let (second_status, second_body, _) = classify(&second_result);
 
-    let combined_status = match (first_status, second_status) {
-        (Some(a), Some(b)) if a == b => Some(a),
-        _ => None,
+    let outcome = match (first_result.is_ok(), second_result.is_ok()) {
+        (true, true) => Outcome::Inconclusive,
+        _ => Outcome::Failure,
     };
-    let outcome = if first_result.is_ok() && second_result.is_ok() {
-        Outcome::Inconclusive
-    } else {
-        Outcome::Failure
-    };
-    let combined_body = if !first_body.is_empty() {
-        format!("first: {first_body}")
-    } else if !second_body.is_empty() {
-        format!("second: {second_body}")
-    } else {
-        String::new()
+    // Don't lose either status when they differ — the differing case
+    // (e.g. first=200, second=429) is the most diagnostic outcome of
+    // the test. Encode both in notes and surface the first as the
+    // numeric http_status for jq grouping.
+    let combined_body = match (first_body.as_str(), second_body.as_str()) {
+        ("", "") => String::new(),
+        (f, "") => format!("first: {f}"),
+        ("", s) => format!("second: {s}"),
+        (f, s) => format!("first: {f} | second: {s}"),
     };
     findings::append(&Finding {
         timestamp: Utc::now(),
         operation: "replace-test",
         bot_id: Some(bot_id),
-        duration_ms: first_ms + second_ms,
+        duration_ms: elapsed_ms,
         outcome,
-        http_status: combined_status,
+        http_status: first_status,
         response_body: &combined_body,
         spec_invariants_relevant: &[
             "spec §9 (Priority::Replace semantics)",
             "spec Invariant 11 (atomic replace as single primitive)",
         ],
         notes: format!(
-            "first_accept={first_ms}ms second_accept={second_ms}ms; \
+            "concurrent submission via tokio::join!; \
+             first_status={first_status:?} second_status={second_status:?} elapsed={elapsed_ms}ms; \
              observe in-meeting: did Recall queue, replace, or play both? \
              (Recall has no documented Replace primitive — finding records what we observe.)"
         ),
@@ -1245,6 +1306,34 @@ mod tests {
     }
 
     #[test]
+    fn truncate_handles_multibyte_utf8() {
+        // Emoji is 4 bytes; if we naively String::truncate at 5 we would
+        // panic. Verify we snap back to a char boundary cleanly.
+        let s = "abc😀def";
+        let out = recall_api::truncate(s, 5);
+        assert!(
+            out.starts_with("abc") || out == s,
+            "expected snap-to-boundary; got {out:?}"
+        );
+        // Pure ASCII passes through untouched if shorter than cap.
+        let out_ascii = recall_api::truncate("hi", 100);
+        assert_eq!(out_ascii, "hi");
+        // Longer ASCII gets truncated and tagged with overflow byte count.
+        let long = "x".repeat(2000);
+        let out_long = recall_api::truncate(&long, 100);
+        assert!(out_long.starts_with(&"x".repeat(100)));
+        assert!(out_long.contains("(+1900 bytes)"));
+    }
+
+    #[test]
+    fn participant_id_normalization() {
+        // Same logical id as int and string must hash to same key.
+        let as_int = json!({ "participant": { "id": 42 }, "words": [] });
+        let as_str = json!({ "participant": { "id": "42" }, "words": [] });
+        assert_eq!(super::segment_key(&as_int), super::segment_key(&as_str));
+    }
+
+    #[test]
     fn finding_omits_empty_invariants() -> Result<()> {
         let f = Finding {
             timestamp: Utc::now(),
@@ -1264,6 +1353,3 @@ mod tests {
     }
 }
 
-// `anyhow!` is not currently used at top level but kept available for
-// future inline diagnostics; suppress the dead-code warning.
-const _: fn() -> anyhow::Error = || anyhow!("unused");
