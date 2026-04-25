@@ -4,6 +4,7 @@
 //! The binary `heron` lives in `src/main.rs` and re-uses everything
 //! here.
 
+pub mod pipeline;
 pub mod salvage;
 pub mod session;
 pub mod session_log;

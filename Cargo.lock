@@ -1808,6 +1808,7 @@ dependencies = [
  "heron-types",
  "heron-vault",
  "heron-zoom",
+ "hound",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1816,6 +1817,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

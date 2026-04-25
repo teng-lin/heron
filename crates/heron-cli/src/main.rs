@@ -107,6 +107,12 @@ struct RecordArgs {
     /// `0` disables.
     #[arg(long, default_value = "0", hide = true)]
     fake_stt_lag: f64,
+    /// Drive the FSM through a no-op happy path without invoking any
+    /// backend. Used by CI runners that lack TCC permissions for live
+    /// audio capture; the real `record` flow needs Mic + Screen
+    /// Recording + Accessibility grants.
+    #[arg(long)]
+    no_op: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -277,35 +283,67 @@ fn cmd_synthesize(args: SynthesizeArgs) -> Result<()> {
 fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
     tracing::info!(?args, "record requested");
 
-    // Wire the orchestrator skeleton: even though every backend
-    // returns NotYetImplemented today, going through Orchestrator
-    // exercises the FSM + selection logic so a "real audio yet?"
-    // smoke test boils down to running this command.
     let cache = args
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from("/tmp/heron-cli-cache"));
     let vault_root = vault.unwrap_or_else(|| PathBuf::from("/tmp/heron-cli-vault"));
+    // Each invocation gets a fresh v7 UUID so the cache + transcript
+    // + recording paths don't collide across runs. Tests that need a
+    // deterministic id construct `SessionConfig` directly.
     let cfg = session::SessionConfig {
-        session_id: heron_types::SessionId::nil(),
+        session_id: uuid::Uuid::now_v7(),
         target_bundle_id: args.app.clone(),
         cache_dir: cache,
         vault_root,
         stt_backend_name: "sherpa".into(),
         llm_preference: heron_llm::Preference::Auto,
     };
-    let orch = session::Orchestrator::new(cfg);
+
+    if args.no_op {
+        tracing::info!("--no-op: walking FSM without invoking backends");
+        let mut orch = session::Orchestrator::new(cfg);
+        let outcome = orch
+            .run_no_op(heron_types::SummaryOutcome::Done)
+            .map_err(|e| anyhow::anyhow!("no-op session: {e}"))?;
+        println!("no-op session complete: {outcome:?}");
+        return Ok(());
+    }
+
+    let mut orch = session::Orchestrator::new(cfg);
     let (stt, ax, _llm) = orch
         .backends()
         .map_err(|e| anyhow::anyhow!("backend wiring: {e}"))?;
     tracing::info!(stt = stt.name(), ax = ax.name(), "backends resolved");
 
-    Err(anyhow::anyhow!(
-        "record: orchestrator wired but audio capture is stubbed \
-         (NotYetImplemented). Real recording arrives once the §6 \
-         capture pipeline lands. Use the Tauri shell once §13 \
-         ships for the full UX."
-    ))
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+    runtime.block_on(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        // Ctrl-C handler: signals the orchestrator to drain + finalize
+        // rather than aborting mid-write. A second Ctrl-C is treated
+        // by the OS — we don't trap it, so the user can still escape
+        // a stuck pipeline.
+        tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %e, "ctrl_c handler failed; orchestrator will run until duration cap");
+                return;
+            }
+            let _ = stop_tx.send(());
+            eprintln!("\nstop signal received; finalizing session...");
+        });
+        let outcome = orch
+            .run(stop_rx)
+            .await
+            .map_err(|e| anyhow::anyhow!("session run: {e}"))?;
+        match outcome.note_path {
+            Some(p) => println!("session complete: {}", p.display()),
+            None => println!("session complete: no note written ({:?})", outcome.last_idle_reason),
+        }
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn cmd_summarize(args: SummarizeArgs, _vault: Option<PathBuf>) -> Result<()> {
