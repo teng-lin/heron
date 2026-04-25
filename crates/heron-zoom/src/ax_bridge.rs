@@ -237,16 +237,34 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn register_stub_returns_not_yet_implemented() {
+    fn register_against_zoom_surfaces_process_or_permission_error_in_ci() {
+        // Real-impl behavior: with no Zoom process running, the Swift
+        // bridge returns AX_PROCESS_NOT_RUNNING. If Zoom *is* running
+        // but Accessibility isn't granted, AX_NO_PERMISSION. Both are
+        // valid CI outcomes; the live-Zoom happy path lives in
+        // tests/ax_observer_real.rs.
         let result = ax_register("us.zoom.xos");
-        assert!(matches!(result, Err(AxBridgeError::NotYetImplemented)));
+        match result {
+            Err(AxBridgeError::ProcessNotRunning) | Err(AxBridgeError::NoPermission) => {}
+            Ok(()) => panic!(
+                "ax_register unexpectedly succeeded; this test expects no Zoom \
+                 running on the CI host. Run tests/ax_observer_real.rs instead."
+            ),
+            Err(other) => panic!("expected ProcessNotRunning or NoPermission; got {other:?}"),
+        }
     }
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn poll_stub_returns_not_yet_implemented() {
+    fn poll_with_no_observer_returns_none() {
+        // Real-impl behavior: with nothing registered, the Swift queue
+        // is empty and the bridge writes "" → AX_OK, which the Rust
+        // wrapper translates to Ok(None).
         let result = ax_poll();
-        assert!(matches!(result, Err(AxBridgeError::NotYetImplemented)));
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
     }
 
     #[cfg(target_vendor = "apple")]
