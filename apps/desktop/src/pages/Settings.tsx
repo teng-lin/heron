@@ -855,7 +855,10 @@ function KeychainEditDialog({
           }
         >
           <Dialog.Title className="text-lg font-semibold">{label}</Dialog.Title>
-          <Dialog.Description className="text-sm text-muted-foreground">
+          <Dialog.Description
+            id={`keychain-desc-${account}`}
+            className="text-sm text-muted-foreground"
+          >
             {hasKey
               ? "A key is already stored. Enter a new value to replace it, or delete the existing entry."
               : "Paste your key. heron stores it in the macOS login Keychain only."}
@@ -866,7 +869,12 @@ function KeychainEditDialog({
             <Input
               id={`keychain-${account}`}
               type="password"
-              autoComplete="off"
+              // `new-password` is the broadly-honored value for
+              // suppressing password-manager autofill on a field
+              // that isn't a real login form. Plain `off` is honored
+              // inconsistently on `type="password"` across Chromium /
+              // Safari / Firefox.
+              autoComplete="new-password"
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
@@ -874,9 +882,12 @@ function KeychainEditDialog({
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
               disabled={busy}
-              // `aria-describedby` ties the password field to the
-              // dialog's description so screen readers announce the
-              // "stored in Keychain" copy alongside the input.
+              // Tie the input to the dialog description so screen
+              // readers re-announce the "stored in Keychain" copy
+              // when the input takes focus (Radix's auto-wiring on
+              // `Dialog.Content` only fires on dialog open, not on
+              // subsequent focus events).
+              aria-describedby={`keychain-desc-${account}`}
             />
           </div>
 

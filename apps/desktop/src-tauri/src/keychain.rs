@@ -306,6 +306,30 @@ mod tests {
         assert_eq!(labels.len(), sorted.len(), "duplicate account labels");
     }
 
+    /// `KeychainAccount::all()` is hand-maintained — adding a variant
+    /// to the enum without adding it to `all()` would silently leave
+    /// `keychain_list` skipping that slot. The exhaustive match in
+    /// `count_variants` won't compile if a new variant is added,
+    /// forcing whoever adds it to pick the new count + thus revisit
+    /// `all()`. This is the cheapest compile-time guard for two
+    /// variants; if the enum grows, switch to `strum::EnumIter`.
+    #[test]
+    fn all_covers_every_variant() {
+        const fn count_variants(a: KeychainAccount) -> usize {
+            match a {
+                // Each arm contributes 1 — sum equals the variant count.
+                // Adding a variant fails to compile until added here.
+                KeychainAccount::AnthropicApiKey => 2,
+                KeychainAccount::OpenAiApiKey => 2,
+            }
+        }
+        assert_eq!(
+            KeychainAccount::all().len(),
+            count_variants(KeychainAccount::AnthropicApiKey),
+            "KeychainAccount::all() is out of sync with the enum's variant count",
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn non_macos_set_returns_unsupported() {
