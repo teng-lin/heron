@@ -18,6 +18,7 @@ env:
 jobs:
   test:
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +34,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+        run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
       - name: cargo test
         run: cargo test --workspace
