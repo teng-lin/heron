@@ -22,12 +22,14 @@ use tokio::sync::mpsc;
 
 pub mod health;
 pub mod jitter;
+pub mod mix;
 pub mod pcm;
 pub use health::{
     CriticalReason, DROPS_CRITICAL, DROPS_DEGRADED, DegradationReason, HealthVerdict,
     JITTER_CRITICAL_MS, JITTER_DEGRADED_MS, verdict,
 };
 pub use jitter::{InsertOutcome, JitterBuffer, JitterConfig};
+pub use mix::{average_saturating, mix_inplace_saturating, mix_saturating};
 pub use pcm::{
     DEFAULT_SILENCE_THRESHOLD, PcmFrameExt, SAMPLE_RATE_HZ, ms_to_samples, samples_to_ms,
 };
