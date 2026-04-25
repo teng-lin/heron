@@ -365,6 +365,14 @@ fn spawn_consumer_task(
     tokio::spawn(async move {
         let mut monitor = BackpressureMonitor::new(session_id, RING_CAPACITY, events_tx);
         loop {
+            // Sample ring depth BEFORE draining: this is the backlog
+            // that accumulated while the consumer was asleep, which
+            // is precisely the saturation signal we care about.
+            // Sampling AFTER drain would observe ~0 (the drain runs
+            // until empty), defeating the saturation check entirely.
+            // `Consumer::slots` reports the current readable count.
+            let depth = consumer.slots();
+
             // Drain all currently-available frames before sleeping.
             // `pop()` is wait-free; `Err(_)` means empty.
             while let Ok(frame) = consumer.pop() {
@@ -374,11 +382,6 @@ fn spawn_consumer_task(
                 let _ = frames_tx.send(frame);
             }
 
-            // The "in_flight" count for `BackpressureMonitor` is the
-            // depth of the SPSC ring after this drain: i.e. what
-            // wasn't drained. `Consumer::slots` reports the current
-            // readable count (slots holding values).
-            let depth = consumer.slots();
             let drops_now = dropped.load(Ordering::Relaxed);
             // Cast u64 → u32 saturating: a long-lived session could
             // in principle accumulate more than u32::MAX drops; the
