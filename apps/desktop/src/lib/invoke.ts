@@ -139,6 +139,18 @@ export interface HeronCommands {
     args: Record<string, never>;
     returns: string;
   };
+  heron_read_note: {
+    args: { vaultPath: string; sessionId: string };
+    returns: string;
+  };
+  heron_write_note_atomic: {
+    args: { vaultPath: string; sessionId: string; contents: string };
+    returns: void;
+  };
+  heron_list_sessions: {
+    args: { vaultPath: string };
+    returns: string[];
+  };
   heron_test_microphone: {
     args: Record<string, never>;
     returns: TestOutcome;

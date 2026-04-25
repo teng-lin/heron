@@ -47,6 +47,12 @@ interface SettingsState {
   error: string | null;
   /** Read settings from disk. Idempotent — concurrent calls coalesce. */
   load: () => Promise<void>;
+  /**
+   * Read settings from disk only if not already cached. Returns the
+   * current snapshot (post-load). Used by read-only consumers (Review
+   * UI sidebar) that don't want to trigger a re-read every mount.
+   */
+  ensureLoaded: () => Promise<Settings | null>;
   /** Patch the in-memory snapshot. Marks the store dirty. */
   update: (patch: Partial<Settings>) => void;
   /**
@@ -102,6 +108,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       }
     })();
     return inFlightLoad;
+  },
+  ensureLoaded: async () => {
+    const cached = get().settings;
+    if (cached !== null) return cached;
+    await get().load();
+    return get().settings;
   },
   update: (patch) => {
     const current = get().settings;
