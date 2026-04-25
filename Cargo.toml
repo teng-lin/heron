@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# macOS bindings — VERSION-PINNED, see docs/implementation.md §1.3
+cidre = "=0.5.3"
+cpal = "0.15"
+swift-rs = "1.0"
+security-framework = "3"
+core-foundation = "0.10"
+
+# audio processing
+hound = "3.5"
+webrtc-audio-processing = "0.4"
+rtrb = "0.3"
+rubato = "0.16"
+symphonia = "0.5"
+
+# HTTP / LLM
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+
+# templating / markdown
+handlebars = "6"
+yaml-front-matter = "0.1"
+pulldown-cmark = "0.12"
+
+# fuzzy text match (for v1.1 ID-resolution fallback; bundled in v1
+# but unused unless prompt-side ID preservation fails frequently)
+strsim = "0.11"
+
+heron-types = { path = "crates/heron-types" }
+heron-audio = { path = "crates/heron-audio" }
+heron-speech = { path = "crates/heron-speech" }
+heron-zoom = { path = "crates/heron-zoom" }
+heron-llm = { path = "crates/heron-llm" }
+heron-vault = { path = "crates/heron-vault" }
+
+[profile.dev]
+opt-level = 1

@@ -151,9 +151,9 @@ availability and lock calendar slots before week 0 starts.
 | Phase | Time | Activity |
 |---|---|---|
 | Week 0 | 4–6 hours total across 5 short sessions | AX edge-case calls (gallery, active-speaker, paginated, dial-in, shared-screen, tile-rename) |
-| **Week 2** (1 hour) | **AEC test rig** (§6.3) — partner is on a Zoom call with the engineer and runs an `osascript` to play the test noise from their machine. Required so `tap.wav` actually contains the noise. |
+| **Week 2** | 1 hour | **AEC test rig** (§6.3) — partner is on a Zoom call with the engineer and runs an `osascript` to play the test noise from their machine. Required so `tap.wav` actually contains the noise. |
 | Week 3 | 2 hours | Three reference call captures for fixture corpus |
-| **Week 7** (1 hour) | **Live regression call recorded as a fixture** (§9.5). 4-person Zoom call with author + 3 partners; recorded and labeled post-hoc. |
+| **Week 7** | 1 hour | **Live regression call recorded as a fixture** (§9.5). 4-person Zoom call with author + 3 partners; recorded and labeled post-hoc. |
 | Week 16 | full week | Exec-friend dogfood |
 
 **Schedule the partner blocks before week 0 begins.** A dropped slot
@@ -1631,8 +1631,8 @@ open /Applications/heron.app   # launches as if first run
 ```
 
 12 walkthroughs total (5 positive paths + 5 counter-tests + 2 edge
-cases — paginated gallery, slow-network model download). Each ~3 min
-+ ~1 min reset overhead = ~1 day.
+cases — paginated gallery, slow-network model download). Each
+~3 min + ~1 min reset overhead = ~1 day.
 
 **Coverage caveat (recorded in `docs/manual-test-matrix.md`):** the
 laptop has dev tools, hardware peripherals, and existing user state.

@@ -1,4 +1,4 @@
-name: release
+name: notarize
 
 # Notarization stub. Full implementation lands week 2
 # (see docs/implementation.md §6.4). This file exists now so that
@@ -21,7 +21,7 @@ jobs:
 
       - name: placeholder
         run: |
-          echo "release workflow stub — full notarization pipeline arrives week 2"
+          echo "notarize workflow stub — full notarization pipeline arrives week 2"
           echo "tag: ${GITHUB_REF_NAME}"
           echo "see docs/implementation.md §6.4"
 
