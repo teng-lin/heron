@@ -42,6 +42,26 @@ rtrb = "0.3"
 rubato = "0.16"
 symphonia = "0.5"
 
+# speech-to-text — see docs/implementation.md §8.3. Pinned exact per
+# §1.3 because the bundled sherpa-onnx C ABI shifts between point
+# releases and the prebuilt dylibs the `download-binaries` feature
+# fetches are matched 1:1 to the binding version.
+sherpa-rs = { version = "=0.6.8", default-features = false, features = ["download-binaries"] }
+
+# platform-standard cache / config / data dirs
+dirs = "5"
+
+# blocking HTTP client used by `heron_speech::sherpa::ensure_model` for
+# the one-shot model download. Aligned with the version sherpa-rs-sys
+# already pulls in via its `download-binaries` build script so the
+# dep tree stays compact.
+ureq = "2.12"
+
+# SHA-256 verification of downloaded model artifacts. Already in the
+# transitive dep tree via reqwest; surfacing it here makes the audit
+# obvious.
+sha2 = "0.10"
+
 # HTTP / LLM
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 eventsource-stream = "0.2"
@@ -54,11 +74,6 @@ pulldown-cmark = "0.12"
 # fuzzy text match (for v1.1 ID-resolution fallback; bundled in v1
 # but unused unless prompt-side ID preservation fails frequently)
 strsim = "0.11"
-
-# OS-aware cache / config / data dir lookup. Used by heron-speech to
-# place the WhisperKit model under `~/Library/Caches/heron/whisperkit/`
-# on macOS without hard-coding the platform path.
-dirs = "5"
 
 heron-types = { path = "crates/heron-types" }
 heron-audio = { path = "crates/heron-audio" }
