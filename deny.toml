@@ -41,6 +41,12 @@ allow = [
     "CC0-1.0",
     "Zlib",
     "MPL-2.0",
+    # Apache-style; carried by `webpki-roots`, which `reqwest`'s
+    # rustls TLS path pulls in for the Mozilla CA bundle. Reviewed:
+    # https://www.cdla.dev/permissive-2-0/ — derived works are
+    # unrestricted; attribution is required and we already pass it
+    # through dependency manifests.
+    "CDLA-Permissive-2.0",
     # Our own workspace crates declare `LicenseRef-Proprietary`
     # because they're not yet open source. Allow it explicitly.
     "LicenseRef-Proprietary",
