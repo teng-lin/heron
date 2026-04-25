@@ -52,17 +52,25 @@ Three rules:
 Example:
 
 ```swift
+// The result lives in a class so the Task.detached closure captures a
+// reference (immutable from the closure's POV) instead of a `var`,
+// which Swift 6 strict concurrency rejects. The semaphore enforces
+// happens-before between Task and caller.
+private final class Int32Box: @unchecked Sendable {
+    var value: Int32 = 0
+}
+
 @_cdecl("ek_request_access")
 public func ek_request_access() -> Int32 {
-    var result: Int32 = 0
+    let result = Int32Box()
     let sem = DispatchSemaphore(value: 0)
     Task.detached {
-        do { result = try await store.requestFullAccessToEvents() ? 1 : 0 }
-        catch { result = 0 }
+        do { result.value = try await store.requestFullAccessToEvents() ? 1 : 0 }
+        catch { result.value = 0 }
         sem.signal()
     }
     sem.wait()
-    return result
+    return result.value
 }
 ```
 

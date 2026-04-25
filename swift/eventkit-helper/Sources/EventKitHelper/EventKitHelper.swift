@@ -55,13 +55,16 @@ public func ek_read_window_json(
     let predicate = store.predicateForEvents(withStart: s, end: e, calendars: nil)
     let events = store.events(matching: predicate)
 
+    // JSONSerialization requires every value to be a JSON-bridgeable
+    // type — `Optional.none` does NOT bridge to NSNull and would make
+    // the whole call return nil. Default any nil string field to "".
     let serialized = events.map { event -> [String: Any] in
         [
-            "title": event.title as Any,
+            "title": event.title ?? "",
             "start": event.startDate.timeIntervalSince1970,
             "end":   event.endDate.timeIntervalSince1970,
             "attendees": (event.attendees ?? []).map { p -> [String: Any] in
-                ["name": p.name as Any, "email": p.url.absoluteString]
+                ["name": p.name ?? "", "email": p.url.absoluteString]
             },
         ]
     }
