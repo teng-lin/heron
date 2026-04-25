@@ -184,21 +184,16 @@ impl Orchestrator {
         // the current `<note>.md` and pass them to the LLM. The
         // §10.5 prompt block then asks the model to RETURN THE EXACT
         // SAME `id` for items that mean the same thing as before.
+        // `as_summarizer_inputs` maps empty → `None` so the prompt
+        // block stays out on a first summarize.
         let prior = heron_vault::read_prior_items(note_path)?;
-
-        // Pass `None` rather than an empty slice on a first
-        // re-summarize so the §10.5 prompt block stays out — the
-        // LLM should not be asked to "preserve" IDs it was never
-        // told about.
-        let prior_action_items =
-            (!prior.action_items.is_empty()).then_some(&prior.action_items[..]);
-        let prior_attendees = (!prior.attendees.is_empty()).then_some(&prior.attendees[..]);
+        let (existing_action_items, existing_attendees) = prior.as_summarizer_inputs();
 
         let input = SummarizerInput {
             transcript,
             meeting_type,
-            existing_action_items: prior_action_items,
-            existing_attendees: prior_attendees,
+            existing_action_items,
+            existing_attendees,
         };
         let mut output = summarizer.summarize(input).await?;
 

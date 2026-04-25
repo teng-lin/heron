@@ -188,6 +188,17 @@ impl PriorItems {
     pub fn is_empty(&self) -> bool {
         self.action_items.is_empty() && self.attendees.is_empty()
     }
+
+    /// Borrow the lists as `Option<&[_]>` shaped for
+    /// `heron_llm::SummarizerInput`: empty list → `None` so the
+    /// §10.5 prompt block stays out on a first summarize, populated
+    /// list → `Some(&...)` so the LLM is asked to preserve those
+    /// IDs.
+    pub fn as_summarizer_inputs(&self) -> (Option<&[ActionItem]>, Option<&[Attendee]>) {
+        let actions = (!self.action_items.is_empty()).then_some(&self.action_items[..]);
+        let attendees = (!self.attendees.is_empty()).then_some(&self.attendees[..]);
+        (actions, attendees)
+    }
 }
 
 /// Read just the prior `action_items` + `attendees` from a note —
