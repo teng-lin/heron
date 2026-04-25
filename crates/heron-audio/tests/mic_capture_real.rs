@@ -22,8 +22,9 @@
 
 use std::time::Duration;
 
-use heron_audio::AudioError;
-use heron_types::{Channel, SessionId};
+use heron_audio::{AudioError, CaptureFrame, mic_capture};
+use heron_types::{Channel, Event, SessionClock, SessionId};
+use tokio::sync::broadcast;
 
 #[tokio::test]
 #[ignore = "needs HERON_MIC_CAPTURE_REAL=1 + TCC microphone + a working input device; see docs/manual-test-matrix.md"]
@@ -38,46 +39,35 @@ async fn mic_capture_emits_at_least_one_mic_frame() {
         return;
     }
 
-    // The mic pipeline lives inside `AudioCapture::start`, which also
-    // tries to open a process tap. Use a deliberately-not-running
-    // bundle id so the tap path returns `ProcessNotFound` cleanly —
-    // BUT note: under the "mic-failure-doesn't-fail-the-session"
-    // policy, the orchestrator's `start()` is the one that swallows
-    // mic failures, while a tap failure DOES propagate. So this test
-    // can't reuse `AudioCapture::start` against a no-such-app and
-    // exercise the mic path. Instead we call `mic_capture::start_mic`
-    // directly to keep the test focused.
-    use heron_audio::mic_capture;
-    use heron_types::{Event, SessionClock};
-    use tokio::sync::broadcast;
-
-    let (frames_tx, mut frames_rx) = broadcast::channel::<heron_audio::CaptureFrame>(256);
+    // We deliberately call `mic_capture::start_mic` directly rather
+    // than `AudioCapture::start`. The orchestrator's `start()`
+    // swallows mic failures (mic-failure-doesn't-fail-session policy)
+    // while a tap failure DOES propagate, so going through `start()`
+    // against a no-such-app would mask the mic outcome we're trying
+    // to assert on.
+    let (frames_tx, mut frames_rx) = broadcast::channel::<CaptureFrame>(256);
     let (events_tx, _events_rx) = broadcast::channel::<Event>(64);
     let clock = SessionClock::new();
 
-    let _handle = match mic_capture::start_mic(
-        frames_tx.clone(),
-        events_tx.clone(),
-        SessionId::nil(),
-        clock,
-    ) {
-        Ok(h) => h,
-        Err(AudioError::PermissionDenied(msg)) => {
-            panic!(
-                "TCC denied: {msg} — grant System Settings → Privacy & Security → \
-                 Microphone to the test runner and re-run"
-            );
-        }
-        Err(AudioError::NotYetImplemented) => {
-            panic!("start_mic returned NotYetImplemented on macOS — cfg gate regressed");
-        }
-        Err(other) => panic!("start_mic failed: {other}"),
-    };
+    let _handle =
+        match mic_capture::start_mic(frames_tx.clone(), events_tx, SessionId::nil(), clock) {
+            Ok(h) => h,
+            Err(AudioError::PermissionDenied(msg)) => {
+                panic!(
+                    "TCC denied: {msg} — grant System Settings → \
+                     Privacy & Security → Microphone to the test runner and re-run"
+                );
+            }
+            Err(AudioError::NotYetImplemented) => {
+                panic!("start_mic returned NotYetImplemented on macOS — cfg gate regressed");
+            }
+            Err(other) => panic!("start_mic failed: {other}"),
+        };
 
-    // Drop our owning sender end so the broadcast channel relies on
-    // the consumer task's clone for the receiver to stay live (the
-    // mic handle clones from inside `start_mic`). Confirms the handle
-    // owns enough of the producer side to keep recv() alive.
+    // Drop our local sender clone — the consumer task spawned inside
+    // `start_mic` owns its own clone of the original sender, so the
+    // broadcast channel stays open and `frames_rx.recv()` is still
+    // serviced by the realtime pipeline.
     drop(frames_tx);
 
     // Up to 5 s for the first mic frame. Internal mics on Apple
@@ -98,12 +88,14 @@ async fn mic_capture_emits_at_least_one_mic_frame() {
                 panic!("frames broadcast closed unexpectedly")
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                // Receiver fell behind — that's fine, just keep
-                // polling. The mic pipeline is alive and producing.
+                // Receiver fell behind the realtime pipeline — that
+                // confirms frames ARE being produced; keep polling
+                // for the next one we can actually see.
                 continue;
             }
             Err(_elapsed) => {
-                // No frame this round; keep polling.
+                // No frame this 250 ms slice; keep polling until
+                // the 5 s deadline.
             }
         }
     }

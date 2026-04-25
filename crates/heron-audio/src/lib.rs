@@ -85,9 +85,9 @@ pub enum AudioError {
 ///
 /// Real impl (week 2): spins up the Core Audio process tap on
 /// `target_bundle_id`, opens the user's mic via `cpal`, wires WebRTC
-/// APM (`process_reverse_stream` for AEC), and starts a SPSC ring
-/// from the realtime callback into the APM thread, which broadcasts
-/// post-APM frames out via [`AudioCaptureHandle::frames`].
+/// APM (`process_reverse_stream` for AEC, future PR), and starts a
+/// SPSC ring from each realtime callback into the broadcast channel
+/// behind [`AudioCaptureHandle::frames`].
 pub struct AudioCapture {
     _private: (),
 }
@@ -95,19 +95,27 @@ pub struct AudioCapture {
 impl AudioCapture {
     /// Start a capture session.
     ///
-    /// On macOS this resolves the meeting client by bundle id, builds
-    /// a Core Audio process tap, wraps it in a private aggregate
-    /// device, and returns an [`AudioCaptureHandle`] whose
-    /// `frames` / `events` receivers stay live for the lifetime of
-    /// the handle. The aggregate device's IO proc is **not yet**
-    /// wired into `frames` — that callback path arrives with the
-    /// week-3 ringbuffer integration (§7). Until then `frames` will
-    /// be silent, but the tap + aggregate device are owned by the
-    /// returned handle and released cleanly on drop.
+    /// On macOS this:
+    /// 1. Resolves the meeting client by bundle id and builds a Core
+    ///    Audio process tap (`Channel::Tap` frames). Required — a tap
+    ///    failure fails the whole call.
+    /// 2. Opens the default microphone via cpal (`Channel::Mic`
+    ///    frames). Best-effort — a mic failure (no input device, TCC
+    ///    denied, format unsupported) logs a warning, emits
+    ///    `Event::CaptureDegraded`, and continues with a tap-only
+    ///    session. The tap is the load-bearing capture surface for
+    ///    v0; a tap-only session is still useful for transcribing
+    ///    the remote side of the call.
+    ///
+    /// Both pipelines push into the same broadcast channel; consumers
+    /// differentiate via `frame.channel`. WebRTC APM AEC isn't wired
+    /// yet — mic frames are raw at this point. AEC integration is the
+    /// next PR.
     ///
     /// On non-Apple platforms this returns
     /// [`AudioError::NotYetImplemented`] — there is no Core Audio
-    /// process tap off-Apple.
+    /// process tap off-Apple, and `cpal` is gated to macOS in our
+    /// `Cargo.toml` for v0 (§6).
     pub async fn start(
         session_id: SessionId,
         target_bundle_id: &str,

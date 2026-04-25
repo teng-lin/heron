@@ -233,23 +233,29 @@ pub fn start_mic(
         started_at,
     );
 
-    // 6) Build the input stream. cpal's `build_input_stream` takes an
-    //    owning closure; we reach into `ctx` via a raw pointer so the
-    //    Box is the single owner of the heap allocation (mirrors the
-    //    `IoProcCtx` raw-pointer pattern in process_tap.rs).
+    // 6) Build the input stream. cpal's `build_input_stream` takes
+    //    an owning closure with `Send + 'static` bounds; we reach
+    //    into `ctx` via a raw pointer so the Box is the single owner
+    //    of the heap allocation (mirrors the `IoProcCtx` raw-pointer
+    //    pattern in `process_tap.rs`).
     //
-    //    SAFETY: `ctx_ptr` aliases `*ctx` which is owned by the
-    //    `MicHandle` returned from this function. The handle's drop
-    //    order (stream → ctx) guarantees the stream is fully torn
-    //    down (and therefore no callback is in flight) before the
-    //    Box is freed. cpal's macOS Stream::drop is synchronous —
-    //    it stops the AudioUnit before returning.
-    // Stash the pointer as `usize` to skirt the `*mut T: !Send` auto
-    // trait — the closure has to be `Send` for cpal to spawn the
-    // realtime thread, but raw pointers aren't `Send` even when the
-    // referent is. The pointer's referent (`MicCtx`) is owned by the
-    // `MicHandle` returned from this function; the handle's drop
-    // ordering keeps the box alive past the cpal stream's lifetime.
+    //    Stash the pointer as `usize` to skirt the `*mut T: !Send`
+    //    auto trait — the closure has to be `Send` for cpal to ferry
+    //    it onto the realtime thread, but raw pointers aren't `Send`
+    //    even when the referent is.
+    //
+    //    SAFETY (the deref inside the closure body below): the
+    //    pointer's referent (`MicCtx`) is owned by the `MicHandle`
+    //    returned from this function. The handle's drop order
+    //    (stream → ctx) guarantees the stream is fully torn down —
+    //    and therefore no callback is in flight — before the Box is
+    //    freed. cpal's macOS `Stream` drops `StreamInner`, which
+    //    drops `AudioUnit`, whose `Drop` impl calls
+    //    `AudioOutputUnitStop` + `AudioUnitUninitialize` synchronously
+    //    (see `coreaudio-rs::audio_unit::AudioUnit::drop`); after
+    //    `AudioOutputUnitStop` returns, no new realtime callbacks
+    //    fire. cpal does not clone the inner `Arc<Mutex<StreamInner>>`
+    //    in 0.15, so our `Stream` drop is the last reference.
     let ctx_addr: usize = ctx.as_mut() as *mut MicCtx as usize;
 
     let stream = device
@@ -425,14 +431,23 @@ fn spawn_consumer_task(
 /// Map cpal's `BuildStreamError` to our `AudioError`. macOS-only
 /// because `BuildStreamError` itself is only in scope when the cpal
 /// dep is compiled in.
+///
+/// Note on the `DeviceNotAvailable` mapping: cpal 0.15 routes most
+/// `coreaudio::Error` values through `DeviceNotAvailable` (see
+/// `cpal::host::coreaudio::From<coreaudio::Error> for BuildStreamError`),
+/// so this variant covers both TCC mic denial AND a genuinely
+/// disconnected device. We surface as `PermissionDenied` because
+/// that's the actionable case for the onboarding flow (week 6's TCC
+/// prompt re-trigger); a true disconnect retries on the next
+/// `AudioCapture::start`.
 #[cfg(target_os = "macos")]
 fn map_build_stream_error(err: cpal::BuildStreamError) -> AudioError {
     match err {
-        // cpal surfaces TCC mic denial as DeviceNotAvailable on
-        // macOS — there's no dedicated permission variant in cpal
-        // 0.15. Best-effort translation.
         cpal::BuildStreamError::DeviceNotAvailable => AudioError::PermissionDenied(
-            "default input device not available; likely TCC microphone denied".to_string(),
+            "default input device not available; \
+             check Privacy & Security → Microphone (TCC), \
+             then re-attach the input device if removed"
+                .to_string(),
         ),
         other => AudioError::Aborted(format!("cpal build_input_stream failed: {other}")),
     }
