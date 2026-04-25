@@ -1,0 +1,63 @@
+{{!--
+  heron-llm summarization template.
+  See docs/implementation.md §11.2 + docs/merge-model.md.
+  Rendered by heron-llm::render_meeting_prompt(SummarizerInput).
+--}}
+You are summarizing a meeting transcript for the user.
+The transcript is in JSONL form, one turn per line, with stable
+{t0, t1, speaker, speaker_source, confidence, text, channel}
+fields. Treat low-confidence (`confidence < 0.7`) and
+`speaker_source == "channel"` turns as attributable-but-not-guaranteed.
+
+Meeting type: {{meeting_type}}
+{{#if (eq meeting_type "client")}}
+This is an EXTERNAL client meeting. Surface decisions, action items,
+and any pricing / commercial commitments. Be concise.
+{{else if (eq meeting_type "internal")}}
+This is an INTERNAL team meeting. Surface decisions and owners; skip
+small-talk.
+{{else if (eq meeting_type "1:1")}}
+This is a 1:1. Capture the headline updates and follow-ups for both
+sides; preserve the participants' framings rather than collapsing
+them into a single voice.
+{{else}}
+Surface the most important content for someone who didn't attend.
+{{/if}}
+
+{{#if existing_action_items}}
+The following action items were generated from a prior summary of
+this meeting. Each has a stable `id`. **For items that you would
+output again with the same meaning, RETURN THE EXACT SAME `id`.**
+Mint a new `id` only for genuinely new items not in this list.
+{{#each existing_action_items}}
+- id: "{{id}}" | owner: {{owner}} | text: {{text}}{{#if due}} | due: {{due}}{{/if}}
+{{/each}}
+{{/if}}
+
+{{#if existing_attendees}}
+The following attendees were captured from the prior summary. Each
+has a stable `id`. **For attendees you would output again with the
+same name, RETURN THE EXACT SAME `id`.**
+{{#each existing_attendees}}
+- id: "{{id}}" | name: {{name}}{{#if company}} | company: {{company}}{{/if}}
+{{/each}}
+{{/if}}
+
+Output a single JSON object with this exact shape:
+{
+  "body": "...markdown summary...",
+  "company": "...optional company name...",
+  "meeting_type": "{{meeting_type}}",
+  "tags": ["..."],
+  "action_items": [
+    { "id": "...uuid...", "owner": "...", "text": "...", "due": null }
+  ],
+  "attendees": [
+    { "id": "...uuid...", "name": "...", "company": "..." }
+  ]
+}
+
+Do not wrap the JSON in markdown fences. Do not output any text
+outside the JSON object.
+
+Transcript path (read by the wrapper, not by you): {{transcript}}
