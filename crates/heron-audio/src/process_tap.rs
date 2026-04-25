@@ -420,13 +420,25 @@ pub fn install_io_proc(
     session_id: SessionId,
     clock: SessionClock,
 ) -> Result<IoProcHandle, AudioError> {
-    // 1) Build the SPSC ringbuffer. RING_CAPACITY frames of headroom
+    // 1) Verify a Tokio runtime is available BEFORE registering the
+    //    IO proc — `tokio::spawn` panics otherwise, and we don't want
+    //    to be holding a registered (but un-cleanupable) proc id at
+    //    that point. cidre 0.15 doesn't expose
+    //    `AudioDeviceDestroyIOProcID`; on failure we rely on
+    //    `AggregateDevice` Drop to tear down the proc registration.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(AudioError::Aborted(
+            "install_io_proc requires a Tokio runtime context".to_string(),
+        ));
+    }
+
+    // 2) Build the SPSC ringbuffer. RING_CAPACITY frames of headroom
     //    (~10 s at 480 samples/frame), large enough to absorb a 1 s
     //    consumer hiccup without dropping.
     let (producer, consumer) = RingBuffer::<CaptureFrame>::new(RING_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
 
-    // 2) Heap-allocate the IO proc context. Core Audio gets a raw
+    // 3) Heap-allocate the IO proc context. Core Audio gets a raw
     //    pointer into this; the box must outlive the started device.
     let mut ctx = Box::new(IoProcCtx {
         producer,
@@ -435,7 +447,7 @@ pub fn install_io_proc(
         channel: Channel::Tap,
     });
 
-    // 3) Register the IO proc. cidre's `create_io_proc_id` transmutes
+    // 4) Register the IO proc. cidre's `create_io_proc_id` transmutes
     //    the typed `&mut T` into a `*mut c_void` and stores it; the
     //    box guarantees the pointer stays valid until we drop the
     //    handle.
@@ -444,34 +456,27 @@ pub fn install_io_proc(
         .create_io_proc_id(io_proc, Some(ctx.as_mut()))
         .map_err(|e| AudioError::Aborted(format!("AudioDeviceCreateIOProcID failed: {e:?}")))?;
 
-    // 4) Spawn the consumer task BEFORE starting the device so it's
-    //    ready to drain on the first callback. `tokio::spawn` panics
-    //    if there's no runtime — but `AudioCapture::start` is async,
-    //    so by construction we're inside one. Catch the panic case
-    //    defensively as Aborted.
+    // 5) Spawn the consumer task BEFORE starting the device so it's
+    //    ready to drain on the first callback. We checked above that
+    //    a runtime is present, so `tokio::spawn` won't panic.
     let started_at = std::time::Instant::now();
-    let consumer_task = match tokio::runtime::Handle::try_current() {
-        Ok(_) => spawn_consumer_task(
-            consumer,
-            Arc::clone(&dropped),
-            frames_tx,
-            events_tx,
-            session_id,
-            started_at,
-        ),
-        Err(_) => {
-            return Err(AudioError::Aborted(
-                "install_io_proc requires a Tokio runtime context".to_string(),
-            ));
-        }
-    };
+    let consumer_task = spawn_consumer_task(
+        consumer,
+        Arc::clone(&dropped),
+        frames_tx,
+        events_tx,
+        session_id,
+        started_at,
+    );
 
-    // 5) Start the device. AudioDeviceStart with a proc_id activates
+    // 6) Start the device. AudioDeviceStart with a proc_id activates
     //    the realtime callback. From this point on the IO proc thread
     //    can fire at any time.
     let started = ca::device_start(aggregate.device, Some(proc_id)).map_err(|e| {
         // If start failed, abort the consumer (RAII guards take care
-        // of the producer/ctx on drop).
+        // of the producer/ctx on drop). The proc id is technically
+        // leaked here — see the §1 note above; the AggregateDevice
+        // drop unregisters it.
         consumer_task.abort();
         AudioError::Aborted(format!("AudioDeviceStart failed: {e:?}"))
     })?;
@@ -533,31 +538,27 @@ mod tests {
     /// accounting without touching Core Audio.
     #[test]
     fn full_ring_increments_drop_counter() {
-        // Tiny capacity so we can fill it instantly.
+        // Tiny capacity so we can fill it instantly. `_consumer` is
+        // held alive (not popped) so the ring stays full.
         let (mut producer, _consumer) = RingBuffer::<CaptureFrame>::new(2);
         let dropped = Arc::new(AtomicU64::new(0));
 
+        let make_frame = || CaptureFrame {
+            channel: Channel::Tap,
+            host_time: 0,
+            session_secs: 0.0,
+            samples: vec![],
+        };
+
         // Fill the ring.
         for _ in 0..2 {
-            producer
-                .push(CaptureFrame {
-                    channel: Channel::Tap,
-                    host_time: 0,
-                    session_secs: 0.0,
-                    samples: vec![],
-                })
-                .expect("push under capacity");
+            producer.push(make_frame()).expect("push under capacity");
         }
 
-        // Next push must fail. Mirror the realtime path: bump the
+        // Next pushes must fail. Mirror the realtime path: bump the
         // counter exactly the way `io_proc` does.
         for _ in 0..5 {
-            if let Err(PushError::Full(_)) = producer.push(CaptureFrame {
-                channel: Channel::Tap,
-                host_time: 0,
-                session_secs: 0.0,
-                samples: vec![],
-            }) {
+            if let Err(PushError::Full(_)) = producer.push(make_frame()) {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
