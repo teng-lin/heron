@@ -19,20 +19,45 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+#[cfg(target_vendor = "apple")]
+use std::os::raw::c_void;
 use std::path::Path;
+#[cfg(target_vendor = "apple")]
+use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Default WhisperKit model variant. Mirrors the Swift constant
+/// `WK_DEFAULT_VARIANT`. ~1GB CoreML bundle (English-only small),
+/// matches `docs/plan.md` week-9 step 5.
+pub const DEFAULT_WK_VARIANT: &str = "openai_whisper-small.en";
+
 #[cfg(target_vendor = "apple")]
 mod ffi {
-    use std::os::raw::c_char;
+    use std::os::raw::{c_char, c_void};
+
+    use super::ProgressThunk;
 
     unsafe extern "C" {
         pub(super) fn wk_init(model_dir: *const c_char) -> i32;
+        pub(super) fn wk_fetch_model(
+            variant: *const c_char,
+            dest_dir: *const c_char,
+            progress_cb: Option<ProgressThunk>,
+            progress_userdata: *mut c_void,
+            out_model_dir: *mut *mut c_char,
+        ) -> i32;
         pub(super) fn wk_transcribe(wav_path: *const c_char, out: *mut *mut c_char) -> i32;
         pub(super) fn wk_free_string(p: *mut c_char);
     }
 }
+
+/// C-ABI thunk passed to the Swift bridge so it can call back into a
+/// Rust closure from the WhisperKit download Task. The userdata is an
+/// opaque pointer to a `Box<dyn FnMut(f32)>` allocated by the caller
+/// of `whisperkit_fetch`; the thunk downcasts and invokes it.
+#[cfg(target_vendor = "apple")]
+pub(super) type ProgressThunk = unsafe extern "C" fn(*mut c_void, f32);
 
 /// Pinned constants matching the Swift side. Drift here is caught at
 /// **compile time** by the unit tests below that assert each enum
@@ -130,6 +155,109 @@ pub fn whisperkit_init(model_dir: &Path) -> Result<(), WkError> {
 #[cfg(not(target_vendor = "apple"))]
 pub fn whisperkit_init(_model_dir: &Path) -> Result<(), WkError> {
     Err(WkError::NotYetImplemented)
+}
+
+/// Download a WhisperKit `variant` into `dest_dir` and return the
+/// resolved model folder.
+///
+/// `dest_dir` is the HubApi `downloadBase`; the actual `.mlmodelc`
+/// bundles end up under `<dest_dir>/models/argmaxinc/whisperkit-coreml/<variant>`.
+/// The returned `PathBuf` points at that resolved folder so the caller
+/// can hand it straight to [`whisperkit_init`].
+///
+/// `on_progress` is invoked with values in `[0.0, 1.0]` from the
+/// WhisperKit download Task. Closures may capture; the boxed trait
+/// object lives on the stack frame for the duration of the call (no
+/// `'static` requirement).
+///
+/// # Threading
+///
+/// Blocks the caller — wrap in `tokio::task::spawn_blocking` from
+/// async contexts. The Swift bridge bridges async→sync via
+/// `DispatchSemaphore`, mirroring [`whisperkit_init`].
+#[cfg(target_vendor = "apple")]
+pub fn whisperkit_fetch(
+    variant: &str,
+    dest_dir: &Path,
+    on_progress: impl FnMut(f32),
+) -> Result<PathBuf, WkError> {
+    let c_variant = CString::new(variant.as_bytes()).map_err(|_| WkError::PathNul)?;
+    let c_dest = path_to_cstring(dest_dir)?;
+
+    // The closure goes into a double-Box: outer `Box<dyn FnMut>` so
+    // the inner pointer is thin (one word), then `Box::into_raw` to
+    // hand the heap address to Swift as opaque userdata. We rebuild
+    // the Box from the raw pointer after the call returns so the
+    // closure (and any captures) are dropped.
+    let trait_obj: Box<dyn FnMut(f32)> = Box::new(on_progress);
+    let mut boxed: Box<Box<dyn FnMut(f32)>> = Box::new(trait_obj);
+    let userdata: *mut c_void = (&mut *boxed as *mut Box<dyn FnMut(f32)>).cast();
+
+    let mut out_buf: *mut c_char = std::ptr::null_mut();
+    // SAFETY: all pointers are non-NULL (`c_variant`, `c_dest` outlive
+    // the call; `userdata` points at the boxed closure on the stack
+    // above). The thunk only runs while the Swift Task is alive,
+    // which is bracketed by the semaphore wait inside `wk_fetch_model`,
+    // so `userdata` is always valid for the duration of any callback.
+    let raw = unsafe {
+        ffi::wk_fetch_model(
+            c_variant.as_ptr(),
+            c_dest.as_ptr(),
+            Some(progress_thunk),
+            userdata,
+            &mut out_buf,
+        )
+    };
+    drop(boxed);
+
+    let status = WkStatus::from_raw(raw);
+
+    let resolved = if out_buf.is_null() {
+        None
+    } else {
+        // SAFETY: bridge guarantees a NUL-terminated buffer when
+        // `out_buf` is non-NULL; we copy to an owned String and free.
+        let parsed: Result<String, WkError> = unsafe {
+            CStr::from_ptr(out_buf)
+                .to_str()
+                .map(str::to_owned)
+                .map_err(WkError::from)
+        };
+        // SAFETY: same allocator pairing as `whisperkit_transcribe`.
+        unsafe { ffi::wk_free_string(out_buf) };
+        Some(parsed?)
+    };
+
+    match status {
+        WkStatus::Ok => match resolved {
+            Some(p) => Ok(PathBuf::from(p)),
+            None => Err(WkError::NullBuffer),
+        },
+        other => Err(WkError::from(other)),
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn whisperkit_fetch(
+    _variant: &str,
+    _dest_dir: &Path,
+    _on_progress: impl FnMut(f32),
+) -> Result<std::path::PathBuf, WkError> {
+    Err(WkError::NotYetImplemented)
+}
+
+/// C-ABI thunk Swift invokes for each download progress tick. We
+/// downcast `userdata` back to the boxed Rust closure and call it.
+/// SAFETY: the caller of `whisperkit_fetch` guarantees `userdata`
+/// points at a live `Box<dyn FnMut(f32)>` for the duration of the
+/// fetch.
+#[cfg(target_vendor = "apple")]
+unsafe extern "C" fn progress_thunk(userdata: *mut c_void, value: f32) {
+    if userdata.is_null() {
+        return;
+    }
+    let cb = unsafe { &mut *userdata.cast::<Box<dyn FnMut(f32)>>() };
+    cb(value);
 }
 
 /// Transcribe `wav_path` and return the JSONL turn array as a `String`.
@@ -326,6 +454,25 @@ mod tests {
         assert_eq!(c.as_bytes(), bytes);
     }
 
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn fetch_with_nul_in_variant_is_rejected() {
+        // CString::new bails on any embedded NUL; the wrapper surfaces
+        // PathNul rather than silently truncating the variant string.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let result = whisperkit_fetch("bad\0variant", tmp.path(), |_| {});
+        assert!(matches!(result, Err(WkError::PathNul)));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn fetch_with_nul_in_dest_dir_is_rejected() {
+        use std::path::PathBuf;
+        let p = PathBuf::from("/tmp/foo\0bar");
+        let result = whisperkit_fetch(DEFAULT_WK_VARIANT, &p, |_| {});
+        assert!(matches!(result, Err(WkError::PathNul)));
+    }
+
     #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn off_apple_shims_return_not_yet_implemented() {
@@ -337,6 +484,10 @@ mod tests {
         ));
         assert!(matches!(
             whisperkit_transcribe(&p),
+            Err(WkError::NotYetImplemented)
+        ));
+        assert!(matches!(
+            whisperkit_fetch(DEFAULT_WK_VARIANT, &p, |_| {}),
             Err(WkError::NotYetImplemented)
         ));
     }

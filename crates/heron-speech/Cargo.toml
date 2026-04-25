@@ -19,6 +19,7 @@ tracing = { workspace = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
+dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -33,7 +33,9 @@ pub use selection::{
     Platform, RealPlatform, WER_THRESHOLDS, WerBaseline, WerThreshold, lookup_threshold,
     select_backend,
 };
-pub use whisperkit_bridge::{WkError, WkStatus, whisperkit_init, whisperkit_transcribe};
+pub use whisperkit_bridge::{
+    DEFAULT_WK_VARIANT, WkError, WkStatus, whisperkit_fetch, whisperkit_init, whisperkit_transcribe,
+};
 
 /// Per-backend telemetry collected during a successful transcription.
 #[derive(Debug, Clone)]
@@ -138,78 +140,194 @@ pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
 /// blocks on a `DispatchSemaphore` waiting for WhisperKit's async
 /// transcribe.
 ///
-/// Construction is cheap (no model load); the heavy lifting happens
-/// in [`SttBackend::ensure_model`]. The `init_cell` guards against
-/// accidental double-load — Swift maintains a single global instance,
-/// but a paranoid Rust caller can re-call `ensure_model` safely.
-/// `OnceCell` (over `AtomicBool`) makes that idempotency race-free
-/// across concurrent `ensure_model` calls: only the first task runs
-/// the underlying `wk_init`, others await its result.
+/// Construction is cheap (no model load and no network); the heavy
+/// lifting — fetch + load — happens in [`SttBackend::ensure_model`].
+/// The `init_cell` guards against accidental double-load: only the
+/// first concurrent `ensure_model` call runs the fetch and `wk_init`;
+/// others await its result. The cell stores the resolved model path
+/// so subsequent runs (and the diagnostics tab) can read it back.
 #[cfg(target_vendor = "apple")]
 pub struct WhisperKitBackend {
-    /// Folder containing the WhisperKit-compiled `.mlmodelc` bundles.
-    /// Resolved from `HERON_WHISPERKIT_MODEL_DIR` by [`Self::from_env`]
-    /// or supplied directly via [`Self::new`] in tests.
-    model_dir: PathBuf,
-    /// Initialized exactly once across all concurrent `ensure_model`
-    /// callers. Failed inits leave the cell empty so a retry can run
-    /// the init again rather than caching the failure.
-    init_cell: OnceCell<()>,
+    /// Configured model location. When `Override(dir)`, ensure_model
+    /// uses it verbatim and skips the fetch step (escape hatch for CI
+    /// and integration tests). When `Cache(root)`, ensure_model
+    /// resolves the variant under `<root>/<variant>` and triggers a
+    /// download on first run.
+    location: ModelLocation,
+    /// WhisperKit variant identifier, e.g. `"openai_whisper-small.en"`.
+    variant: String,
+    /// Resolved model folder after a successful `ensure_model` —
+    /// the directory we actually pass to `wk_init`. Initialized
+    /// exactly once across concurrent `ensure_model` callers.
+    init_cell: OnceCell<PathBuf>,
+}
+
+/// Where the WhisperKit model lives.
+#[cfg(target_vendor = "apple")]
+#[derive(Debug, Clone)]
+enum ModelLocation {
+    /// Cache root under which the variant is fetched on first run.
+    /// The actual model folder is resolved by `wk_fetch_model`.
+    Cache(PathBuf),
+    /// Operator-supplied path (via `HERON_WHISPERKIT_MODEL_DIR`). Used
+    /// verbatim and never downloaded into.
+    Override(PathBuf),
 }
 
 #[cfg(target_vendor = "apple")]
 impl WhisperKitBackend {
-    /// Construct a backend with an explicit model directory.
+    /// Construct a backend with an explicit model directory. The
+    /// fetch step is skipped — the directory must already contain the
+    /// `.mlmodelc` bundles. Used by tests and by `from_env` when the
+    /// `HERON_WHISPERKIT_MODEL_DIR` escape hatch is set.
     pub fn new(model_dir: PathBuf) -> Self {
         Self {
-            model_dir,
+            location: ModelLocation::Override(model_dir),
+            variant: DEFAULT_WK_VARIANT.to_owned(),
             init_cell: OnceCell::new(),
         }
     }
 
-    /// Construct from `HERON_WHISPERKIT_MODEL_DIR` if set, else point
-    /// at a sentinel that will fail `ensure_model` with `ModelMissing`.
-    /// We don't fail construction here so `build_backend("whisperkit")`
-    /// keeps returning a value the CLI can store before any models are
-    /// downloaded.
-    pub fn from_env() -> Self {
-        let dir = std::env::var_os("HERON_WHISPERKIT_MODEL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/nonexistent/heron-whisperkit-model-dir"));
-        Self::new(dir)
+    /// Construct a backend that downloads the default variant under
+    /// the supplied cache root on first `ensure_model`.
+    pub fn with_cache_root(cache_root: PathBuf) -> Self {
+        Self {
+            location: ModelLocation::Cache(cache_root),
+            variant: DEFAULT_WK_VARIANT.to_owned(),
+            init_cell: OnceCell::new(),
+        }
     }
+
+    /// Construct from environment.
+    ///
+    /// - If `HERON_WHISPERKIT_MODEL_DIR` is set, use it verbatim
+    ///   (no download). Tests and sandboxed CI take this path.
+    /// - Otherwise, pick the OS cache dir (`dirs::cache_dir()`) and
+    ///   use `<cache>/heron/whisperkit` as the cache root. On macOS
+    ///   that's `~/Library/Caches/heron/whisperkit/`.
+    /// - Last-resort fallback (cache_dir unavailable, e.g. a stripped
+    ///   sandbox without HOME): `/tmp/heron-whisperkit-cache`. Lets
+    ///   construction succeed; ensure_model surfaces any path issue.
+    pub fn from_env() -> Self {
+        if let Some(dir) = std::env::var_os("HERON_WHISPERKIT_MODEL_DIR") {
+            return Self::new(PathBuf::from(dir));
+        }
+        let cache_root = dirs::cache_dir()
+            .map(|d| d.join("heron").join("whisperkit"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/heron-whisperkit-cache"));
+        Self::with_cache_root(cache_root)
+    }
+
+    /// Resolved model directory after a successful ensure_model. Only
+    /// `Some` once the cell is initialized. Currently used by tests
+    /// and the integration check; orchestrator code may want it once
+    /// the diagnostics tab grows a "where is my model" line.
+    #[cfg(test)]
+    fn resolved_model_dir(&self) -> Option<&Path> {
+        self.init_cell.get().map(PathBuf::as_path)
+    }
+}
+
+/// Heuristic check that a directory contains a usable WhisperKit
+/// bundle. WhisperKit's `download` writes one or more `.mlmodelc`
+/// directories under the variant folder; if at least one exists we
+/// assume the cache is warm and skip the network round-trip. A
+/// stricter check would inspect tokenizer/json files, but the cost
+/// of a false-positive here is `wk_init` returning Internal, which
+/// the operator can resolve by deleting the cache.
+#[cfg(target_vendor = "apple")]
+fn dir_has_mlmodelc(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        if entry.path().extension().is_some_and(|e| e == "mlmodelc")
+            && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(target_vendor = "apple")]
 #[async_trait]
 impl SttBackend for WhisperKitBackend {
     async fn ensure_model(&self, mut on_progress: ProgressFn) -> Result<(), SttError> {
-        // Per §14.1, fire progress at start *and* end so a first-run
-        // UI never sits at zero. WhisperKit doesn't expose granular
-        // load progress today; if it does in a future release we'll
-        // wire a callback through the Swift bridge.
+        // Per §14.1, fire progress at start so the first-run UI never
+        // sits at zero while the cache check / Swift Task spin up.
         on_progress(0.0);
+
+        // Wrap the (boxed) progress callback in an Arc<Mutex<...>> so
+        // both the fetch closure (which fires repeatedly) and the
+        // post-init "1.0" sentinel can call it. Mutex (over an
+        // exclusive borrow) is needed because spawn_blocking moves the
+        // closure into another thread.
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
+
+        let location = self.location.clone();
+        let variant = self.variant.clone();
+        let progress_for_init = std::sync::Arc::clone(&progress);
 
         // OnceCell::get_or_try_init runs the init body exactly once
         // across concurrent callers; failures don't poison the cell,
-        // so a retry can re-run the init.
+        // so a retry can re-run the fetch + init.
         self.init_cell
-            .get_or_try_init(|| async {
-                let model_dir = self.model_dir.clone();
-                tokio::task::spawn_blocking(move || whisperkit_init(&model_dir))
-                    .await
-                    .map_err(|e| SttError::Failed(format!("whisperkit init join failed: {e}")))?
-                    .map_err(|e| match e {
+            .get_or_try_init(|| async move {
+                let progress_inner = std::sync::Arc::clone(&progress_for_init);
+                tokio::task::spawn_blocking(move || -> Result<PathBuf, SttError> {
+                    let model_dir = match &location {
+                        ModelLocation::Override(dir) => dir.clone(),
+                        ModelLocation::Cache(root) => {
+                            let variant_dir = root.join(&variant);
+                            if dir_has_mlmodelc(&variant_dir) {
+                                // Cache hit — skip the network round-trip.
+                                variant_dir
+                            } else {
+                                std::fs::create_dir_all(root).map_err(|e| {
+                                    SttError::Failed(format!(
+                                        "create whisperkit cache root {}: {e}",
+                                        root.display()
+                                    ))
+                                })?;
+                                let cb_arc = std::sync::Arc::clone(&progress_inner);
+                                // WhisperKit's `download` reports
+                                // 0.0…1.0 incrementally; we forward
+                                // each tick to the boxed callback
+                                // under the mutex.
+                                let on_p = move |p: f32| {
+                                    if let Ok(mut g) = cb_arc.lock() {
+                                        g(p);
+                                    }
+                                };
+                                whisperkit_fetch(&variant, root, on_p).map_err(|e| match e {
+                                    WkError::ModelMissing => SttError::ModelMissing(format!(
+                                        "unknown whisperkit variant: {variant}"
+                                    )),
+                                    WkError::NotYetImplemented => SttError::NotYetImplemented,
+                                    other => SttError::Failed(format!("whisperkit fetch: {other}")),
+                                })?
+                            }
+                        }
+                    };
+
+                    whisperkit_init(&model_dir).map_err(|e| match e {
                         WkError::ModelMissing => {
-                            SttError::ModelMissing(self.model_dir.display().to_string())
+                            SttError::ModelMissing(model_dir.display().to_string())
                         }
                         WkError::NotYetImplemented => SttError::NotYetImplemented,
                         other => SttError::Failed(format!("whisperkit init: {other}")),
-                    })
+                    })?;
+                    Ok(model_dir)
+                })
+                .await
+                .map_err(|e| SttError::Failed(format!("whisperkit init join failed: {e}")))?
             })
             .await?;
 
-        on_progress(1.0);
+        if let Ok(mut g) = progress.lock() {
+            g(1.0);
+        }
         Ok(())
     }
 
@@ -384,22 +502,27 @@ mod tests {
 
     #[tokio::test]
     async fn whisperkit_backend_with_missing_model_dir_errors() {
-        // On Apple targets `build_backend("whisperkit")` returns the
-        // real `WhisperKitBackend`, which resolves its model folder
-        // from `HERON_WHISPERKIT_MODEL_DIR`. Without that env var the
-        // backend points at a sentinel non-existent path; ensure_model
-        // must surface `ModelMissing` rather than silently succeeding.
-        // Off-Apple this test still hits the stub and gets
-        // `NotYetImplemented`.
+        // With `HERON_WHISPERKIT_MODEL_DIR` set to a non-existent
+        // path, ensure_model takes the override branch (skip fetch,
+        // pass the path verbatim to `wk_init`) and surfaces
+        // `ModelMissing`. The override path is the contract tests
+        // and sandboxed CI rely on so neither requires network. Off
+        // Apple the stub returns `NotYetImplemented` regardless.
         // SAFETY: tests run with a single tokio runtime per test fn;
         // no other test reads this env var concurrently in the same
         // process.
         unsafe {
-            std::env::remove_var("HERON_WHISPERKIT_MODEL_DIR");
+            std::env::set_var(
+                "HERON_WHISPERKIT_MODEL_DIR",
+                "/nonexistent/heron-whisperkit-model-dir",
+            );
         }
         let b = build_backend("whisperkit").expect("build");
         assert_eq!(b.name(), "whisperkit");
         let result = b.ensure_model(Box::new(|_p| {})).await;
+        unsafe {
+            std::env::remove_var("HERON_WHISPERKIT_MODEL_DIR");
+        }
         #[cfg(target_vendor = "apple")]
         assert!(
             matches!(result, Err(SttError::ModelMissing(_))),
@@ -410,6 +533,57 @@ mod tests {
             matches!(result, Err(SttError::NotYetImplemented)),
             "expected NotYetImplemented off-Apple, got {result:?}"
         );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn whisperkit_backend_with_cache_root_carries_default_variant() {
+        // Construction with an explicit cache root is the path
+        // ensure_model takes when no `HERON_WHISPERKIT_MODEL_DIR`
+        // override is set. Asserts the default variant flows through;
+        // doesn't touch the env so it can't race the override test.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let b = WhisperKitBackend::with_cache_root(tmp.path().to_path_buf());
+        assert_eq!(b.variant, DEFAULT_WK_VARIANT);
+    }
+
+    /// End-to-end fetch + init against a real WhisperKit download.
+    /// Network-dependent, so gated by `HERON_WHISPERKIT_INTEGRATION=1`
+    /// to keep CI without network egress green.
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn ensure_model_downloads_real_whisperkit_when_opted_in() {
+        if std::env::var("HERON_WHISPERKIT_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        // Construct via `with_cache_root` directly so we never touch
+        // `HERON_WHISPERKIT_MODEL_DIR` — the env var coordinates with
+        // the override-path test in the same process and a clear
+        // here would race that test's set.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let b = WhisperKitBackend::with_cache_root(tmp.path().to_path_buf());
+        let progress_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pc = std::sync::Arc::clone(&progress_count);
+        let result = b
+            .ensure_model(Box::new(move |_p| {
+                pc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }))
+            .await;
+        assert!(result.is_ok(), "ensure_model failed: {result:?}");
+        let resolved = b.resolved_model_dir().expect("init_cell populated");
+        let mut found = false;
+        for entry in std::fs::read_dir(resolved)
+            .expect("read resolved dir")
+            .flatten()
+        {
+            if entry.path().extension().is_some_and(|e| e == "mlmodelc") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "no .mlmodelc in resolved dir {resolved:?}");
+        // At minimum the start (0.0) and end (1.0) ticks fire.
+        assert!(progress_count.load(std::sync::atomic::Ordering::Relaxed) >= 2);
     }
 
     #[tokio::test]
