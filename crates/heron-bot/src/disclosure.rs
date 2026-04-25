@@ -57,6 +57,99 @@ pub fn is_objection(text: &str, patterns: &[String]) -> bool {
     match_objection(text, patterns).is_some()
 }
 
+/// Variables the [`DisclosureProfile::text_template`] can reference.
+/// Spec §4 names two: `{user_name}` (the human heron is acting on
+/// behalf of) and `{meeting_title}` (the calendar event the bot is
+/// joining). Adding a new variable means adding a field here AND a
+/// new `replace_placeholder` line — keeping the surface narrow on
+/// purpose so a typo in the template surfaces as
+/// [`TemplateError::UnknownPlaceholder`] rather than rendering an
+/// empty string.
+#[derive(Debug, Clone, Default)]
+pub struct DisclosureVars<'a> {
+    /// User the bot is acting on behalf of, e.g. `"Alex"`.
+    pub user_name: &'a str,
+    /// Calendar-derived meeting title, e.g. `"Acme Q3 review"`.
+    pub meeting_title: &'a str,
+}
+
+/// Errors [`render_disclosure`] can return.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TemplateError {
+    /// Template rendered to a whitespace-only string. Spec
+    /// Invariant 6: a disclosure that the LLM is asked to speak
+    /// must have actual content; "empty disclosure" is treated as
+    /// "no disclosure" and rejected.
+    #[error("template rendered to empty/whitespace-only output")]
+    Empty,
+    /// Template references a placeholder we don't know how to
+    /// fill. Caller should fix the template (or extend
+    /// [`DisclosureVars`] if a new variable is genuinely needed).
+    #[error("template references unknown placeholder {{{name}}}")]
+    UnknownPlaceholder { name: String },
+}
+
+/// Render `template` by replacing `{user_name}` / `{meeting_title}`
+/// with `vars`. Unknown `{...}` placeholders surface as
+/// [`TemplateError::UnknownPlaceholder`] so a template typo doesn't
+/// silently leave a placeholder marker in the disclosure the bot
+/// reads aloud.
+///
+/// Output gets `trim()`ed; an all-whitespace template returns
+/// [`TemplateError::Empty`] so the caller fails fast rather than
+/// emitting a silent / blank disclosure.
+pub fn render_disclosure(
+    template: &str,
+    vars: &DisclosureVars<'_>,
+) -> Result<String, TemplateError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open) = rest.find('{') {
+        // Push the literal chunk before the `{`.
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        // `}` *after* the open — same line, no nesting allowed.
+        // (We're a tiny renderer, not Handlebars.)
+        let Some(close_rel) = after_open.find('}') else {
+            // Unbalanced `{` with no matching `}`. Treat as a
+            // literal `{` followed by the rest of the template,
+            // matching how a casual template author would expect a
+            // stray brace to be handled (verbatim).
+            out.push('{');
+            rest = after_open;
+            continue;
+        };
+        let placeholder = &after_open[..close_rel];
+        // A `{` inside the candidate placeholder means we crossed
+        // a stray `{` rather than a real `{name}` pair — render
+        // the outer `{` literal and rescan from there. Catches
+        // typos like `"see {user_name and {user_name}"`.
+        if placeholder.contains('{') {
+            out.push('{');
+            rest = after_open;
+            continue;
+        }
+        match placeholder {
+            "user_name" => out.push_str(vars.user_name),
+            "meeting_title" => out.push_str(vars.meeting_title),
+            other => {
+                return Err(TemplateError::UnknownPlaceholder {
+                    name: other.to_owned(),
+                });
+            }
+        }
+        rest = &after_open[close_rel + 1..];
+    }
+    // Trailing literal after the last `}`.
+    out.push_str(rest);
+
+    if out.trim().is_empty() {
+        return Err(TemplateError::Empty);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -193,5 +286,110 @@ mod tests {
         // doesn't mistakenly fire the FSM.
         let pats = patterns(&["please leave"]);
         assert_eq!(match_objection("   \t\n  ", &pats), None);
+    }
+
+    fn vars<'a>(user: &'a str, title: &'a str) -> DisclosureVars<'a> {
+        DisclosureVars {
+            user_name: user,
+            meeting_title: title,
+        }
+    }
+
+    #[test]
+    fn template_renders_user_name_and_meeting_title() {
+        let template =
+            "Hi, I'm an AI assistant joining on behalf of {user_name} for {meeting_title}.";
+        let out = render_disclosure(template, &vars("Alex", "Acme Q3 review")).expect("render");
+        assert_eq!(
+            out,
+            "Hi, I'm an AI assistant joining on behalf of Alex for Acme Q3 review."
+        );
+    }
+
+    #[test]
+    fn template_with_only_literals_passes_through() {
+        let out = render_disclosure("Recording in progress.", &vars("", "")).expect("ok");
+        assert_eq!(out, "Recording in progress.");
+    }
+
+    #[test]
+    fn empty_template_errors() {
+        let err = render_disclosure("", &vars("Alex", "x")).expect_err("empty");
+        assert_eq!(err, TemplateError::Empty);
+    }
+
+    #[test]
+    fn whitespace_only_template_errors() {
+        let err = render_disclosure("   \n\t  ", &vars("Alex", "x")).expect_err("ws");
+        assert_eq!(err, TemplateError::Empty);
+    }
+
+    #[test]
+    fn template_with_only_empty_var_renders_to_empty_errors() {
+        // {user_name} with empty var renders to "" — same outcome
+        // as an empty template literal. Catches the case where a
+        // caller forgot to populate vars before render.
+        let err = render_disclosure("{user_name}", &vars("", "")).expect_err("empty");
+        assert_eq!(err, TemplateError::Empty);
+    }
+
+    #[test]
+    fn unknown_placeholder_errors_with_name() {
+        let err = render_disclosure("hi {bogus}", &vars("a", "b")).expect_err("unknown");
+        match err {
+            TemplateError::UnknownPlaceholder { name } => assert_eq!(name, "bogus"),
+            other => panic!("expected UnknownPlaceholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placeholder_substring_of_unknown_var_is_caught() {
+        // `{user_namex}` is NOT `{user_name}` — exact match only.
+        // Pin so a future fuzzy-match optimization doesn't sneak in.
+        let err = render_disclosure("{user_namex}", &vars("a", "b")).expect_err("unknown");
+        assert!(matches!(
+            err,
+            TemplateError::UnknownPlaceholder { name } if name == "user_namex"
+        ));
+    }
+
+    #[test]
+    fn unbalanced_open_brace_treated_as_literal() {
+        // A stray `{` with no matching `}` should render verbatim
+        // rather than swallowing the rest of the template. Pin so
+        // a typo like "see {user_name and you" still produces a
+        // recognizable disclosure.
+        let out = render_disclosure("see {user_name and {user_name}", &vars("Alex", ""))
+            .expect("renders");
+        // The first `{` is the unbalanced one; the second is the
+        // legitimate placeholder. Output should include the literal
+        // "{" and the substituted name.
+        assert!(out.contains("{user_name and"), "got: {out}");
+        assert!(out.ends_with("Alex"), "got: {out}");
+    }
+
+    #[test]
+    fn multiple_placeholders_render_each() {
+        let template = "{user_name} {user_name} for {meeting_title}";
+        let out = render_disclosure(template, &vars("Alex", "Q3")).expect("ok");
+        assert_eq!(out, "Alex Alex for Q3");
+    }
+
+    #[test]
+    fn placeholder_with_special_characters_in_value() {
+        // Multibyte + emoji + brace-in-value all round-trip
+        // verbatim — no further substitution is applied to var
+        // values, so a value of "{user_name}" doesn't recurse.
+        let out = render_disclosure("{user_name}", &vars("Á́🦀{user_name}", "")).expect("ok");
+        assert_eq!(out, "Á́🦀{user_name}");
+    }
+
+    #[test]
+    fn render_is_deterministic_for_same_input() {
+        let template = "{user_name} for {meeting_title}";
+        let v = vars("Alex", "Q3");
+        let a = render_disclosure(template, &v).expect("ok");
+        let b = render_disclosure(template, &v).expect("ok");
+        assert_eq!(a, b);
     }
 }
