@@ -10,11 +10,6 @@ set -euo pipefail
 # uses only POSIX-shell-compatible constructs so it runs on the macOS
 # system bash without a Homebrew bash detour.
 
-OS="$(uname -s)"
-if [ "$OS" != "Darwin" ]; then
-    echo "warning: heron v1 is macOS-only; setup-dev on $OS may miss steps" >&2
-fi
-
 note() { printf "→ %s\n" "$*"; }
 ok()   { printf "✓ %s\n" "$*"; }
 miss() { printf "✘ %s\n" "$*" >&2; }
@@ -29,6 +24,11 @@ ensure_command() {
         return 1
     fi
 }
+
+OS="$(uname -s)"
+if [ "$OS" != "Darwin" ]; then
+    miss "heron v1 is macOS-only; setup-dev on $OS may miss steps"
+fi
 
 ###
 ### Homebrew (macOS only)
@@ -117,7 +117,10 @@ fi
 ### Pre-flight smoke
 ###
 
-note "Running 'cargo build --workspace' as a smoke test (no-op on warm cache)"
-cargo build --workspace --quiet
+note "Running 'cargo build --workspace --all-targets' as a smoke test (no-op on warm cache)"
+# --all-targets pulls dev-dependencies and compiles tests + examples
+# too, which is a more honest "the dev env actually works" check
+# than just compiling the lib targets.
+cargo build --workspace --all-targets --quiet
 
 ok "Setup complete. Try: cargo run --bin heron -- status"

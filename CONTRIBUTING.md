@@ -20,12 +20,18 @@ skips.
 
 | Tool | Pin | Source |
 |---|---|---|
-| Rust | `1.90.0` | `rust-toolchain.toml` |
+| Rust toolchain (dev) | `1.90.0` | `rust-toolchain.toml` |
+| Rust MSRV | `1.88` | `Cargo.toml` `rust-version` |
 | Edition | `2024` | `Cargo.toml` |
 | Bun | latest | per `apps/desktop/package.json` |
 | Swift | system | `xcrun -f swiftc` |
 | ffmpeg / ffprobe | brew | §0.1 prerequisite |
 | cargo-deny | latest | `deny.toml` |
+
+The toolchain pin is what we develop against; the MSRV is the
+minimum the published crates compile under. `1.90` is needed for
+let-chains in the matcher code; `1.88` is the floor below which
+crates depending on us would break.
 
 ## Per-PR checklist
 
