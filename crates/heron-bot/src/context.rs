@@ -80,30 +80,48 @@ pub fn render(ctx: &PreMeetingContext) -> Result<String, ContextError> {
         }
     }
 
-    if !ctx.attendees_known.is_empty() {
-        if needs_blank_line {
-            out.push('\n');
+    // Defer the section header until we see at least one renderable
+    // attendee. A vec full of whitespace-only names would otherwise
+    // produce a bare "## Attendees" with no body — contradicting the
+    // module's "empty sections are omitted entirely" contract.
+    let mut attendees_rendered = false;
+    for att in &ctx.attendees_known {
+        if att.name.trim().is_empty() {
+            continue;
         }
-        out.push_str("## Attendees\n");
-        for att in &ctx.attendees_known {
-            render_attendee(&mut out, att);
+        if !attendees_rendered {
+            if needs_blank_line {
+                out.push('\n');
+            }
+            out.push_str("## Attendees\n");
+            attendees_rendered = true;
         }
+        render_attendee(&mut out, att);
+    }
+    if attendees_rendered {
         needs_blank_line = true;
     }
 
-    if !ctx.related_notes.is_empty() {
-        if needs_blank_line {
-            out.push('\n');
+    // Same deferred-header pattern: a vec of whitespace-only paths
+    // shouldn't emit a stranded "## Related notes (paths)" header.
+    let mut notes_rendered = false;
+    for note in &ctx.related_notes {
+        let trimmed = note.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-        out.push_str("## Related notes (paths)\n");
-        for note in &ctx.related_notes {
-            let trimmed = note.trim();
-            if !trimmed.is_empty() {
-                out.push_str("- ");
-                out.push_str(trimmed);
+        if !notes_rendered {
+            if needs_blank_line {
                 out.push('\n');
             }
+            out.push_str("## Related notes (paths)\n");
+            notes_rendered = true;
         }
+        out.push_str("- ");
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    if notes_rendered {
         needs_blank_line = true;
     }
 
@@ -268,6 +286,52 @@ mod tests {
         let out = render(&c).expect("ok");
         assert!(out.contains("## Related notes (paths)\n"));
         assert!(out.contains("- vault/2026-04-22-acme-q3.md\n"));
+    }
+
+    #[test]
+    fn attendees_all_whitespace_names_omit_section() {
+        // Vec is non-empty but every name trims to empty → header
+        // would otherwise be stranded with bare `- ` bullets.
+        let mut c = ctx();
+        c.attendees_known = vec![attendee(""), attendee("   "), attendee("\t\n")];
+        let out = render(&c).expect("ok");
+        assert_eq!(out, "", "expected fully empty render, got: {out:?}");
+    }
+
+    #[test]
+    fn attendees_section_only_includes_non_empty_names() {
+        // Mixed: one real attendee + whitespace-only padding. Header
+        // must appear once, only the real attendee bulleted.
+        let mut c = ctx();
+        c.attendees_known = vec![attendee("   "), attendee("Alice"), attendee("")];
+        let out = render(&c).expect("ok");
+        assert_eq!(out, "## Attendees\n- Alice\n", "got: {out:?}");
+    }
+
+    #[test]
+    fn related_notes_all_whitespace_omit_section() {
+        // All whitespace-only paths → entire section skipped, no
+        // stranded "## Related notes (paths)" header.
+        let mut c = ctx();
+        c.related_notes = vec!["".into(), "   ".into(), "\n\t".into()];
+        let out = render(&c).expect("ok");
+        assert_eq!(out, "", "expected fully empty render, got: {out:?}");
+    }
+
+    #[test]
+    fn empty_attendees_between_filled_sections_keeps_clean_separators() {
+        // Regression for the deferred-header rewrite: a whitespace-
+        // only attendees vec sandwiched between agenda and briefing
+        // must not introduce a double blank line.
+        let mut c = ctx();
+        c.agenda = Some("Q3".into());
+        c.attendees_known = vec![attendee(""), attendee("  ")];
+        c.user_briefing = Some("Be concise".into());
+        let out = render(&c).expect("ok");
+        assert_eq!(
+            out, "## Agenda\nQ3\n\n## Briefing\nBe concise\n",
+            "got: {out:?}"
+        );
     }
 
     #[test]
