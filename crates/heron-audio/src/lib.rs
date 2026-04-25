@@ -20,6 +20,7 @@ use tokio::sync::broadcast;
 
 pub mod backpressure;
 pub mod disk;
+pub mod mic_capture;
 #[cfg(target_os = "macos")]
 pub mod process_tap;
 pub mod ringbuffer;
@@ -84,9 +85,9 @@ pub enum AudioError {
 ///
 /// Real impl (week 2): spins up the Core Audio process tap on
 /// `target_bundle_id`, opens the user's mic via `cpal`, wires WebRTC
-/// APM (`process_reverse_stream` for AEC), and starts a SPSC ring
-/// from the realtime callback into the APM thread, which broadcasts
-/// post-APM frames out via [`AudioCaptureHandle::frames`].
+/// APM (`process_reverse_stream` for AEC, future PR), and starts a
+/// SPSC ring from each realtime callback into the broadcast channel
+/// behind [`AudioCaptureHandle::frames`].
 pub struct AudioCapture {
     _private: (),
 }
@@ -94,19 +95,27 @@ pub struct AudioCapture {
 impl AudioCapture {
     /// Start a capture session.
     ///
-    /// On macOS this resolves the meeting client by bundle id, builds
-    /// a Core Audio process tap, wraps it in a private aggregate
-    /// device, and returns an [`AudioCaptureHandle`] whose
-    /// `frames` / `events` receivers stay live for the lifetime of
-    /// the handle. The aggregate device's IO proc is **not yet**
-    /// wired into `frames` — that callback path arrives with the
-    /// week-3 ringbuffer integration (§7). Until then `frames` will
-    /// be silent, but the tap + aggregate device are owned by the
-    /// returned handle and released cleanly on drop.
+    /// On macOS this:
+    /// 1. Resolves the meeting client by bundle id and builds a Core
+    ///    Audio process tap (`Channel::Tap` frames). Required — a tap
+    ///    failure fails the whole call.
+    /// 2. Opens the default microphone via cpal (`Channel::Mic`
+    ///    frames). Best-effort — a mic failure (no input device, TCC
+    ///    denied, format unsupported) logs a warning, emits
+    ///    `Event::CaptureDegraded`, and continues with a tap-only
+    ///    session. The tap is the load-bearing capture surface for
+    ///    v0; a tap-only session is still useful for transcribing
+    ///    the remote side of the call.
+    ///
+    /// Both pipelines push into the same broadcast channel; consumers
+    /// differentiate via `frame.channel`. WebRTC APM AEC isn't wired
+    /// yet — mic frames are raw at this point. AEC integration is the
+    /// next PR.
     ///
     /// On non-Apple platforms this returns
     /// [`AudioError::NotYetImplemented`] — there is no Core Audio
-    /// process tap off-Apple.
+    /// process tap off-Apple, and `cpal` is gated to macOS in our
+    /// `Cargo.toml` for v0 (§6).
     pub async fn start(
         session_id: SessionId,
         target_bundle_id: &str,
@@ -134,17 +143,53 @@ impl AudioCapture {
                 session_id,
                 clock,
             )?;
-            // Hold both the cidre resources (`pipeline`) and the
-            // sender end of the broadcast channels alive for the
-            // lifetime of the handle — once the sender is dropped,
-            // every receiver sees `RecvError::Closed` immediately,
-            // which would defeat the point of returning the handle.
+
+            // Mic capture runs in parallel with the tap. A mic failure
+            // (no input device, TCC denied, format unsupported) is NOT
+            // fatal: the orchestrator can fall back to a tap-only
+            // session (still useful for transcribing the remote side
+            // of the call). We surface the degradation as
+            // `Event::CaptureDegraded` so the UI/onboarding flow can
+            // prompt the user to fix the underlying cause, then
+            // continue without a mic handle. The tap is the
+            // load-bearing capture surface for v0.
+            let mic_handle = match mic_capture::start_mic(
+                frames_tx.clone(),
+                events_tx.clone(),
+                session_id,
+                clock,
+            ) {
+                Ok(h) => Some(h),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "mic capture failed; continuing with tap-only session"
+                    );
+                    // Best-effort signal to subscribers. Send returns
+                    // Err only when there are no receivers; ignore.
+                    let _ = events_tx.send(Event::CaptureDegraded {
+                        id: session_id,
+                        at: Duration::from_secs(0),
+                        dropped_frames: 0,
+                        reason: format!("mic capture unavailable: {err}"),
+                    });
+                    None
+                }
+            };
+
+            // Hold both the cidre resources (`pipeline`) + the cpal
+            // mic handle and the sender end of the broadcast channels
+            // alive for the lifetime of the handle — once the sender
+            // is dropped, every receiver sees `RecvError::Closed`
+            // immediately, which would defeat the point of returning
+            // the handle.
             Ok(AudioCaptureHandle {
                 frames: frames_rx,
                 events: events_rx,
                 clock,
                 _macos_pipeline: Some(MacosPipelineGuard {
                     _pipeline: pipeline,
+                    _mic: mic_handle,
                     _frames_tx: frames_tx,
                     _events_tx: events_tx,
                 }),
@@ -162,13 +207,25 @@ impl AudioCapture {
     }
 }
 
-/// macOS-only owner of the cidre resources backing a live capture
-/// session. Held inside [`AudioCaptureHandle`] as an opaque private
-/// field so dropping the handle releases the tap + aggregate device
-/// + broadcast senders in the right order.
+/// macOS-only owner of the cidre + cpal resources backing a live
+/// capture session. Held inside [`AudioCaptureHandle`] as an opaque
+/// private field so dropping the handle releases the tap + aggregate
+/// device + mic stream + broadcast senders in the right order.
+///
+/// Drop order (Rust drops fields in declaration order):
+/// 1. `_pipeline` first — stops the tap IO proc, releases the tap.
+/// 2. `_mic` next — stops the cpal input stream (callback quiescent),
+///    aborts the mic consumer task, frees the `MicCtx` box.
+/// 3. `_frames_tx` / `_events_tx` last — receivers stay alive through
+///    every prior step, so a final flush can land before the channel
+///    closes.
 #[cfg(target_os = "macos")]
 struct MacosPipelineGuard {
     _pipeline: process_tap::TapPipeline,
+    /// `None` when mic capture failed at session start (no input
+    /// device / TCC denied / format unsupported). The `_pipeline`
+    /// keeps producing tap frames either way.
+    _mic: Option<mic_capture::MicHandle>,
     _frames_tx: broadcast::Sender<CaptureFrame>,
     _events_tx: broadcast::Sender<Event>,
 }
