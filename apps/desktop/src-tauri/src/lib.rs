@@ -15,6 +15,7 @@
 
 pub mod asset_protocol;
 pub mod diagnostics;
+pub mod keychain;
 pub mod notes;
 pub mod onboarding;
 pub mod settings;
@@ -38,6 +39,7 @@ pub use onboarding::{
 // we keep the underlying free functions in `onboarding` for direct
 // unit-testing, and the `#[tauri::command]` shims below thread the
 // arguments through.
+pub use keychain::{KEYCHAIN_SERVICE, KeychainAccount, KeychainError};
 pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +211,82 @@ fn heron_open_window(app: tauri::AppHandle, target: String) -> Result<(), String
     app.emit(event, ()).map_err(|e| e.to_string())
 }
 
+// ---- Keychain commands (PR-θ / phase 70) --------------------------
+//
+// Surface for the Settings pane's API-key field. `set` and `delete`
+// are user-initiated mutations; `has` and `list` are existence
+// probes. There is **no** read-back command — the cleartext secret is
+// never returned across the Tauri boundary, only the boolean
+// "populated?" answer.
+//
+// All four shims use `Result<_, String>` so JS gets a plain rejection;
+// `KeychainError`'s `Display` impl is safe to surface (it never embeds
+// the secret value — see the type's doc comment in `keychain.rs`).
+
+/// Parse a wire-format account label into a [`KeychainAccount`]. The
+/// helper is local to the command shims so unknown labels reject with
+/// a uniform message.
+fn parse_account(label: &str) -> Result<KeychainAccount, String> {
+    KeychainAccount::from_label(label).ok_or_else(|| format!("unknown keychain account: {label}"))
+}
+
+/// Tauri command: store `secret` for the named account in the macOS
+/// login Keychain.
+///
+/// `secret` is consumed by the Security framework call and never logged
+/// or echoed. The argument arrives over the Tauri IPC bridge — the
+/// renderer is expected to obtain it from a password input field the
+/// user just typed into.
+///
+/// Defence in depth: an empty (or whitespace-only) secret is rejected
+/// here as well as in the renderer's Save button. A misbehaving
+/// renderer can't write empties and turn the slot into a user-visible
+/// "set" status with no real value behind it.
+#[tauri::command]
+fn heron_keychain_set(account: String, secret: String) -> Result<(), String> {
+    let account = parse_account(&account)?;
+    if secret.trim().is_empty() {
+        // Note: the error message intentionally describes the value's
+        // *shape* ("empty"), never any of its content.
+        return Err("keychain secret must not be empty".into());
+    }
+    keychain::keychain_set(account, &secret).map_err(|e| e.to_string())
+}
+
+/// Tauri command: report whether the named account currently has a
+/// stored entry. **Does not return the secret value** — the renderer
+/// only learns "set" / "not set", which is what the UI's status pill
+/// needs.
+#[tauri::command]
+fn heron_keychain_has(account: String) -> Result<bool, String> {
+    let account = parse_account(&account)?;
+    keychain::keychain_get(account)
+        .map(|opt| opt.is_some())
+        .map_err(|e| e.to_string())
+}
+
+/// Tauri command: delete the entry for the named account. Idempotent —
+/// deleting a missing entry returns `Ok(())`.
+#[tauri::command]
+fn heron_keychain_delete(account: String) -> Result<(), String> {
+    let account = parse_account(&account)?;
+    keychain::keychain_delete(account).map_err(|e| e.to_string())
+}
+
+/// Tauri command: enumerate the wire-format labels of accounts that
+/// currently have entries.
+#[tauri::command]
+fn heron_keychain_list() -> Result<Vec<String>, String> {
+    keychain::keychain_list()
+        .map(|accounts| {
+            accounts
+                .into_iter()
+                .map(|a| a.as_str().to_owned())
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Default settings location.
 ///
 /// Resolves via [`dirs::config_dir`] so the path is correct on every
@@ -271,6 +349,10 @@ pub fn run() {
             heron_test_calendar,
             heron_test_model_download,
             heron_open_window,
+            heron_keychain_set,
+            heron_keychain_has,
+            heron_keychain_delete,
+            heron_keychain_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");
@@ -320,5 +402,56 @@ mod tests {
             status.audio_available,
             heron_audio::audio_capture_available()
         );
+    }
+
+    /// `parse_account` is the gatekeeper for the keychain command shims;
+    /// any unknown label must reject before the call reaches the
+    /// platform layer. A successful parse round-trips back to the same
+    /// wire-format label.
+    #[test]
+    fn parse_account_rejects_unknown_labels() {
+        assert!(parse_account("not-a-real-account").is_err());
+        assert!(parse_account("").is_err());
+        // Known labels round-trip via `as_str`.
+        assert_eq!(
+            parse_account("anthropic_api_key").map(|a| a.as_str()),
+            Ok("anthropic_api_key"),
+        );
+        assert_eq!(
+            parse_account("openai_api_key").map(|a| a.as_str()),
+            Ok("openai_api_key"),
+        );
+    }
+
+    /// On non-macOS targets the keychain stub returns `Unsupported`.
+    /// The Tauri shim must surface that as a string error rather than
+    /// panicking — exercise the full path here so a regression that
+    /// e.g. unwraps the platform result gets caught at CI time.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keychain_has_on_non_macos_surfaces_unsupported() {
+        let res = heron_keychain_has("anthropic_api_key".into());
+        assert!(res.is_err(), "expected Unsupported error on non-macOS");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keychain_list_on_non_macos_surfaces_unsupported() {
+        let res = heron_keychain_list();
+        assert!(res.is_err(), "expected Unsupported error on non-macOS");
+    }
+
+    /// Empty-secret rejection is a defence-in-depth check: the
+    /// renderer's Save button already disables on empty input, but a
+    /// misbehaving / compromised renderer must not be able to write an
+    /// empty value that the UI then renders as "key set". The check
+    /// runs *before* the platform call, so this assertion holds on
+    /// every target — no `cfg` gate needed.
+    #[test]
+    fn keychain_set_rejects_empty_secret() {
+        let res = heron_keychain_set("anthropic_api_key".into(), String::new());
+        assert!(res.is_err());
+        let res2 = heron_keychain_set("anthropic_api_key".into(), "   ".into());
+        assert!(res2.is_err(), "whitespace-only secret must reject too");
     }
 }

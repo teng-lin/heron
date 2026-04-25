@@ -86,6 +86,18 @@ export type TestOutcome =
   | { status: "needs_permission"; details: string }
   | { status: "skipped"; details: string };
 
+/**
+ * Wire-format labels for the macOS-Keychain accounts heron knows
+ * about (PR-θ / phase 70). Mirrors `KeychainAccount::as_str` in
+ * `apps/desktop/src-tauri/src/keychain.rs`.
+ *
+ * The Rust shim rejects any unknown label with an error string, so
+ * narrowing the type here is belt-and-suspenders rather than a
+ * security boundary — but it does keep the call sites honest at
+ * compile time.
+ */
+export type KeychainAccount = "anthropic_api_key" | "openai_api_key";
+
 // ---- Command surface ----------------------------------------------
 
 /**
@@ -179,6 +191,51 @@ export interface HeronCommands {
   heron_open_window: {
     args: { target: string };
     returns: void;
+  };
+  /**
+   * Phase 70 (PR-θ): store an API-key secret in the macOS login
+   * Keychain. The Rust side never logs `secret`, never echoes it
+   * back, and never returns it across the IPC bridge. Replaces an
+   * existing entry on the same `account` slot. Errors stringly:
+   * unknown account labels, backend failures, or `Unsupported` on
+   * non-macOS.
+   *
+   * `secret` should come straight from a password input the user
+   * just typed; do not stash it in component state, route state, or
+   * localStorage on the JS side.
+   */
+  heron_keychain_set: {
+    args: { account: KeychainAccount; secret: string };
+    returns: void;
+  };
+  /**
+   * Phase 70 (PR-θ): existence probe — returns `true` iff the named
+   * account currently has a stored entry. **Does NOT return the
+   * secret value.** This is the only command the UI uses to render
+   * "set / not set" status without ever pulling the cleartext into
+   * the renderer.
+   */
+  heron_keychain_has: {
+    args: { account: KeychainAccount };
+    returns: boolean;
+  };
+  /**
+   * Phase 70 (PR-θ): delete the entry for the named account.
+   * Idempotent — deleting a missing entry resolves to `void`.
+   */
+  heron_keychain_delete: {
+    args: { account: KeychainAccount };
+    returns: void;
+  };
+  /**
+   * Phase 70 (PR-θ): enumerate the wire-format labels of accounts
+   * that currently have entries. Returns a subset of the
+   * `KeychainAccount` union; the Rust side is the single source of
+   * truth for what's known.
+   */
+  heron_keychain_list: {
+    args: Record<string, never>;
+    returns: KeychainAccount[];
   };
 }
 
