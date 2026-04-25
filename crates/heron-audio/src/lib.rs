@@ -18,6 +18,12 @@ use heron_types::{Channel, Event, SessionClock, SessionId};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+pub mod backpressure;
+pub mod ringbuffer;
+
+pub use backpressure::{BackpressureMonitor, SATURATION_THRESHOLD};
+pub use ringbuffer::{Ringbuffer, RingbufferError, RingbufferState, recover};
+
 /// One PCM frame as emitted by the capture pipeline. After APM/AEC
 /// processing for the `Mic` channel, before any STT.
 #[derive(Debug, Clone)]
