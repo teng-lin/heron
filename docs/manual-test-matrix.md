@@ -347,8 +347,54 @@ per CI run via `meson + ninja`, see `.github/workflows/rust.yml`).
 **End-to-end gate is still §6.3** — the unit tests cannot replace it
 because (a) APM's adaptive filter behaves differently against
 synthetic tones than real speech, and (b) the §6.3 metric is the
-contract with downstream STT. Once the live-pipeline wiring PR lands
-(mic + tap → APM → cleaned broadcast), the §6.3 test becomes
-runnable end-to-end. Until then, the unit tests catch wiring
-regressions in the AEC processor without blocking on partner
-availability.
+contract with downstream STT. With the live-pipeline wiring in
+place (mic + tap → APM → cleaned broadcast → per-channel WAVs at
+stop), the §6.3 test rig is now runnable end-to-end. The unit
+tests catch wiring regressions in the AEC processor without
+blocking on partner availability.
+
+### §6.3 AEC test rig — end-to-end runbook
+
+The matrix row above (#5) is the engineer + partner exercise. With
+the wire-up + WAV finalization landed, the procedure is now:
+
+1. **Both machines.** macOS 14.2+, latest Zoom, TCC microphone +
+   system-audio-recording granted to the test runner's parent
+   process. Headphones **off** on Mac A (the mic must hear speaker
+   bleed for AEC to have anything to subtract).
+2. **Mac B (partner).** Joins a private Zoom meeting with Mac A and
+   plays a known reference signal — the canonical choice is a
+   30-second clip of pink noise at conversational volume, but a
+   spoken-word podcast clip works too (it stresses the adaptive
+   filter more than synthetic noise does). Stays muted otherwise so
+   the only audio Mac A hears via the call is the reference signal.
+3. **Mac A (engineer).** Runs the end-to-end harness against the
+   live call:
+   ```sh
+   HERON_PROCESS_TAP_REAL=1 \
+     cargo test -p heron-audio --test end_to_end_real -- --ignored --nocapture
+   ```
+   The harness drives a 2-second session, calls `stop()`, and
+   asserts that `mic.wav`, `tap.wav`, and `mic_clean.wav` all
+   exist with consistent frame counts.
+4. **Locate the artifacts.** The harness prints the session
+   directory under a `tempfile` path; copy the three WAVs out into
+   `fixtures/manual-validation/aec/<YYYY-MM-DD>/` for the matrix
+   archive. The engineer should also run a longer 30-second
+   capture (modify the `tokio::time::sleep` line locally; do not
+   commit the change) for the correlation metric below.
+5. **Compute the §6.3 metric.** With the 30 s capture in
+   `fixtures/manual-validation/aec/<date>/`, run any signal-
+   correlation tool the engineer has handy (e.g. `numpy.corrcoef`
+   on the time-aligned mono samples). Pass criterion per
+   §6.3: `mic_clean × tap < 0.15` (echo successfully removed) and
+   `mic × tap >= 0.5` (the raw mic *was* correlated, so the AEC
+   actually did work — not just a silent input).
+6. **Record the row.** Update the matrix's row #5 status to "Run"
+   with the date, the two correlation values, and the artifact
+   directory link.
+
+The `end_to_end_real.rs` harness above is the lightweight
+sanity-check used during development; it does not compute the
+correlation metric. The full §6.3 row remains a `[needs-human]`
+gate because it requires two machines and partner coordination.

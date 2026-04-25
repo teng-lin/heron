@@ -239,12 +239,17 @@ impl SttBackend for WhisperKitBackend {
         let mut writer = PartialWriter::create(partial_jsonl_path.to_path_buf())
             .map_err(|e| SttError::Failed(format!("partial writer: {e}")))?;
 
+        // `MicClean` is the post-AEC mic stream — same speaker (the
+        // user, "me") as raw `Mic`, just with speaker bleed removed.
+        // STT consumes `MicClean` in the wired pipeline, but the
+        // legacy raw-`Mic` path is still valid for offline rebuild
+        // tests (re-running APM against archived mic.raw / tap.raw).
         let speaker = match channel {
-            Channel::Mic => "me".to_owned(),
+            Channel::Mic | Channel::MicClean => "me".to_owned(),
             Channel::Tap => "them".to_owned(),
         };
         let speaker_source = match channel {
-            Channel::Mic => SpeakerSource::Self_,
+            Channel::Mic | Channel::MicClean => SpeakerSource::Self_,
             Channel::Tap => SpeakerSource::Channel,
         };
 

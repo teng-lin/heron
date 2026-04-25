@@ -129,11 +129,16 @@ impl Aligner {
 
     /// Attribute a single `Tap` [`Turn`] to a speaker. Returns the
     /// turn with `speaker`, `speaker_source`, and `confidence` fields
-    /// populated. `Mic` channel turns are returned with
-    /// `speaker = "me"` / `SpeakerSource::Self_` and confidence 1.0
-    /// — the aligner is a no-op for them.
+    /// populated. `Mic` and `MicClean` channel turns are returned
+    /// with `speaker = "me"` / `SpeakerSource::Self_` and confidence
+    /// 1.0 — the aligner is a no-op for them (the user's own voice
+    /// doesn't need AX disambiguation regardless of whether AEC has
+    /// run on it).
     pub fn attribute(&mut self, mut turn: Turn) -> Turn {
-        if matches!(turn.channel, heron_types::Channel::Mic) {
+        if matches!(
+            turn.channel,
+            heron_types::Channel::Mic | heron_types::Channel::MicClean
+        ) {
             turn.speaker = "me".into();
             turn.speaker_source = SpeakerSource::Self_;
             turn.confidence = Some(1.0);
