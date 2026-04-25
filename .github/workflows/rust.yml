@@ -42,10 +42,33 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
-      - name: cargo test
-        run: cargo test --workspace
+      # nextest runs unit + integration tests in parallel and is ~2×
+      # faster than `cargo test` on multi-crate workspaces. Install
+      # via the precompiled-binary action (~3 s) instead of
+      # `cargo install` (~30–60 s).
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
+      - name: cargo nextest run
+        run: cargo nextest run --workspace
+
+      # nextest deliberately does not run doc-tests
+      # (https://nexte.st/book/usage.html#filtering-tests). Keep a
+      # vanilla `cargo test --doc` so the doc-test pipeline still
+      # gates merges; today there are zero doc-tests so this step
+      # is dominated by per-crate compile-cache hits.
+      - name: cargo test --doc
+        run: cargo test --workspace --doc
+
+      # Release builds re-compile the entire workspace in optimized
+      # mode after the tests already proved correctness. Keep that
+      # gate on push-to-main only — optimization-only regressions
+      # are rare and a main failure is cheap to revert. PR runs save
+      # ~40 s by skipping this step.
       - name: cargo build --release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo build --workspace --release
 
   deny:
