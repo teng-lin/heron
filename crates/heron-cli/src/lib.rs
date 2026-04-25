@@ -8,4 +8,5 @@ pub mod pipeline;
 pub mod salvage;
 pub mod session;
 pub mod session_log;
+pub mod summarize;
 pub mod synthesize;

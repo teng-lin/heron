@@ -15,6 +15,7 @@ use heron_cli::salvage::{
     SalvageFormat, default_cache_root, exit_code as salvage_exit, print_salvage_list,
 };
 use heron_cli::session;
+use heron_cli::summarize;
 use heron_cli::synthesize::{SynthOptions, synthesize_fixture};
 
 #[derive(Debug, Parser)]
@@ -386,13 +387,43 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
     })
 }
 
-fn cmd_summarize(args: SummarizeArgs, _vault: Option<PathBuf>) -> Result<()> {
+fn cmd_summarize(args: SummarizeArgs, vault: Option<PathBuf>) -> Result<()> {
     tracing::info!(?args, "summarize requested");
-    Err(anyhow::anyhow!(
-        "summarize: not yet implemented (arrives week 9 per §11). \
-         heron-llm trait surface + meeting.hbs template are in place; \
-         this command needs the orchestrator wiring to call them."
-    ))
+
+    // The note's `transcript:` frontmatter field is vault-relative
+    // (so notes survive the user moving the vault), and §10.3 merge
+    // writes go through `VaultWriter` which is rooted at the vault.
+    // Both code paths need an authoritative vault root, so require it.
+    let vault_root = vault.ok_or_else(|| {
+        anyhow::anyhow!(
+            "summarize: --vault not set and $HERON_VAULT unset; \
+             pass --vault <path> to the Obsidian vault containing the note"
+        )
+    })?;
+
+    let backend = summarize::parse_backend_flag(&args.backend)?;
+    let summarizer = heron_llm::build_summarizer(backend);
+    tracing::info!(?backend, "summarize: using LLM backend");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+    let outcome = runtime
+        .block_on(summarize::re_summarize_in_vault(
+            &*summarizer,
+            &vault_root,
+            &args.note,
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!(
+        "summarize complete: {} ({} action items, {} attendees)",
+        args.note.display(),
+        outcome.frontmatter.action_items.len(),
+        outcome.frontmatter.attendees.len(),
+    );
+    Ok(())
 }
 
 fn cmd_status(vault: Option<PathBuf>) -> Result<()> {
