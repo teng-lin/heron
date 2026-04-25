@@ -38,36 +38,34 @@ fixture=$(basename "$fixture_dir")
 
 # Threshold table mirrors selection.rs::WER_THRESHOLDS. Drift here is
 # caught by the §8.7 done-when test that re-reads the Rust constant.
-declare -A WHISPERKIT_THRESHOLD=(
-    ["client-3person-gallery"]="15.0"
-    ["team-5person-with-dialin"]="22.0"
-    ["1on1-internal"]="12.0"
-)
-declare -A SHERPA_THRESHOLD=(
-    ["client-3person-gallery"]="22.0"
-    ["team-5person-with-dialin"]="30.0"
-    ["1on1-internal"]="18.0"
-)
-
-wk_threshold=${WHISPERKIT_THRESHOLD[$fixture]:-}
-sh_threshold=${SHERPA_THRESHOLD[$fixture]:-}
-if [[ -z "$wk_threshold" || -z "$sh_threshold" ]]; then
-    echo "unknown fixture: $fixture (no §8.5 threshold)" >&2
-    exit 1
-fi
-
-# Sanity-check fixture layout per fixtures/speech/README.md.
-for f in mic.wav tap.wav ground-truth.jsonl README.md; do
-    if [[ ! -e "$fixture_dir/$f" ]]; then
-        echo "fixture incomplete: missing $fixture_dir/$f" >&2
-        # placeholder: don't fail on layout in v0; warn only.
-        echo "  (warning: bench-wer placeholder skips this case)" >&2
-        exit 0
-    fi
-done
+#
+# `case` rather than `declare -A` so the script runs on macOS's
+# default Bash 3.2 (associative arrays need 4.0+). This script is
+# expected to be run on the dev's laptop, which may not have Homebrew
+# Bash on PATH.
+case "$fixture" in
+    "client-3person-gallery")    wk_threshold="15.0"; sh_threshold="22.0" ;;
+    "team-5person-with-dialin")  wk_threshold="22.0"; sh_threshold="30.0" ;;
+    "1on1-internal")             wk_threshold="12.0"; sh_threshold="18.0" ;;
+    *)
+        echo "unknown fixture: $fixture (no §8.5 threshold)" >&2
+        exit 1 ;;
+esac
 
 echo "fixture: $fixture"
 echo "thresholds: whisperkit ≤ ${wk_threshold}%   sherpa ≤ ${sh_threshold}%"
+
+# Sanity-check fixture layout per fixtures/speech/README.md. `break`
+# (not `exit`) on the first missing file: we still want the threshold
+# + placeholder banners above to surface so the operator sees what
+# would have run.
+for f in mic.wav tap.wav ground-truth.jsonl README.md; do
+    if [[ ! -e "$fixture_dir/$f" ]]; then
+        echo "fixture incomplete: missing $fixture_dir/$f" >&2
+        echo "  (warning: bench-wer placeholder skips this case)" >&2
+        break
+    fi
+done
 
 # Real impl (week 4–5):
 #   wk_wer=$(cargo run --release --bin heron -- transcribe \
