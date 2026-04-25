@@ -16,9 +16,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  # Parallel split: `lint` (fmt + clippy) and `test` (cargo test + release
+  # build) used to run sequentially in one job. Their compile artifacts
+  # barely overlap (clippy runs in `check` mode, `cargo test` in `test`
+  # mode — different `target/` subdirs), so the sequential layout wasn't
+  # actually sharing much work. Splitting lets the slower of the two
+  # define wall-clock instead of their sum. Each job carries its own
+  # rust-cache `shared-key` so the two caches don't fight for the same
+  # slot — `lint` stores `check` artifacts; `test` stores `test`/`release`
+  # artifacts.
+  lint:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +38,8 @@ jobs:
 
       - name: cargo registry + target cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
 
       # WhisperKit's transitive swift-jinja requires swift-tools-version 6.0+,
       # which means Xcode 16+. macos-14's default is Xcode 15.4 (Swift 5.10);
@@ -41,6 +52,23 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: cargo registry + target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+
+      - name: select Xcode 16 (Swift 6 toolchain)
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
       - name: cargo test
         run: cargo test --workspace
