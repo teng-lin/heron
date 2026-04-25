@@ -358,3 +358,150 @@ public func ax_release_observer() -> Int32 {
 public func ax_free_string(_ p: UnsafeMutablePointer<CChar>?) {
     if let p = p { free(p) }
 }
+
+// MARK: - Tree-dump helper for the docs/plan.md §3.3 spike
+//
+// The orchestrator can't bind a real `(role, subrole, identifier)`
+// triple until we record one against a live Zoom call. `ax_dump_tree`
+// walks the AX tree under the bundle's running process and emits a
+// JSON document — one entry per visited node — so the user can grep
+// the output for the speaker-indicator element while a meeting is
+// in progress.
+//
+// Capture procedure (run from `heron ax-dump --bundle us.zoom.xos`):
+//   1. Open Zoom and join a multi-participant meeting.
+//   2. Run the dump while another participant is *actively speaking*.
+//   3. Diff the dump against a second one taken while everyone is
+//      muted; the entries that change between the two are the speaker
+//      indicator candidates.
+//   4. Replace SPEAKER_INDICATOR_ROLE / SUBROLE / IDENTIFIER above with
+//      the matching values, and SPEAKER_INDICATOR_NOTIFICATION with the
+//      AX notification kind that fires on the changed attribute.
+
+private func describeNode(_ node: AXUIElement, depth: Int) -> [String: Any] {
+    var entry: [String: Any] = ["depth": depth]
+    if let role = stringAttr(node, kAXRoleAttribute as String) {
+        entry["role"] = role
+    }
+    if let subrole = stringAttr(node, kAXSubroleAttribute as String) {
+        entry["subrole"] = subrole
+    }
+    if let ident = stringAttr(node, kAXIdentifierAttribute as String) {
+        entry["identifier"] = ident
+    }
+    if let title = stringAttr(node, kAXTitleAttribute as String) {
+        entry["title"] = title
+    }
+    if let desc = stringAttr(node, kAXDescriptionAttribute as String) {
+        entry["description"] = desc
+    }
+    if let help = stringAttr(node, kAXHelpAttribute as String) {
+        entry["help"] = help
+    }
+    // Speaker-indicator state typically lives in kAXValueAttribute /
+    // kAXSelectedAttribute as a CFBoolean (or occasionally CFNumber),
+    // NOT a CFString. The whole purpose of this dumper is to diff a
+    // "someone speaking" capture against a "everyone muted" capture
+    // and find the attribute that flipped — if we silently drop the
+    // non-string value, the diff is empty and the spike workflow
+    // fails. Use anyAttr so booleans/numbers/CGRect/etc. all serialize.
+    if let value = anyAttr(node, kAXValueAttribute as String) {
+        entry["value"] = value
+    }
+    if let selected = anyAttr(node, kAXSelectedAttribute as String) {
+        entry["selected"] = selected
+    }
+    return entry
+}
+
+/// Permissive variant of [`stringAttr`] that handles non-string CF
+/// types. Returns:
+/// - the underlying `String` for `CFStringRef`,
+/// - a Swift `Bool` for `CFBooleanRef`,
+/// - the `NSNumber` bridge for `CFNumberRef`,
+/// - `CFCopyDescription` text for everything else (AXValue wrapping
+///   CGPoint/CGRect, CFArray, CFDictionary). All four are
+///   JSONSerialization-compatible.
+///
+/// Returns `nil` only when the attribute is genuinely absent or the
+/// CF value resists every coercion above.
+private func anyAttr(_ element: AXUIElement, _ key: String) -> Any? {
+    var raw: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(element, key as CFString, &raw)
+    if err != .success { return nil }
+    guard let raw = raw else { return nil }
+    if let s = raw as? String { return s }
+    if CFGetTypeID(raw) == CFBooleanGetTypeID() {
+        return (raw as? Bool) ?? false
+    }
+    if let n = raw as? NSNumber { return n }
+    if let desc = CFCopyDescription(raw) as String? { return desc }
+    return nil
+}
+
+@_cdecl("ax_dump_tree")
+public func ax_dump_tree(
+    _ bundle_id: UnsafePointer<CChar>?,
+    _ max_nodes: Int32,
+    _ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let bundle_id = bundle_id, let out = out else { return AX_INTERNAL }
+    let bundleId = String(cString: bundle_id)
+
+    // Locate the target process by bundle id. Same shape as
+    // `ax_register_observer` — return the same status codes so the
+    // Rust side can map them via the existing AxStatus matcher.
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+    guard let app = apps.first else { return AX_PROCESS_NOT_RUNNING }
+    let pid = app.processIdentifier
+
+    let opts: CFDictionary = [:] as CFDictionary
+    if !AXIsProcessTrustedWithOptions(opts) {
+        return AX_NO_PERMISSION
+    }
+
+    let appElement = AXUIElementCreateApplication(pid)
+
+    // Cap walks at the smaller of the caller-requested max_nodes and
+    // our internal MAX_NODES so a buggy caller can't ask us to walk
+    // an unbounded tree.
+    let cap: Int = max_nodes <= 0 ? MAX_NODES : min(Int(max_nodes), MAX_NODES)
+    var entries: [[String: Any]] = []
+    var visited = 0
+
+    func walk(_ node: AXUIElement, depth: Int) {
+        if visited >= cap || depth > MAX_DEPTH { return }
+        visited += 1
+        entries.append(describeNode(node, depth: depth))
+        for child in childrenAttr(node) {
+            walk(child, depth: depth + 1)
+        }
+    }
+    walk(appElement, depth: 0)
+
+    let payload: [String: Any] = [
+        "bundle_id": bundleId,
+        "pid": Int(pid),
+        "node_count": entries.count,
+        "node_cap": cap,
+        "max_depth": MAX_DEPTH,
+        "nodes": entries,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        out.pointee = nil
+        return AX_INTERNAL
+    }
+
+    return json.withCString { src -> Int32 in
+        let count = strlen(src)
+        guard let buf = malloc(count + 1)?.assumingMemoryBound(to: CChar.self) else {
+            out.pointee = nil
+            return AX_INTERNAL
+        }
+        memcpy(buf, src, count + 1)
+        out.pointee = buf
+        return AX_OK
+    }
+}

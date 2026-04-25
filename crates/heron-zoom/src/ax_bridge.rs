@@ -23,6 +23,11 @@ mod ffi {
         pub(super) fn ax_poll(out: *mut *mut c_char) -> i32;
         pub(super) fn ax_release_observer() -> i32;
         pub(super) fn ax_free_string(p: *mut c_char);
+        pub(super) fn ax_dump_tree(
+            bundle_id: *const c_char,
+            max_nodes: i32,
+            out: *mut *mut c_char,
+        ) -> i32;
     }
 }
 
@@ -184,6 +189,53 @@ fn bundle_id_to_cstring(s: &str) -> Result<CString, AxBridgeError> {
     CString::new(s.as_bytes()).map_err(|_| AxBridgeError::BundleIdNul)
 }
 
+/// Walk the AX tree under `bundle_id`'s running process and return a
+/// JSON document describing every visited node. Used by the
+/// `heron ax-dump` subcommand to capture the speaker-indicator
+/// `(role, subrole, identifier)` triple during a live Zoom call (per
+/// `docs/plan.md` §3.3 — the week-0 spike deliverable).
+///
+/// `max_nodes` caps the walk; pass `0` to use the bridge's internal
+/// default (4096 — enough for a fully-populated 49-tile gallery).
+#[cfg(target_vendor = "apple")]
+pub fn ax_dump_tree(bundle_id: &str, max_nodes: i32) -> Result<String, AxBridgeError> {
+    let c = bundle_id_to_cstring(bundle_id)?;
+    let mut buf: *mut c_char = std::ptr::null_mut();
+    // SAFETY: `ax_dump_tree` reads the bundle_id C string, writes a
+    // malloc'd buffer into `*out`, and returns the status code. We
+    // free the buffer below regardless of which branch we take.
+    let raw = unsafe { ffi::ax_dump_tree(c.as_ptr(), max_nodes, &mut buf) };
+    let status = AxStatus::from_raw(raw);
+
+    if buf.is_null() {
+        return match status {
+            AxStatus::Ok => Err(AxBridgeError::NullBuffer),
+            other => Err(AxBridgeError::from(other)),
+        };
+    }
+
+    // SAFETY: NUL-terminated string allocated by Swift; copy into
+    // a Rust String, then free regardless of parse outcome.
+    let parsed: Result<String, AxBridgeError> = unsafe {
+        let cstr = CStr::from_ptr(buf);
+        cstr.to_str()
+            .map(|s| s.to_owned())
+            .map_err(AxBridgeError::from)
+    };
+    unsafe { ffi::ax_free_string(buf) };
+
+    let body = parsed?;
+    match status {
+        AxStatus::Ok => Ok(body),
+        other => Err(AxBridgeError::from(other)),
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn ax_dump_tree(_bundle_id: &str, _max_nodes: i32) -> Result<String, AxBridgeError> {
+    Err(AxBridgeError::NotYetImplemented)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -291,6 +343,10 @@ mod tests {
             Err(AxBridgeError::NotYetImplemented)
         ));
         assert!(matches!(ax_poll(), Err(AxBridgeError::NotYetImplemented)));
+        assert!(matches!(
+            ax_dump_tree("us.zoom.xos", 0),
+            Err(AxBridgeError::NotYetImplemented)
+        ));
         // Off-Apple release is a no-op success — there's nothing to
         // release on a platform without the bridge.
         ax_release().expect("off-Apple release is a no-op");

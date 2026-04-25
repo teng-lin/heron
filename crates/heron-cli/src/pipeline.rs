@@ -25,17 +25,37 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use heron_types::{
-    Channel, Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, MeetingType,
-    RecordingFsm, SessionId, SessionPhase, SessionStateRecord, SpeakerEvent, SpeakerSource,
-    SummaryOutcome, Turn, write_state,
+    Attendee, Channel, Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, ItemId,
+    MeetingType, RecordingFsm, SessionId, SessionPhase, SessionStateRecord, SpeakerEvent,
+    SpeakerSource, SummaryOutcome, Turn, write_state,
 };
+use heron_vault::{CalendarAttendee, CalendarEvent, CalendarReader};
 use heron_zoom::Aligner;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::session::{Backends, SessionConfig, SessionError, SessionOutcome};
+
+/// Slop on either side of the session window when querying calendar.
+/// 30 minutes covers users who join early or run long without pulling
+/// in unrelated all-day events.
+const CALENDAR_WINDOW_SLOP_SECS: i64 = 30 * 60;
+
+/// Hard cap on the calendar FFI round-trip. The Swift side blocks on
+/// `EKEventStore.requestFullAccessToEvents` via a `DispatchSemaphore`
+/// with no timeout knob (per the comment in `heron_vault::calendar`),
+/// so on a fresh install or after `tccutil reset Calendar` the call
+/// can stall waiting for the user to dismiss a TCC dialog. The plan
+/// `§4.1` data flow says calendar reads must not prompt from the CLI
+/// path; this timeout enforces that contract: if the bridge doesn't
+/// return promptly we fall through to the "denied" branch and the
+/// note still finalizes (slug stays "untitled", attendees stay
+/// LLM-inferred). 5s is well above typical EventKit query latency
+/// (low-ms when access is already granted) but tight enough to
+/// prevent a wedged TCC daemon from hanging session finalize.
+const CALENDAR_READ_TIMEOUT_SECS: u64 = 5;
 
 /// 48 kHz f32 mono per `docs/implementation.md` §6 (capture sample rate).
 const SAMPLE_RATE_HZ: u32 = 48_000;
@@ -60,7 +80,7 @@ pub async fn run_pipeline(
     stop_rx: oneshot::Receiver<()>,
     skip_audio_capture: bool,
 ) -> Result<SessionOutcome, SessionError> {
-    let (stt, ax, llm) = backends;
+    let (stt, ax, llm, calendar) = backends;
 
     // Capture wall-clock at session arm so the note's filename and
     // frontmatter `start` reflect when the meeting actually began,
@@ -215,7 +235,34 @@ pub async fn run_pipeline(
     let date_str = started_at_wall.format("%Y-%m-%d").to_string();
     let start_hhmm = started_at_wall.format("%H%M").to_string();
     let frontmatter_start = started_at_wall.format("%H:%M").to_string();
-    let slug = "untitled";
+
+    // Calendar lookup. Picks the event whose [start, end] window has
+    // maximum overlap with the session window; its title becomes the
+    // filename slug and its attendees override anything the LLM
+    // inferred from the transcript (calendar is authoritative for who
+    // was on the call). Honors the §12.2 denial contract — when the
+    // user has not granted Calendar access, `read_window` returns
+    // `Ok(None)` and the slug falls through to "untitled" + frontmatter
+    // attendees stay LLM-inferred.
+    let session_end_wall =
+        started_at_wall + chrono::Duration::milliseconds((duration_secs * 1000.0) as i64);
+    let calendar_match = match read_calendar_event(calendar, started_at_wall, session_end_wall)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "calendar read failed; falling back to LLM-inferred attendees + 'untitled' slug");
+            None
+        }
+    };
+    let (slug_owned, calendar_attendees) = match &calendar_match {
+        Some(event) => (
+            slug_from_title(&event.title),
+            Some(calendar_attendees_to_attendees(&event.attendees)),
+        ),
+        None => ("untitled".to_owned(), None),
+    };
+    let slug = &slug_owned;
 
     // LLM summarize. A failure here is non-fatal — we still write a
     // transcript-only note so the user has the raw turns to read.
@@ -255,6 +302,16 @@ pub async fn run_pipeline(
             MeetingType::Other,
         ),
     };
+
+    // Calendar attendees win over LLM-inferred attendees when present:
+    // calendar entries have the canonical attendee list for invited
+    // meetings, while the LLM's list is best-effort name extraction
+    // from the transcript. An empty calendar attendees list (event
+    // exists, no attendees recorded) falls back to LLM inference so a
+    // self-scheduled blocker doesn't wipe transcript-derived names.
+    let attendees = calendar_attendees
+        .filter(|a| !a.is_empty())
+        .unwrap_or(attendees);
 
     let frontmatter = Frontmatter {
         date: started_at_wall.date_naive(),
@@ -541,6 +598,173 @@ async fn summarize(
     Ok(llm.summarize(input).await?)
 }
 
+/// Run the EventKit bridge on a `[start - slop, end + slop]` window
+/// and pick the event whose own `[start, end]` has maximum overlap
+/// with the session. Wraps the synchronous FFI call in
+/// `spawn_blocking` so it can't stall the orchestrator's tokio thread
+/// if EventKit takes a moment to return.
+///
+/// Returns `Ok(None)` when Calendar permission is not granted (the
+/// reader's denial contract) or when the window has no overlapping
+/// events. `Err` only on bridge / parse failures the caller should
+/// log; a failure must not abort the session.
+async fn read_calendar_event(
+    reader: Box<dyn CalendarReader>,
+    session_start: DateTime<Utc>,
+    session_end: DateTime<Utc>,
+) -> Result<Option<CalendarEvent>, heron_vault::CalendarError> {
+    let window_start = session_start - chrono::Duration::seconds(CALENDAR_WINDOW_SLOP_SECS);
+    let window_end = session_end + chrono::Duration::seconds(CALENDAR_WINDOW_SLOP_SECS);
+    // `Box<dyn CalendarReader>` is `Send`; move it into the blocking
+    // task so the FFI call (which may block on a TCC dialog or the
+    // EventKit semaphore) does not stall a tokio worker.
+    let blocking =
+        tokio::task::spawn_blocking(move || reader.read_window(window_start, window_end));
+    let timed = tokio::time::timeout(
+        std::time::Duration::from_secs(CALENDAR_READ_TIMEOUT_SECS),
+        blocking,
+    )
+    .await;
+    let join_result = match timed {
+        Ok(jr) => jr,
+        Err(_elapsed) => {
+            // Bridge didn't return within the budget — almost certainly
+            // a TCC prompt waiting for user input. Treat as denial; the
+            // session still finalizes with "untitled" + LLM attendees.
+            tracing::warn!(
+                "calendar read exceeded {}s budget; treating as denial",
+                CALENDAR_READ_TIMEOUT_SECS,
+            );
+            return Ok(None);
+        }
+    };
+    let result = match join_result {
+        Ok(r) => r,
+        Err(e) => {
+            // Blocking task panicked — log and treat as denial so we
+            // fall through to the no-calendar code path rather than
+            // failing the whole session over an EventKit hiccup.
+            tracing::warn!(error = %e, "calendar read task panicked; treating as denial");
+            return Ok(None);
+        }
+    };
+    let events: Vec<CalendarEvent> = match result? {
+        Some(events) => events,
+        None => return Ok(None),
+    };
+    Ok(pick_best_calendar_event(&events, session_start, session_end).cloned())
+}
+
+/// Pick the calendar event with the largest time-overlap against the
+/// session `[session_start, session_end]` window. Ties are broken by
+/// proximity of the event's start to the session's start. Returns
+/// `None` when no event has any overlap.
+fn pick_best_calendar_event(
+    events: &[CalendarEvent],
+    session_start: DateTime<Utc>,
+    session_end: DateTime<Utc>,
+) -> Option<&CalendarEvent> {
+    // Millisecond precision so a sub-second test session (or a
+    // legitimately short call cancelled in the first second) can still
+    // intersect a calendar event that fully contains it.
+    let session_start_secs = session_start.timestamp_millis() as f64 / 1000.0;
+    let session_end_secs = session_end.timestamp_millis() as f64 / 1000.0;
+    let mut best: Option<(&CalendarEvent, f64, f64)> = None;
+    for event in events {
+        // Reject only when the windows truly don't touch. A 0-length
+        // session contained inside the event window has 0.0 overlap
+        // but is still a legitimate match — gate on containment, not
+        // strict positive overlap.
+        let touches = event.start <= session_end_secs && event.end >= session_start_secs;
+        if !touches {
+            continue;
+        }
+        let overlap_start = event.start.max(session_start_secs);
+        let overlap_end = event.end.min(session_end_secs);
+        let overlap = (overlap_end - overlap_start).max(0.0);
+        let start_distance = (event.start - session_start_secs).abs();
+        match &best {
+            Some((_, best_overlap, best_dist))
+                if overlap < *best_overlap
+                    || (overlap == *best_overlap && start_distance >= *best_dist) => {}
+            _ => best = Some((event, overlap, start_distance)),
+        }
+    }
+    best.map(|(e, _, _)| e)
+}
+
+/// Maximum slug byte length. APFS caps each path component at 255
+/// bytes; the surrounding `YYYY-MM-DD-HHMM <slug>.md` template eats
+/// 22 bytes (date + space + ".md"), so 200 leaves comfortable room
+/// for date-prefix changes without ever provoking ENAMETOOLONG.
+const MAX_SLUG_BYTES: usize = 200;
+
+/// Strip path-unsafe characters from a calendar title so it can sit in
+/// the `YYYY-MM-DD-HHMM <slug>.md` filename template. Keeps spaces
+/// (per §3.2 the template explicitly allows them) and collapses
+/// whitespace runs. Empty or all-stripped titles return `"untitled"`.
+fn slug_from_title(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '\0' | '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Drop pure-dot tokens during whitespace-collapse so titles like
+    // ". . . ." don't survive as a residue of spaces and dots after
+    // `trim_matches`. A calendar entry of ". v2 ." reduces to "v2"
+    // rather than ". v2 .", and "v1.0 release" stays intact (the
+    // tokens carry non-dot content).
+    let collapsed: String = cleaned
+        .split_whitespace()
+        .filter(|p| !p.chars().all(|c| c == '.'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim_matches('.').trim();
+    if trimmed.is_empty() {
+        return "untitled".to_owned();
+    }
+    // APFS-safe length cap on a UTF-8 char boundary. Calendar titles
+    // can run hundreds of chars (shared agendas, pasted URLs); without
+    // this the vault writer would silently fail with ENAMETOOLONG and
+    // the session would land with `note_path = None`.
+    if trimmed.len() <= MAX_SLUG_BYTES {
+        return trimmed.to_owned();
+    }
+    let mut cut = MAX_SLUG_BYTES;
+    while cut > 0 && !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    trimmed[..cut].trim_end().to_owned()
+}
+
+/// Convert EventKit's `(name, email)` shape into heron's `Attendee`
+/// shape. Each attendee gets a fresh `ItemId`; company defaults to
+/// `None` (EventKit doesn't carry an org field — the LLM fills it in
+/// via frontmatter merge if it can derive one from the transcript).
+///
+/// This minting is safe across re-summarizes because the calendar
+/// path runs at first-summarize *only*: re-summarize goes through
+/// [`crate::session::Orchestrator::re_summarize_note`], which feeds
+/// the prior attendees (with their stable IDs from this first run)
+/// to the LLM via the §10.5 ID-preservation contract — calendar is
+/// not consulted again.
+fn calendar_attendees_to_attendees(attendees: &[CalendarAttendee]) -> Vec<Attendee> {
+    attendees
+        .iter()
+        .filter(|a| !a.name.trim().is_empty())
+        .map(|a| Attendee {
+            id: ItemId::now_v7(),
+            name: a.name.clone(),
+            company: None,
+        })
+        .collect()
+}
+
 fn derive_diarize_source(turns: &[Turn]) -> DiarizeSource {
     if turns.is_empty() {
         return DiarizeSource::Channel;
@@ -652,5 +876,153 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let back: Turn = serde_json::from_str(body.lines().next().expect("line")).expect("parse");
         assert_eq!(back.text, "hi");
+    }
+
+    // ----- slug_from_title -----
+
+    #[test]
+    fn slug_from_title_keeps_normal_titles() {
+        assert_eq!(slug_from_title("Acme sync"), "Acme sync");
+        assert_eq!(slug_from_title("  Acme sync  "), "Acme sync");
+    }
+
+    #[test]
+    fn slug_from_title_strips_path_separators_and_collapses_whitespace() {
+        assert_eq!(
+            slug_from_title("foo/bar\\baz: weekly\nstandup"),
+            "foo bar baz weekly standup"
+        );
+    }
+
+    #[test]
+    fn slug_from_title_neutralizes_dot_traversal() {
+        // `.` characters that would let a title escape the meetings/
+        // directory or produce a hidden dotfile must collapse to the
+        // "untitled" fallback. Tests the trailing-trim guard against
+        // the residual-whitespace bug Claude flagged on partial strips.
+        assert_eq!(slug_from_title("..."), "untitled");
+        assert_eq!(slug_from_title(". . . ."), "untitled");
+        assert_eq!(slug_from_title("..foo.."), "foo");
+    }
+
+    #[test]
+    fn slug_from_title_empty_or_all_whitespace_falls_back_to_untitled() {
+        assert_eq!(slug_from_title(""), "untitled");
+        assert_eq!(slug_from_title("   "), "untitled");
+        assert_eq!(slug_from_title("\t\n\r"), "untitled");
+    }
+
+    #[test]
+    fn slug_from_title_truncates_to_apfs_safe_byte_length_on_char_boundary() {
+        // 250 ASCII chars exceeds MAX_SLUG_BYTES (200) — slug must
+        // truncate to ≤ MAX_SLUG_BYTES so the surrounding filename
+        // template stays under APFS's 255-byte component limit.
+        let long = "a".repeat(250);
+        let s = slug_from_title(&long);
+        assert!(s.len() <= MAX_SLUG_BYTES, "got {} bytes", s.len());
+        assert!(s.chars().all(|c| c == 'a'));
+
+        // Multibyte: ✨ is 3 bytes. 100 stars = 300 bytes; truncation
+        // must land on a UTF-8 char boundary (no panic, valid UTF-8).
+        let stars = "✨".repeat(100);
+        let s = slug_from_title(&stars);
+        assert!(s.len() <= MAX_SLUG_BYTES);
+        assert!(s.chars().all(|c| c == '✨'));
+    }
+
+    // ----- pick_best_calendar_event -----
+
+    fn cal_event(title: &str, start: f64, end: f64) -> CalendarEvent {
+        CalendarEvent {
+            title: title.into(),
+            start,
+            end,
+            attendees: vec![],
+        }
+    }
+
+    fn dt(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).expect("in-range")
+    }
+
+    #[test]
+    fn pick_best_calendar_event_returns_none_for_empty_list() {
+        assert!(pick_best_calendar_event(&[], dt(1000), dt(2000)).is_none());
+    }
+
+    #[test]
+    fn pick_best_calendar_event_skips_non_overlapping() {
+        let events = vec![
+            cal_event("before", 0.0, 500.0),
+            cal_event("after", 3000.0, 4000.0),
+        ];
+        assert!(pick_best_calendar_event(&events, dt(1000), dt(2000)).is_none());
+    }
+
+    #[test]
+    fn pick_best_calendar_event_picks_max_overlap() {
+        // Session 1000–2000. Three candidates with overlaps 100, 800, 250.
+        let events = vec![
+            cal_event("brief", 900.0, 1100.0),
+            cal_event("best", 1100.0, 1900.0),
+            cal_event("tail", 1750.0, 2500.0),
+        ];
+        let pick = pick_best_calendar_event(&events, dt(1000), dt(2000)).expect("match");
+        assert_eq!(pick.title, "best");
+    }
+
+    #[test]
+    fn pick_best_calendar_event_breaks_overlap_ties_by_start_proximity() {
+        // Both events fully contain the session window (overlap = full
+        // session for both). Tie-break by start-distance picks the
+        // event that begins closer to the session start.
+        let events = vec![
+            cal_event("far", 0.0, 5000.0),    // start_distance 1000s
+            cal_event("near", 950.0, 5000.0), // start_distance 50s
+        ];
+        let pick = pick_best_calendar_event(&events, dt(1000), dt(2000)).expect("match");
+        assert_eq!(pick.title, "near");
+    }
+
+    #[test]
+    fn pick_best_calendar_event_accepts_zero_duration_session_inside_event() {
+        // A session that starts and ends in the same instant (e.g. an
+        // immediately-cancelled record) must still match an event that
+        // contains that instant — gated on touches-not-overlap.
+        let events = vec![cal_event("sync", 1000.0, 2000.0)];
+        let pick = pick_best_calendar_event(&events, dt(1500), dt(1500)).expect("match");
+        assert_eq!(pick.title, "sync");
+    }
+
+    // ----- calendar_attendees_to_attendees -----
+
+    #[test]
+    fn calendar_attendees_to_attendees_filters_empty_names() {
+        let raw = vec![
+            CalendarAttendee {
+                name: "Alice".into(),
+                email: "mailto:a@x".into(),
+            },
+            CalendarAttendee {
+                name: "  ".into(),
+                email: "mailto:b@x".into(),
+            },
+            CalendarAttendee {
+                name: String::new(),
+                email: "mailto:c@x".into(),
+            },
+            CalendarAttendee {
+                name: "Bob".into(),
+                email: "mailto:d@x".into(),
+            },
+        ];
+        let out = calendar_attendees_to_attendees(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "Alice");
+        assert_eq!(out[1].name, "Bob");
+        // Each attendee gets a distinct fresh ID.
+        assert_ne!(out[0].id, out[1].id);
+        // Company stays None — EventKit doesn't carry org info.
+        assert!(out.iter().all(|a| a.company.is_none()));
     }
 }
