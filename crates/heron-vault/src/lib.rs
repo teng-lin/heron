@@ -10,6 +10,7 @@
 
 pub mod calendar;
 pub mod encode;
+pub mod id_match;
 pub mod merge;
 pub mod purge;
 pub mod writer;
@@ -19,6 +20,7 @@ pub use calendar::{
     epoch_seconds_to_utc,
 };
 pub use encode::{EncodeError, encode_to_m4a, verify_m4a};
+pub use id_match::{LayerTwoMatch, MIN_SIMILARITY, apply_matches, match_action_items_by_text};
 pub use merge::{MergeInputs, MergeOutcome, merge, merge_action_items, merge_attendees};
 pub use purge::{PurgeOutcome, purge_after_verify};
 pub use writer::{VaultError, VaultWriter, atomic_write, read_note};

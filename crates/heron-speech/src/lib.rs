@@ -16,6 +16,17 @@ use async_trait::async_trait;
 use heron_types::{Channel, SessionId, Turn};
 use thiserror::Error;
 
+pub mod partial_writer;
+pub mod selection;
+
+pub use partial_writer::{
+    FLUSH_INTERVAL, FLUSH_TURNS, PartialWriter, PartialWriterError, read_partial_jsonl,
+};
+pub use selection::{
+    Platform, RealPlatform, WER_THRESHOLDS, WerBaseline, WerThreshold, lookup_threshold,
+    select_backend,
+};
+
 /// Per-backend telemetry collected during a successful transcription.
 #[derive(Debug, Clone)]
 pub struct TranscribeSummary {
@@ -97,7 +108,7 @@ pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
     }
 }
 
-mod stub {
+pub(crate) mod stub {
     use super::{Channel, ProgressFn, SessionId, SttBackend, SttError, TranscribeSummary, TurnFn};
     use async_trait::async_trait;
     use std::path::Path;
