@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Live API smoke harness for the [`heron_llm`] summarizer backends.
 //!
 //! Unlike the in-crate unit tests (which mock everything via wiremock
