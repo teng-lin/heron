@@ -13,8 +13,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod clock;
+pub mod recording;
 
 pub use clock::SessionClock;
+pub use recording::{
+    ARM_COOLDOWN, IdleReason, RecordingFsm, RecordingState, SummaryOutcome, TransitionError,
+};
 
 pub type SessionId = uuid::Uuid;
 /// Identifier on entries that survive merge-on-write (action items,
