@@ -20,6 +20,12 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+pub mod health;
+pub use health::{
+    CriticalReason, DROPS_CRITICAL, DROPS_DEGRADED, DegradationReason, HealthVerdict,
+    JITTER_CRITICAL_MS, JITTER_DEGRADED_MS, verdict,
+};
+
 /// Single audio chunk crossing a layer boundary. 16kHz mono i16 by
 /// convention; the bridge resamples on input/output as needed.
 #[derive(Debug, Clone)]
