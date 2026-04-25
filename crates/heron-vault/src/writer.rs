@@ -20,7 +20,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use heron_types::Frontmatter;
+use heron_types::{ActionItem, Attendee, Frontmatter};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -162,6 +162,48 @@ pub fn read_note(path: &Path) -> Result<(Frontmatter, String), VaultError> {
     let mut buf = String::new();
     File::open(path)?.read_to_string(&mut buf)?;
     parse_note(&buf, path)
+}
+
+/// The prior `action_items` and `attendees` extracted from a note's
+/// frontmatter — the inputs the LLM needs to honor the §10.5
+/// ID-preservation contract on a re-summarize.
+///
+/// Owned (rather than borrowed) so the orchestrator can keep the
+/// items alive across the async `summarize` call without juggling
+/// the source `Frontmatter` lifetime. `[Self::is_empty]` lets the
+/// caller decide whether to pass `None` to `SummarizerInput` (first
+/// summarize) or `Some(&...)` (re-summarize).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PriorItems {
+    pub action_items: Vec<ActionItem>,
+    pub attendees: Vec<Attendee>,
+}
+
+impl PriorItems {
+    /// `true` when both lists are empty — the caller should treat
+    /// the summarize as a "first summarize" and pass `None` to the
+    /// summarizer rather than priming it with empty arrays (which
+    /// would still render the §10.5 prompt block, suggesting the
+    /// LLM mint UUIDs to "preserve" things we never told it about).
+    pub fn is_empty(&self) -> bool {
+        self.action_items.is_empty() && self.attendees.is_empty()
+    }
+}
+
+/// Read just the prior `action_items` + `attendees` from a note —
+/// the inputs `heron_llm::SummarizerInput::existing_action_items` and
+/// `existing_attendees` need on a re-summarize per §10.5.
+///
+/// Convenience over [`read_note`] for callers that don't care about
+/// the body or the rest of the frontmatter; the source-of-truth note
+/// is the **current** `<note>.md` (i.e., `ours` in the §10.3 merge),
+/// **not** `<note>.md.bak` — see §11.2.
+pub fn read_prior_items(path: &Path) -> Result<PriorItems, VaultError> {
+    let (fm, _body) = read_note(path)?;
+    Ok(PriorItems {
+        action_items: fm.action_items,
+        attendees: fm.attendees,
+    })
 }
 
 fn parse_note(input: &str, path: &Path) -> Result<(Frontmatter, String), VaultError> {
