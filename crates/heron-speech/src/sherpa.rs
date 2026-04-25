@@ -226,12 +226,15 @@ impl SttBackend for SherpaBackend {
         let mut writer = PartialWriter::create(partial_jsonl_path.to_path_buf())
             .map_err(|e| SttError::Failed(format!("partial writer: {e}")))?;
 
+        // `MicClean` is the post-AEC mic stream — same speaker (the
+        // user) but the orchestrator hands us this channel when AEC
+        // is wired. Treat it as Mic for attribution.
         let speaker = match channel {
-            Channel::Mic => "me".to_owned(),
+            Channel::Mic | Channel::MicClean => "me".to_owned(),
             Channel::Tap => "them".to_owned(),
         };
         let speaker_source = match channel {
-            Channel::Mic => SpeakerSource::Self_,
+            Channel::Mic | Channel::MicClean => SpeakerSource::Self_,
             Channel::Tap => SpeakerSource::Channel,
         };
 
