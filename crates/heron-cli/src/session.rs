@@ -19,9 +19,12 @@
 // CI gate doesn't push us to delete shape we know we'll need.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use heron_types::{IdleReason, RecordingFsm, RecordingState, SessionId, SummaryOutcome};
+use heron_llm::{Summarizer, SummarizerInput, SummarizerOutput};
+use heron_types::{
+    IdleReason, MeetingType, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -150,6 +153,71 @@ impl Orchestrator {
     pub fn state(&self) -> RecordingState {
         self.fsm.state()
     }
+
+    /// Re-summarize an existing meeting note while honoring the §10.5
+    /// ID-preservation contract.
+    ///
+    /// Reads the prior `action_items` + `attendees` from the current
+    /// `<note>.md` (per §11.2 — *not* `.md.bak`), passes them to the
+    /// LLM via [`SummarizerInput::existing_action_items`] /
+    /// `existing_attendees` so the prompt-side preservation block
+    /// fires (§10.5 layer 1), then runs the text-similarity matcher
+    /// in [`heron_vault::match_action_items_by_text`] over the LLM's
+    /// output to rewrite any LLM-minted IDs back to their base
+    /// counterparts (§10.5 layer 2). The resulting `SummarizerOutput`
+    /// has IDs that the §10.3 merge can rely on.
+    ///
+    /// Today the caller still owns the `Summarizer` (the orchestrator
+    /// would `select_summarizer()` in `backends()` but holding a live
+    /// Summarizer across the full session lifetime is the next phase
+    /// of wiring). This shape lets a unit test inject a no-op
+    /// summarizer and assert the prior items reach
+    /// [`render_meeting_prompt`] / the matcher.
+    pub async fn re_summarize_note(
+        &self,
+        summarizer: &dyn Summarizer,
+        note_path: &Path,
+        meeting_type: MeetingType,
+        transcript: &Path,
+    ) -> Result<SummarizerOutput, SessionError> {
+        // Layer-1: read prior items (action_items + attendees) from
+        // the current `<note>.md` and pass them to the LLM. The
+        // §10.5 prompt block then asks the model to RETURN THE EXACT
+        // SAME `id` for items that mean the same thing as before.
+        // `as_summarizer_inputs` maps empty → `None` so the prompt
+        // block stays out on a first summarize.
+        let prior = heron_vault::read_prior_items(note_path)?;
+        let (existing_action_items, existing_attendees) = prior.as_summarizer_inputs();
+
+        let input = SummarizerInput {
+            transcript,
+            meeting_type,
+            existing_action_items,
+            existing_attendees,
+        };
+        let mut output = summarizer.summarize(input).await?;
+
+        // Layer-2: the LLM may have minted fresh UUIDs for items it
+        // should have preserved IDs for (the §10.5 contract floor is
+        // 80%, not 100%). Run the text-similarity fallback to rewrite
+        // those IDs back to the matching base IDs so the standard
+        // §10.3 merge resolves them per stable `ItemId`.
+        if !prior.action_items.is_empty() {
+            let matches =
+                heron_vault::match_action_items_by_text(&prior.action_items, &output.action_items);
+            let rewrites = heron_vault::apply_matches(&mut output.action_items, &matches);
+            if rewrites > 0 {
+                tracing::info!(
+                    rewrites,
+                    prior = prior.action_items.len(),
+                    fresh = output.action_items.len(),
+                    "ID-preservation layer-2 matcher rewrote LLM-minted IDs to base IDs"
+                );
+            }
+        }
+
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +325,232 @@ mod tests {
     fn state_starts_idle() {
         let orch = Orchestrator::new(cfg());
         assert_eq!(orch.state(), RecordingState::Idle);
+    }
+
+    /// Capturing summarizer: records the inputs it received so the
+    /// test can assert on `existing_action_items` / `existing_attendees`,
+    /// and returns a deterministic [`SummarizerOutput`] (with one
+    /// LLM-minted action-item ID — to exercise the §10.5 layer-2
+    /// rewrite path).
+    struct CapturingSummarizer {
+        captured_action_items: std::sync::Mutex<Option<Vec<heron_types::ActionItem>>>,
+        captured_attendees: std::sync::Mutex<Option<Vec<heron_types::Attendee>>>,
+        canned_output: std::sync::Mutex<Option<SummarizerOutput>>,
+    }
+
+    #[async_trait::async_trait]
+    impl heron_llm::Summarizer for CapturingSummarizer {
+        async fn summarize(
+            &self,
+            input: SummarizerInput<'_>,
+        ) -> Result<SummarizerOutput, heron_llm::LlmError> {
+            *self.captured_action_items.lock().expect("lock") =
+                input.existing_action_items.map(<[_]>::to_vec);
+            *self.captured_attendees.lock().expect("lock") =
+                input.existing_attendees.map(<[_]>::to_vec);
+            self.canned_output
+                .lock()
+                .expect("lock")
+                .take()
+                .ok_or_else(|| heron_llm::LlmError::Backend("test fixture exhausted".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn re_summarize_note_threads_prior_items_to_summarizer_and_preserves_ids() {
+        use heron_types::{
+            ActionItem, Attendee, Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter,
+            ItemId,
+        };
+        use heron_vault::VaultWriter;
+
+        // Lay down a finalized note with one action item + one
+        // attendee in its frontmatter. The base ID is what the
+        // ID-preservation contract must keep alive across re-runs.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let base_action_id = ItemId::from_u128(0xA1);
+        let base_attendee_id = ItemId::from_u128(0xB1);
+        let prior_action = ActionItem {
+            id: base_action_id,
+            owner: "alice".into(),
+            text: "Send pricing deck to Acme".into(),
+            due: None,
+        };
+        let prior_attendee = Attendee {
+            id: base_attendee_id,
+            name: "Alice".into(),
+            company: Some("Acme".into()),
+        };
+        let frontmatter = Frontmatter {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 4, 24).expect("date"),
+            start: "14:00".into(),
+            duration_min: 47,
+            company: Some("Acme".into()),
+            attendees: vec![prior_attendee.clone()],
+            meeting_type: heron_types::MeetingType::Client,
+            source_app: "us.zoom.xos".into(),
+            recording: PathBuf::from("recordings/2026-04-24-1400.m4a"),
+            transcript: PathBuf::from("transcripts/2026-04-24-1400.jsonl"),
+            diarize_source: DiarizeSource::Ax,
+            disclosed: Disclosure {
+                stated: true,
+                when: Some("00:14".into()),
+                how: DisclosureHow::Verbal,
+            },
+            cost: Cost {
+                summary_usd: 0.04,
+                tokens_in: 14_231,
+                tokens_out: 612,
+                model: "claude-sonnet-4-6".into(),
+            },
+            action_items: vec![prior_action.clone()],
+            tags: vec!["acme".into()],
+            extra: serde_yaml::Mapping::default(),
+        };
+        let note_path = writer
+            .finalize_session("2026-04-24", "1400", "acme", &frontmatter, "Body.\n")
+            .expect("finalize");
+
+        // The "LLM" mints a fresh UUID for the same item — exactly
+        // the failure mode the §10.5 layer-2 matcher exists to fix.
+        let minted_id = ItemId::from_u128(0xDEADBEEF);
+        let canned = SummarizerOutput {
+            body: "Polished body.".into(),
+            company: Some("Acme".into()),
+            meeting_type: heron_types::MeetingType::Client,
+            tags: vec!["acme".into()],
+            action_items: vec![ActionItem {
+                id: minted_id,
+                owner: "alice".into(),
+                text: "Send the pricing deck to Acme".into(),
+                due: None,
+            }],
+            attendees: vec![prior_attendee.clone()],
+            cost: Cost {
+                summary_usd: 0.05,
+                tokens_in: 1000,
+                tokens_out: 200,
+                model: "claude-sonnet-4-6".into(),
+            },
+        };
+
+        let summarizer = CapturingSummarizer {
+            captured_action_items: std::sync::Mutex::new(None),
+            captured_attendees: std::sync::Mutex::new(None),
+            canned_output: std::sync::Mutex::new(Some(canned)),
+        };
+
+        let orch = Orchestrator::new(cfg());
+        let transcript = PathBuf::from("/tmp/heron-test-transcript.jsonl");
+        let output = orch
+            .re_summarize_note(
+                &summarizer,
+                &note_path,
+                heron_types::MeetingType::Client,
+                &transcript,
+            )
+            .await
+            .expect("re_summarize_note");
+
+        // Assertion 1: the orchestrator handed the prior items to
+        // the summarizer (layer-1 prompt-side preservation can fire).
+        let captured_actions = summarizer
+            .captured_action_items
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("existing_action_items must be Some on a re-summarize");
+        assert_eq!(captured_actions, vec![prior_action.clone()]);
+        let captured_attendees = summarizer
+            .captured_attendees
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("existing_attendees must be Some on a re-summarize");
+        assert_eq!(captured_attendees, vec![prior_attendee.clone()]);
+
+        // Assertion 2: the layer-2 text-similarity matcher rewrote
+        // the LLM's minted id back to the base id — the §10.5
+        // contract is honored even when the LLM ignores layer-1.
+        assert_eq!(output.action_items.len(), 1);
+        assert_eq!(
+            output.action_items[0].id, base_action_id,
+            "layer-2 matcher must rewrite minted id {minted_id:?} back to base id {base_action_id:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_summarize_note_omits_prior_items_when_note_has_none() {
+        use heron_types::{
+            Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, MeetingType,
+        };
+        use heron_vault::VaultWriter;
+
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let frontmatter = Frontmatter {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 4, 24).expect("date"),
+            start: "14:00".into(),
+            duration_min: 30,
+            company: None,
+            attendees: vec![],
+            meeting_type: MeetingType::Other,
+            source_app: "us.zoom.xos".into(),
+            recording: PathBuf::from("r.m4a"),
+            transcript: PathBuf::from("t.jsonl"),
+            diarize_source: DiarizeSource::Channel,
+            disclosed: Disclosure {
+                stated: false,
+                when: None,
+                how: DisclosureHow::None,
+            },
+            cost: Cost {
+                summary_usd: 0.0,
+                tokens_in: 0,
+                tokens_out: 0,
+                model: "stub".into(),
+            },
+            action_items: vec![],
+            tags: vec![],
+            extra: serde_yaml::Mapping::default(),
+        };
+        let note_path = writer
+            .finalize_session("2026-04-24", "1400", "x", &frontmatter, "Body.\n")
+            .expect("finalize");
+
+        let canned = SummarizerOutput {
+            body: "Body.".into(),
+            company: None,
+            meeting_type: MeetingType::Other,
+            tags: vec![],
+            action_items: vec![],
+            attendees: vec![],
+            cost: Cost {
+                summary_usd: 0.0,
+                tokens_in: 0,
+                tokens_out: 0,
+                model: "stub".into(),
+            },
+        };
+        let summarizer = CapturingSummarizer {
+            captured_action_items: std::sync::Mutex::new(None),
+            captured_attendees: std::sync::Mutex::new(None),
+            canned_output: std::sync::Mutex::new(Some(canned)),
+        };
+
+        let orch = Orchestrator::new(cfg());
+        let transcript = PathBuf::from("/tmp/heron-test-transcript.jsonl");
+        orch.re_summarize_note(&summarizer, &note_path, MeetingType::Other, &transcript)
+            .await
+            .expect("re_summarize_note");
+
+        // First-summarize-shaped vault: pass `None` so the §10.5
+        // prompt block stays out of the prompt entirely.
+        assert_eq!(
+            *summarizer.captured_action_items.lock().expect("lock"),
+            None
+        );
+        assert_eq!(*summarizer.captured_attendees.lock().expect("lock"), None);
     }
 }
