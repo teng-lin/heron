@@ -6,3 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+heron-types = { workspace = true }
+async-trait = { workspace = true }
+handlebars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
