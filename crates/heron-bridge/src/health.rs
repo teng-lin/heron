@@ -60,9 +60,10 @@ pub enum HealthVerdict {
 /// records the *first* one that crossed (jitter > drops) so audit
 /// logs are deterministic.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum DegradationReason {
     /// `jitter_ms` is in the soft band [`JITTER_DEGRADED_MS`,
-    /// `JITTER_CRITICAL_MS`).
+    /// `JITTER_CRITICAL_MS`].
     Jitter { observed_ms: f32 },
     /// `recent_drops` is in the soft band [1, `DROPS_CRITICAL`].
     PacketLoss { observed_drops: u32 },
@@ -73,11 +74,16 @@ pub enum DegradationReason {
 /// restart); critical jitter / drops are recoverable when network
 /// conditions improve.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum CriticalReason {
     /// `aec_tracking == false`; the agent's outbound audio is
     /// leaking back into MeetingIn.
     AecTrackingLost,
-    /// `jitter_ms >= JITTER_CRITICAL_MS`.
+    /// `jitter_ms > JITTER_CRITICAL_MS`, or jitter is `NaN`. NaN
+    /// surfaces here rather than getting filtered upstream because
+    /// a buggy bridge reporting NaN must mute the agent — falling
+    /// through as Healthy would let the agent keep speaking through
+    /// broken telemetry.
     JitterCritical { observed_ms: f32 },
     /// `recent_drops > DROPS_CRITICAL`.
     PacketLossCritical { observed_drops: u32 },
@@ -114,7 +120,12 @@ pub fn verdict(health: &BridgeHealth) -> HealthVerdict {
         };
     }
 
-    if health.jitter_ms >= JITTER_CRITICAL_MS {
+    // NaN jitter surfaces as Critical: a bridge reporting NaN means
+    // upstream telemetry is broken, and we must mute the agent
+    // rather than ship audio through a broken health pipeline.
+    // Strict `>` not `>=`: the documented table says > 200 ⇒ Critical,
+    // 200 itself stays in the Degraded band.
+    if health.jitter_ms.is_nan() || health.jitter_ms > JITTER_CRITICAL_MS {
         return HealthVerdict::Critical {
             reason: CriticalReason::JitterCritical {
                 observed_ms: health.jitter_ms,
@@ -210,15 +221,45 @@ mod tests {
 
     #[test]
     fn critical_jitter_is_critical() {
-        let v = verdict(&health(true, JITTER_CRITICAL_MS, 0));
+        // Strict `>`: 200 itself is the boundary of the Degraded
+        // band; 200.001 trips Critical.
+        let v = verdict(&health(true, JITTER_CRITICAL_MS + 0.001, 0));
         match v {
             HealthVerdict::Critical {
                 reason: CriticalReason::JitterCritical { observed_ms },
             } => {
-                assert_eq!(observed_ms, JITTER_CRITICAL_MS);
+                assert!(observed_ms > JITTER_CRITICAL_MS, "got {observed_ms}");
             }
             other => panic!("expected JitterCritical, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn jitter_at_critical_threshold_is_only_degraded() {
+        // Documented table says jitter `> 200` is Critical and
+        // `80–200` is Degraded — i.e., 200 is in Degraded. Pin the
+        // boundary so a future flip from `>` to `>=` surfaces here.
+        let v = verdict(&health(true, JITTER_CRITICAL_MS, 0));
+        assert!(matches!(
+            v,
+            HealthVerdict::Degraded {
+                reason: DegradationReason::Jitter { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn nan_jitter_lands_in_critical() {
+        // Broken telemetry must not let the agent keep speaking.
+        // Verify NaN routes to JitterCritical regardless of other
+        // signals.
+        let v = verdict(&health(true, f32::NAN, 0));
+        assert!(matches!(
+            v,
+            HealthVerdict::Critical {
+                reason: CriticalReason::JitterCritical { .. }
+            }
+        ));
     }
 
     #[test]
@@ -279,7 +320,7 @@ mod tests {
     #[test]
     fn jitter_critical_with_drops_critical_picks_jitter() {
         // Both Critical; jitter wins per the documented order.
-        let v = verdict(&health(true, JITTER_CRITICAL_MS, DROPS_CRITICAL + 5));
+        let v = verdict(&health(true, JITTER_CRITICAL_MS + 0.1, DROPS_CRITICAL + 5));
         assert!(matches!(
             v,
             HealthVerdict::Critical {

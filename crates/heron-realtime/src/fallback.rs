@@ -27,6 +27,11 @@
 use crate::RealtimeCapabilities;
 
 /// How the controller should fulfill a `cancel`-shaped request.
+///
+/// `#[non_exhaustive]` so adding a `NoOp` variant for a future
+/// session-less backend (raw TTS without `truncate`) is non-breaking;
+/// today's `RealtimeBackend` trait requires `truncate_current`, so
+/// every concrete backend supports at least the truncate emulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CancelStrategy {
@@ -38,10 +43,6 @@ pub enum CancelStrategy {
     /// "stop speaking" instruction. Audible-cut quality is worse
     /// than Native but the agent stops promptly.
     EmulateViaTruncate,
-    /// Backend has neither cancel nor truncate. Caller must wait
-    /// for the response to complete naturally; the user sees a
-    /// "couldn't interrupt" indicator.
-    NoOp,
 }
 
 /// How the controller should fulfill a barge-in event.
@@ -62,6 +63,12 @@ pub enum BargeInStrategy {
 }
 
 /// How the controller should fulfill a tool-result injection.
+///
+/// `#[non_exhaustive]` so adding a `NotSupported` variant for a
+/// future fail-fast path (a backend that explicitly forbids tool
+/// calls) is non-breaking. Today's planner always returns one of
+/// the two real variants because every backend that exposes a
+/// session model supports synthetic-conversation-turn emulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolResultStrategy {
@@ -73,10 +80,6 @@ pub enum ToolResultStrategy {
     /// "function-call-emulation" pattern); ergonomics are worse
     /// because the model loses the structured-call contract.
     EmulateViaConversationTurn,
-    /// Backend explicitly forbids tool calls. The orchestrator
-    /// should not have built a tool-using session in the first
-    /// place; mark this as a configuration bug.
-    NotSupported,
 }
 
 /// How the controller surfaces text deltas to the diagnostics tab
@@ -122,11 +125,25 @@ pub fn plan(caps: &RealtimeCapabilities) -> StrategyPlan {
         CancelStrategy::EmulateViaTruncate
     };
 
-    let barge_in = match (caps.server_vad, caps.atomic_response_cancel) {
-        (true, _) => BargeInStrategy::ServerSideVad,
-        (false, true) => BargeInStrategy::ClientSideCancel,
-        // No VAD anywhere: run local VAD against the inbound PCM.
-        (false, false) => BargeInStrategy::LocalVad,
+    // Per the variant docs: ClientSideCancel requires the backend
+    // to emit `InputSpeechStarted` (= server_vad), so it must NOT
+    // fire when the backend has no VAD at all. Backends without VAD
+    // need LocalVad (controller runs its own VAD) regardless of
+    // whether they support atomic cancel.
+    //
+    // Within `server_vad = true`: ServerSideVad if the backend can
+    // also auto-interrupt; ClientSideCancel if VAD-only and the
+    // controller has to fire `cancel` itself. We use atomic_response_
+    // cancel as the closest proxy for "interrupt_response auto" today;
+    // the capability matrix doesn't distinguish them yet.
+    let barge_in = if caps.server_vad {
+        if caps.atomic_response_cancel {
+            BargeInStrategy::ServerSideVad
+        } else {
+            BargeInStrategy::ClientSideCancel
+        }
+    } else {
+        BargeInStrategy::LocalVad
     };
 
     let tool_result = if caps.tool_calling {
@@ -211,21 +228,40 @@ mod tests {
     }
 
     #[test]
-    fn server_vad_alone_picks_server_side_barge_in() {
-        let p = plan(&caps(true, true, false, true, true));
+    fn server_vad_with_cancel_picks_server_side_vad() {
+        // Phase-52 fix: ServerSideVad requires server_vad=true AND
+        // atomic_response_cancel=true (auto-interrupt). The
+        // pre-fix logic returned ServerSideVad for any
+        // server_vad=true case regardless of cancel.
+        let p = plan(&caps(true, true, true, true, true));
         assert_eq!(p.barge_in, BargeInStrategy::ServerSideVad);
     }
 
     #[test]
-    fn no_vad_with_cancel_picks_client_side_cancel() {
-        let p = plan(&caps(true, false, true, true, true));
+    fn server_vad_without_cancel_picks_client_side_cancel() {
+        // Phase-52 fix: ClientSideCancel is "backend has VAD but
+        // controller fires cancel itself" — that requires
+        // server_vad=true (so we get InputSpeechStarted events) +
+        // atomic_response_cancel=false.
+        let p = plan(&caps(true, true, false, true, true));
         assert_eq!(p.barge_in, BargeInStrategy::ClientSideCancel);
     }
 
     #[test]
-    fn no_vad_no_cancel_picks_local_vad() {
-        let p = plan(&caps(true, false, false, true, true));
-        assert_eq!(p.barge_in, BargeInStrategy::LocalVad);
+    fn no_vad_picks_local_vad_regardless_of_cancel() {
+        // Phase-52 fix: LocalVad is the only valid choice when the
+        // backend doesn't emit InputSpeechStarted events. The pre-
+        // fix logic incorrectly mapped (no VAD, has cancel) to
+        // ClientSideCancel, which would have left the controller
+        // listening for events that never arrive.
+        for cancel in [false, true] {
+            let p = plan(&caps(true, false, cancel, true, true));
+            assert_eq!(
+                p.barge_in,
+                BargeInStrategy::LocalVad,
+                "no VAD must always pick LocalVad (cancel={cancel})"
+            );
+        }
     }
 
     #[test]
