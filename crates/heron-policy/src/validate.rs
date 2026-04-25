@@ -16,11 +16,21 @@
 //!
 //! ## Invariants
 //!
-//! Topic comparison everywhere here is **case-insensitive** after
-//! `.trim()`, matching the substring semantics
-//! [`crate::filter::evaluate`] uses at runtime — a profile author
-//! who writes `"Pricing"` and `"pricing"` is making one mistake, not
-//! configuring two distinct topics.
+//! Duplicate / overlap comparison is **case-insensitive only** — no
+//! `.trim()`. That mirrors [`crate::filter::evaluate`] exactly, which
+//! lowercases both haystack and needle but treats whitespace as part
+//! of the substring. A profile with `["pricing", " pricing "]`
+//! validates because at runtime the two are genuinely different
+//! matchers (one matches anywhere, the other requires whitespace
+//! boundaries). The emptiness check below still uses
+//! `.trim().is_empty()` so all-whitespace entries are rejected as
+//! malformed config.
+//!
+//! Case folding uses Rust's [`str::to_lowercase`] (Unicode-default).
+//! Locale-sensitive forms (Turkish dotted/dotless I) and combining-
+//! character variants (NFC vs. NFD) are treated as distinct, matching
+//! `filter::evaluate`. ASCII topic strings — the realistic case —
+//! behave as expected.
 //!
 //! Failures are returned in priority order so a single misconfigured
 //! profile produces a deterministic error message run-to-run:
@@ -111,14 +121,16 @@ pub fn validate(profile: &PolicyProfile) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Return the first entry whose case-insensitive trimmed form has
-/// already appeared earlier in `topics`. Returns the original
-/// (un-normalized) string of the *second* occurrence so the error
-/// message points at the casing the author actually typed.
+/// Return the first entry whose case-folded form has already
+/// appeared earlier in `topics`. No `.trim()` — that would say two
+/// strings are duplicates when `filter::evaluate` would treat them
+/// as distinct matchers. Returns the original (un-normalized) string
+/// of the *second* occurrence so the error message points at the
+/// casing the author actually typed.
 fn first_duplicate(topics: &[String]) -> Option<String> {
     let mut seen: Vec<String> = Vec::with_capacity(topics.len());
     for topic in topics {
-        let key = topic.trim().to_lowercase();
+        let key = topic.to_lowercase();
         if seen.iter().any(|s| s == &key) {
             return Some(topic.clone());
         }
@@ -127,15 +139,16 @@ fn first_duplicate(topics: &[String]) -> Option<String> {
     None
 }
 
-/// Return the first `allow` entry whose case-insensitive trimmed
-/// form also appears in `deny`. Returns the allow-side original
-/// string so the error message names what the author wrote.
+/// Return the first `allow` entry whose case-folded form also
+/// appears in `deny`. No `.trim()`, mirroring `first_duplicate`.
+/// Returns the allow-side original string so the error message names
+/// what the author wrote.
 fn first_overlap(allow: &[String], deny: &[String]) -> Option<String> {
-    let deny_keys: Vec<String> = deny.iter().map(|t| t.trim().to_lowercase()).collect();
+    let deny_keys: Vec<String> = deny.iter().map(|t| t.to_lowercase()).collect();
     allow
         .iter()
         .find(|topic| {
-            let key = topic.trim().to_lowercase();
+            let key = topic.to_lowercase();
             deny_keys.iter().any(|d| d == &key)
         })
         .cloned()
@@ -205,13 +218,48 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_allow_with_whitespace_rejected() {
+    fn whitespace_padded_topic_is_not_a_duplicate() {
+        // `"pricing"` and `"  Pricing  "` are NOT duplicates — at
+        // runtime `filter::evaluate` does substring match without
+        // trim, so the second entry only fires on utterances
+        // literally containing whitespace-pricing-whitespace. The
+        // validator must agree with the runtime; flagging this as
+        // a duplicate would lie to the caller. Pin so a future
+        // refactor that re-introduces `.trim()` in the dup key
+        // surfaces here.
         let mut p = profile();
         p.allow_topics = vec!["pricing".into(), "  Pricing  ".into()];
-        match validate(&p).expect_err("duplicate") {
-            ValidationError::DuplicateAllowTopic { topic } => assert_eq!(topic, "  Pricing  "),
-            other => panic!("expected DuplicateAllowTopic, got {other:?}"),
-        }
+        validate(&p).expect("whitespace-padded variant is a distinct matcher");
+    }
+
+    #[test]
+    fn validator_and_runtime_agree_on_duplicates() {
+        // The two strings the validator says are duplicates must
+        // produce the same `filter::evaluate` decision on every
+        // utterance — otherwise the validator is rejecting profiles
+        // the runtime would accept. Mirror the case-insensitive,
+        // no-trim normalization that `first_substring_match` uses.
+        use crate::{PolicyDecision, evaluate};
+        let dup_p = PolicyProfile {
+            allow_topics: vec!["Pricing".into(), "pricing".into()],
+            deny_topics: vec![],
+            mute: false,
+            escalation: EscalationMode::None,
+        };
+        // Validator rejects.
+        assert!(matches!(
+            validate(&dup_p),
+            Err(ValidationError::DuplicateAllowTopic { .. })
+        ));
+        // Runtime: an utterance matching one matches the other.
+        let single_p = PolicyProfile {
+            allow_topics: vec!["pricing".into()],
+            ..dup_p.clone()
+        };
+        assert!(matches!(
+            evaluate("what's our pricing?", &single_p),
+            PolicyDecision::Allowed
+        ));
     }
 
     #[test]
