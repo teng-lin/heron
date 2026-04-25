@@ -24,8 +24,6 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use heron_types::{
@@ -141,7 +139,7 @@ pub async fn run_pipeline(
     }
     let mut turns: Vec<Turn> = mic_turns
         .into_iter()
-        .chain(tap_turns_raw.into_iter())
+        .chain(tap_turns_raw)
         .map(|t| aligner.attribute(t))
         .collect();
     // Stable timeline ordering: turns from both channels are emitted
@@ -192,30 +190,29 @@ pub async fn run_pipeline(
 
     // LLM summarize. A failure here is non-fatal — we still write a
     // transcript-only note so the user has the raw turns to read.
-    let (body, llm_meta) = match summarize(llm.as_ref(), &transcript_path).await {
-        Ok(out) => (
-            out.body,
-            Some((
-                out.cost,
-                out.action_items,
-                out.attendees,
-                out.tags,
-                out.company,
-                out.meeting_type,
-            )),
-        ),
+    let llm_out = match summarize(llm.as_ref(), &transcript_path).await {
+        Ok(out) => Some(out),
         Err(e) => {
             tracing::warn!(error = %e, "summarize failed; writing transcript-only note");
-            (fallback_body(&turns), None)
+            None
         }
     };
 
     // Frontmatter assembly. Defaults align with §3.3; the LLM output
     // overrides company / meeting_type / tags / attendees / action
     // items when available.
-    let (cost, action_items, attendees, tags, company, meeting_type) = match llm_meta {
-        Some((c, ai, at, tg, co, mt)) => (c, ai, at, tg, co, mt),
+    let (body, cost, action_items, attendees, tags, company, meeting_type) = match llm_out {
+        Some(o) => (
+            o.body,
+            o.cost,
+            o.action_items,
+            o.attendees,
+            o.tags,
+            o.company,
+            o.meeting_type,
+        ),
         None => (
+            fallback_body(&turns),
             Cost {
                 summary_usd: 0.0,
                 tokens_in: 0,
@@ -324,19 +321,15 @@ async fn run_capture_phase(
     let capture =
         heron_audio::AudioCapture::start(config.session_id, &config.target_bundle_id, &session_dir)
             .await?;
-    let mic_writer_done = Arc::new(AtomicBool::new(false));
-    let tap_writer_done = Arc::new(AtomicBool::new(false));
     let mic_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
         Channel::Mic,
         mic_wav.to_path_buf(),
-        mic_writer_done.clone(),
     );
     let tap_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
         Channel::Tap,
         tap_wav.to_path_buf(),
-        tap_writer_done.clone(),
     );
 
     // AX listener: subscribe to SpeakerEvents into a Vec we own. The
@@ -409,7 +402,6 @@ fn spawn_wav_writer(
     mut rx: broadcast::Receiver<heron_audio::CaptureFrame>,
     channel: Channel,
     path: PathBuf,
-    done: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let spec = hound::WavSpec {
@@ -422,7 +414,6 @@ fn spawn_wav_writer(
             Ok(w) => w,
             Err(e) => {
                 tracing::error!(error = %e, path = %path.display(), "WAV create failed");
-                done.store(true, Ordering::Release);
                 return;
             }
         };
@@ -454,7 +445,6 @@ fn spawn_wav_writer(
         if let Err(e) = writer.finalize() {
             tracing::warn!(error = %e, path = %path.display(), "WAV finalize failed");
         }
-        done.store(true, Ordering::Release);
     })
 }
 

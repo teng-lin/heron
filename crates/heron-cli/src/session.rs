@@ -22,14 +22,12 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use heron_llm::{Summarizer, SummarizerInput, SummarizerOutput};
 use heron_types::{
     IdleReason, MeetingType, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 use crate::pipeline;
@@ -107,10 +105,7 @@ pub struct Orchestrator {
     /// resolves them from config via [`Orchestrator::backends`]. The
     /// integration test path injects stub backends here so it doesn't
     /// touch the host environment (TCC, network, ANTHROPIC_API_KEY).
-    /// `Mutex` because `run` consumes the inner value via `take()` and
-    /// needs interior mutability behind `&mut self` callers without
-    /// requiring `&mut self` on construction.
-    injected: Arc<Mutex<Option<Backends>>>,
+    injected: Option<Backends>,
     /// When `true`, [`Orchestrator::run`] skips the live
     /// `AudioCapture::start` call and assumes the caller seeded
     /// `<cache>/sessions/<id>/{mic,tap}.wav` ahead of time. Set by
@@ -124,7 +119,7 @@ impl Orchestrator {
         Self {
             config,
             fsm: RecordingFsm::new(),
-            injected: Arc::new(Mutex::new(None)),
+            injected: None,
             skip_audio_capture: false,
         }
     }
@@ -137,7 +132,7 @@ impl Orchestrator {
         Self {
             config,
             fsm: RecordingFsm::new(),
-            injected: Arc::new(Mutex::new(Some(backends))),
+            injected: Some(backends),
             skip_audio_capture: false,
         }
     }
@@ -149,7 +144,7 @@ impl Orchestrator {
         Self {
             config,
             fsm: RecordingFsm::new(),
-            injected: Arc::new(Mutex::new(Some(backends))),
+            injected: Some(backends),
             skip_audio_capture: true,
         }
     }
@@ -187,7 +182,7 @@ impl Orchestrator {
         &mut self,
         stop_rx: oneshot::Receiver<()>,
     ) -> Result<SessionOutcome, SessionError> {
-        let backends = match self.injected.lock().await.take() {
+        let backends = match self.injected.take() {
             Some(b) => b,
             None => self.backends()?,
         };
