@@ -11,8 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-
-mod session;
+use heron_cli::session;
 
 #[derive(Debug, Parser)]
 #[command(

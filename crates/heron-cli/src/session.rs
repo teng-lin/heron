@@ -2,7 +2,7 @@
 //!
 //! Wires the v0 stub backends — [`heron_audio::AudioCapture`],
 //! [`heron_speech::SttBackend`], [`heron_zoom::AxBackend`],
-//! [`heron_llm::Summarizer`], [`heron_vault::VaultWriter`] — onto a
+//! [`heron_llm::Summarizer`] — onto a
 //! single [`RecordingFsm`] driven session lifecycle.
 //!
 //! Until the real backends land in their respective weeks, the
@@ -36,8 +36,13 @@ pub enum SessionError {
     Ax(#[from] heron_zoom::AxError),
     #[error("LLM failed: {0}")]
     Llm(#[from] heron_llm::LlmError),
-    #[error("vault write failed: {0}")]
-    Vault(#[from] heron_vault::VaultError),
+    // A `Vault(#[from] heron_vault::VaultError)` variant lives here
+    // once heron-cli re-adds the heron-vault dep. The dep was
+    // dropped because Cargo doesn't propagate build-script rpath
+    // directives to test binaries of dependents — heron-vault's
+    // EventKit Swift bridge made integration tests fail to load
+    // libswift_Concurrency. The orchestrator skeleton doesn't call
+    // the vault writer yet, so removing the dep is no-loss for v0.
 }
 
 /// Configuration the orchestrator needs to start a session.
