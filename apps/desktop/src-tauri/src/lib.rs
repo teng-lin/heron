@@ -8,9 +8,22 @@
 //!   gains a `run()` async path),
 //! - one demonstrative `heron_status` command that returns the
 //!   FSM state + a few orchestrator-side flags so the frontend
-//!   has something concrete to render before week 11.
+//!   has something concrete to render before week 11,
+//! - the §15.2 asset-protocol resolver + §15.4 diagnostics +
+//!   §16.1 settings persistence backends so the review UI and
+//!   Settings pane can land in week 13/14 against stable Rust.
+
+pub mod asset_protocol;
+pub mod diagnostics;
+pub mod settings;
+
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
+pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
+pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HeronStatus {
@@ -36,6 +49,62 @@ fn heron_status() -> HeronStatus {
     }
 }
 
+/// Tauri command: resolve `heron://recording/<id>` to a concrete asset.
+///
+/// Errors map to `String` so they reach the frontend without the
+/// frontend needing the `AssetError` type — the UI distinguishes the
+/// "missing" / "partial" cases by inspecting the message.
+#[tauri::command]
+fn heron_resolve_recording(
+    session_id: String,
+    m4a_candidate: String,
+    cache_root: String,
+) -> Result<AssetSource, String> {
+    resolve_recording_uri(
+        &session_id,
+        Path::new(&m4a_candidate),
+        Path::new(&cache_root),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Tauri command: read `heron_session.json` and return the diagnostics
+/// view.
+#[tauri::command]
+fn heron_diagnostics(session_log_path: String) -> Result<DiagnosticsView, String> {
+    read_diagnostics(Path::new(&session_log_path)).map_err(|e| e.to_string())
+}
+
+/// Tauri command: load user settings.
+#[tauri::command]
+fn heron_read_settings(settings_path: String) -> Result<Settings, String> {
+    read_settings(Path::new(&settings_path)).map_err(|e| e.to_string())
+}
+
+/// Tauri command: persist user settings.
+#[tauri::command]
+fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(), String> {
+    write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
+}
+
+/// Default settings location.
+///
+/// Resolves via [`dirs::config_dir`] so the path is correct on every
+/// platform Tauri targets:
+/// - macOS: `~/Library/Application Support/com.heronnote.heron/settings.json`
+/// - Linux: `$XDG_CONFIG_HOME/com.heronnote.heron/settings.json`
+/// - Windows: `%APPDATA%\com.heronnote.heron\settings.json`
+///
+/// v1 ships macOS-only, but keeping this portable means `cargo test`
+/// runs the same path-resolution code on Linux CI runners and on a
+/// future Windows build without surprise. Falls back to `./` if the
+/// platform's config dir cannot be resolved (sandboxed test runners,
+/// minimal containers).
+pub fn default_settings_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("com.heronnote.heron").join("settings.json")
+}
+
 /// Entry point used by `main.rs` and (eventually) by Tauri's mobile
 /// build target. The function name + `#[cfg_attr(...)]` line below
 /// are required by Tauri 2's mobile entry point glue.
@@ -54,7 +123,27 @@ pub fn run() {
             let _ = app;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![heron_status])
+        .invoke_handler(tauri::generate_handler![
+            heron_status,
+            heron_resolve_recording,
+            heron_diagnostics,
+            heron_read_settings,
+            heron_write_settings,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_path_ends_in_app_id_and_filename() {
+        let p = default_settings_path();
+        // The `dirs::config_dir()` prefix is platform-specific; assert
+        // only the tail we control. (macOS adds `Application Support`,
+        // Linux adds `.config`, Windows adds `AppData/Roaming`, etc.)
+        assert!(p.ends_with("com.heronnote.heron/settings.json"));
+    }
 }
