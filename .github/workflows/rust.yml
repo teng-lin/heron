@@ -66,8 +66,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `cache: false` disables setup-rust-toolchain's bundled
+      # rust-cache step so the only cache in effect is the explicit
+      # one below. Without this, the action restores a separate
+      # `v0-rust-test-…` cache layer that bypasses our `shared-key`
+      # bump and re-introduces a stale `target/` carrying
+      # sherpa-rs-sys's build-script output without the prebuilt
+      # dylibs (see the `test-sherpa` rationale below).
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       # The `test-sherpa` shared-key busts the `test` cache that was
       # populated before sherpa-rs-sys joined the workspace. The cached
