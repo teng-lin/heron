@@ -3,10 +3,16 @@
  * `heron_open_window`) and translate them into `react-router`
  * navigations.
  *
- * Phase 64 (PR-β). The Rust side can't push a route directly because
- * the router lives in JS; instead, the tray menu and the
- * `heron_open_window` Tauri command emit a Tauri event which this
- * hook bridges into `useNavigate()`.
+ * Phase 64 (PR-β) shipped the static `nav:settings` / `nav:recording`
+ * routes. Phase 69 (PR-η) extends the bridge with:
+ *
+ *   - `nav:review` — payload `{ sessionId: string }` — the tray's
+ *     "Open last note…" item picks the newest `.md` in the vault and
+ *     emits this event so the React tree navigates to
+ *     `/review/<sessionId>`.
+ *   - `nav:no_last_note` — emitted when the vault is empty / unset;
+ *     the listener pops a Sonner toast so the user gets feedback
+ *     without us depending on `tauri-plugin-notification`.
  *
  * Mounted exactly once at the app shell level. The hook returns
  * nothing — its only side effect is the listener wiring.
@@ -15,12 +21,18 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { toast } from "sonner";
 
 /** Map from event name (Rust side) to React-router path. */
 const EVENT_TO_PATH: Readonly<Record<string, string>> = {
   "nav:settings": "/settings",
   "nav:recording": "/recording",
 };
+
+/** Payload shape for `nav:review`. Matches the Rust `ReviewPayload`. */
+interface ReviewPayload {
+  sessionId?: string;
+}
 
 export function useTrayNav() {
   const navigate = useNavigate();
@@ -48,7 +60,7 @@ export function useTrayNav() {
       // which entries register doesn't matter — running them
       // concurrently halves the registration latency without changing
       // semantics.
-      const results = await Promise.all(
+      const staticResults = await Promise.all(
         Object.entries(EVENT_TO_PATH).map(async ([event, path]) => {
           const unlisten = await listen(event, () => {
             navigateRef.current(path);
@@ -56,13 +68,39 @@ export function useTrayNav() {
           return unlisten;
         }),
       );
+
+      // `nav:review` carries `{ sessionId }`. Validate the payload
+      // shape before navigating so a malformed event can't push us
+      // to a bogus URL.
+      const reviewUnlisten = await listen<ReviewPayload>(
+        "nav:review",
+        (event) => {
+          const sessionId = event.payload?.sessionId;
+          if (typeof sessionId === "string" && sessionId.length > 0) {
+            navigateRef.current(`/review/${encodeURIComponent(sessionId)}`);
+          }
+        },
+      );
+
+      // `nav:no_last_note` is payload-less — pop a toast.
+      const noLastUnlisten = await listen("nav:no_last_note", () => {
+        toast("No notes yet", {
+          description: "Record a meeting and the latest note will land here.",
+        });
+      });
+
+      const allResults: UnlistenFn[] = [
+        ...staticResults,
+        reviewUnlisten,
+        noLastUnlisten,
+      ];
       if (cancelled) {
-        for (const u of results) {
+        for (const u of allResults) {
           u();
         }
         return;
       }
-      unlisteners.push(...results);
+      unlisteners.push(...allResults);
     };
 
     void subscribe();

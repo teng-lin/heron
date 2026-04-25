@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod keychain;
 pub mod notes;
 pub mod onboarding;
+pub mod salvage;
 pub mod settings;
 pub mod tray;
 
@@ -353,6 +354,13 @@ pub fn run() {
             heron_keychain_has,
             heron_keychain_delete,
             heron_keychain_list,
+            // Phase 69 (PR-η): crash-recovery salvage scan + per-
+            // session purge surface used by `/salvage`, plus the
+            // tray's "Open last note…" lookup.
+            salvage::heron_scan_unfinalized,
+            salvage::heron_recover_session,
+            salvage::heron_purge_session,
+            tray::heron_last_note_session_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");
