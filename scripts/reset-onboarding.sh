@@ -26,6 +26,6 @@ tccutil reset Calendar       "${BUNDLE_ID}" || true
 echo "Clearing app preferences and caches..."
 rm -f  "${HOME}/Library/Preferences/${BUNDLE_ID}.plist"
 rm -rf "${HOME}/Library/Application Support/${BUNDLE_ID}"
-rm -rf "${HOME}/Library/Caches/heron"
+rm -rf "${HOME}/Library/Caches/${BUNDLE_ID}"
 
 echo "Reset complete. Re-launch heron — TCC prompts should re-appear."

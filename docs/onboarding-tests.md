@@ -66,7 +66,7 @@ network model download). Each ~3 min + ~1 min reset overhead.
 Each walkthrough produces a screencast committed to
 `fixtures/manual-validation/onboarding/<date>-<test>.mov`. The
 matrix lives in [`docs/manual-test-matrix.md`](manual-test-matrix.md)
-row 7.
+row 11.
 
 ## Coverage limits — explicitly accepted
 
