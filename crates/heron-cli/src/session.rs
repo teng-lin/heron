@@ -1,16 +1,18 @@
-//! Session orchestrator skeleton.
+//! Session orchestrator.
 //!
-//! Wires the v0 stub backends — [`heron_audio::AudioCapture`],
-//! [`heron_speech::SttBackend`], [`heron_zoom::AxBackend`],
-//! [`heron_llm::Summarizer`] — onto a
-//! single [`RecordingFsm`] driven session lifecycle.
+//! Drives one session from `idle → armed → recording → transcribing
+//! → summarizing → idle` per [`heron_types::RecordingFsm`], wiring
+//! [`heron_audio::AudioCapture`], [`heron_speech::SttBackend`],
+//! [`heron_zoom::AxBackend`], [`heron_llm::Summarizer`], and
+//! [`heron_vault::VaultWriter`] into the §4.1 data flow described in
+//! `docs/plan.md`.
 //!
-//! Until the real backends land in their respective weeks, the
-//! orchestrator's `run_no_op()` exercises every FSM transition the
-//! happy path goes through, so the test suite can guard the wiring
-//! today. When the real impls plug in, the orchestrator's `run()`
-//! will be a thin async wrapper that listens on the broadcast
-//! channels and drives the FSM off events.
+//! Two entry points are exposed:
+//!
+//! - [`Orchestrator::run_no_op`] — synchronous FSM-only walk, used by
+//!   the test suite + the `--no-op` CLI flag for environments without
+//!   TCC permissions.
+//! - [`Orchestrator::run`] — the real async pipeline.
 
 // Several fields and methods are part of the orchestrator's public
 // shape but only exercised by tests + cmd_record's smoke wiring
@@ -26,6 +28,9 @@ use heron_types::{
     IdleReason, MeetingType, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
+
+use crate::pipeline;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -43,6 +48,14 @@ pub enum SessionError {
     Vault(#[from] heron_vault::VaultError),
     #[error("m4a encode/verify failed: {0}")]
     Encode(#[from] heron_vault::EncodeError),
+    #[error("partial-jsonl writer failed: {0}")]
+    Partial(#[from] heron_speech::PartialWriterError),
+    #[error("crash-recovery state write failed: {0}")]
+    Recovery(#[from] heron_types::RecoveryError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("session pipeline aborted: {0}")]
+    Pipeline(String),
 }
 
 /// Configuration the orchestrator needs to start a session.
@@ -65,7 +78,7 @@ pub struct SessionConfig {
     pub llm_preference: heron_llm::Preference,
 }
 
-/// Outcome of `run_no_op` and (eventually) `run`.
+/// Outcome of `run_no_op` and `run`.
 #[derive(Debug)]
 pub struct SessionOutcome {
     pub final_state: RecordingState,
@@ -88,6 +101,17 @@ pub type Backends = (
 pub struct Orchestrator {
     config: SessionConfig,
     fsm: RecordingFsm,
+    /// Optional pre-built backends. When `None`, [`Orchestrator::run`]
+    /// resolves them from config via [`Orchestrator::backends`]. The
+    /// integration test path injects stub backends here so it doesn't
+    /// touch the host environment (TCC, network, ANTHROPIC_API_KEY).
+    injected: Option<Backends>,
+    /// When `true`, [`Orchestrator::run`] skips the live
+    /// `AudioCapture::start` call and assumes the caller seeded
+    /// `<cache>/sessions/<id>/{mic,tap}.wav` ahead of time. Set by
+    /// [`Orchestrator::with_test_backends`] for the integration-test
+    /// path; production CLI / Tauri callers leave it `false`.
+    skip_audio_capture: bool,
 }
 
 impl Orchestrator {
@@ -95,13 +119,39 @@ impl Orchestrator {
         Self {
             config,
             fsm: RecordingFsm::new(),
+            injected: None,
+            skip_audio_capture: false,
+        }
+    }
+
+    /// Construct an orchestrator with pre-built backends. Live audio
+    /// capture is still attempted — useful when a caller wants real
+    /// PCM but a non-default LLM (e.g., a hosted backend that needs
+    /// custom auth headers).
+    pub fn with_backends(config: SessionConfig, backends: Backends) -> Self {
+        Self {
+            config,
+            fsm: RecordingFsm::new(),
+            injected: Some(backends),
+            skip_audio_capture: false,
+        }
+    }
+
+    /// Test-only constructor: inject backends AND skip live audio
+    /// capture. Caller must seed `<cache>/sessions/<id>/{mic,tap}.wav`
+    /// before calling [`Orchestrator::run`].
+    pub fn with_test_backends(config: SessionConfig, backends: Backends) -> Self {
+        Self {
+            config,
+            fsm: RecordingFsm::new(),
+            injected: Some(backends),
+            skip_audio_capture: true,
         }
     }
 
     /// Drive the FSM through the full happy-path transitions without
     /// actually invoking any backends. Used today for testing the
-    /// wiring; real `run()` arrives once the audio pipeline is real
-    /// (week 11 per §13).
+    /// wiring; real `run()` is below.
     pub fn run_no_op(&mut self, summary: SummaryOutcome) -> Result<SessionOutcome, SessionError> {
         // idle → armed
         self.fsm.on_hotkey()?;
@@ -120,9 +170,44 @@ impl Orchestrator {
         })
     }
 
-    /// Try to start the audio capture. Returns the `NotYetImplemented`
-    /// error from the v0 stub today; real impl wires the broadcast
-    /// channels.
+    /// Real session pipeline. Drives audio capture → STT → aligner →
+    /// JSONL → m4a encode → LLM summarize → vault writer.
+    ///
+    /// `stop_rx` fires when the user releases the hotkey or the CLI
+    /// receives Ctrl-C. Any backend failure downstream of "recording"
+    /// is logged and the FSM is still walked to `idle` with the
+    /// appropriate [`IdleReason`] — partial outputs (transcript only,
+    /// no summary) are preferable to a panic that loses the session.
+    pub async fn run(
+        &mut self,
+        stop_rx: oneshot::Receiver<()>,
+    ) -> Result<SessionOutcome, SessionError> {
+        let backends = match self.injected.take() {
+            Some(b) => b,
+            None => self.backends()?,
+        };
+        // FSM walks idle → armed → recording inside `run_pipeline` so
+        // the integration-test path that injects backends still goes
+        // through the same transition guards as the live path.
+        let outcome = pipeline::run_pipeline(
+            &mut self.fsm,
+            &self.config,
+            backends,
+            stop_rx,
+            self.skip_audio_capture,
+        )
+        .await;
+        match outcome {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                tracing::error!(error = %e, "orchestrator pipeline failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Try to start the audio capture. Returns the live handle; surfaces
+    /// `AudioError::NotYetImplemented` on non-Apple builds.
     pub async fn try_start_audio(&self) -> Result<heron_audio::AudioCaptureHandle, SessionError> {
         let handle = heron_audio::AudioCapture::start(
             self.config.session_id,
@@ -137,11 +222,11 @@ impl Orchestrator {
     /// downstream code (Tauri commands, CLI subcommands) can consume
     /// them without re-deriving the selection logic.
     ///
-    /// LLM selection is driven by the new
-    /// [`heron_llm::select_summarizer`] selector — the chosen
-    /// backend + reason are emitted via `tracing::info!` so an
-    /// operator inspecting logs can tell whether the API path was
-    /// picked or a CLI fallback fired.
+    /// LLM selection is driven by the
+    /// [`heron_llm::select_summarizer`] selector — the chosen backend
+    /// + reason are emitted via `tracing::info!` so an operator
+    ///   inspecting logs can tell whether the API path was picked or a
+    ///   CLI fallback fired.
     pub fn backends(&self) -> Result<Backends, SessionError> {
         let stt = heron_speech::build_backend(&self.config.stt_backend_name)?;
         let ax = heron_zoom::select_ax_backend();
@@ -217,6 +302,10 @@ impl Orchestrator {
         }
 
         Ok(output)
+    }
+
+    pub fn config(&self) -> &SessionConfig {
+        &self.config
     }
 }
 
