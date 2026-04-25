@@ -11,6 +11,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use heron_cli::salvage::{
+    SalvageFormat, default_cache_root, exit_code as salvage_exit, print_salvage_list,
+};
 use heron_cli::session;
 use heron_cli::synthesize::{SynthOptions, synthesize_fixture};
 
@@ -53,6 +56,23 @@ enum Commands {
     /// for offline regression of the aligner / STT / partial writer
     /// without committing real recordings to the repo.
     Synthesize(SynthesizeArgs),
+    /// List unfinished sessions in the cache root (per §14.3 crash
+    /// recovery). Exits 3 when any are found, 0 when clean, 2 on IO
+    /// errors so a launch script can branch on the code without
+    /// parsing stdout.
+    Salvage(SalvageArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SalvageArgs {
+    /// Cache root to walk. Defaults to the platform path under
+    /// Application Support.
+    #[arg(long)]
+    cache_root: Option<PathBuf>,
+    /// Output format: `human` (default) or `json` (one record per
+    /// line, machine-parsable for the Tauri shell).
+    #[arg(long, value_enum, default_value_t = SalvageFormat::Human)]
+    format: SalvageFormat,
 }
 
 #[derive(Debug, clap::Args)]
@@ -189,16 +209,56 @@ mod duration {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
     install_tracing(cli.verbose);
 
-    match cli.command {
-        Commands::Record(args) => cmd_record(args, cli.vault),
-        Commands::Summarize(args) => cmd_summarize(args, cli.vault),
-        Commands::Status => cmd_status(cli.vault),
+    let exit = match cli.command {
+        // Salvage uses bespoke exit codes per §14.3; the others
+        // collapse to anyhow's default 0/1.
+        Commands::Salvage(args) => cmd_salvage(args),
+        cmd => match dispatch(cmd, cli.vault) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        },
+    };
+    std::process::exit(exit);
+}
+
+fn dispatch(cmd: Commands, vault: Option<PathBuf>) -> Result<()> {
+    match cmd {
+        Commands::Record(args) => cmd_record(args, vault),
+        Commands::Summarize(args) => cmd_summarize(args, vault),
+        Commands::Status => cmd_status(vault),
         Commands::VerifyM4a(args) => cmd_verify_m4a(args),
         Commands::Synthesize(args) => cmd_synthesize(args),
+        // Handled by `main` directly so it can pick its own exit
+        // code; this arm is unreachable but keeps the match
+        // exhaustive without a wildcard.
+        Commands::Salvage(_) => unreachable!("salvage handled in main"),
+    }
+}
+
+fn cmd_salvage(args: SalvageArgs) -> i32 {
+    let root = args.cache_root.unwrap_or_else(default_cache_root);
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    match print_salvage_list(&mut handle, &root, args.format) {
+        Ok(0) => salvage_exit::CLEAN,
+        Ok(_) => salvage_exit::HAS_CANDIDATES,
+        Err(e) => {
+            // `{e:#}` walks the source chain so the user sees the
+            // actual IO cause (e.g. permission denied), not just the
+            // outer "walking cache root failed" wrapper.
+            eprintln!("salvage: {e:#}");
+            // Surface the source via tracing too — heron-doctor
+            // tails this for anomalies.
+            tracing::warn!(error = %e, "salvage walk failed");
+            salvage_exit::IO_ERROR
+        }
     }
 }
 
