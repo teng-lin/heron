@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+pub mod fallback;
+pub use fallback::{
+    BargeInStrategy, CancelStrategy, StrategyPlan, TextDeltaStrategy, ToolResultStrategy,
+    plan as plan_strategies,
+};
 pub use heron_types::prefixed_id::IdParseError;
 
 heron_types::prefixed_id! {
