@@ -14,6 +14,13 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Lock-free single-producer single-consumer ringbuffer used by the
+# Core Audio IO callback (realtime thread, no allocations / no locks)
+# to hand frames to a Tokio consumer task that broadcasts them out.
+# Pure Rust, cross-platform; only the macOS process-tap path actually
+# pushes into it today, but the dep is unconditional so non-macOS
+# builds compile the consumer-side surface unchanged.
+rtrb = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
