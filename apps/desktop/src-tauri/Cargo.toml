@@ -31,10 +31,27 @@ heron-types = { workspace = true }
 # device + cfg-gated cidre process tap symbols) instead of the v0
 # hardcode. The probe is sub-millisecond on macOS and returns `false`
 # unconditionally off-Apple — see `crates/heron-audio/src/lib.rs`.
+#
+# Onboarding probes (`onboarding.rs`) reuse `heron-audio` plus call into
+# `heron-zoom`, `heron-vault`, and `heron-speech` to exercise the real
+# mic / system-audio / Accessibility / Calendar / WhisperKit-model
+# paths instead of returning hardcoded `Skipped`.
 heron-audio = { workspace = true }
+heron-zoom = { workspace = true }
+heron-vault = { workspace = true }
+# Probes that hit TCC (mic, calendar) need `spawn_blocking`, and the
+# tap probe is async — pull `tokio` in for the shared runtime. The
+# `rt` + `time` features are the minimum the probes need (timeout +
+# blocking pool); the desktop binary itself runs on Tauri's own loop.
+tokio = { workspace = true }
+# Calendar probe builds a `[start, end)` window via `chrono` and
+# threads it through `heron_vault::calendar::calendar_read_one_shot`.
+chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true }
 
 [lints]
 workspace = true

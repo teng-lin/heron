@@ -1824,15 +1824,20 @@ dependencies = [
 name = "heron-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "heron-audio",
  "heron-types",
+ "heron-vault",
+ "heron-zoom",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -25,8 +25,9 @@ use serde::Serialize;
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
 pub use onboarding::{
-    TestOutcome, test_accessibility, test_audio_tap, test_calendar, test_microphone,
-    test_model_download,
+    TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
+    test_audio_tap_async, test_calendar, test_calendar_async, test_microphone,
+    test_microphone_async, test_model_download,
 };
 
 // Tauri's command-handler macro requires the function names it
@@ -127,9 +128,17 @@ fn heron_test_calendar() -> TestOutcome {
 }
 
 /// Tauri command: §13.3 step 5 model-download Test button.
+///
+/// The probe takes no arguments — it inspects
+/// `HERON_WHISPERKIT_MODEL_DIR` (the same env var the orchestrator
+/// reads via `WhisperKitBackend::from_env`) to answer "is a usable
+/// model already on disk?". The earlier draft accepted a `progress:
+/// f32` from the renderer, which inverted the trust direction (only
+/// the model folder authoritatively knows whether the bundle is
+/// complete) and turned the test into a pure function of its input.
 #[tauri::command]
-fn heron_test_model_download(progress: f32) -> TestOutcome {
-    test_model_download(progress)
+fn heron_test_model_download() -> TestOutcome {
+    test_model_download()
 }
 
 /// Default settings location.
