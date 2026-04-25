@@ -298,28 +298,19 @@ public func ax_poll(_ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) 
     queueLock.unlock()
 
     let payload = next ?? ""
-    let utf8 = payload.utf8
-    let count = utf8.count
-    guard let buf = malloc(count + 1)?.assumingMemoryBound(to: CChar.self) else {
-        out.pointee = nil
-        return AX_INTERNAL
+    // `withCString` hands us a NUL-terminated buffer the runtime owns
+    // for the duration of the closure. We `memcpy` it into a malloc'd
+    // buffer the Rust side will free via `ax_free_string`.
+    return payload.withCString { src -> Int32 in
+        let count = strlen(src)
+        guard let buf = malloc(count + 1)?.assumingMemoryBound(to: CChar.self) else {
+            out.pointee = nil
+            return AX_INTERNAL
+        }
+        memcpy(buf, src, count + 1) // includes the trailing NUL
+        out.pointee = buf
+        return AX_OK
     }
-    if count > 0 {
-        utf8.withContiguousStorageIfAvailable { src in
-            _ = memcpy(buf, src.baseAddress, count)
-        } ?? {
-            // Fallback for platforms where utf8 doesn't expose
-            // contiguous storage. Copy byte-by-byte.
-            var i = 0
-            for b in utf8 {
-                buf[i] = CChar(bitPattern: b)
-                i += 1
-            }
-        }()
-    }
-    buf[count] = 0
-    out.pointee = buf
-    return AX_OK
 }
 
 @_cdecl("ax_release_observer")

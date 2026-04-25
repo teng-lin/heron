@@ -14,6 +14,8 @@
 
 use async_trait::async_trait;
 use heron_types::{Event, SessionClock, SessionId, SpeakerEvent};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -73,20 +75,59 @@ impl From<AxBridgeError> for AxError {
 /// Live handle returned by [`AxBackend::start`]. Drop or `stop()` to
 /// halt the AX listener; both broadcast channels close on drop.
 pub struct AxHandle {
-    /// Backend-side `JoinHandle`-equivalent the orchestrator awaits
-    /// to know when the AX listener has actually torn down. Stub
-    /// keeps the field for shape-stability; week-7 wiring fills it
-    /// in with a `tokio::task::JoinHandle`.
-    _stop: Option<tokio::task::JoinHandle<()>>,
+    /// JoinHandle for the spawn_blocking polling worker. `None` only
+    /// in unit tests that exercise the stop() shape without a live
+    /// observer.
+    worker: Option<tokio::task::JoinHandle<()>>,
+    /// Cooperative shutdown signal. `stop()` flips this; the worker
+    /// checks it each iteration so it can exit promptly even when
+    /// `ax_poll` is steadily returning `Ok(None)` (i.e. the receiver
+    /// is alive but no events are flowing).
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl AxHandle {
-    pub async fn stop(self) -> Result<(), AxError> {
-        if let Some(h) = self._stop {
-            h.abort();
+    pub async fn stop(mut self) -> Result<(), AxError> {
+        // 1. Tell the worker to bail on its next iteration.
+        self.stop_flag.store(true, Ordering::Release);
+
+        // 2. Tear down the Swift observer so any in-flight `ax_poll`
+        //    returns promptly. `ax_release` is idempotent and the
+        //    polling-loop's own teardown is too, so a double release
+        //    is fine.
+        let _ = tokio::task::spawn_blocking(ax_release).await;
+
+        // 3. Wait for the worker to actually exit so the caller knows
+        //    no more events will be sent on `out`. Take the worker
+        //    out of `self` so `Drop` (which still runs after `stop`)
+        //    has nothing left to do.
+        if let Some(h) = self.worker.take() {
             let _ = h.await;
         }
         Ok(())
+    }
+}
+
+/// Best-effort teardown if the caller forgets to `stop().await`. The
+/// worker thread cannot be awaited synchronously, but we can still
+/// flip the stop flag + tell Swift to release so the worker's next
+/// iteration exits and the underlying CFRunLoop unwinds. Prefer
+/// `stop().await` whenever possible — Drop here is a safety net, not
+/// the primary path.
+impl Drop for AxHandle {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if self.worker.is_some() {
+            // Best-effort, synchronous Swift teardown. We cannot await
+            // the worker from a Drop impl, but the worker will see
+            // `stop_flag` on its next iteration and exit on its own.
+            if let Err(e) = ax_release() {
+                tracing::warn!(
+                    error = %e,
+                    "heron-zoom: ax_release failed during AxHandle::drop teardown",
+                );
+            }
+        }
     }
 }
 
@@ -150,15 +191,21 @@ impl AxBackend for AxObserverBackend {
         // Step 2: spawn the polling task that drains the Swift queue
         // and forwards parsed `SpeakerEvent`s to `out`. The task
         // owns the responsibility of calling `ax_release` when it
-        // exits — whether that's via `JoinHandle::abort` (handled by
-        // catching the abort error in the loop) or `out` closing
-        // (we send-error and break the loop).
+        // exits — whether that's via the `stop_flag` (set by
+        // `AxHandle::stop`), `out` closing (send-error breaks the
+        // loop), or `ax_poll` itself returning an error.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop_flag = Arc::clone(&stop_flag);
         let handle = tokio::task::spawn_blocking(move || {
-            // Polling loop. Each pass: try `ax_poll`. On a `Some`,
-            // parse + send. On `None`, sleep. On error, log + exit
-            // (the orchestrator surfaces the AttributionDegraded
-            // event; our job is just to bail cleanly).
+            // Polling loop. Each pass: check `stop_flag`, try
+            // `ax_poll`. On a `Some`, parse + send. On `None`, sleep.
+            // On error, log + exit (the orchestrator surfaces the
+            // AttributionDegraded event; our job is just to bail
+            // cleanly).
             loop {
+                if worker_stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 match ax_poll() {
                     Ok(Some(line)) => match serde_json::from_str::<SpeakerEvent>(&line) {
                         Ok(ev) => {
@@ -202,7 +249,8 @@ impl AxBackend for AxObserverBackend {
         });
 
         Ok(AxHandle {
-            _stop: Some(handle),
+            worker: Some(handle),
+            stop_flag,
         })
     }
     fn name(&self) -> &'static str {
@@ -322,7 +370,31 @@ mod tests {
         // The stub AxHandle has no inner task. stop() should
         // still complete cleanly so callers don't have to special-
         // case the v0 phase.
-        let handle = AxHandle { _stop: None };
+        let handle = AxHandle {
+            worker: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+        };
         handle.stop().await.expect("stop");
+    }
+
+    #[test]
+    fn ax_handle_drop_flips_stop_flag() {
+        // Drop is the safety-net path when callers forget to await
+        // `stop()`. It must at minimum signal the worker to exit so
+        // the polling loop tears down on its own. We assert the
+        // observable side-effect: `stop_flag` is true after drop.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let observer = Arc::clone(&stop_flag);
+        {
+            let _handle = AxHandle {
+                worker: None, // skip the real Swift teardown branch
+                stop_flag,
+            };
+            assert!(!observer.load(Ordering::Acquire));
+        }
+        assert!(
+            observer.load(Ordering::Acquire),
+            "Drop must flip the stop flag so the polling worker exits"
+        );
     }
 }
