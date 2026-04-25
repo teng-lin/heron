@@ -30,6 +30,12 @@ jobs:
       - name: cargo registry + target cache
         uses: Swatinem/rust-cache@v2
 
+      # WhisperKit's transitive swift-jinja requires swift-tools-version 6.0+,
+      # which means Xcode 16+. macos-14's default is Xcode 15.4 (Swift 5.10);
+      # 16.2 is preinstalled on the runner image, just not selected by default.
+      - name: select Xcode 16 (Swift 6 toolchain)
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
