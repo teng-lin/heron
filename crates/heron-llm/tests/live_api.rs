@@ -153,7 +153,9 @@ async fn live_anthropic_summarize_returns_non_empty() {
         .filter(|s| !s.is_empty())
         .is_none()
     {
-        eprintln!("skipped: ANTHROPIC_API_KEY unset; export it to exercise the live Anthropic path");
+        eprintln!(
+            "skipped: ANTHROPIC_API_KEY unset; export it to exercise the live Anthropic path"
+        );
         return;
     }
     let (_dir, transcript) = write_fixture_transcript();
