@@ -15,6 +15,7 @@
 
 pub mod asset_protocol;
 pub mod diagnostics;
+pub mod disk;
 pub mod keychain;
 pub mod notes;
 pub mod onboarding;
@@ -27,9 +28,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
+pub use disk::{DiskError, DiskUsage, disk_usage, purge_audio_older_than};
 pub use onboarding::{
     TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
     test_audio_tap_async, test_calendar, test_calendar_async, test_microphone,
@@ -193,6 +196,111 @@ fn heron_default_cache_root() -> String {
     default_cache_root().to_string_lossy().into_owned()
 }
 
+/// Phase 68 (PR-ζ): event name fired on the main webview when the
+/// global hotkey triggers. The Rust handler logs + emits this; real
+/// Start/Stop wiring lands in a future phase.
+const EVENT_HOTKEY_FIRED: &str = "hotkey:fired";
+
+/// Tauri command: register `combo` as the system-wide Start/Stop
+/// Recording hotkey.
+///
+/// On success the chord is held by this app until
+/// [`heron_unregister_hotkey`] runs (or the app exits). On failure the
+/// returned `String` carries a human-facing reason — usually "another
+/// app already owns this chord". The frontend renders the message
+/// verbatim under the input.
+///
+/// The handler is intentionally a stub for PR-ζ: it logs `"hotkey
+/// fired"` and emits the [`EVENT_HOTKEY_FIRED`] event so a future
+/// recording-wiring PR can replace the body with a real FSM
+/// transition without touching the registration plumbing.
+#[tauri::command]
+fn heron_register_hotkey(app: tauri::AppHandle, combo: String) -> Result<(), String> {
+    let manager = app.global_shortcut();
+    // Idempotent re-register: if the user clicks Save twice with the
+    // same chord, the second `register()` would error with "already
+    // registered". Treat the in-app re-register as a no-op rather than
+    // surfacing an error the user can't act on.
+    if manager.is_registered(combo.as_str()) {
+        return Ok(());
+    }
+    manager
+        .register(combo.as_str())
+        .map_err(|e| e.to_string())?;
+    // The plugin's per-shortcut handler isn't bound here — we register
+    // a global handler at plugin-build time (see `run`) that fires for
+    // every chord. That sidesteps the lifetime gymnastics of holding
+    // an `AppHandle` inside a `'static` closure passed to
+    // `on_shortcut`.
+    Ok(())
+}
+
+/// Tauri command: probe whether `combo` would conflict with an
+/// existing system-wide hotkey.
+///
+/// Returns `Ok(true)` if the chord is free (heron can register it),
+/// `Ok(false)` if another app or the OS already owns it. The
+/// underlying plugin's `is_registered` only reports per-app state, so
+/// we attempt the OS-level register + immediately unregister to read
+/// the platform's answer. This is the same pattern Electron's
+/// `globalShortcut.isRegistered` uses internally on macOS.
+///
+/// Note: a hotkey we already own ourselves returns `true` (free),
+/// since re-registering it from this app is a no-op.
+#[tauri::command]
+fn heron_check_hotkey(app: tauri::AppHandle, combo: String) -> Result<bool, String> {
+    let manager = app.global_shortcut();
+    if manager.is_registered(combo.as_str()) {
+        // Already owned by us — `register()` would no-op, so the chord
+        // is effectively "free for heron".
+        return Ok(true);
+    }
+    match manager.register(combo.as_str()) {
+        Ok(()) => {
+            // Free — release immediately so the caller's "Save" path
+            // is the canonical owner. Errors here are unexpected
+            // (we just registered it) and surface as the same wire
+            // error so a regression in the plugin can't go silent.
+            manager
+                .unregister(combo.as_str())
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Tauri command: release a previously-registered hotkey.
+///
+/// Tolerant of "not registered" — the Settings pane calls this with
+/// the *previous* combo before re-registering the new one, and the
+/// previous combo may have failed to register at startup (e.g. user
+/// changed mind without saving). Surfacing that as an error would
+/// block the user from saving the new chord.
+#[tauri::command]
+fn heron_unregister_hotkey(app: tauri::AppHandle, combo: String) -> Result<(), String> {
+    let manager = app.global_shortcut();
+    if !manager.is_registered(combo.as_str()) {
+        return Ok(());
+    }
+    manager
+        .unregister(combo.as_str())
+        .map_err(|e| e.to_string())
+}
+
+/// Tauri command: vault disk-usage gauge for the Audio tab.
+#[tauri::command]
+fn heron_disk_usage(vault_path: String) -> Result<DiskUsage, String> {
+    disk_usage(Path::new(&vault_path)).map_err(|e| e.to_string())
+}
+
+/// Tauri command: purge `.wav` / `.m4a` audio sidecars older than
+/// `days` days. Returns the count actually deleted.
+#[tauri::command]
+fn heron_purge_audio_older_than(vault_path: String, days: u32) -> Result<u32, String> {
+    purge_audio_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
+}
+
 /// Tauri command: §13.3 step 1 microphone Test button.
 #[tauri::command]
 fn heron_test_microphone() -> TestOutcome {
@@ -331,6 +439,37 @@ fn heron_keychain_list() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Register the user's saved hotkey at app startup so the chord works
+/// from anywhere in macOS without first opening the Settings pane.
+///
+/// Reads `default_settings_path()` and consults the `record_hotkey`
+/// field; an empty string short-circuits ("hotkey disabled"). Any
+/// failure is logged and swallowed — the app should still launch even
+/// if the user's saved chord conflicts with another app, since the
+/// Settings pane is the user's recovery path.
+fn register_startup_hotkey(app: &tauri::AppHandle) {
+    let path = default_settings_path();
+    let Ok(settings) = read_settings(&path) else {
+        // Corrupt/missing settings is the first-run state — fall
+        // through silently. The Settings pane's own load path will
+        // surface the error if it persists.
+        return;
+    };
+    if settings.record_hotkey.is_empty() {
+        return;
+    }
+    if let Err(e) = app
+        .global_shortcut()
+        .register(settings.record_hotkey.as_str())
+    {
+        tracing::warn!(
+            "could not register saved hotkey {:?}: {}",
+            settings.record_hotkey,
+            e
+        );
+    }
+}
+
 /// Default settings location.
 ///
 /// Resolves via [`dirs::config_dir`] so the path is correct on every
@@ -381,6 +520,25 @@ pub fn run() {
         // surface the native folder picker. Registering the plugin
         // here wires up the IPC handler the JS bridge talks to.
         .plugin(tauri_plugin_dialog::init())
+        // Phase 68 (PR-ζ): system-wide Start/Stop Recording hotkey.
+        // The `with_handler` closure fires for *every* chord this app
+        // registers — we currently only register one (the user's
+        // Settings pane choice), so the handler can unconditionally
+        // log + emit. Real recording wiring lands in a future phase.
+        // The `Pressed` filter avoids a duplicate fire on key-release.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        tracing::info!("hotkey fired");
+                        // Best-effort emit; a missing main window
+                        // (e.g. during shutdown) drops the event
+                        // rather than panicking.
+                        let _ = app.emit(EVENT_HOTKEY_FIRED, ());
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             // Phase 64: install the menubar tray. The tray's polling
             // task lives on the Tauri async runtime, so it shuts down
@@ -390,6 +548,13 @@ pub fn run() {
             // it: a missing tray on macOS is a regression worth
             // surfacing in CI logs, not silently degrading.
             tray::install(app.handle())?;
+            // Phase 68 (PR-ζ): register the saved hotkey at app
+            // startup so the chord is live the moment the app
+            // launches — not only when the user opens Settings →
+            // Hotkey tab. Failures (e.g. another app already owns the
+            // chord) are logged but don't block launch; the user can
+            // pick a different chord in Settings without re-launching.
+            register_startup_hotkey(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -423,6 +588,12 @@ pub fn run() {
             salvage::heron_recover_session,
             salvage::heron_purge_session,
             tray::heron_last_note_session_id,
+            // Phase 68 (PR-ζ) — Settings pane Hotkey + Audio tabs.
+            heron_register_hotkey,
+            heron_check_hotkey,
+            heron_unregister_hotkey,
+            heron_disk_usage,
+            heron_purge_audio_older_than,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");

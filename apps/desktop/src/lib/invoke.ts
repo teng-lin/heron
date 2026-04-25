@@ -87,6 +87,22 @@ export interface Settings {
   min_free_disk_mib: number;
   session_logging: boolean;
   crash_telemetry: boolean;
+  /**
+   * PR-ζ (phase 68). `null` means "keep all" — the backend's
+   * `Option<u32>` deserializes `None` as `null` over the IPC bridge.
+   * The Audio tab radio binds to this directly: `null` → "Keep all",
+   * `42` → "Purge audio older than 42 days".
+   */
+  audio_retention_days: number | null;
+}
+
+/**
+ * Wire shape returned by `heron_disk_usage`. Mirrors the Rust
+ * `DiskUsage` struct in `apps/desktop/src-tauri/src/disk.rs`.
+ */
+export interface DiskUsage {
+  vault_bytes: number;
+  vault_session_count: number;
 }
 
 /**
@@ -334,6 +350,44 @@ export interface HeronCommands {
   heron_last_note_session_id: {
     args: Record<string, never>;
     returns: string | null;
+  };
+  /**
+   * Phase 68 (PR-ζ): register the system-wide Start/Stop Recording
+   * hotkey. Errors carry a human-facing reason ("another app already
+   * owns this chord"); the Settings pane surfaces them inline.
+   */
+  heron_register_hotkey: {
+    args: { combo: string };
+    returns: void;
+  };
+  /**
+   * Phase 68 (PR-ζ): probe whether `combo` would conflict with an
+   * existing system-wide hotkey. `true` means "free to register".
+   */
+  heron_check_hotkey: {
+    args: { combo: string };
+    returns: boolean;
+  };
+  /** Phase 68 (PR-ζ): release a previously-registered hotkey. */
+  heron_unregister_hotkey: {
+    args: { combo: string };
+    returns: void;
+  };
+  /**
+   * Phase 68 (PR-ζ): vault disk-usage gauge for the Audio tab.
+   * Returns total bytes + session count at the vault root.
+   */
+  heron_disk_usage: {
+    args: { vaultPath: string };
+    returns: DiskUsage;
+  };
+  /**
+   * Phase 68 (PR-ζ): purge `.wav` / `.m4a` audio sidecars whose mtime
+   * is older than `days`. Returns the count actually deleted.
+   */
+  heron_purge_audio_older_than: {
+    args: { vaultPath: string; days: number };
+    returns: number;
   };
 }
 

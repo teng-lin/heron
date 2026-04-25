@@ -14,12 +14,20 @@
  * crowd an explicit commit. Both paths route through `save()` which
  * coalesces in-flight writes.
  *
+ * Phase 68 (PR-ζ) extensions:
+ *   - Hotkey tab — adds a "Test" button + auto-register-on-save flow
+ *     calling `heron_register_hotkey` / `heron_check_hotkey` /
+ *     `heron_unregister_hotkey`.
+ *   - Audio tab — disk-space gauge via `heron_disk_usage`, retention
+ *     radio + "Purge now" via `heron_purge_audio_older_than`.
+ *   - About tab — enables "View licenses…" → opens a Radix Dialog
+ *     rendering the bundled `THIRD_PARTY_NOTICES.md` via
+ *     `react-markdown`.
+ *
  * Out of scope for this PR (deliberately):
- * - Keychain plumbing for the API-key field (placeholder + disclaimer).
- * - "Purge audio older than N days" implementation (Audio tab).
- * - Disk-space gauge (Audio tab).
- * - Hotkey conflict detection (Hotkey tab).
- * - License-viewer modal (About tab "view licenses…" button is a no-op).
+ * - Keychain plumbing for the API-key field (PR-θ / phase 70).
+ * - Real Start/Stop wiring on hotkey trigger — for now the handler
+ *   logs + emits `hotkey:fired` for the frontend to react to.
  *
  * The five onboarding probes are wired to `<TestStatus>`; this PR
  * surfaces the Calendar probe only — the rest land with the
@@ -31,9 +39,28 @@ import { Link } from "react-router-dom";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as Dialog from "@radix-ui/react-dialog";
 import { CheckCircle2, Circle, Loader2 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
 import { toast } from "sonner";
 
+// Vite's `?raw` import (declared via `vite/client` reference in
+// `vite-env.d.ts`) inlines the file as a string at build time. We bundle
+// the notices once rather than reading from disk because the Tauri
+// app's `frontendDist` may live anywhere on disk relative to the user's
+// vault — relying on the renderer's filesystem access here would
+// require a fs:read permission we don't otherwise need.
+//
+// `eslint-disable-next-line` is unnecessary because the project doesn't
+// run eslint, but the import path looks unconventional — that's the
+// Vite ?raw suffix, which TypeScript's `vite/client` types declare.
+import licenseNotices from "../../THIRD_PARTY_NOTICES.md?raw";
+
 import { Button } from "../components/ui/button";
+import {
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "../components/ui/dialog";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import {
@@ -46,7 +73,12 @@ import {
 import { Switch } from "../components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { TestStatus } from "../components/TestStatus";
-import { invoke, type KeychainAccount, type TestOutcome } from "../lib/invoke";
+import {
+  invoke,
+  type DiskUsage,
+  type KeychainAccount,
+  type TestOutcome,
+} from "../lib/invoke";
 import { useSettingsStore } from "../store/settings";
 
 /** Debounce window (ms) for auto-save after the last `update()` call. */
@@ -322,22 +354,282 @@ function GeneralTab() {
   );
 }
 
+/**
+ * Default retention window when the user flips the radio to "purge"
+ * without typing a number. 30 days is the §16.1 brief's example
+ * value — a month of audio retention is the median ask from the
+ * design-partner interviews documented in `docs/scope-fixes.md`.
+ */
+const DEFAULT_RETENTION_DAYS = 30;
+
+/** How often we re-poll the disk-usage gauge while the Audio tab is open. */
+const DISK_USAGE_POLL_MS = 5000;
+
+/**
+ * Humanize a byte count for the disk-usage gauge. SI units (1000-step),
+ * not IEC, so the displayed number matches what macOS Finder reports.
+ * Returns e.g. `"1.4 GB"` / `"38 MB"` / `"512 B"`.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1000) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"] as const;
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1000;
+    unit += 1;
+  } while (value >= 1000 && unit < units.length - 1);
+  // One decimal for KB/MB/GB; bytes <1000 already returned above.
+  // `toFixed(1)` keeps the trailing `.0` so "1.0 GB" doesn't visually
+  // jitter into "1 GB" between polls.
+  return `${value.toFixed(1)} ${units[unit] ?? "TB"}`;
+}
+
 function AudioTab() {
   const settings = useSettingsStore((s) => s.settings);
   const update = useSettingsStore((s) => s.update);
+  const [usage, setUsage] = useState<DiskUsage | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [purging, setPurging] = useState(false);
+  const [confirmingPurge, setConfirmingPurge] = useState(false);
+  // The number input shows `retentionDraft` while the radio is on
+  // "Keep all" (so flipping to "purge" picks up the user's last
+  // typed value); when the radio is on "purge" the draft is the
+  // canonical source — every keystroke re-saves via `update()`.
+  // Seeded from the loaded settings so a returning user sees their
+  // saved value, not a hardcoded default.
+  const [retentionDraft, setRetentionDraft] = useState<number>(
+    settings?.audio_retention_days ?? DEFAULT_RETENTION_DAYS,
+  );
+
+  // Re-poll disk usage on tab focus + periodic refresh while open. The
+  // poll is cheap (single non-recursive `read_dir`) and lets the gauge
+  // reflect a `Purge now` outcome without forcing a manual refresh.
+  // The vault path is captured at effect-setup time so subsequent
+  // edits to other Settings fields (which re-render the component but
+  // don't change `vault_root`) don't churn the polling timer.
+  const vaultRoot = settings?.vault_root ?? "";
+  useEffect(() => {
+    if (vaultRoot === "") {
+      setUsage(null);
+      setUsageError(null);
+      return;
+    }
+    let cancelled = false;
+    async function refresh() {
+      try {
+        const result = await invoke("heron_disk_usage", {
+          vaultPath: vaultRoot,
+        });
+        if (!cancelled) {
+          setUsage(result);
+          setUsageError(null);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!cancelled) {
+          setUsage(null);
+          setUsageError(message);
+        }
+      }
+    }
+    void refresh();
+    const handle = setInterval(() => void refresh(), DISK_USAGE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [vaultRoot]);
 
   if (settings === null) return null;
+
+  const purgeMode = settings.audio_retention_days === null ? "keep_all" : "purge";
+
+  function setKeepAll() {
+    update({ audio_retention_days: null });
+  }
+
+  function setPurgeMode() {
+    update({ audio_retention_days: retentionDraft });
+  }
+
+  async function runPurge() {
+    setConfirmingPurge(false);
+    if (settings === null) return;
+    if (settings.vault_root === "") {
+      toast.error("Pick a vault path on the General tab first.");
+      return;
+    }
+    const days = settings.audio_retention_days ?? retentionDraft;
+    setPurging(true);
+    try {
+      const count = await invoke("heron_purge_audio_older_than", {
+        vaultPath: settings.vault_root,
+        days,
+      });
+      toast.success(
+        count === 0
+          ? "Nothing to purge — no audio older than the threshold."
+          : `Purged ${count} audio file${count === 1 ? "" : "s"}.`,
+      );
+      // Re-poll so the gauge reflects the deletion immediately rather
+      // than waiting for the next interval tick.
+      try {
+        const next = await invoke("heron_disk_usage", {
+          vaultPath: settings.vault_root,
+        });
+        setUsage(next);
+      } catch {
+        // Gauge refresh failure is non-fatal — the next poll will retry.
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Purge failed: ${message}`);
+    } finally {
+      setPurging(false);
+    }
+  }
 
   return (
     <section className="space-y-6">
       <h2 className="text-lg font-medium">Audio</h2>
 
-      <p className="text-sm text-muted-foreground">
-        Audio retention controls (purge older than N days, disk-space
-        gauge) ship with week 12 polish.
-      </p>
+      <div className="rounded-md border border-border p-4 space-y-1">
+        <div className="text-sm font-medium">Disk usage</div>
+        {settings.vault_root === "" ? (
+          <p className="text-xs text-muted-foreground">
+            Pick a vault path on the General tab to see disk usage.
+          </p>
+        ) : usageError !== null ? (
+          <p className="text-xs text-destructive">{usageError}</p>
+        ) : usage === null ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : (
+          <p className="text-sm">
+            {formatBytes(usage.vault_bytes)} across{" "}
+            {usage.vault_session_count} session
+            {usage.vault_session_count === 1 ? "" : "s"}
+          </p>
+        )}
+      </div>
 
-      <div className="space-y-2">
+      <fieldset className="space-y-3">
+        <legend className="text-sm font-medium">Audio retention</legend>
+        <label className="flex items-start gap-2 text-sm cursor-pointer">
+          <input
+            type="radio"
+            name="retention"
+            checked={purgeMode === "keep_all"}
+            onChange={setKeepAll}
+            className="mt-1 h-4 w-4 accent-primary"
+          />
+          <div>
+            <div>Keep all audio</div>
+            <div className="text-xs text-muted-foreground">
+              `.wav` and `.m4a` files stay next to each session's `.md`
+              forever. Choose this if you re-process recordings.
+            </div>
+          </div>
+        </label>
+
+        <label className="flex items-start gap-2 text-sm cursor-pointer">
+          <input
+            type="radio"
+            name="retention"
+            checked={purgeMode === "purge"}
+            onChange={setPurgeMode}
+            className="mt-1 h-4 w-4 accent-primary"
+          />
+          <div className="space-y-2">
+            <div>
+              Purge audio older than{" "}
+              <Input
+                type="number"
+                min={1}
+                max={3650}
+                value={retentionDraft}
+                onChange={(e) => {
+                  const raw = e.target.valueAsNumber;
+                  const next = Number.isNaN(raw)
+                    ? DEFAULT_RETENTION_DAYS
+                    : Math.max(1, Math.floor(raw));
+                  setRetentionDraft(next);
+                  if (purgeMode === "purge") {
+                    update({ audio_retention_days: next });
+                  }
+                }}
+                className="inline-block w-20 mx-1 align-middle"
+              />{" "}
+              days, keep transcript + .md
+            </div>
+            <div className="text-xs text-muted-foreground">
+              The `.md` summary and the transcript inside it are
+              **never** purged — only the audio sidecars.
+            </div>
+          </div>
+        </label>
+      </fieldset>
+
+      <div>
+        <Button
+          variant="outline"
+          onClick={() => setConfirmingPurge(true)}
+          disabled={
+            purging ||
+            settings.vault_root === "" ||
+            settings.audio_retention_days === null
+          }
+        >
+          {purging ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              Purging…
+            </>
+          ) : (
+            "Purge now"
+          )}
+        </Button>
+        {settings.audio_retention_days === null && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Switch retention to "purge older than" first to enable
+            on-demand purge.
+          </p>
+        )}
+      </div>
+
+      <Dialog.Root open={confirmingPurge} onOpenChange={setConfirmingPurge}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Purge audio sidecars?</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm">
+            Delete `.wav` and `.m4a` files older than{" "}
+            <strong>
+              {settings.audio_retention_days ?? retentionDraft} days
+            </strong>{" "}
+            in <code className="font-mono">{settings.vault_root}</code>?
+            The transcript and `.md` summary stay.
+          </p>
+          <div className="flex justify-end gap-2 mt-2">
+            <Button
+              variant="outline"
+              onClick={() => setConfirmingPurge(false)}
+              disabled={purging}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void runPurge()}
+              disabled={purging}
+            >
+              Purge
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog.Root>
+
+      <div className="space-y-2 pt-4 border-t border-border">
         <Label htmlFor="remind-interval">Disclosure-banner reminder (seconds)</Label>
         <Input
           id="remind-interval"
@@ -526,11 +818,79 @@ function SummarizerTab() {
   );
 }
 
+/**
+ * Result of `heron_check_hotkey` rendered next to the Test button.
+ * Tri-state because a fresh tab visit shouldn't show stale "free" /
+ * "conflict" copy from the previous chord.
+ */
+type ConflictState = "unknown" | "free" | "conflict" | "checking";
+
 function HotkeyTab() {
   const settings = useSettingsStore((s) => s.settings);
   const update = useSettingsStore((s) => s.update);
   const [capturing, setCapturing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const [conflict, setConflict] = useState<ConflictState>("unknown");
+  // Track the chord that was *registered with the OS* so a save that
+  // changes the chord can call `heron_unregister_hotkey(oldCombo)`
+  // before registering the new one. We seed this with `null`; the
+  // first effect run picks up whatever was registered at app startup
+  // (lib.rs::register_startup_hotkey) — `heron_register_hotkey` is
+  // idempotent, so the redundant call is harmless.
+  const registeredComboRef = useRef<string | null>(null);
+  // Monotonic counter so concurrent sync runs (rapid hotkey edits
+  // before the previous async register resolves) don't race each
+  // other. See the effect's "generation counter" comment.
+  const hotkeySyncGenRef = useRef<number>(0);
+
+  // On mount + on every saved-chord change, sync the OS-level
+  // registration to match. The dependency list watches
+  // `settings.record_hotkey`: the autosave path persists each edit,
+  // and we re-register here whenever the saved combo changes.
+  //
+  // ## Why a generation counter, not just `cancelled`
+  //
+  // Rapid hotkey edits (capture-then-edit-again before the first
+  // async register resolves) would otherwise race: effect-A's
+  // unregister call would observe `registeredComboRef` still pointing
+  // at the pre-A combo, and effect-A's late `ref = A` write could
+  // overwrite effect-B's `ref = B`. The `gen` counter pins each
+  // effect run to a snapshot of the run number; only the latest
+  // generation is allowed to mutate the ref or surface a toast.
+  useEffect(() => {
+    if (settings === null) return;
+    const next = settings.record_hotkey;
+    if (next === "") return;
+    if (registeredComboRef.current === next) return;
+
+    const myGen = ++hotkeySyncGenRef.current;
+    let cancelled = false;
+    const previousCombo = registeredComboRef.current;
+
+    async function syncRegistration() {
+      try {
+        if (previousCombo !== null) {
+          await invoke("heron_unregister_hotkey", { combo: previousCombo });
+        }
+        await invoke("heron_register_hotkey", { combo: next });
+        if (cancelled || hotkeySyncGenRef.current !== myGen) {
+          // A newer sync started (or we unmounted) while ours was in
+          // flight. Don't claim ownership of the ref — the newer
+          // run's success will handle it.
+          return;
+        }
+        registeredComboRef.current = next;
+      } catch (err) {
+        if (cancelled || hotkeySyncGenRef.current !== myGen) return;
+        const message = err instanceof Error ? err.message : String(err);
+        toast.error(`Hotkey registration failed: ${message}`);
+      }
+    }
+    void syncRegistration();
+    return () => {
+      cancelled = true;
+    };
+  }, [settings?.record_hotkey]);
 
   if (settings === null) return null;
 
@@ -555,8 +915,25 @@ function HotkeyTab() {
     if (e.shiftKey) parts.push("Shift");
     parts.push(normalizeKey(e.key));
     update({ record_hotkey: parts.join("+") });
+    // Capturing a new chord invalidates the previous Test result.
+    setConflict("unknown");
     setCapturing(false);
     inputRef.current?.blur();
+  }
+
+  async function runCheck() {
+    if (settings === null) return;
+    setConflict("checking");
+    try {
+      const free = await invoke("heron_check_hotkey", {
+        combo: settings.record_hotkey,
+      });
+      setConflict(free ? "free" : "conflict");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not test hotkey: ${message}`);
+      setConflict("unknown");
+    }
   }
 
   return (
@@ -565,24 +942,50 @@ function HotkeyTab() {
 
       <div className="space-y-2">
         <Label htmlFor="record-hotkey">Record / stop hotkey</Label>
-        <Input
-          id="record-hotkey"
-          ref={inputRef}
-          readOnly
-          value={settings.record_hotkey}
-          onFocus={() => setCapturing(true)}
-          onBlur={() => setCapturing(false)}
-          onKeyDown={captureChord}
-          placeholder="Click to capture"
-          className="font-mono"
-        />
+        <div className="flex gap-2">
+          <Input
+            id="record-hotkey"
+            ref={inputRef}
+            readOnly
+            value={settings.record_hotkey}
+            onFocus={() => setCapturing(true)}
+            onBlur={() => setCapturing(false)}
+            onKeyDown={captureChord}
+            placeholder="Click to capture"
+            className="font-mono"
+          />
+          <Button
+            variant="outline"
+            onClick={() => void runCheck()}
+            disabled={settings.record_hotkey === "" || conflict === "checking"}
+          >
+            {conflict === "checking" ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                Testing…
+              </>
+            ) : (
+              "Test"
+            )}
+          </Button>
+        </div>
         <p className="text-xs text-muted-foreground">
           {capturing
             ? "Press the chord you'd like — Escape to cancel."
             : "Click the field and press a chord to rebind."}
         </p>
+        {conflict === "free" && (
+          <p className="text-xs text-emerald-600 dark:text-emerald-400">
+            Chord is free — no other app has claimed it.
+          </p>
+        )}
+        {conflict === "conflict" && (
+          <p className="text-xs text-destructive">
+            Another app already owns this chord. Pick a different one.
+          </p>
+        )}
         <p className="text-xs text-muted-foreground">
-          Hotkey conflict detection ships in week 12 polish.
+          Triggers Start/Stop Recording from anywhere in macOS.
         </p>
       </div>
     </section>
@@ -599,9 +1002,71 @@ function AboutTab() {
         <dt className="text-muted-foreground">Build</dt>
         <dd>{__APP_BUILD__}</dd>
       </dl>
-      <Button variant="outline" disabled title="License viewer ships in a follow-up">
-        View licenses…
-      </Button>
+      <Dialog.Root>
+        <DialogTrigger asChild>
+          <Button variant="outline">View licenses…</Button>
+        </DialogTrigger>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Third-party notices</DialogTitle>
+          </DialogHeader>
+          {/*
+           * `prose` styling lives inline since the design system doesn't
+           * (yet) ship a Tailwind typography preset. The component
+           * overrides give us readable headings + spacing without
+           * a `prose` plugin dep. Limiting to common nodes — paragraph,
+           * heading, link, list, code, strong — matches the markdown
+           * subset the bundled notices file uses.
+           */}
+          <div className="text-sm leading-relaxed space-y-3">
+            <ReactMarkdown
+              components={{
+                h1: ({ children }) => (
+                  <h1 className="text-lg font-semibold mt-4 first:mt-0">
+                    {children}
+                  </h1>
+                ),
+                h2: ({ children }) => (
+                  <h2 className="text-base font-semibold mt-4">{children}</h2>
+                ),
+                h3: ({ children }) => (
+                  <h3 className="text-sm font-semibold mt-3">{children}</h3>
+                ),
+                p: ({ children }) => <p className="my-2">{children}</p>,
+                a: ({ href, children }) => (
+                  <a
+                    href={href}
+                    className="underline text-primary hover:opacity-80"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {children}
+                  </a>
+                ),
+                ul: ({ children }) => (
+                  <ul className="list-disc pl-6 my-2 space-y-1">{children}</ul>
+                ),
+                ol: ({ children }) => (
+                  <ol className="list-decimal pl-6 my-2 space-y-1">
+                    {children}
+                  </ol>
+                ),
+                code: ({ children }) => (
+                  <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
+                    {children}
+                  </code>
+                ),
+                strong: ({ children }) => (
+                  <strong className="font-semibold">{children}</strong>
+                ),
+                hr: () => <hr className="my-4 border-border" />,
+              }}
+            >
+              {licenseNotices}
+            </ReactMarkdown>
+          </div>
+        </DialogContent>
+      </Dialog.Root>
       <p className="text-xs text-muted-foreground">
         heron is private, on-device, and AGPL-3.0-or-later licensed.
       </p>

@@ -34,7 +34,21 @@ pub enum SettingsError {
 /// Defaults match the §16.1 v1 starting values: STT runs WhisperKit
 /// with the small/quantized variant, LLM via Anthropic, summary on
 /// stop. The Settings pane lets the user override each.
+///
+/// ## Forward-compat / migration
+///
+/// Every field carries `#[serde(default)]` so an on-disk `settings.json`
+/// written by an older heron build (missing fields the current build
+/// added) deserializes cleanly with the missing fields filled by
+/// [`Settings::default`]. Without it, `serde_json::from_slice` would
+/// reject the file with `missing field 'audio_retention_days'` (PR-ζ
+/// added that field in phase 68) and the Settings pane would refuse
+/// to load. The `default` attribute is paired with a per-field
+/// `default = "..."` only where the field's "missing" value differs
+/// from `Default::default()`'s; in every case here the struct-level
+/// `Default` impl already provides the right fallback.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     /// `"whisperkit"` or `"sherpa"`. STT backend selection per §8.6.
     pub stt_backend: String,
@@ -62,6 +76,17 @@ pub struct Settings {
     pub session_logging: bool,
     /// Send local diagnostics on crash? Off by default.
     pub crash_telemetry: bool,
+    /// Phase 68 (PR-ζ): how long to keep `.wav` / `.m4a` audio files
+    /// next to a session's `.md` summary.
+    ///
+    /// `None` means "keep all" — the Audio tab's "Keep all" radio.
+    /// `Some(N)` means "purge audio whose mtime is older than N days".
+    /// The transcript and summary `.md` are never purged regardless of
+    /// the setting; only the lossy/lossless audio sidecars are
+    /// candidates. The actual purge is driven by
+    /// [`crate::disk::purge_audio_older_than`], which the Settings
+    /// pane's "Purge now" button + an eventual launch-time hook call.
+    pub audio_retention_days: Option<u32>,
 }
 
 impl Default for Settings {
@@ -77,6 +102,7 @@ impl Default for Settings {
             min_free_disk_mib: 2048,
             session_logging: true,
             crash_telemetry: false,
+            audio_retention_days: None,
         }
     }
 }
@@ -164,12 +190,59 @@ mod tests {
             vault_root: "/tmp/vault".to_owned(),
             remind_interval_secs: 60,
             crash_telemetry: true,
+            audio_retention_days: Some(30),
             ..Default::default()
         };
 
         write_settings(&path, &settings).expect("write");
         let parsed = read_settings(&path).expect("read");
         assert_eq!(parsed, settings);
+    }
+
+    /// Older heron builds wrote a `settings.json` without the
+    /// `audio_retention_days` field PR-ζ added. The `#[serde(default)]`
+    /// container attribute on `Settings` must let those files load
+    /// rather than failing the deserialize — otherwise the user's
+    /// Settings pane breaks the first time they upgrade.
+    #[test]
+    fn read_pre_phase_68_settings_fills_audio_retention_default() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // Verbatim copy of the field-set heron-desktop wrote before
+        // phase 68. Note the absence of `audio_retention_days`.
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"sherpa","llm_backend":"claude_code_cli","auto_summarize":false,
+                "vault_root":"/tmp/vault","record_hotkey":"F12","remind_interval_secs":60,
+                "recover_on_launch":false,"min_free_disk_mib":1024,"session_logging":false,
+                "crash_telemetry":true}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        assert_eq!(s.stt_backend, "sherpa");
+        assert_eq!(s.audio_retention_days, None);
+        // The non-default fields the file carried must survive the
+        // partial deserialize untouched — the `#[serde(default)]`
+        // container attribute fills *only* missing fields.
+        assert_eq!(s.record_hotkey, "F12");
+        assert!(s.crash_telemetry);
+        assert!(!s.recover_on_launch);
+        assert_eq!(s.min_free_disk_mib, 1024);
+    }
+
+    /// Conversely, a brand-new on-disk file with every field present
+    /// (including `audio_retention_days`) must round-trip exactly.
+    #[test]
+    fn read_settings_with_audio_retention_some_round_trips() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        let s_in = Settings {
+            audio_retention_days: Some(14),
+            ..Default::default()
+        };
+        write_settings(&path, &s_in).expect("write");
+        let s_out = read_settings(&path).expect("read");
+        assert_eq!(s_out.audio_retention_days, Some(14));
     }
 
     #[test]
@@ -193,7 +266,7 @@ mod tests {
             r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
                 "vault_root":"","record_hotkey":"CmdOrCtrl+Shift+R","remind_interval_secs":30,
                 "recover_on_launch":true,"min_free_disk_mib":2048,"session_logging":true,
-                "crash_telemetry":false,"future_v2_field":"hello"}"#,
+                "crash_telemetry":false,"audio_retention_days":null,"future_v2_field":"hello"}"#,
         )
         .expect("seed");
         let s = read_settings(&path).expect("read");

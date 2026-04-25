@@ -69,10 +69,28 @@ chrono = { workspace = true }
 # true })`, which routes to this plugin's IPC handler. Pinned to the
 # matching JS package version on the renderer side.
 tauri-plugin-dialog = "2.7.0"
+# Phase 68 (PR-ζ): system-wide hotkey for Start/Stop Recording
+# (§16.1 Hotkey tab). The plugin exposes a `GlobalShortcut` manager
+# we wrap behind the `heron_register_hotkey` / `heron_check_hotkey`
+# / `heron_unregister_hotkey` commands. Conflict detection works by
+# attempting the OS-level register and observing whether the platform's
+# global-hotkey daemon already owns the chord — `is_registered` only
+# reports per-app state, which is why we also try-register the chord
+# in `heron_check_hotkey` and unregister immediately on success.
+tauri-plugin-global-shortcut = "2.3.1"
+# `tracing` already lives in the transitive dep graph via `heron-zoom`;
+# surfacing it here lets `lib.rs` log the hotkey-fired stub line without
+# pulling a second log crate. The `tracing-subscriber` set up by the
+# binary's `main.rs` (or by tests) routes the line to stderr.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# `disk.rs` mtime-based purge tests need to backdate created files.
+# `filetime` is the standard knob for setting `mtime` portably; pulling
+# it in only as a dev-dep keeps it out of the release binary.
+filetime = "0.2"
 
 # macOS Keychain integration (PR-θ / phase 70). The crate is broadly
 # used (rustls, reqwest, cargo) and dual-licensed MIT/Apache-2.0 (already

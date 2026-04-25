@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"default permissions for the heron shell scaffold; widens during week 11 onboarding wiring","local":true,"windows":["main"],"permissions":["core:default","dialog:default"]}}
+{"default":{"identifier":"default","description":"default permissions for the heron shell scaffold; widens during week 11 onboarding wiring","local":true,"windows":["main"],"permissions":["core:default","dialog:default","global-shortcut:default","global-shortcut:allow-register","global-shortcut:allow-is-registered","global-shortcut:allow-unregister"]}}
