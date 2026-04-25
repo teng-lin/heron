@@ -47,7 +47,6 @@ tokio = { workspace = true }
 # Calendar probe builds a `[start, end)` window via `chrono` and
 # threads it through `heron_vault::calendar::calendar_read_one_shot`.
 chrono = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

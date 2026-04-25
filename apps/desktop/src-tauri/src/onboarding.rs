@@ -169,26 +169,49 @@ async fn probe_microphone() -> TestOutcome {
     let (frames_tx, _frames_rx) = broadcast::channel::<CaptureFrame>(8);
     let (events_tx, _events_rx) = broadcast::channel::<Event>(8);
 
-    // `start_mic` itself is sync but must be called from inside a
-    // Tokio runtime (it spawns the consumer task). We're already in
-    // an async context here, so the call is direct.
-    let result =
-        mic_capture::start_mic(frames_tx, events_tx, SessionId::nil(), SessionClock::new());
+    // `start_mic` is sync but does cpal device probing (`default_input_config`,
+    // `build_input_stream`) that can hang if the CoreAudio HAL is wedged.
+    // We bound it via `spawn_blocking` + `timeout` — but the cpal
+    // `Stream` inside `MicHandle` is `!Send`, so the handle cannot
+    // cross the `spawn_blocking` boundary. We drop it inside the
+    // closure and pass back only the unit/Err discriminant, which
+    // also matches the probe semantic ("did start_mic succeed?", not
+    // "give me a live mic handle").
+    //
+    // The blocking pool inherits the runtime handle, so the
+    // `tokio::spawn` start_mic does internally for its consumer task
+    // resolves correctly. The consumer task is aborted by the
+    // `ConsumerTaskGuard` when we drop the handle in-closure.
+    let started = tokio::task::spawn_blocking(move || {
+        mic_capture::start_mic(frames_tx, events_tx, SessionId::nil(), SessionClock::new()).map(
+            |handle| {
+                // Drop tears down the cpal stream (Stream::drop calls
+                // AudioOutputUnitStop synchronously) before we return.
+                // A handful of frames may have landed in the broadcast
+                // channel during the µs between play() and drop; the
+                // receivers go out of scope with the channel.
+                drop(handle);
+            },
+        )
+    });
+    let timed = tokio::time::timeout(PROBE_TIMEOUT, started).await;
 
-    match result {
-        Ok(handle) => {
-            // Drop tears down the cpal stream (Stream::drop calls
-            // AudioOutputUnitStop synchronously) before we return.
-            drop(handle);
-            TestOutcome::pass("microphone available; TCC granted")
+    match timed {
+        Ok(Ok(Ok(()))) => TestOutcome::pass("microphone available; TCC granted"),
+        Ok(Ok(Err(AudioError::PermissionDenied(reason)))) => {
+            TestOutcome::needs_permission(format!(
+                "microphone access denied; grant in Privacy & Security → Microphone ({reason})"
+            ))
         }
-        Err(AudioError::PermissionDenied(reason)) => TestOutcome::needs_permission(format!(
-            "microphone access denied; grant in Privacy & Security → Microphone ({reason})"
-        )),
-        Err(AudioError::NotYetImplemented) => {
+        Ok(Ok(Err(AudioError::NotYetImplemented))) => {
             TestOutcome::skipped("microphone capture not implemented on this platform")
         }
-        Err(other) => TestOutcome::fail(format!("microphone probe failed: {other}")),
+        Ok(Ok(Err(other))) => TestOutcome::fail(format!("microphone probe failed: {other}")),
+        Ok(Err(join_err)) => TestOutcome::fail(format!("microphone probe panicked: {join_err}")),
+        Err(_elapsed) => TestOutcome::fail(format!(
+            "microphone probe timed out after {} ms",
+            PROBE_TIMEOUT.as_millis()
+        )),
     }
 }
 
