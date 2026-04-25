@@ -28,7 +28,9 @@ pub mod disclosure;
 pub mod fsm;
 pub mod ids;
 pub use context::{ContextError, MAX_CONTEXT_BYTES, render as render_context};
-pub use disclosure::{is_objection, match_objection};
+pub use disclosure::{
+    DisclosureVars, TemplateError, is_objection, match_objection, render_disclosure,
+};
 pub use fsm::{BotEvent, BotFsm, TransitionError};
 pub use ids::IdParseError;
 
