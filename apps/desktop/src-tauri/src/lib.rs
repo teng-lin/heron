@@ -15,7 +15,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct HeronStatus {
     pub version: String,
-    pub fsm_state: String,
+    /// Serializes via `RecordingState`'s `#[serde(rename_all =
+    /// "snake_case")]`, so the wire format matches what the
+    /// frontend already parses ("idle" / "armed" / etc.).
+    pub fsm_state: heron_types::RecordingState,
     pub audio_available: bool,
     pub ax_backend: String,
 }
@@ -25,13 +28,7 @@ fn heron_status() -> HeronStatus {
     let fsm = heron_types::RecordingFsm::new();
     HeronStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        // serde rename_all = "snake_case" on RecordingState; format
-        // the value through serde_json so frontend parsers don't
-        // need to know about Rust's enum syntax.
-        fsm_state: serde_json::to_value(fsm.state())
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "idle".into()),
+        fsm_state: fsm.state(),
         // Once heron-audio's real capture lands, this will probe the
         // process tap permissions; v0 reports the stub state.
         audio_available: false,
