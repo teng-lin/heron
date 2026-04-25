@@ -18,8 +18,10 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 pub mod aligner;
+pub mod ax_bridge;
 
 pub use aligner::{ATTRIBUTION_GAP_THRESHOLD, Aligner, CONFIDENCE_FLOOR, DEFAULT_EVENT_LAG};
+pub use ax_bridge::{AxBridgeError, AxStatus, ax_poll, ax_register, ax_release};
 
 #[derive(Debug, Error)]
 pub enum AxError {
