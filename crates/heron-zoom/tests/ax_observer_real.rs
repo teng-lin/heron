@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Live AXObserver smoke test for the Zoom helper.
 //!
 //! Skipped on every host where `HERON_ZOOM_RUNNING` is unset — i.e.
