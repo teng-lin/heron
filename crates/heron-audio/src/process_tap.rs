@@ -69,13 +69,13 @@ pub struct AggregateHandle {
 /// proc keeps firing into the broadcast channel passed at install
 /// time. Drop stops the device.
 ///
-/// The cidre `StartedDevice` wrapper itself stops on drop — we hold it
-/// in a `Box<dyn Any>` because it's parameterized by an unknown `D`.
+/// The cidre `StartedDevice` wrapper itself calls `AudioDeviceStop`
+/// on drop, so holding it as a plain field is enough — no explicit
+/// `stop()` method needed.
 pub struct IoProcHandle {
-    /// The cidre `StartedDevice<AggregateDevice>` (boxed because it
-    /// drops correctly via `cidre::core_audio::AudioDeviceStop`).
-    /// `_started_device: Some(...)` while running; `take()` to stop.
-    _started_device: Option<StartedDevice<ca::AggregateDevice>>,
+    /// The cidre `StartedDevice<AggregateDevice>`; drops via
+    /// `cidre::core_audio::AudioDeviceStop`.
+    _started_device: StartedDevice<ca::AggregateDevice>,
 }
 
 /// Resolve the unix pid of the running app whose bundle identifier
@@ -261,7 +261,7 @@ pub fn install_io_proc(
         .map_err(|e| AudioError::Aborted(format!("AudioDeviceStart failed: {e:?}")))?;
 
     Ok(IoProcHandle {
-        _started_device: Some(started),
+        _started_device: started,
     })
 }
 
@@ -279,18 +279,26 @@ pub fn open_tap(
     let tap_uid = tap.uid()?;
     let aggregate = build_aggregate_device(&tap_uid)?;
     let io_proc = install_io_proc(aggregate, frames_tx, clock)?;
+    // Field order here matches the struct definition: `_io_proc`
+    // first so it drops first (stops the device), then `_tap`.
     Ok(TapPipeline {
-        _tap: tap,
         _io_proc: io_proc,
+        _tap: tap,
     })
 }
 
 /// All the macOS-side resources backing a live capture session.
 ///
-/// Drop order is `IoProcHandle` (stops the device) then `TapHandle`
-/// (tears down the tap); the `AggregateHandle` is owned by
+/// Drop order matters: stop the device *before* destroying the tap,
+/// otherwise the HAL can pull one more buffer out of a tap whose
+/// underlying process object is mid-teardown. Rust drops fields in
+/// declaration order, so `_io_proc` (which owns the cidre
+/// `StartedDevice` and calls `AudioDeviceStop` on drop) is listed
+/// first and `_tap` (which calls `AudioHardwareDestroyProcessTap`)
+/// second. The cidre `core-audio-record` example relies on the same
+/// ordering by construction. The `AggregateHandle` is owned by
 /// `IoProcHandle` indirectly via the cidre `StartedDevice`.
 pub struct TapPipeline {
-    _tap: TapHandle,
     _io_proc: IoProcHandle,
+    _tap: TapHandle,
 }
