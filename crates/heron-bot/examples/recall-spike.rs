@@ -216,11 +216,8 @@ mod recall_api {
         /// Recall. Post-join, this returns 4xx; the spike treats that
         /// as a *successful* validation of spec §3.
         pub async fn delete_bot(&self, bot_id: &str) -> Result<ApiOk<()>> {
-            self.send_no_content(
-                reqwest::Method::DELETE,
-                &format!("/api/v1/bot/{bot_id}/"),
-            )
-            .await
+            self.send_no_content(reqwest::Method::DELETE, &format!("/api/v1/bot/{bot_id}/"))
+                .await
         }
 
         // ── transport helpers ────────────────────────────────────────
@@ -262,11 +259,7 @@ mod recall_api {
             })
         }
 
-        async fn send_no_content(
-            &self,
-            method: reqwest::Method,
-            path: &str,
-        ) -> Result<ApiOk<()>> {
+        async fn send_no_content(&self, method: reqwest::Method, path: &str) -> Result<ApiOk<()>> {
             let resp = self
                 .auth(self.http.request(method, self.url(path)))
                 .send()
@@ -329,10 +322,7 @@ mod recall_api {
         /// `bot.done` and `bot.fatal` are the only terminal codes.
         /// `bot.call_ended` is NOT terminal — `bot.done` follows.
         pub fn is_terminal(&self) -> bool {
-            matches!(
-                self.current_code(),
-                Some("bot.done") | Some("bot.fatal")
-            )
+            matches!(self.current_code(), Some("bot.done") | Some("bot.fatal"))
         }
     }
 
@@ -506,7 +496,11 @@ fn classify<T>(result: &Result<ApiOk<T>>) -> (Option<u16>, String, Outcome) {
     match result {
         Ok(ok) => (Some(ok.status), String::new(), Outcome::Success),
         Err(e) => match e.downcast_ref::<ApiError>() {
-            Some(api) => (Some(api.http_status()), api.body().to_string(), Outcome::Failure),
+            Some(api) => (
+                Some(api.http_status()),
+                api.body().to_string(),
+                Outcome::Failure,
+            ),
             None => (None, String::new(), Outcome::Failure),
         },
     }
@@ -568,10 +562,7 @@ enum Cmd {
         poll_secs: u64,
     },
     /// POST /bot/{id}/output_audio/ — play an MP3 file.
-    Speak {
-        bot_id: String,
-        audio_path: PathBuf,
-    },
+    Speak { bot_id: String, audio_path: PathBuf },
     /// DELETE /bot/{id}/output_audio/ — stop the channel.
     Interrupt { bot_id: String },
     /// Poll `status_changes` and print transitions; exit on a terminal
@@ -596,10 +587,7 @@ enum Cmd {
     /// Send two `output_audio` calls back-to-back to validate Spec §9
     /// `Replace` semantics. Records the gap behavior; reveals whether
     /// Recall queues, replaces, or rejects the second call.
-    ReplaceTest {
-        bot_id: String,
-        audio_path: PathBuf,
-    },
+    ReplaceTest { bot_id: String, audio_path: PathBuf },
     /// POST /bot/{id}/leave_call/ — graceful leave (post-join).
     Leave { bot_id: String },
     /// DELETE /bot/{id}/ — only legal pre-join per Recall.
@@ -626,7 +614,16 @@ async fn main() -> Result<()> {
             meeting_url,
             bot_name,
             placeholder_audio,
-        } => cmd_join(&client, &active, &meeting_url, &bot_name, placeholder_audio.as_deref()).await,
+        } => {
+            cmd_join(
+                &client,
+                &active,
+                &meeting_url,
+                &bot_name,
+                placeholder_audio.as_deref(),
+            )
+            .await
+        }
         Cmd::Status { bot_id } => cmd_status(&client, &bot_id).await,
         Cmd::Listen { bot_id, poll_secs } => cmd_listen(&client, &bot_id, poll_secs).await,
         Cmd::Speak { bot_id, audio_path } => cmd_speak(&client, &bot_id, &audio_path).await,
@@ -637,15 +634,17 @@ async fn main() -> Result<()> {
             bot_name,
             audio_path,
             timeout_secs,
-        } => cmd_disclosure_inject(
-            &client,
-            &active,
-            &meeting_url,
-            &bot_name,
-            &audio_path,
-            timeout_secs,
-        )
-        .await,
+        } => {
+            cmd_disclosure_inject(
+                &client,
+                &active,
+                &meeting_url,
+                &bot_name,
+                &audio_path,
+                timeout_secs,
+            )
+            .await
+        }
         Cmd::ReplaceTest { bot_id, audio_path } => {
             cmd_replace_test(&client, &bot_id, &audio_path).await
         }
@@ -907,11 +906,7 @@ async fn cmd_interrupt(client: &recall_api::Client, bot_id: &str) -> Result<()> 
     Ok(())
 }
 
-async fn cmd_watch_eject(
-    client: &recall_api::Client,
-    bot_id: &str,
-    poll_secs: u64,
-) -> Result<()> {
+async fn cmd_watch_eject(client: &recall_api::Client, bot_id: &str, poll_secs: u64) -> Result<()> {
     println!("watching status_changes every {poll_secs}s; Ctrl-C to stop");
     let mut seen: usize = 0;
     loop {
@@ -992,15 +987,8 @@ async fn cmd_disclosure_inject(
     // cost leak. Cleanup failures are surfaced via a dedicated finding
     // (not silently swallowed) so the JSONL summary makes
     // possibly-orphaned bots visible at audit time.
-    let outcome = run_disclosure_post_join(
-        client,
-        &bot_id,
-        &b64,
-        timeout_secs,
-        join_started,
-        join_ms,
-    )
-    .await;
+    let outcome =
+        run_disclosure_post_join(client, &bot_id, &b64, timeout_secs, join_started, join_ms).await;
     if let Err(orig) = &outcome {
         eprintln!("disclosure-inject failed: {orig:#}");
         eprintln!("attempting graceful leave for bot {bot_id}…");
@@ -1206,7 +1194,10 @@ async fn cmd_terminate(client: &recall_api::Client, bot_id: &str) -> Result<()> 
     // For this op, an error after join is the *expected* spec-§3
     // outcome: Recall enforces "DELETE only legal pre-join."
     let (outcome, notes) = match &result {
-        Ok(_) => (Outcome::Success, "DELETE accepted (bot was pre-join)".to_string()),
+        Ok(_) => (
+            Outcome::Success,
+            "DELETE accepted (bot was pre-join)".to_string(),
+        ),
         Err(e) => (
             Outcome::Success,
             format!("DELETE rejected (bot was post-join — validates spec §3): {e:#}"),
@@ -1352,4 +1343,3 @@ mod tests {
         Ok(())
     }
 }
-
