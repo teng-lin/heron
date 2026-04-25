@@ -15,7 +15,9 @@ use heron_types::{ActionItem, Attendee, Cost, MeetingType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod anthropic;
 pub mod cost;
+pub use anthropic::{AnthropicClient, AnthropicClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
 
 /// Convenience alias so the public surface doesn't leak `String` for
@@ -61,6 +63,8 @@ pub enum LlmError {
     Parse(String),
     #[error("ID preservation rate {observed:.0}% < required {required:.0}%; week-8 §10.5")]
     IdPreservationTooLow { observed: f32, required: f32 },
+    #[error("ANTHROPIC_API_KEY is unset or empty; export it before running summarize")]
+    MissingApiKey,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -85,12 +89,43 @@ pub trait Summarizer: Send + Sync {
 
 /// Build a [`Summarizer`] for the requested backend.
 ///
-/// Returns stub impls until week 9 lands the real wires; each stub
-/// returns [`LlmError::NotYetImplemented`] from `summarize` so
-/// downstream type signatures resolve without an API key.
+/// `Anthropic` returns the real reqwest-backed client when
+/// `ANTHROPIC_API_KEY` is present in the environment; without the
+/// key (CI / offline) it falls back to a stub that returns
+/// [`LlmError::NotYetImplemented`]. The other two backends still
+/// stub through to the wire shape land in their respective phases.
+///
+/// Callers that need a configured client (custom base URL, model,
+/// timeout) should construct [`AnthropicClient`] directly and pass
+/// it as a boxed [`Summarizer`].
 pub fn build_summarizer(backend: Backend) -> Box<dyn Summarizer> {
     match backend {
-        Backend::Anthropic => Box::new(stub::AnthropicStub),
+        Backend::Anthropic => match AnthropicClientConfig::from_env() {
+            Ok(cfg) => match AnthropicClient::new(cfg) {
+                Ok(c) => Box::new(c),
+                // Fall through to the stub on construction failure
+                // rather than panicking — the orchestrator should
+                // never explode on startup just because rustls
+                // didn't load in this build.
+                Err(e) => {
+                    tracing::warn!(
+                        "AnthropicClient construction failed; falling back to stub: {e}"
+                    );
+                    Box::new(stub::AnthropicStub)
+                }
+            },
+            Err(e) => {
+                // Loud-but-non-fatal: a user who picked
+                // `Backend::Anthropic` and forgot the env var
+                // should know the call will return
+                // NotYetImplemented rather than 401.
+                tracing::warn!(
+                    "Anthropic backend selected but {e}; \
+                     summarize calls will return NotYetImplemented"
+                );
+                Box::new(stub::AnthropicStub)
+            }
+        },
         Backend::ClaudeCodeCli => Box::new(stub::ClaudeCodeStub),
         Backend::CodexCli => Box::new(stub::CodexStub),
     }
