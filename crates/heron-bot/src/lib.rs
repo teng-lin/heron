@@ -32,14 +32,14 @@ pub use ids::IdParseError;
 
 // ── identity ──────────────────────────────────────────────────────────
 
-prefixed_id! {
+heron_types::prefixed_id! {
     /// Stripe-style prefixed UUID for a bot. Wire form `bot_<uuid>`.
     /// Spec §2 Invariant 4: internal canonical identity. Composite
     /// keys / URLs are resolver inputs, never primary identity.
     pub BotId, "bot"
 }
 
-prefixed_id! {
+heron_types::prefixed_id! {
     /// Stripe-style prefixed UUID for a persona. Wire form
     /// `persona_<uuid>`. A misrouted JSON parse (persona ID into a
     /// BotId field) fails at deserialize time rather than running
@@ -47,7 +47,7 @@ prefixed_id! {
     pub PersonaId, "persona"
 }
 
-prefixed_id! {
+heron_types::prefixed_id! {
     /// Stripe-style prefixed UUID for a meeting. Wire form
     /// `meeting_<uuid>`.
     pub MeetingId, "meeting"

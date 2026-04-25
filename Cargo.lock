@@ -1608,6 +1608,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "heron-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1698,7 +1699,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "heron-types",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
@@ -1710,6 +1713,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "heron-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

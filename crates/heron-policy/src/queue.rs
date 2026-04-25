@@ -40,8 +40,6 @@
 
 use std::collections::VecDeque;
 
-use uuid::Uuid;
-
 use crate::{Priority, UtteranceId};
 
 /// One queued or speaking utterance. Held inside the queue; the
@@ -109,7 +107,7 @@ impl SpeechQueue {
     /// [`EnqueueOutcome`] the controller commits against the TTS
     /// backend.
     pub fn enqueue(&mut self, text: String, priority: Priority) -> EnqueueOutcome {
-        let new_id = UtteranceId(Uuid::now_v7());
+        let new_id = UtteranceId::now_v7();
         let new_utt = QueuedUtterance { id: new_id, text };
 
         match priority {
@@ -357,7 +355,7 @@ mod tests {
     #[test]
     fn cancel_unknown_id_is_idempotent_not_found() {
         let mut q = SpeechQueue::new();
-        let outcome = q.cancel(UtteranceId(Uuid::now_v7()));
+        let outcome = q.cancel(UtteranceId::now_v7());
         assert_eq!(outcome, CancelOutcome::NotFound);
         assert!(q.is_idle());
     }
@@ -489,7 +487,7 @@ mod tests {
         assert!(q.is_idle());
 
         // Cancel a non-existent ID is still NotFound after Idle.
-        let out = q.cancel(UtteranceId(Uuid::now_v7()));
+        let out = q.cancel(UtteranceId::now_v7());
         assert_eq!(out, CancelOutcome::NotFound);
         // For coverage: assert correction was actually installed.
         assert_ne!(boss, correction);

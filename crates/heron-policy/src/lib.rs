@@ -17,23 +17,36 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 pub mod filter;
 pub mod queue;
 pub use filter::{PolicyDecision, evaluate};
+pub use heron_types::prefixed_id::IdParseError;
 pub use queue::{CancelOutcome, EnqueueOutcome, QueuedUtterance, SpeechQueue};
 
 // ── identity ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UtteranceId(pub Uuid);
+heron_types::prefixed_id! {
+    /// Stripe-style prefixed UUID for a single utterance. Wire form
+    /// `utt_<uuid>`. Returned from `SpeechController::speak`; carried
+    /// on every `SpeechEvent` for correlation.
+    pub UtteranceId, "utt"
+}
 
+heron_types::prefixed_id! {
+    /// Stripe-style prefixed UUID for a TTS voice asset. Wire form
+    /// `voice_<uuid>`. Distinct from a `PersonaId`: a persona may
+    /// pick from several voices over its lifetime.
+    pub VoiceId, "voice"
+}
+
+/// Speaker identifier, sourced from the realtime backend (e.g.
+/// OpenAI Realtime's `speaker_id` or LiveKit's participant SID). The
+/// wire form is whatever the backend emits — heron does not mint
+/// these — so this stays a thin `String` newtype rather than a
+/// prefixed UUID.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeakerId(pub String);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VoiceId(pub Uuid);
 
 // ── speech contract ───────────────────────────────────────────────────
 
@@ -182,4 +195,48 @@ pub enum EscalationMode {
     None,
     Notify { destination: String },
     LeaveMeeting,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod prefix_tests {
+    //! Per-consumer wire-shape regression guards for phase-48 IDs.
+    //! The `heron-types::prefixed_id!` macro's own tests cover
+    //! macro codegen; these pin that the *consumers* still get the
+    //! prefixes documented in `docs/api-design-spec.md`.
+
+    use super::*;
+
+    #[test]
+    fn utterance_id_uses_utt_prefix_on_the_wire() {
+        let id = UtteranceId::now_v7();
+        let json = serde_json::to_string(&id).expect("serialize");
+        assert!(json.starts_with(r#""utt_"#), "got: {json}");
+        let back: UtteranceId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn voice_id_uses_voice_prefix_on_the_wire() {
+        let id = VoiceId::now_v7();
+        let json = serde_json::to_string(&id).expect("serialize");
+        assert!(json.starts_with(r#""voice_"#), "got: {json}");
+        let back: VoiceId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn cross_type_misroute_utt_into_voice_fails_at_deserialize() {
+        // A JSON document carrying `"utt_..."` deserialized into a
+        // `VoiceId` field must fail rather than installing a
+        // silently-wrong-typed UUID. Phase 45's TestId/OtherId
+        // pin this for the macro itself; this pins it for the
+        // heron-policy instantiation.
+        let utt = UtteranceId::now_v7();
+        let json = serde_json::to_string(&utt).expect("serialize");
+        let err = serde_json::from_str::<VoiceId>(&json).expect_err("misroute");
+        let msg = err.to_string();
+        assert!(msg.contains("voice"), "missing expected prefix: {msg}");
+        assert!(msg.contains("utt"), "missing actual prefix: {msg}");
+    }
 }

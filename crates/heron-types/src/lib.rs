@@ -13,10 +13,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod clock;
+pub mod prefixed_id;
 pub mod recording;
 pub mod recovery;
 
 pub use clock::SessionClock;
+pub use prefixed_id::{IdParseError, parse_prefixed};
 pub use recording::{
     ARM_COOLDOWN, IdleReason, RecordingFsm, RecordingState, SummaryOutcome, TransitionError,
 };
