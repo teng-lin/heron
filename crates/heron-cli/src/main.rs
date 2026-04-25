@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod session;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "heron",
@@ -180,13 +182,37 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_record(args: RecordArgs, _vault: Option<PathBuf>) -> Result<()> {
+fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
     tracing::info!(?args, "record requested");
+
+    // Wire the orchestrator skeleton: even though every backend
+    // returns NotYetImplemented today, going through Orchestrator
+    // exercises the FSM + selection logic so a "real audio yet?"
+    // smoke test boils down to running this command.
+    let cache = args
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/tmp/heron-cli-cache"));
+    let vault_root = vault.unwrap_or_else(|| PathBuf::from("/tmp/heron-cli-vault"));
+    let cfg = session::SessionConfig {
+        session_id: heron_types::SessionId::nil(),
+        target_bundle_id: args.app.clone(),
+        cache_dir: cache,
+        vault_root,
+        stt_backend_name: "sherpa".into(),
+        llm_backend: heron_llm::Backend::Anthropic,
+    };
+    let orch = session::Orchestrator::new(cfg);
+    let (stt, ax, _llm) = orch
+        .backends()
+        .map_err(|e| anyhow::anyhow!("backend wiring: {e}"))?;
+    tracing::info!(stt = stt.name(), ax = ax.name(), "backends resolved");
+
     Err(anyhow::anyhow!(
-        "record: not yet implemented (arrives week 11 per §13). \
-         The audio + STT + AX wires aren't routed yet; run from the \
-         Tauri shell once it ships, or wait for the orchestrator \
-         crate to land."
+        "record: orchestrator wired but audio capture is stubbed \
+         (NotYetImplemented). Real recording arrives once the §6 \
+         capture pipeline lands. Use the Tauri shell once §13 \
+         ships for the full UX."
     ))
 }
 

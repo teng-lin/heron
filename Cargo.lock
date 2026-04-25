@@ -425,8 +425,16 @@ name = "heron-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "heron-audio",
+ "heron-llm",
+ "heron-speech",
  "heron-types",
+ "heron-vault",
+ "heron-zoom",
+ "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
