@@ -13,14 +13,14 @@
 use std::path::Path;
 #[cfg(target_vendor = "apple")]
 use std::path::PathBuf;
-#[cfg(target_vendor = "apple")]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 #[cfg(target_vendor = "apple")]
 use heron_types::SpeakerSource;
 use heron_types::{Channel, SessionId, Turn};
 use thiserror::Error;
+#[cfg(target_vendor = "apple")]
+use tokio::sync::OnceCell;
 
 pub mod partial_writer;
 pub mod selection;
@@ -139,18 +139,22 @@ pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
 /// transcribe.
 ///
 /// Construction is cheap (no model load); the heavy lifting happens
-/// in [`SttBackend::ensure_model`]. The `initialized` atomic guards
-/// against accidental double-load — Swift maintains a single global
-/// instance, but a paranoid Rust caller can re-call `ensure_model`
-/// safely (it's idempotent).
+/// in [`SttBackend::ensure_model`]. The `init_cell` guards against
+/// accidental double-load — Swift maintains a single global instance,
+/// but a paranoid Rust caller can re-call `ensure_model` safely.
+/// `OnceCell` (over `AtomicBool`) makes that idempotency race-free
+/// across concurrent `ensure_model` calls: only the first task runs
+/// the underlying `wk_init`, others await its result.
 #[cfg(target_vendor = "apple")]
 pub struct WhisperKitBackend {
     /// Folder containing the WhisperKit-compiled `.mlmodelc` bundles.
     /// Resolved from `HERON_WHISPERKIT_MODEL_DIR` by [`Self::from_env`]
     /// or supplied directly via [`Self::new`] in tests.
     model_dir: PathBuf,
-    /// Set after a successful `ensure_model`; allows fast-path re-entry.
-    initialized: AtomicBool,
+    /// Initialized exactly once across all concurrent `ensure_model`
+    /// callers. Failed inits leave the cell empty so a retry can run
+    /// the init again rather than caching the failure.
+    init_cell: OnceCell<()>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -159,7 +163,7 @@ impl WhisperKitBackend {
     pub fn new(model_dir: PathBuf) -> Self {
         Self {
             model_dir,
-            initialized: AtomicBool::new(false),
+            init_cell: OnceCell::new(),
         }
     }
 
@@ -186,28 +190,27 @@ impl SttBackend for WhisperKitBackend {
         // wire a callback through the Swift bridge.
         on_progress(0.0);
 
-        if self.initialized.load(Ordering::Acquire) {
-            on_progress(1.0);
-            return Ok(());
-        }
+        // OnceCell::get_or_try_init runs the init body exactly once
+        // across concurrent callers; failures don't poison the cell,
+        // so a retry can re-run the init.
+        self.init_cell
+            .get_or_try_init(|| async {
+                let model_dir = self.model_dir.clone();
+                tokio::task::spawn_blocking(move || whisperkit_init(&model_dir))
+                    .await
+                    .map_err(|e| SttError::Failed(format!("whisperkit init join failed: {e}")))?
+                    .map_err(|e| match e {
+                        WkError::ModelMissing => {
+                            SttError::ModelMissing(self.model_dir.display().to_string())
+                        }
+                        WkError::NotYetImplemented => SttError::NotYetImplemented,
+                        other => SttError::Failed(format!("whisperkit init: {other}")),
+                    })
+            })
+            .await?;
 
-        let model_dir = self.model_dir.clone();
-        let result = tokio::task::spawn_blocking(move || whisperkit_init(&model_dir))
-            .await
-            .map_err(|e| SttError::Failed(format!("whisperkit init join failed: {e}")))?;
-
-        match result {
-            Ok(()) => {
-                self.initialized.store(true, Ordering::Release);
-                on_progress(1.0);
-                Ok(())
-            }
-            Err(WkError::ModelMissing) => {
-                Err(SttError::ModelMissing(self.model_dir.display().to_string()))
-            }
-            Err(WkError::NotYetImplemented) => Err(SttError::NotYetImplemented),
-            Err(other) => Err(SttError::Failed(format!("whisperkit init: {other}"))),
-        }
+        on_progress(1.0);
+        Ok(())
     }
 
     async fn transcribe(
