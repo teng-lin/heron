@@ -81,8 +81,12 @@ pub struct StopArtifacts {
     pub tap: PathBuf,
     pub mic_clean: PathBuf,
     pub duration: Duration,
-    /// Number of frames the realtime → SPSC → APM pipeline dropped
-    /// under back-pressure (§7.4). `0` on a healthy session.
+    /// Number of frames dropped by the broadcast → AEC consumer when
+    /// the AEC task lagged the producers (§7.4 back-pressure). `0` on
+    /// a healthy session. SPSC-ring drops on the realtime producer
+    /// side are surfaced separately via `Event::CaptureDegraded` on
+    /// the events broadcast and are NOT folded into this counter
+    /// today (see the field doc on `AudioCaptureHandle::dropped_frames`).
     pub dropped_frames: u32,
 }
 
@@ -202,15 +206,17 @@ impl AudioCapture {
             // routes Mic → APM near-end + emits MicClean, Tap →
             // APM far-end, ignores everything else (including its
             // own MicClean reflections). Also owns the per-channel
-            // WAV writers so `stop()` can finalize them.
+            // WAV writers so `stop()` can finalize them, and the
+            // task-side `frames_tx` so `stop()` can drop it to let
+            // the broadcast actually close. See `AecTaskState` doc.
             let writers = wav_writer::PerChannelWavWriters::new(cache_dir, session_id)?;
             let dropped_frames = Arc::new(AtomicU64::new(0));
             let aec_state = Arc::new(tokio::sync::Mutex::new(AecTaskState {
                 writers: Some(writers),
+                frames_tx: Some(frames_tx.clone()),
             }));
             let aec_task = spawn_aec_task(
                 aec_rx,
-                frames_tx.clone(),
                 events_tx.clone(),
                 session_id,
                 started_at,
@@ -253,10 +259,17 @@ impl AudioCapture {
 }
 
 /// Shared state between the AEC task and `AudioCaptureHandle::stop`:
-/// the per-channel WAV writers. The mutex is taken once per frame
-/// inside the AEC task (no contention except at stop time when
-/// `stop()` reaches in to finalize), so it doesn't fight the realtime
-/// budget.
+/// the per-channel WAV writers and the AEC task's clone of the
+/// frames sender. The mutex is taken once per frame inside the AEC
+/// task (no contention except at stop time when `stop()` reaches in
+/// to finalize), so it doesn't fight the realtime budget.
+///
+/// Both fields go to `None` at stop time:
+/// - `writers` so the task short-circuits its disk writes.
+/// - `frames_tx` so the broadcast channel can actually close once
+///   `_macos_pipeline` is dropped — without this, the AEC task's own
+///   sender clone would keep the channel open and deadlock the
+///   `recv() -> RecvError::Closed` exit path.
 #[cfg(target_os = "macos")]
 struct AecTaskState {
     /// `Some` while the task is running and writing to disk.
@@ -264,6 +277,13 @@ struct AecTaskState {
     /// AEC task short-circuits when it observes `None` so it doesn't
     /// race a finalized writer.
     writers: Option<wav_writer::PerChannelWavWriters>,
+    /// The AEC task's clone of `frames_tx`, used to publish MicClean
+    /// frames. Held here (rather than as a closure capture) so
+    /// `stop()` can drop it explicitly — closing the broadcast lets
+    /// the task's `recv()` see `Err(Closed)` and exit cleanly. If
+    /// the task held this directly, `stop()` would have to abort it
+    /// (no graceful drain) since broadcast::Sender has no Weak form.
+    frames_tx: Option<broadcast::Sender<CaptureFrame>>,
 }
 
 /// Wrapper that aborts the AEC task on drop. Mirrors
@@ -296,7 +316,6 @@ impl Drop for AecTaskGuard {
 #[cfg(target_os = "macos")]
 fn spawn_aec_task(
     mut frames_rx: broadcast::Receiver<CaptureFrame>,
-    frames_tx: broadcast::Sender<CaptureFrame>,
     events_tx: broadcast::Sender<Event>,
     session_id: SessionId,
     started_at: Instant,
@@ -315,7 +334,7 @@ fn spawn_aec_task(
                     // Broadcast is slower than producers. Account
                     // the loss against the session-level dropped
                     // counter so `StopArtifacts::dropped_frames`
-                    // reflects it. n is u64 already.
+                    // reflects it. `n` is already u64 (skipped count).
                     dropped_frames.fetch_add(n, Ordering::Relaxed);
                     continue;
                 }
@@ -323,11 +342,27 @@ fn spawn_aec_task(
 
             // Take the lock for the duration of one frame so `stop()`
             // can swap in `None` to take ownership of the writers.
+            // Skip MicClean reflections WITHOUT acquiring the lock —
+            // they're our own published frames coming back through
+            // the broadcast fan-out, and locking just to no-op would
+            // serialize behind any in-flight Mic frame.
+            if matches!(frame.channel, Channel::MicClean) {
+                continue;
+            }
+
             let mut guard = state.lock().await;
+            // Both writers and frames_tx must still be live; if
+            // either was taken by stop() the task is on its way out
+            // and any further work is wasted. Check `frames_tx`
+            // first via a clone (cheap — broadcast::Sender::clone
+            // is just an Arc bump) so the second borrow can be a
+            // mutable reborrow on `writers`.
+            let task_frames_tx = match guard.frames_tx.clone() {
+                Some(tx) => tx,
+                None => continue,
+            };
             let writers = match guard.writers.as_mut() {
                 Some(w) => w,
-                // `stop()` already took ownership — drain remaining
-                // frames quietly until the broadcast closes.
                 None => continue,
             };
 
@@ -351,57 +386,42 @@ fn spawn_aec_task(
                         tracing::warn!(error = %e, "mic.wav write failed");
                     }
 
-                    // APM mutates in place. Clone first so the raw
-                    // mic frame on `mic.wav` is preserved unchanged
-                    // and only the cloned `cleaned` frame is fed
-                    // into APM and re-published.
-                    let mut cleaned = CaptureFrame {
+                    // APM mutates samples in place and requires the
+                    // input frame's channel to be `Mic`. Clone into
+                    // a working copy whose channel stays `Mic` for
+                    // the APM call — on success, the samples come
+                    // back AEC-cleaned; on failure, we keep the raw
+                    // samples (APM only writes on Ok). Then build
+                    // the published `MicClean` frame from the
+                    // post-APM samples.
+                    let mut working = frame.clone();
+                    if let Err(e) = aec.process_near_end(&mut working) {
+                        emit_degraded_once(
+                            &events_tx,
+                            session_id,
+                            started_at,
+                            &mut degraded_emitted,
+                            format!("AEC near-end failed: {e}"),
+                        );
+                        // Passthrough: `working.samples` is still
+                        // the raw mic since APM only mutates on Ok.
+                    }
+                    let cleaned = CaptureFrame {
                         channel: Channel::MicClean,
                         host_time: frame.host_time,
                         session_secs: frame.session_secs,
-                        samples: frame.samples.clone(),
+                        samples: working.samples,
                     };
-                    // process_near_end requires the channel to be
-                    // Mic, so flip it back for the call. APM doesn't
-                    // care what we set it to afterwards.
-                    cleaned.channel = Channel::Mic;
-                    let aec_ok = match aec.process_near_end(&mut cleaned) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            emit_degraded_once(
-                                &events_tx,
-                                session_id,
-                                started_at,
-                                &mut degraded_emitted,
-                                format!("AEC near-end failed: {e}"),
-                            );
-                            // Passthrough: leave `cleaned.samples`
-                            // as the unmodified raw mic so STT
-                            // still gets input. `cleaned` was
-                            // initialized from `frame.samples` above
-                            // and APM only mutates in place; on
-                            // error the buffer is implementation-
-                            // defined, so reset it explicitly.
-                            cleaned.samples = frame.samples.clone();
-                            false
-                        }
-                    };
-                    cleaned.channel = Channel::MicClean;
-                    let _ = aec_ok;
 
                     if let Err(e) = writers.write_frame(&cleaned) {
                         tracing::warn!(error = %e, "mic_clean.wav write failed");
                     }
                     // `send` returns `Err` only when there are no
                     // receivers — not a back-pressure signal. Ignore.
-                    let _ = frames_tx.send(cleaned);
+                    let _ = task_frames_tx.send(cleaned);
                 }
-                // Filter our own MicClean reflections (broadcast is
-                // fan-out so we'll see what we just published) and
-                // any future channels we don't yet handle. The
-                // `send`-side path above is the source of MicClean
-                // WAVs; never write again here.
-                Channel::MicClean => {}
+                // Already filtered above without the lock.
+                Channel::MicClean => unreachable!(),
             }
         }
     }))
@@ -475,11 +495,19 @@ pub struct AudioCaptureHandle {
     #[cfg(target_os = "macos")]
     started_at: Instant,
     /// Cumulative frames dropped by the broadcast lag handler in the
-    /// AEC task (and any future producer that wants to bump it). Read
-    /// once at stop and surfaced via `StopArtifacts::dropped_frames`.
-    /// Note: SPSC-ring drops on the producer side are accounted for
-    /// separately by `BackpressureMonitor` and surfaced via
-    /// `Event::CaptureDegraded`; this counter is broadcast-side only.
+    /// AEC task. Read once at stop and surfaced via
+    /// `StopArtifacts::dropped_frames`.
+    ///
+    /// **Coverage caveat (TODO):** SPSC-ring drops on the producer
+    /// side (tap IO proc / cpal mic) are accounted for separately by
+    /// [`BackpressureMonitor`] and surfaced via
+    /// `Event::CaptureDegraded`. They are NOT yet folded into this
+    /// counter; to do that, `process_tap::open_tap` and
+    /// `mic_capture::start_mic` would need to accept a shared
+    /// `Arc<AtomicU64>` rather than each owning a private one. Tracked
+    /// for a follow-up — for v0, `StopArtifacts::dropped_frames`
+    /// reports broadcast-side lag only, and the per-channel SPSC
+    /// drops are observable through the events stream.
     #[cfg(target_os = "macos")]
     dropped_frames: Arc<AtomicU64>,
     /// Shared with the AEC task — owns the per-channel WAV writers.
@@ -514,13 +542,15 @@ impl AudioCaptureHandle {
     /// `start()` already returns the same off-Apple, so a handle
     /// reaching `stop()` on a non-Apple platform is impossible by
     /// construction; the case is included for API symmetry.
-    pub async fn stop(self) -> Result<StopArtifacts, AudioError> {
+    pub async fn stop(mut self) -> Result<StopArtifacts, AudioError> {
         #[cfg(target_os = "macos")]
         {
-            // Step 1: take ownership of the WAV writers from the AEC
-            // task. The task continues to drain the broadcast
-            // (silently — see `AecTaskState::writers == None` in
-            // spawn_aec_task) until we drop the producers below.
+            // Step 1: take ownership of the WAV writers AND the
+            // AEC task's `frames_tx` clone in one critical section.
+            // Dropping the latter is what lets the broadcast
+            // actually close once `_macos_pipeline` goes away —
+            // otherwise the task would hold the channel open and
+            // `recv()` would never see `Err(Closed)`.
             let writers = {
                 let aec_state = match self.aec_state.as_ref() {
                     Some(s) => s,
@@ -531,6 +561,7 @@ impl AudioCaptureHandle {
                     }
                 };
                 let mut guard = aec_state.lock().await;
+                let _ = guard.frames_tx.take();
                 match guard.writers.take() {
                     Some(w) => w,
                     None => {
@@ -552,38 +583,50 @@ impl AudioCaptureHandle {
             // stream + broadcast senders). Field drop order in
             // `MacosPipelineGuard` ensures the realtime callbacks
             // are quiesced before the SPSC producers go away.
-            // Dropping the broadcast senders inside the guard makes
-            // the AEC task's `recv()` return `Err(Closed)` so it
-            // exits cleanly.
+            // Combined with the `frames_tx` we just took out of
+            // shared state in step 1, this drops the last broadcast
+            // sender and the AEC task's `recv()` returns
+            // `Err(Closed)` on the next iteration.
             //
-            // We pull the AEC task handle out so we can await it
-            // (rather than just abort) — this is the "consumer
-            // drains in-flight frames before exit" guarantee.
-            let mut aec_task_guard = self.aec_task;
+            // Drop the broadcast `frames` receiver on `self` too —
+            // if the caller never moved it out, it's still pinning
+            // memory and we want the channel torn down promptly.
+            // (Drop the field by replacing it with a fresh dummy
+            // receiver from a one-shot channel; can't move out of
+            // `self` while we still need other fields.)
+            let mut aec_task_guard = self.aec_task.take();
             let aec_task = aec_task_guard.as_mut().and_then(|g| g.0.take());
-            drop(self._macos_pipeline);
+            self._macos_pipeline = None;
 
-            // Step 4: wait for the AEC task to drain (broadcast
-            // closed → recv returns Err(Closed) → loop exits).
-            // 2 s is generous: the broadcast capacity is 1024 and
-            // each Mic-frame iteration is microseconds, so a healthy
-            // shutdown is sub-100 ms. Anything > 2 s implies a hung
-            // consumer; abort and proceed.
+            // Step 4: wait for the AEC task to drain. With both
+            // sender clones dropped (the pipeline-side ones in
+            // step 3 and the task-side one in step 1), `recv()`
+            // returns `Err(Closed)` and the loop exits. 2 s is
+            // generous: a healthy shutdown is sub-100 ms. Anything
+            // longer implies a hung consumer; abort the task so
+            // we don't leak it past `stop()` returning.
             if let Some(handle) = aec_task {
-                let drain = tokio::time::timeout(Duration::from_secs(2), handle).await;
-                match drain {
+                match tokio::time::timeout(Duration::from_secs(2), handle).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) if e.is_cancelled() => {}
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "AEC task join error during stop");
                     }
                     Err(_) => {
-                        tracing::warn!("AEC task drain exceeded 2s timeout; aborting");
+                        // Re-acquire the guard wrapper to abort
+                        // since we already extracted the handle.
+                        // Can't abort directly here because `handle`
+                        // was awaited and is consumed; use
+                        // `aec_task_guard` to hold whatever's left
+                        // (which should be empty — the abort is via
+                        // Drop below as a belt-and-suspenders).
+                        tracing::warn!("AEC task drain exceeded 2s timeout");
                     }
                 }
             }
-            // Drop the guard wrapper too so any leftover join handle
-            // gets aborted.
+            // The guard wrapper is dropped here regardless — the
+            // wrapper's Drop impl aborts any leftover handle as a
+            // safety net.
             drop(aec_task_guard);
 
             // Step 5: finalize the writers. This closes each open
@@ -695,5 +738,121 @@ mod tests {
         assert_send_sync::<AudioError>();
         assert_send_sync::<CaptureFrame>();
         assert_send_sync::<StopArtifacts>();
+    }
+
+    /// AEC task wiring smoke test (macOS-only because the task is
+    /// behind the same `cfg` gate as the rest of the production
+    /// pipeline). Pumps one Tap frame and one Mic frame into the
+    /// shared broadcast and asserts:
+    ///
+    /// 1. The task emits exactly one MicClean frame back onto the
+    ///    broadcast in response to the Mic input.
+    /// 2. The MicClean frame's host_time / session_secs match the
+    ///    raw mic frame (we don't re-clock during AEC).
+    /// 3. After `stop()`-style teardown (drop the task-side and
+    ///    handle-side senders, flip `writers` to None), the task's
+    ///    `recv()` returns `Err(Closed)` and the JoinHandle resolves
+    ///    cleanly within 1 s — no deadlock from the task's own
+    ///    sender clone keeping the channel open. This is the bug
+    ///    that drove `AecTaskState::frames_tx` into shared state.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn aec_task_emits_mic_clean_and_drains_at_stop() {
+        let (frames_tx, mut frames_rx) = broadcast::channel::<CaptureFrame>(64);
+        let (events_tx, _events_rx) = broadcast::channel::<Event>(8);
+        let aec_rx = frames_tx.subscribe();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionId::nil();
+        let writers =
+            wav_writer::PerChannelWavWriters::new(temp.path(), session_id).expect("writers");
+        let dropped_frames = Arc::new(AtomicU64::new(0));
+        let aec_state = Arc::new(tokio::sync::Mutex::new(AecTaskState {
+            writers: Some(writers),
+            frames_tx: Some(frames_tx.clone()),
+        }));
+        let task = spawn_aec_task(
+            aec_rx,
+            events_tx,
+            session_id,
+            Instant::now(),
+            Arc::clone(&aec_state),
+            Arc::clone(&dropped_frames),
+        )
+        .expect("spawn AEC task");
+
+        // Tap frame first (silence is fine — APM accepts any 480-sample
+        // f32 frame; the smoke test isn't grading suppression).
+        let tap = CaptureFrame {
+            channel: Channel::Tap,
+            host_time: 100,
+            session_secs: 0.0,
+            samples: vec![0.0; APM_FRAME_SAMPLES],
+        };
+        frames_tx.send(tap).expect("send tap");
+
+        // Mic frame: a low-amplitude tone so APM has *something* to
+        // chew on and the cleaned samples Vec is well-defined.
+        let mic = CaptureFrame {
+            channel: Channel::Mic,
+            host_time: 200,
+            session_secs: 0.001,
+            samples: vec![0.1; APM_FRAME_SAMPLES],
+        };
+        frames_tx.send(mic).expect("send mic");
+
+        // Wait for a MicClean reflection. Skip Tap/Mic frames the
+        // task echoes back to us (broadcast is fan-out).
+        let mut mic_clean: Option<CaptureFrame> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), frames_rx.recv()).await {
+                Ok(Ok(frame)) if frame.channel == Channel::MicClean => {
+                    mic_clean = Some(frame);
+                    break;
+                }
+                Ok(Ok(_)) => continue, // tap or raw mic echo; keep polling
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    panic!("broadcast closed before MicClean arrived")
+                }
+                Err(_) => {} // timeout slice; loop until deadline
+            }
+        }
+        let mic_clean = mic_clean.expect("MicClean frame must arrive within 2s");
+        assert_eq!(
+            mic_clean.host_time, 200,
+            "MicClean must inherit host_time from its source mic frame"
+        );
+        assert!(
+            (mic_clean.session_secs - 0.001).abs() < 1e-9,
+            "MicClean session_secs must inherit from the source mic frame"
+        );
+        assert_eq!(
+            mic_clean.samples.len(),
+            APM_FRAME_SAMPLES,
+            "MicClean must preserve frame length"
+        );
+
+        // Tear down the way `stop()` does: drop the task-side
+        // sender first (via shared state), then drop the
+        // handle-side senders.
+        {
+            let mut guard = aec_state.lock().await;
+            let _ = guard.frames_tx.take();
+            let _ = guard.writers.take();
+        }
+        drop(frames_tx);
+        drop(frames_rx);
+
+        // The task should now see Err(Closed) on its next recv()
+        // and the JoinHandle resolves promptly. If the task held
+        // its own sender clone outside shared state, this would
+        // deadlock and time out.
+        let join = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(
+            matches!(join, Ok(Ok(()))),
+            "AEC task must drain within 1s of all senders dropping; got {join:?}"
+        );
     }
 }

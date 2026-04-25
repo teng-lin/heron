@@ -85,13 +85,6 @@ impl PerChannelWavWriters {
         })
     }
 
-    /// Path that the channel's WAV will (or does) live at. Useful for
-    /// the empty-WAV contract — callers can pre-compute the path even
-    /// before any frame has arrived for that channel.
-    pub fn path_for(&self, channel: Channel) -> PathBuf {
-        self.session_dir.join(filename_for(channel))
-    }
-
     /// Append `frame.samples` to the channel's WAV. Opens the file
     /// lazily on the first call for that channel.
     ///
