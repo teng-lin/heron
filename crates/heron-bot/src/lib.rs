@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod disclosure;
 pub mod fsm;
 pub mod ids;
+pub use disclosure::{is_objection, match_objection};
 pub use fsm::{BotEvent, BotFsm, TransitionError};
 pub use ids::IdParseError;
 

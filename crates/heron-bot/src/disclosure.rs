@@ -1,0 +1,197 @@
+//! Disclosure-objection matcher per spec §4 + Invariant 6.
+//!
+//! After the bot speaks its disclosure, the orchestrator listens to
+//! the inbound transcript stream for `objection_timeout_secs`
+//! seconds. Any participant turn matching one of the configured
+//! `objection_patterns` triggers the FSM's
+//! [`crate::BotEvent::DisclosureObjected`] transition, which in turn
+//! routes the bot to `Leaving → Completed` per
+//! [`crate::BotFsm`].
+//!
+//! Why a separate module from `fsm.rs`:
+//! - The FSM is event-shaped (consumes `BotEvent::DisclosureObjected`).
+//!   The matcher is text-shaped (consumes inbound transcript turns
+//!   and decides when to *produce* that event).
+//! - Keeping the matcher pure (no clock, no I/O) lets the
+//!   orchestrator unit-test "did this turn objection-match" without
+//!   spinning up a real disclosure flow.
+//!
+//! ## Matching semantics
+//!
+//! Mirrors the policy filter: case-insensitive substring match. The
+//! spec calls these "objection patterns" but a regex engine would
+//! over-shoot — profile authors write things like `"please leave"` /
+//! `"don't record"` / `"no AI"`, not regexes. A substring match
+//! against those terms catches the common forms reliably without
+//! the metacharacter footguns.
+//!
+//! ## What this returns
+//!
+//! [`match_objection`] returns the first matched pattern, so the
+//! orchestrator can:
+//!
+//! 1. Log *which* pattern fired (for the audit log + the user-
+//!    facing "exited because participant said X" indicator).
+//! 2. Route the FSM to `DisclosureObjected` exactly once even if
+//!    several inbound turns each match — the caller decides
+//!    whether to ignore subsequent matches once the FSM has moved.
+
+/// First pattern from `patterns` that appears as a substring of
+/// `text` (case-insensitive). Returns `None` when no pattern fires
+/// — the orchestrator keeps listening until the timeout expires.
+pub fn match_objection<'a>(text: &str, patterns: &'a [String]) -> Option<&'a str> {
+    if patterns.is_empty() || text.is_empty() {
+        return None;
+    }
+    let lowered_text = text.to_lowercase();
+    patterns
+        .iter()
+        .map(String::as_str)
+        .find(|pattern| !pattern.is_empty() && lowered_text.contains(&pattern.to_lowercase()))
+}
+
+/// `true` when [`match_objection`] would fire. Convenience for the
+/// orchestrator's hot loop: the boolean answer is what gates the
+/// `BotEvent::DisclosureObjected` send.
+pub fn is_objection(text: &str, patterns: &[String]) -> bool {
+    match_objection(text, patterns).is_some()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn patterns(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn finds_first_matching_pattern() {
+        let pats = patterns(&["please leave", "no recording", "don't record"]);
+        let result = match_objection("excuse me, no recording please", &pats);
+        assert_eq!(result, Some("no recording"));
+    }
+
+    #[test]
+    fn returns_first_pattern_when_multiple_match() {
+        // Pin iteration order so audit logs are predictable: the
+        // first pattern in the configured list wins.
+        let pats = patterns(&["please leave", "no recording"]);
+        let result = match_objection("please leave AND stop the recording", &pats);
+        assert_eq!(result, Some("please leave"));
+    }
+
+    #[test]
+    fn case_insensitive_in_both_directions() {
+        let pats = patterns(&["Please Leave"]);
+        assert_eq!(
+            match_objection("you should PLEASE LEAVE now", &pats),
+            Some("Please Leave"),
+        );
+        let pats = patterns(&["please leave"]);
+        assert_eq!(match_objection("PLEASE LEAVE", &pats), Some("please leave"),);
+    }
+
+    #[test]
+    fn empty_text_returns_none() {
+        let pats = patterns(&["please leave"]);
+        assert_eq!(match_objection("", &pats), None);
+    }
+
+    #[test]
+    fn empty_pattern_list_returns_none() {
+        let result = match_objection("please leave", &[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn empty_pattern_string_is_skipped() {
+        // A misconfigured profile with `""` in the pattern list
+        // would otherwise match every utterance (every string
+        // contains the empty string). Skip empties so a typo can't
+        // accidentally kick the bot out of every meeting.
+        let pats = patterns(&["", "please leave"]);
+        assert_eq!(
+            match_objection("please leave the meeting", &pats),
+            Some("please leave"),
+        );
+    }
+
+    #[test]
+    fn empty_pattern_string_only_returns_none() {
+        let pats = patterns(&[""]);
+        assert_eq!(match_objection("any text at all", &pats), None);
+    }
+
+    #[test]
+    fn substring_match_does_not_require_word_boundary() {
+        // "no" inside "innovation" intentionally matches — we don't
+        // run a tokenizer here. The trade-off is documented in the
+        // module preamble; profile authors should pick patterns
+        // that aren't accidentally embedded in benign words.
+        let pats = patterns(&["no"]);
+        assert_eq!(match_objection("innovation", &pats), Some("no"));
+    }
+
+    #[test]
+    fn is_objection_is_a_thin_wrapper() {
+        let pats = patterns(&["please leave"]);
+        assert!(is_objection("please leave now", &pats));
+        assert!(!is_objection("good morning", &pats));
+        assert!(!is_objection("anything", &[]));
+    }
+
+    #[test]
+    fn realistic_objection_phrases() {
+        // Sanity-check against the kind of phrasing real
+        // participants would actually use.
+        let pats = patterns(&[
+            "please leave",
+            "no recording",
+            "don't record",
+            "no AI",
+            "stop the recording",
+        ]);
+        let cases = [
+            ("Hey, please leave the call", Some("please leave")),
+            ("we have a no recording policy here", Some("no recording")),
+            ("Don't record this discussion", Some("don't record")),
+            ("we're a no AI shop", Some("no AI")),
+            ("STOP THE RECORDING right now", Some("stop the recording")),
+            ("good morning everyone", None),
+        ];
+        for (text, expected) in cases {
+            let result = match_objection(text, &pats);
+            assert_eq!(
+                result, expected,
+                "failed on input: {text:?} expected {expected:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_text_with_ascii_pattern() {
+        // Mixed-encoding inputs: a Spanish "por favor déjenos" + an
+        // English "please leave" pattern. The English pattern fires
+        // only on English text (substring), so the Spanish doesn't
+        // match. Pinned so we don't accidentally introduce a fancy
+        // tokenizer that would.
+        let pats = patterns(&["please leave"]);
+        assert_eq!(match_objection("por favor déjenos", &pats), None);
+        // Same English pattern, English-with-emoji input → matches.
+        assert_eq!(
+            match_objection("please leave 🙏", &pats),
+            Some("please leave"),
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_returns_none() {
+        // " " is not the empty string, but contains no objection
+        // patterns either. Pin this so a transcript pause-marker
+        // doesn't mistakenly fire the FSM.
+        let pats = patterns(&["please leave"]);
+        assert_eq!(match_objection("   \t\n  ", &pats), None);
+    }
+}
