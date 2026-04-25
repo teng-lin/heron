@@ -71,7 +71,7 @@ public func wk_init(_ model_dir: UnsafePointer<CChar>?) -> Int32 {
     }
     sem.wait()
 
-    if let _ = initErr {
+    if initErr != nil {
         return WK_INTERNAL
     }
     guard let instance = instance else {
