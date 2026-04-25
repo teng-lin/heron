@@ -135,6 +135,10 @@ export interface HeronCommands {
     args: { settingsPath: string; settings: Settings };
     returns: void;
   };
+  heron_default_settings_path: {
+    args: Record<string, never>;
+    returns: string;
+  };
   heron_test_microphone: {
     args: Record<string, never>;
     returns: TestOutcome;

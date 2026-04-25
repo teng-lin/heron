@@ -47,6 +47,11 @@ tokio = { workspace = true }
 # Calendar probe builds a `[start, end)` window via `chrono` and
 # threads it through `heron_vault::calendar::calendar_read_one_shot`.
 chrono = { workspace = true }
+# Native file/directory picker for the Settings pane vault-path field
+# (§16.1). The frontend calls `@tauri-apps/plugin-dialog::open({ directory:
+# true })`, which routes to this plugin's IPC handler. Pinned to the
+# matching JS package version on the renderer side.
+tauri-plugin-dialog = "2.7.0"
 
 [dev-dependencies]
 tempfile = "3"
