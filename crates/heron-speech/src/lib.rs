@@ -18,6 +18,7 @@ use thiserror::Error;
 
 pub mod partial_writer;
 pub mod selection;
+pub mod whisperkit_bridge;
 
 pub use partial_writer::{
     FLUSH_INTERVAL, FLUSH_TURNS, PartialWriter, PartialWriterError, read_partial_jsonl,
@@ -26,6 +27,7 @@ pub use selection::{
     Platform, RealPlatform, WER_THRESHOLDS, WerBaseline, WerThreshold, lookup_threshold,
     select_backend,
 };
+pub use whisperkit_bridge::{WkError, WkStatus, whisperkit_init, whisperkit_transcribe};
 
 /// Per-backend telemetry collected during a successful transcription.
 #[derive(Debug, Clone)]
