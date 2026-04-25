@@ -76,15 +76,37 @@ fn summary_failure_sets_idle_reason_to_failed() {
     assert_eq!(outcome.last_idle_reason, Some(IdleReason::SummaryFailed));
 }
 
+/// Off-Apple targets still get `NotYetImplemented` from
+/// `AudioCapture::start` — the cidre process tap only compiles on macOS.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
-async fn audio_pipeline_returns_not_yet_implemented() {
+async fn audio_pipeline_returns_not_yet_implemented_off_apple() {
     let tmp = TempDir::new().expect("tmpdir");
     let orch = Orchestrator::new(cfg(&tmp));
     let result = orch.try_start_audio().await;
     match result {
         Err(SessionError::Audio(heron_audio::AudioError::NotYetImplemented)) => {}
         Err(other) => panic!("expected NotYetImplemented, got {other:?}"),
-        Ok(_handle) => panic!("unexpected Ok from stub audio pipeline"),
+        Ok(_handle) => panic!("expected NotYetImplemented, got Ok(_handle)"),
+    }
+}
+
+/// On macOS we now exercise the real Core Audio process tap path.
+/// On a CI runner without TCC granted this surfaces as
+/// `PermissionDenied` / `ProcessNotFound` / `Aborted`; what we lock
+/// down here is that we never regress back to `NotYetImplemented`.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn audio_pipeline_does_not_return_not_yet_implemented_on_macos() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let orch = Orchestrator::new(cfg(&tmp));
+    let result = orch.try_start_audio().await;
+    match result {
+        Err(SessionError::Audio(heron_audio::AudioError::NotYetImplemented)) => {
+            panic!("macOS branch must not return NotYetImplemented");
+        }
+        Err(SessionError::Audio(_)) | Ok(_) => {}
+        Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }
 
