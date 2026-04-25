@@ -1,7 +1,7 @@
 //! `heron-audio` — per-app audio capture, AEC, and recording.
 //!
 //! This crate exposes the v0 surface from
-//! [`docs/implementation.md`](../../docs/implementation.md) §6.2.
+//! [`docs/implementation.md`](../../../docs/implementation.md) §6.2.
 //! The real implementation (Core Audio process tap, WebRTC APM AEC,
 //! disk-spill ringbuffer) lands across weeks 2–3 (§6 + §7).
 //!
@@ -61,7 +61,7 @@ pub enum AudioError {
     #[error("target meeting app not running: {bundle_id}")]
     ProcessNotFound { bundle_id: String },
     #[error("permission denied: {0}")]
-    PermissionDenied(&'static str),
+    PermissionDenied(String),
     #[error("capture pipeline aborted: {0}")]
     Aborted(String),
     #[error(transparent)]
