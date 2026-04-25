@@ -1,1 +1,1239 @@
-{"nodes":[{"title":"zoom.us","depth":0,"role":"AXApplication"},{"title":"Zoom Workplace","subrole":"AXStandardWindow","role":"AXWindow","depth":1},{"depth":2,"role":"","description":""},{"description":"Back in Chat(⌘ + left bracket)","role":"AXButton","help":"Back in Chat(⌘ + left bracket)","depth":2},{"depth":2,"role":"AXButton","description":"Forward in Chat(⌘ + right bracket)","help":"Forward in Chat(⌘ + right bracket)"},{"description":"History","role":"AXButton","depth":2,"help":"History"},{"role":"AXButton","depth":2,"description":"Search (⌘E)  ⌘E","help":"Press ⌘E to search"},{"depth":2,"description":"Create new","help":"Create new","role":"AXButton"},{"depth":2,"role":"AXButton","help":"Open activity center","description":"Hide activity center"},{"title":"","role":"AXButton","help":"In a Zoom Meeting","depth":2,"description":"Zoom, Teng Lin, In a Zoom Meeting, Basic account"},{"description":"Hide AI Companion panel","role":"AXButton","help":"AI Companion always shows on the home screen.","depth":2},{"help":"Calendar always shows on the home screen.","depth":2,"role":"AXButton","description":"Calendar always shows on the home screen."},{"depth":2,"description":"Navigation tabs","role":"AXGroup"},{"description":"Home, selected, 1 of 6","role":"AXUnknown","depth":3,"help":"Home, selected, 1 of 6","value":"Home, selected"},{"title":"","help":"Home, selected, 1 of 6","depth":4,"role":"AXButton"},{"help":"Meetings, 2 of 6","depth":3,"role":"AXUnknown","value":"Meetings","description":"Meetings, 2 of 6"},{"help":"Meetings, 2 of 6","role":"AXButton","depth":4,"title":""},{"description":"Chat, 3 of 6","role":"AXUnknown","depth":3,"value":"Chat","help":"Chat, 3 of 6"},{"role":"AXButton","depth":4,"help":"Chat, 3 of 6","title":""},{"help":"Scheduler, 4 of 6","description":"Scheduler, 4 of 6","value":"Scheduler","depth":3,"role":"AXUnknown"},{"title":"","depth":4,"help":"Scheduler, 4 of 6","role":"AXButton"},{"description":"Hub, 5 of 6","role":"AXUnknown","help":"Hub, 5 of 6","value":"Hub","depth":3},{"help":"Hub, 5 of 6","title":"","depth":4,"role":"AXButton"},{"description":"More, 6 of 6","role":"AXUnknown","help":"More, 6 of 6","value":"More","depth":3},{"role":"AXButton","help":"More, 6 of 6","title":"","depth":4},{"title":"Settings","depth":2,"role":"AXButton","help":"Settings"},{"depth":2,"role":"AXSplitGroup"},{"role":"AXStaticText","depth":3,"value":"6:16 PM"},{"role":"AXStaticText","depth":3,"value":"Saturday, April 25"},{"depth":3,"role":"AXGroup"},{"description":"Back to meeting","depth":4,"role":"AXButton","identifier":"44C2E00B-8419-42CF-B801-09CE1616F70F","title":""},{"role":"AXGroup","depth":3},{"description":"Join meeting","identifier":"7EFFADCF-73D2-4125-B433-2B5F1A03C4C2","role":"AXButton","depth":4,"title":""},{"depth":3,"role":"AXGroup"},{"depth":4,"title":"","role":"AXButton","identifier":"496FE469-2749-43A1-BDA6-DAD928A07B03","description":"Schedule meeting"},{"depth":3,"role":"AXGroup"},{"role":"AXButton","description":"Share screen","depth":4,"title":"","identifier":"54433F9C-B6D7-4FCE-98D7-A13533490B3D"},{"depth":3,"role":"AXGroup"},{"identifier":"0EFAEFAC-7A5D-4C43-9DA1-2D45BF1948D4","role":"AXButton","title":"","description":"My notes, new","depth":4},{"role":"AXGroup","depth":3},{"role":"AXGroup","depth":4},{"description":"","help":"","selected":false,"title":"","depth":5,"role":"AXScrollArea","value":""},{"title":"","role":"AXWebArea","value":"","depth":6,"description":"Zoom Calendar","help":"","selected":false},{"depth":7,"selected":false,"help":"","description":"","role":"AXGroup","title":"","value":""},{"value":"You haven't connected your calendar yet. ","description":"","depth":8,"title":"","help":"","selected":false,"role":"AXStaticText"},{"description":"Connect now","role":"AXLink","title":"Connect now","value":"","selected":false,"help":"","depth":8},{"depth":9,"help":"","value":"Connect now","description":"","role":"AXStaticText","selected":false,"title":""},{"selected":false,"help":"","title":"","value":" to manage all your meetings and events in one place.","depth":8,"description":"","role":"AXStaticText"},{"help":"","depth":7,"title":"Dismiss banner message","description":"Dismiss banner message","selected":false,"role":"AXButton","value":""},{"role":"AXButton","help":"Create event","value":"","selected":false,"description":"Create event","depth":7,"title":"Create event"},{"description":"","role":"AXGroup","title":"","selected":false,"help":"","value":"","depth":7},{"help":"","title":"Select calendar date: Today, Apr 25","value":"","description":"Select calendar date: Today, Apr 25","role":"AXPopUpButton","depth":8,"selected":false},{"role":"AXButton","depth":7,"title":"Today","help":"Today","description":"Today","value":"","selected":false},{"help":"Previous","selected":false,"depth":7,"title":"Previous","description":"Previous","role":"AXButton","value":""},{"role":"AXButton","depth":7,"title":"Next","value":"","description":"Next","help":"Next","selected":false},{"role":"AXGroup","title":"","help":"","depth":7,"subrole":"AXApplicationGroup","value":"","description":"","selected":false},{"value":"","help":"","description":"","depth":8,"role":"AXGroup","title":"","selected":false},{"value":"","description":"More options","title":"More options","depth":9,"role":"AXButton","selected":false,"help":""},{"value":"","selected":false,"help":"","title":"","depth":7,"role":"AXGroup","description":""},{"description":"","value":"No meetings scheduled.","help":"","depth":8,"title":"","selected":false,"role":"AXStaticText"},{"value":"","help":"","title":"Schedule a meeting","depth":7,"role":"AXButton","description":"Schedule a meeting","selected":false},{"selected":false,"role":"AXButton","description":"Open recordings","help":"","depth":7,"value":"","title":"Open recordings"},{"role":"AXSplitter","value":638,"depth":3,"selected":false},{"depth":3,"role":"AXGroup"},{"role":"AXGroup","depth":4},{"title":"","selected":false,"role":"AXScrollArea","description":"","help":"","depth":5,"value":""},{"role":"AXWebArea","depth":6,"description":"Zoom AI Companion Plus","selected":false,"title":"","value":"","help":""},{"subrole":"AXLandmarkBanner","role":"AXGroup","help":"","value":"","selected":false,"title":"","description":"","depth":7},{"value":1,"depth":8,"title":"AI CompanionBASIC","help":"","role":"AXHeading","selected":false,"description":""},{"role":"AXStaticText","selected":false,"depth":9,"value":"AI Companion","description":"","help":"","title":""},{"role":"AXStaticText","description":"","title":"","selected":false,"help":"","depth":9,"value":"BASIC"},{"description":"","help":"","selected":false,"role":"AXGroup","value":"","depth":8,"title":""},{"description":"","help":"","selected":false,"title":"","role":"AXGroup","value":"","depth":9},{"selected":false,"help":"","role":"AXButton","description":"Open Notification Center","value":"","title":"Open Notification Center","depth":10},{"title":"Pop out window","description":"Pop out window","depth":8,"role":"AXButton","value":"","help":"","selected":false},{"help":"","title":"","value":"","selected":false,"subrole":"AXApplicationAlert","description":"","depth":7,"role":"AXGroup"},{"help":"","depth":8,"selected":false,"description":"See what’s included","title":"See what’s included","role":"AXButton","value":""},{"help":"","selected":false,"title":"Close","value":"","description":"Close","depth":8,"role":"AXButton"},{"selected":false,"depth":7,"help":"","subrole":"AXEmptyGroup","description":"","role":"AXGroup","value":"","title":""},{"description":"","value":2,"title":"Suggested prompts","help":"","depth":7,"role":"AXHeading","selected":false},{"help":"","value":"Suggested prompts","depth":8,"title":"","selected":false,"role":"AXStaticText","description":""},{"description":"","value":"","title":"","depth":7,"subrole":"AXApplicationGroup","help":"","role":"AXGroup","selected":false},{"title":"What are some tips for running a Zoom meeting","selected":false,"depth":8,"role":"AXButton","value":"What are some tips for running a Zoom meeting","description":"What are some tips for running a Zoom meeting","help":""},{"value":"Coordinate meetings with external contacts","description":"Coordinate meetings with external contacts","title":"Coordinate meetings with external contacts","selected":false,"role":"AXButton","depth":8,"help":""},{"description":"Schedule a meeting with contact","title":"Schedule a meeting with contact","selected":false,"value":"Schedule a meeting with contact","role":"AXButton","depth":8,"help":""},{"title":"Tell me what I can do with AI Companion","role":"AXButton","help":"","depth":8,"selected":false,"value":"Tell me what I can do with AI Companion","description":"Tell me what I can do with AI Companion"},{"title":"","value":"","selected":false,"help":"","description":"","depth":7,"role":"AXGroup"},{"selected":false,"depth":8,"description":"Try on the web","help":"","value":"","role":"AXLink","title":"Try on the web"},{"description":"","help":"","depth":9,"title":"","selected":false,"role":"AXStaticText","value":"Try on the web"},{"value":"","help":"","role":"AXGroup","selected":false,"description":"","title":"","depth":7},{"title":"Attach file","depth":8,"selected":false,"value":"","help":"","role":"AXPopUpButton","description":"Attach file"},{"role":"AXTextArea","selected":false,"value":"\n","depth":7,"title":"Message AI Companion Write a message or type \/ for more","description":"Message AI Companion Write a message or type \/ for more","help":""},{"title":"","role":"AXGroup","subrole":"AXEmptyGroup","depth":8,"value":"","description":"","help":"","selected":false},{"help":"","description":"","role":"AXGroup","depth":7,"selected":false,"value":"","title":""},{"value":"","description":"Send message","title":"Send message","help":"","role":"AXButton","depth":8,"selected":false},{"role":"AXGroup","value":"","selected":false,"description":"","help":"","depth":7,"title":""},{"subrole":"AXApplicationGroup","description":"AI can make mistakes. Review for accuracy.","title":"AI can make mistakes. Review for accuracy.","role":"AXGroup","help":"","value":"","selected":false,"depth":8},{"depth":9,"selected":false,"role":"AXStaticText","title":"","description":"","help":"","value":"AI can make mistakes. Review for accuracy."},{"selected":false,"title":"","role":"AXGroup","help":"","value":"","depth":7,"description":"","subrole":"AXEmptyGroup"},{"role":"AXGroup","subrole":"AXEmptyGroup","title":"","selected":false,"value":"","description":"","depth":7,"help":""},{"title":"","subrole":"AXEmptyGroup","help":"","role":"AXGroup","depth":7,"description":"","selected":false,"value":""},{"depth":3,"role":"AXGroup"},{"depth":4,"role":"AXGroup"},{"value":"","title":"","help":"","description":"","depth":5,"role":"AXScrollArea","selected":false},{"depth":6,"title":"","value":"","help":"","role":"AXWebArea","description":"Activity Center","selected":false},{"title":"More options","help":"More","value":"","description":"More options","role":"AXPopUpButton","selected":false,"depth":7},{"depth":7,"selected":false,"subrole":"AXApplicationGroup","help":"","role":"AXGroup","title":"","description":"","value":""},{"description":"Filter","help":"Filter","value":"","selected":false,"title":"Filter","depth":8,"role":"AXButton"},{"role":"AXStaticText","title":"","value":"Activity","help":"","selected":false,"description":"","depth":7},{"value":"","depth":7,"help":"","description":"Learn more about Close","title":"Learn more about Close","role":"AXButton","selected":false},{"depth":7,"selected":false,"help":"","description":"","title":"","role":"AXTabGroup","value":"<AXUIElement 0x98103d3e0> {pid=80247}"},{"role":"AXRadioButton","value":true,"description":"","selected":true,"depth":8,"help":"","title":"Focus"},{"value":false,"title":"Others","depth":8,"help":"","selected":false,"role":"AXRadioButton","description":""},{"depth":7,"role":"AXGroup","help":"","description":"Focus","subrole":"AXTabPanel","title":"Focus","value":"","selected":false},{"title":"","value":"🎉 Activity Center 2.0 is here","role":"AXStaticText","selected":false,"depth":8,"description":"","help":""},{"role":"AXGroup","selected":false,"value":"","help":"","description":"","depth":8,"title":""},{"title":"","depth":9,"description":"","role":"AXStaticText","selected":false,"value":"A smarter side panel for all your Zoom Workplace notifications with a new Focus tab for your most important notifications - easy to access, easy to act on!","help":""},{"selected":false,"value":"","help":"","depth":8,"description":"Learn more, link","role":"AXButton","title":"Learn more, link"},{"description":"Dismiss banner message","depth":8,"role":"AXButton","title":"Dismiss banner message","help":"","selected":false,"value":""},{"help":"Mark All as Read","role":"AXGroup","description":"","depth":8,"title":"","value":"","selected":false},{"selected":false,"description":"","title":"","role":"AXImage","depth":9,"value":"","help":""},{"depth":8,"selected":false,"value":"","subrole":"AXEmptyGroup","description":"","help":"","title":"","role":"AXGroup"},{"value":"","title":"","selected":false,"description":"","role":"AXGroup","depth":8,"help":""},{"depth":9,"help":"","role":"AXStaticText","title":"","value":"You've cleared your suggestions","description":"","selected":false},{"description":"","value":"","help":"","selected":false,"depth":8,"title":"","role":"AXGroup"},{"description":"","depth":9,"title":"","value":"Check out the rest of your notifications in the Other tab.","help":"","role":"AXStaticText","selected":false},{"help":"","selected":false,"role":"AXButton","depth":8,"description":"","value":"","title":"View other notifications"},{"title":"","depth":7,"role":"AXImage","selected":false,"description":"","help":"","value":""},{"help":"","depth":8,"role":"AXImage","selected":false,"title":"","description":"","value":""},{"help":"","selected":false,"role":"AXImage","title":"","description":"","depth":7,"value":""},{"role":"AXImage","depth":8,"value":"","selected":false,"description":"","title":"","help":""},{"depth":7,"description":"","selected":false,"role":"AXImage","title":"","value":"","help":""},{"depth":7,"help":"","selected":false,"role":"AXImage","value":"","title":"","description":""},{"value":0.58187435633367657,"role":"AXSplitter","depth":3},{"role":"AXButton","depth":2,"subrole":"AXCloseButton"},{"depth":2,"role":"AXButton","subrole":"AXFullScreenButton","help":"this button also has an action to zoom the window"},{"depth":3,"role":"AXGroup"},{"subrole":"AXMinimizeButton","depth":2,"role":"AXButton"},{"role":"AXWindow","depth":1,"subrole":"AXStandardWindow","title":"Zoom Meeting"},{"role":"AXTabGroup","help":"","description":"Blackmyth, Computer audio unmuted","depth":2},{"description":"View Blackmyth's profile","role":"AXButton","depth":3},{"role":"AXTabGroup","description":"Teng Lin, Computer audio muted, Video off","depth":2,"help":""},{"depth":3,"role":"AXImage"},{"role":"AXButton","description":"View Teng Lin's profile","depth":3},{"role":"AXSplitter","depth":2,"value":0.12862547288776796},{"depth":2,"role":"AXScrollArea"},{"role":"AXOutline","description":"Participants list","help":"Press tab for more options and to return to the main meeting window","depth":3},{"subrole":"AXTableRow","role":"AXRow","depth":4,"selected":false},{"role":"AXCell","identifier":"ZMHCTableItemType_PANELIST","depth":5},{"depth":6,"value":"Teng Lin (me)","role":"AXStaticText"},{"description":"More options for Teng Lin, collapsed","role":"AXMenuButton","help":"More","depth":6},{"depth":6,"help":"Start video","description":"Start video","role":"AXButton"},{"role":"AXButton","help":"Unmute","depth":6,"description":"Unmute"},{"subrole":"AXTableRow","selected":false,"depth":4,"role":"AXRow"},{"role":"AXCell","depth":5,"identifier":"ZMHCTableItemType_PANELIST"},{"description":"Invite","role":"AXButton","depth":2},{"role":"AXButton","depth":2,"description":"Unmute me"},{"role":"AXUnknown","description":"Participants (2)","depth":2},{"help":"Close","depth":3,"title":"Close","role":"AXButton","description":"Button"},{"role":"AXButton","description":"Button","title":"Pop out","help":"Pop out","depth":3},{"value":"Participants (2)","depth":3,"role":"AXStaticText"},{"depth":2,"role":"AXSplitter","value":0.71570121951219512},{"role":"AXButton","subrole":"AXCloseButton","selected":false,"depth":2},{"depth":2,"subrole":"AXMinimizeButton","role":"AXButton","selected":false},{"subrole":"AXFullScreenButton","selected":false,"role":"AXButton","depth":2},{"depth":1,"selected":false,"role":"AXMenuBar"},{"role":"AXMenuBarItem","depth":2,"title":"Apple","selected":false},{"selected":false,"role":"AXMenu","depth":3},{"identifier":"_aboutThisMacRequested:","role":"AXMenuItem","depth":4,"title":"About This Mac","selected":false},{"role":"AXMenuItem","identifier":"_systemInformationRequested:","title":"System Information","selected":false,"depth":4},{"selected":false,"title":"","depth":4,"role":"AXMenuItem"},{"depth":4,"identifier":"_systemSettingsRequested:","role":"AXMenuItem","selected":false,"title":"System Settings…"},{"title":"App Store","role":"AXMenuItem","depth":4,"identifier":"_appStoreRequested:","selected":false},{"depth":4,"title":"","selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","title":"Recent Items","depth":4,"selected":false,"identifier":"_recentsRequested:"},{"role":"AXMenu","depth":5,"selected":false},{"title":"Applications","selected":false,"role":"AXMenuItem","depth":6},{"selected":false,"depth":6,"identifier":"_recentItemRequested:","title":"Activity Monitor","role":"AXMenuItem"},{"selected":false,"depth":6,"title":"Show “Activity Monitor” in Finder","identifier":"_recentItemRequested:","role":"AXMenuItem"},{"depth":6,"role":"AXMenuItem","title":"App Store","selected":false,"identifier":"_recentItemRequested:"},{"title":"Show “App Store” in Finder","selected":false,"depth":6,"identifier":"_recentItemRequested:","role":"AXMenuItem"},{"title":"Finder","identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem","selected":false},{"role":"AXMenuItem","depth":6,"selected":false,"title":"Show “Finder” in Finder","identifier":"_recentItemRequested:"},{"role":"AXMenuItem","depth":6,"identifier":"_recentItemRequested:","title":"Google Chrome","selected":false},{"title":"Show “Google Chrome” in Finder","depth":6,"identifier":"_recentItemRequested:","selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","title":"Installer","selected":false,"depth":6,"identifier":"_recentItemRequested:"},{"depth":6,"identifier":"_recentItemRequested:","role":"AXMenuItem","title":"Show “Installer” in Finder","selected":false},{"identifier":"_recentItemRequested:","title":"Microsoft Excel","selected":false,"depth":6,"role":"AXMenuItem"},{"identifier":"_recentItemRequested:","role":"AXMenuItem","selected":false,"depth":6,"title":"Show “Microsoft Excel” in Finder"},{"title":"Microsoft Word","identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem","selected":false},{"identifier":"_recentItemRequested:","role":"AXMenuItem","depth":6,"title":"Show “Microsoft Word” in Finder","selected":false},{"title":"Preview","role":"AXMenuItem","identifier":"_recentItemRequested:","selected":false,"depth":6},{"selected":false,"role":"AXMenuItem","title":"Show “Preview” in Finder","depth":6,"identifier":"_recentItemRequested:"},{"selected":false,"depth":6,"role":"AXMenuItem","title":"SubEthaEdit","identifier":"_recentItemRequested:"},{"role":"AXMenuItem","depth":6,"selected":false,"identifier":"_recentItemRequested:","title":"Show “SubEthaEdit” in Finder"},{"depth":6,"selected":false,"identifier":"_recentItemRequested:","title":"zoom.us","role":"AXMenuItem"},{"selected":false,"identifier":"_recentItemRequested:","role":"AXMenuItem","depth":6,"title":"Show “zoom.us” in Finder"},{"depth":6,"title":"","role":"AXMenuItem","selected":false},{"depth":6,"selected":false,"title":"Documents","role":"AXMenuItem"},{"title":"2026-04-25 - Weekly Client Summary.pdf","depth":6,"identifier":"_recentItemRequested:","selected":false,"role":"AXMenuItem"},{"title":"Show “2026-04-25 - Weekly Client Summary.pdf” in Finder","identifier":"_recentItemRequested:","depth":6,"selected":false,"role":"AXMenuItem"},{"selected":false,"identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem","title":"2026-04-25 - Weekly Client Summary.pdf"},{"role":"AXMenuItem","depth":6,"identifier":"_recentItemRequested:","selected":false,"title":"Show “2026-04-25 - Weekly Client Summary.pdf” in Finder"},{"title":"2026-04-25 - Weekly Client Summary.pdf","depth":6,"role":"AXMenuItem","selected":false,"identifier":"_recentItemRequested:"},{"role":"AXMenuItem","title":"Show “2026-04-25 - Weekly Client Summary.pdf” in Finder","selected":false,"identifier":"_recentItemRequested:","depth":6},{"role":"AXMenuItem","selected":false,"depth":6,"identifier":"_recentItemRequested:","title":"apps"},{"depth":6,"role":"AXMenuItem","title":"Show “apps” in Finder","selected":false,"identifier":"_recentItemRequested:"},{"identifier":"_recentItemRequested:","depth":6,"title":"ARCHITECTURE.md","selected":false,"role":"AXMenuItem"},{"title":"Show “ARCHITECTURE.md” in Finder","selected":false,"identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem"},{"role":"AXMenuItem","depth":6,"identifier":"_recentItemRequested:","title":"heron","selected":false},{"title":"Show “heron” in Finder","depth":6,"role":"AXMenuItem","selected":false,"identifier":"_recentItemRequested:"},{"role":"AXMenuItem","selected":false,"title":"oh-my-whisper","depth":6,"identifier":"_recentItemRequested:"},{"identifier":"_recentItemRequested:","selected":false,"depth":6,"role":"AXMenuItem","title":"Show “oh-my-whisper” in Finder"},{"title":"PIPE1.xlsx","identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem","selected":false},{"depth":6,"identifier":"_recentItemRequested:","role":"AXMenuItem","title":"Show “PIPE1.xlsx” in Finder","selected":false},{"identifier":"_recentItemRequested:","depth":6,"role":"AXMenuItem","selected":false,"title":"Sales Lead Weekly Update.xlsx"},{"selected":false,"identifier":"_recentItemRequested:","title":"Show “Sales Lead Weekly Update.xlsx” in Finder","role":"AXMenuItem","depth":6},{"title":"Sales Lead Weekly Update.xlsx","selected":false,"depth":6,"role":"AXMenuItem","identifier":"_recentItemRequested:"},{"selected":false,"depth":6,"identifier":"_recentItemRequested:","title":"Show “Sales Lead Weekly Update.xlsx” in Finder","role":"AXMenuItem"},{"title":"","role":"AXMenuItem","selected":false,"depth":6},{"title":"Servers","selected":false,"role":"AXMenuItem","depth":6},{"depth":6,"identifier":"_recentItemRequested:","selected":false,"title":"Macintosh HD","role":"AXMenuItem"},{"role":"AXMenuItem","selected":false,"depth":6,"title":""},{"title":"Clear Menu","identifier":"_clearRecentItemsRequested:","depth":6,"selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","title":"","selected":false,"depth":4},{"selected":false,"identifier":"_forceQuitPanelRequested:","role":"AXMenuItem","depth":4,"title":"Force Quit…"},{"selected":false,"title":"Force Quit zoom.us","identifier":"_forceQuitRequested:","depth":4,"role":"AXMenuItem"},{"selected":false,"depth":4,"role":"AXMenuItem","title":""},{"selected":false,"identifier":"_sleepRequested:","depth":4,"role":"AXMenuItem","title":"Sleep"},{"identifier":"_restartRequested:","role":"AXMenuItem","depth":4,"title":"Restart…","selected":false},{"selected":false,"depth":4,"identifier":"_restartNowRequested:","role":"AXMenuItem","title":"Restart"},{"title":"Shut Down…","depth":4,"identifier":"_shutDownRequested:","selected":false,"role":"AXMenuItem"},{"depth":4,"role":"AXMenuItem","title":"Shut Down","selected":false,"identifier":"_shutDownNowRequested:"},{"title":"","role":"AXMenuItem","depth":4,"selected":false},{"depth":4,"identifier":"_lockScreenRequested:","role":"AXMenuItem","title":"Lock Screen","selected":false},{"title":"Log Out Teng LIN…","depth":4,"identifier":"_logOutRequested:","role":"AXMenuItem","selected":false},{"role":"AXMenuItem","title":"Log Out Teng LIN","selected":false,"identifier":"_logOutNowRequested:","depth":4},{"selected":false,"role":"AXMenuItem","depth":4,"title":""},{"depth":2,"title":"Zoom Workplace","selected":false,"role":"AXMenuBarItem"},{"depth":3,"selected":false,"role":"AXMenu"},{"identifier":"onSystemMenuClicked:","role":"AXMenuItem","depth":4,"title":"About Zoom Workplace","selected":false},{"selected":false,"title":"","role":"AXMenuItem","depth":4},{"selected":false,"role":"AXMenuItem","depth":4,"identifier":"onSystemMenuClicked:","title":"Settings..."},{"selected":false,"title":"","depth":4,"role":"AXMenuItem"},{"depth":4,"title":"Services","selected":false,"role":"AXMenuItem"},{"selected":false,"role":"AXMenu","depth":5},{"title":"Activity Monitor","role":"AXMenuItem","selected":false,"depth":6,"identifier":"_processRequest:"},{"depth":6,"role":"AXMenuItem","identifier":"_processRequest:","title":"Allocations & Leaks","selected":false},{"title":"File Activity","role":"AXMenuItem","identifier":"_processRequest:","selected":false,"depth":6},{"identifier":"_processRequest:","selected":false,"title":"System Trace","depth":6,"role":"AXMenuItem"},{"depth":6,"identifier":"_processRequest:","title":"Time Profile Active Application","selected":false,"role":"AXMenuItem"},{"selected":false,"identifier":"_processRequest:","title":"Time Profile App Under Mouse","depth":6,"role":"AXMenuItem"},{"selected":false,"role":"AXMenuItem","title":"Time Profile Entire System","depth":6,"identifier":"_processRequest:"},{"role":"AXMenuItem","depth":6,"title":"Toggle Instruments Recording","identifier":"_processRequest:","selected":false},{"role":"AXMenuItem","identifier":"_configureServicesMenu:","depth":6,"title":"Services Settings…","selected":false},{"depth":4,"role":"AXMenuItem","selected":false,"title":""},{"role":"AXMenuItem","selected":false,"identifier":"onSystemMenuClicked:","depth":4,"title":"Check for updates..."},{"selected":false,"role":"AXMenuItem","title":"","depth":4},{"identifier":"onSystemMenuClicked:","role":"AXMenuItem","title":"Uninstall Zoom Workplace","depth":4,"selected":false},{"title":"","role":"AXMenuItem","depth":4,"selected":false},{"identifier":"onSystemMenuClicked:","role":"AXMenuItem","title":"Join meeting...","depth":4,"selected":false},{"depth":4,"title":"Start meeting","selected":false,"identifier":"onSystemMenuClicked:","role":"AXMenuItem"},{"title":"Schedule meeting...","identifier":"onSystemMenuClicked:","selected":false,"role":"AXMenuItem","depth":4},{"depth":4,"selected":false,"role":"AXMenuItem","identifier":"onSystemMenuClicked:","title":"Screen share..."},{"selected":false,"role":"AXMenuItem","title":"","depth":4},{"depth":4,"role":"AXMenuItem","selected":false,"identifier":"onSystemMenuClicked:","title":"Hide Zoom Workplace"},{"identifier":"hideOtherApplications:","selected":false,"depth":4,"role":"AXMenuItem","title":"Hide others"},{"selected":false,"depth":4,"role":"AXMenuItem","identifier":"unhideAllApplications:","title":"Show all"},{"title":"","role":"AXMenuItem","depth":4,"selected":false},{"selected":false,"role":"AXMenuItem","title":"Switch account","depth":4},{"role":"AXMenu","selected":false,"depth":5},{"identifier":"menuItemDidClicked:","depth":6,"role":"AXMenuItem","title":"Teng Lin(teng.lin@gmail.com)","selected":false},{"role":"AXMenuItem","title":"","depth":6,"selected":false},{"role":"AXMenuItem","title":"Add account","selected":false,"depth":6,"identifier":"addAccount:"},{"title":"Sign out","role":"AXMenuItem","selected":false,"depth":4},{"depth":5,"role":"AXMenu","selected":false},{"title":"Teng Lin(teng.lin@gmail.com)","selected":false,"depth":6,"identifier":"menuItemDidClicked:","role":"AXMenuItem"},{"role":"AXMenuItem","title":"","selected":false,"depth":6},{"role":"AXMenuItem","depth":6,"title":"Sign out of all accounts","identifier":"signOutAllAccounts:","selected":false},{"title":"","role":"AXMenuItem","selected":false,"depth":4},{"selected":false,"identifier":"onSystemMenuClicked:","depth":4,"title":"Quit Zoom Workplace","role":"AXMenuItem"},{"role":"AXMenuBarItem","selected":false,"depth":2,"title":"Meeting"},{"selected":false,"depth":3,"role":"AXMenu"},{"title":"Fullscreen","depth":4,"selected":false,"identifier":"onSwitchFullscreen:","role":"AXMenuItem"},{"depth":4,"title":"Keep on top","selected":false,"identifier":"onFloatOnTop:","role":"AXMenuItem"},{"title":"","depth":4,"selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","title":"Enter minimal view","depth":4,"selected":false,"identifier":"onSwitchMinimalVideo:"},{"depth":4,"title":"","selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","title":"Gallery view","identifier":"onSwitchViewMode:","selected":false,"depth":4},{"selected":false,"title":"","depth":4,"role":"AXMenuItem"},{"identifier":"onMuteAudio:","depth":4,"role":"AXMenuItem","title":"Unmute audio","selected":false},{"selected":false,"title":"Start video","role":"AXMenuItem","depth":4,"identifier":"onMuteVideo:"},{"role":"AXMenuItem","depth":4,"title":"Switch camera","selected":false,"identifier":"onSwitchCamera:"},{"title":"Start share","identifier":"onShare:","selected":false,"role":"AXMenuItem","depth":4},{"title":"","depth":4,"selected":false,"role":"AXMenuItem"},{"depth":4,"role":"AXMenuItem","selected":false,"identifier":"onInvite:","title":"Invite..."},{"title":"Copy invite link","identifier":"onCopyInviteLink:","depth":4,"selected":false,"role":"AXMenuItem"},{"title":"","selected":false,"role":"AXMenuItem","depth":4},{"title":"Record","depth":4,"selected":false,"identifier":"onLocalRecord:","role":"AXMenuItem"},{"depth":2,"role":"AXMenuBarItem","title":"View","selected":false},{"role":"AXMenu","selected":false,"depth":3},{"depth":4,"identifier":"onManageParticipants:","title":"Close participants","role":"AXMenuItem","selected":false},{"role":"AXMenuItem","depth":4,"title":"Show chat","identifier":"onChat:","selected":false},{"title":"","role":"AXMenuItem","depth":4,"selected":false},{"selected":false,"role":"AXMenuBarItem","depth":2,"title":"Edit"},{"role":"AXMenu","selected":false,"depth":3},{"selected":false,"depth":4,"identifier":"undo:","title":"Undo","role":"AXMenuItem"},{"title":"Redo","depth":4,"selected":false,"identifier":"redo:","role":"AXMenuItem"},{"role":"AXMenuItem","title":"","depth":4,"selected":false},{"selected":false,"role":"AXMenuItem","title":"Cut","identifier":"cut:","depth":4},{"title":"Copy","identifier":"copy:","selected":false,"depth":4,"role":"AXMenuItem"},{"identifier":"paste:","title":"Paste","role":"AXMenuItem","depth":4,"selected":false},{"identifier":"pasteAsPlainText:","title":"Paste and match style","selected":false,"depth":4,"role":"AXMenuItem"},{"selected":false,"identifier":"delete:","role":"AXMenuItem","title":"Delete","depth":4},{"role":"AXMenuItem","title":"Select all","selected":false,"identifier":"selectAll:","depth":4},{"role":"AXMenuItem","title":"Font","depth":4,"selected":false},{"selected":false,"role":"AXMenu","depth":5},{"identifier":"onSystemMenuClicked:","title":"Bigger","selected":false,"role":"AXMenuItem","depth":6},{"selected":false,"identifier":"onSystemMenuClicked:","role":"AXMenuItem","title":"Smaller","depth":6},{"depth":4,"selected":false,"role":"AXMenuItem","title":""},{"role":"AXMenuItem","identifier":"onSystemMenuClicked:","depth":4,"title":"Search","selected":false},{"role":"AXMenuItem","depth":4,"identifier":"onSystemMenuClicked:","title":"Screenshot","selected":false},{"role":"AXMenuItem","identifier":"onSystemMenuClicked:","depth":4,"title":"Record screen","selected":false},{"identifier":"onSystemMenuClicked:","depth":4,"title":"Back","role":"AXMenuItem","selected":false},{"role":"AXMenuItem","depth":4,"title":"Forward","selected":false,"identifier":"onSystemMenuClicked:"},{"depth":4,"title":"","selected":false,"role":"AXMenuItem"},{"title":"AutoFill","role":"AXMenuItem","identifier":"_NSMenuItemAutoFillIdentifier","depth":4,"selected":false},{"selected":false,"role":"AXMenu","depth":5},{"selected":false,"identifier":"_handleInsertFromContactsCommand:","role":"AXMenuItem","depth":6,"title":"Contact…"},{"depth":6,"title":"Passwords…","identifier":"_handleInsertFromPasswordsCommand:","role":"AXMenuItem","selected":false},{"role":"AXMenuItem","title":"Credit Card…","depth":6,"identifier":"_handleInsertFromCreditCardsCommand:","selected":false},{"title":"Start Dictation…","role":"AXMenuItem","identifier":"startDictation:","depth":4,"selected":false},{"role":"AXMenuItem","depth":4,"identifier":"orderFrontCharacterPalette:","title":"Emoji & Symbols","selected":false},{"role":"AXMenuBarItem","selected":false,"title":"Window","depth":2},{"selected":false,"depth":3,"role":"AXMenu"},{"depth":4,"identifier":"performMiniaturize:","selected":false,"role":"AXMenuItem","title":"Minimize"},{"title":"Minimize All","selected":false,"identifier":"miniaturizeAll:","role":"AXMenuItem","depth":4},{"role":"AXMenuItem","title":"Close","depth":4,"identifier":"performClose:","selected":false},{"role":"AXMenuItem","title":"Close All","identifier":"closeAll:","selected":false,"depth":4},{"depth":4,"identifier":"performZoom:","selected":false,"title":"Zoom","role":"AXMenuItem"},{"identifier":"zoomAll:","selected":false,"depth":4,"title":"Zoom All","role":"AXMenuItem"},{"depth":4,"title":"Fill","identifier":"_zoomFill:","selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","depth":4,"identifier":"_zoomCenter:","title":"Center","selected":false},{"selected":false,"identifier":"toggleFullScreen:","title":"Enter Full Screen","role":"AXMenuItem","depth":4},{"title":"","role":"AXMenuItem","selected":false,"depth":4},{"selected":false,"depth":4,"title":"Move & Resize","role":"AXMenuItem"},{"role":"AXMenu","depth":5,"selected":false},{"selected":false,"role":"AXMenuItem","depth":6,"title":"Halves"},{"role":"AXMenuItem","selected":false,"title":"Left","identifier":"_zoomLeft:","depth":6},{"depth":6,"title":"Right","selected":false,"role":"AXMenuItem","identifier":"_zoomRight:"},{"role":"AXMenuItem","selected":false,"depth":6,"identifier":"_zoomTop:","title":"Top"},{"role":"AXMenuItem","depth":6,"title":"Bottom","selected":false,"identifier":"_zoomBottom:"},{"title":"","role":"AXMenuItem","selected":false,"depth":6},{"role":"AXMenuItem","selected":false,"depth":6,"title":"Quarters"},{"selected":false,"identifier":"_zoomTopLeft:","role":"AXMenuItem","title":"Top Left","depth":6},{"role":"AXMenuItem","selected":false,"identifier":"_zoomTopRight:","depth":6,"title":"Top Right"},{"depth":6,"title":"Bottom Left","role":"AXMenuItem","identifier":"_zoomBottomLeft:","selected":false},{"identifier":"_zoomBottomRight:","title":"Bottom Right","role":"AXMenuItem","depth":6,"selected":false},{"role":"AXMenuItem","title":"","depth":6,"selected":false},{"role":"AXMenuItem","selected":false,"title":"Arrange","depth":6},{"depth":6,"selected":false,"title":"Left & Right","role":"AXMenuItem","identifier":"_zoomLeftAndRight:"},{"role":"AXMenuItem","title":"Left & Quarters","depth":6,"selected":false,"identifier":"_zoomLeftThreeUp:"},{"title":"Right & Left","depth":6,"selected":false,"identifier":"_zoomRightAndLeft:","role":"AXMenuItem"},{"identifier":"_zoomRightThreeUp:","selected":false,"title":"Right & Quarters","role":"AXMenuItem","depth":6},{"depth":6,"role":"AXMenuItem","title":"Top & Bottom","identifier":"_zoomTopAndBottom:","selected":false},{"title":"Top & Quarters","depth":6,"role":"AXMenuItem","selected":false,"identifier":"_zoomTopThreeUp:"},{"title":"Bottom & Top","selected":false,"identifier":"_zoomBottomAndTop:","role":"AXMenuItem","depth":6},{"depth":6,"role":"AXMenuItem","selected":false,"title":"Bottom & Quarters","identifier":"_zoomBottomThreeUp:"},{"selected":false,"identifier":"_zoomQuarters:","role":"AXMenuItem","title":"Quarters","depth":6},{"selected":false,"title":"","role":"AXMenuItem","depth":6},{"identifier":"_zoomUntile:","title":"Return to Previous Size","depth":6,"role":"AXMenuItem","selected":false},{"role":"AXMenuItem","depth":4,"selected":false,"title":"Full Screen Tile"},{"title":"","depth":4,"selected":false,"role":"AXMenuItem"},{"title":"Remove Window from Set","role":"AXMenuItem","selected":false,"depth":4,"identifier":"_removeWindowFromStageManagerSet:"},{"title":"Move focus to next window","selected":false,"identifier":"onSystemMenuClicked:","depth":4,"role":"AXMenuItem"},{"title":"Switch to portrait\/landscape view","identifier":"toggleCompressFromSystemMenu:","depth":4,"selected":false,"role":"AXMenuItem"},{"title":"","depth":4,"role":"AXMenuItem","selected":false},{"role":"AXMenuItem","identifier":"onSelectNextTab:","title":"Switch to next tab","depth":4,"selected":false},{"identifier":"onSystemMenuClicked:","role":"AXMenuItem","depth":4,"title":"Close current chat session","selected":false},{"depth":4,"role":"AXMenuItem","selected":false,"title":""},{"title":"Always Show Meeting Controls","identifier":"onSystemMenuClicked:","role":"AXMenuItem","depth":4,"selected":false},{"selected":false,"title":"","role":"AXMenuItem","depth":4},{"role":"AXMenuItem","depth":4,"identifier":"arrangeInFront:","title":"Bring all to front","selected":false},{"title":"Arrange in Front","selected":false,"identifier":"alternateArrangeInFront:","role":"AXMenuItem","depth":4},{"selected":false,"title":"","role":"AXMenuItem","depth":4},{"title":"Zoom Meeting","selected":false,"role":"AXMenuItem","identifier":"makeKeyAndOrderFront:","depth":4},{"title":"Zoom Workplace","role":"AXMenuItem","identifier":"makeKeyAndOrderFront:","depth":4,"selected":false},{"depth":2,"role":"AXMenuBarItem","selected":false,"title":"Help"},{"selected":false,"role":"AXMenu","depth":3},{"role":"AXMenuItem","depth":4,"identifier":"onSystemMenuClicked:","selected":false,"title":"Zoom Support"},{"role":"AXMenuItem","title":"Zoom Community","identifier":"onSystemMenuClicked:","selected":false,"depth":4},{"title":"","depth":4,"selected":false,"role":"AXMenuItem"},{"role":"AXMenuItem","depth":4,"identifier":"onSystemMenuClicked:","selected":false,"title":"Give feedback..."},{"selected":false,"title":"Report problem...","identifier":"onSystemMenuClicked:","depth":4,"role":"AXMenuItem"},{"depth":1,"role":"AXMenuBar","selected":false},{"selected":false,"subrole":"AXMenuExtra","role":"AXMenuBarItem","depth":2,"title":""},{"role":"AXMenu","depth":3,"selected":false}],"bundle_id":"us.zoom.xos","node_count":397,"pid":80214,"node_cap":4096,"max_depth":12}
+{
+  "nodes": [
+    {
+      "title": "zoom.us",
+      "depth": 0,
+      "role": "AXApplication"
+    },
+    {
+      "title": "Zoom Workplace",
+      "subrole": "AXStandardWindow",
+      "role": "AXWindow",
+      "depth": 1
+    },
+    {
+      "depth": 2,
+      "role": "",
+      "description": ""
+    },
+    {
+      "description": "Back in Chat(⌘ + left bracket)",
+      "role": "AXButton",
+      "help": "Back in Chat(⌘ + left bracket)",
+      "depth": 2
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "description": "Forward in Chat(⌘ + right bracket)",
+      "help": "Forward in Chat(⌘ + right bracket)"
+    },
+    {
+      "description": "History",
+      "role": "AXButton",
+      "depth": 2,
+      "help": "History"
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "description": "Search (⌘E)  ⌘E",
+      "help": "Press ⌘E to search"
+    },
+    {
+      "depth": 2,
+      "description": "Create new",
+      "help": "Create new",
+      "role": "AXButton"
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "help": "Open activity center",
+      "description": "Hide activity center"
+    },
+    {
+      "title": "",
+      "role": "AXButton",
+      "help": "In a Zoom Meeting",
+      "depth": 2,
+      "description": "Zoom, Teng Lin, In a Zoom Meeting, Basic account"
+    },
+    {
+      "description": "Hide AI Companion panel",
+      "role": "AXButton",
+      "help": "AI Companion always shows on the home screen.",
+      "depth": 2
+    },
+    {
+      "help": "Calendar always shows on the home screen.",
+      "depth": 2,
+      "role": "AXButton",
+      "description": "Calendar always shows on the home screen."
+    },
+    {
+      "depth": 2,
+      "description": "Navigation tabs",
+      "role": "AXGroup"
+    },
+    {
+      "description": "Home, selected, 1 of 6",
+      "role": "AXUnknown",
+      "depth": 3,
+      "help": "Home, selected, 1 of 6",
+      "value": "Home, selected"
+    },
+    {
+      "title": "",
+      "help": "Home, selected, 1 of 6",
+      "depth": 4,
+      "role": "AXButton"
+    },
+    {
+      "help": "Meetings, 2 of 6",
+      "depth": 3,
+      "role": "AXUnknown",
+      "value": "Meetings",
+      "description": "Meetings, 2 of 6"
+    },
+    {
+      "help": "Meetings, 2 of 6",
+      "role": "AXButton",
+      "depth": 4,
+      "title": ""
+    },
+    {
+      "description": "Chat, 3 of 6",
+      "role": "AXUnknown",
+      "depth": 3,
+      "value": "Chat",
+      "help": "Chat, 3 of 6"
+    },
+    {
+      "role": "AXButton",
+      "depth": 4,
+      "help": "Chat, 3 of 6",
+      "title": ""
+    },
+    {
+      "help": "Scheduler, 4 of 6",
+      "description": "Scheduler, 4 of 6",
+      "value": "Scheduler",
+      "depth": 3,
+      "role": "AXUnknown"
+    },
+    {
+      "title": "",
+      "depth": 4,
+      "help": "Scheduler, 4 of 6",
+      "role": "AXButton"
+    },
+    {
+      "description": "Hub, 5 of 6",
+      "role": "AXUnknown",
+      "help": "Hub, 5 of 6",
+      "value": "Hub",
+      "depth": 3
+    },
+    {
+      "help": "Hub, 5 of 6",
+      "title": "",
+      "depth": 4,
+      "role": "AXButton"
+    },
+    {
+      "description": "More, 6 of 6",
+      "role": "AXUnknown",
+      "help": "More, 6 of 6",
+      "value": "More",
+      "depth": 3
+    },
+    {
+      "role": "AXButton",
+      "help": "More, 6 of 6",
+      "title": "",
+      "depth": 4
+    },
+    {
+      "title": "Settings",
+      "depth": 2,
+      "role": "AXButton",
+      "help": "Settings"
+    },
+    {
+      "depth": 2,
+      "role": "AXSplitGroup"
+    },
+    {
+      "role": "AXStaticText",
+      "depth": 3,
+      "value": "6:16 PM"
+    },
+    {
+      "role": "AXStaticText",
+      "depth": 3,
+      "value": "Saturday, April 25"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "description": "Back to meeting",
+      "depth": 4,
+      "role": "AXButton",
+      "identifier": "44C2E00B-8419-42CF-B801-09CE1616F70F",
+      "title": ""
+    },
+    {
+      "role": "AXGroup",
+      "depth": 3
+    },
+    {
+      "description": "Join meeting",
+      "identifier": "7EFFADCF-73D2-4125-B433-2B5F1A03C4C2",
+      "role": "AXButton",
+      "depth": 4,
+      "title": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "depth": 4,
+      "title": "",
+      "role": "AXButton",
+      "identifier": "496FE469-2749-43A1-BDA6-DAD928A07B03",
+      "description": "Schedule meeting"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "role": "AXButton",
+      "description": "Share screen",
+      "depth": 4,
+      "title": "",
+      "identifier": "54433F9C-B6D7-4FCE-98D7-A13533490B3D"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "identifier": "0EFAEFAC-7A5D-4C43-9DA1-2D45BF1948D4",
+      "role": "AXButton",
+      "title": "",
+      "description": "My notes, new",
+      "depth": 4
+    },
+    {
+      "role": "AXGroup",
+      "depth": 3
+    },
+    {
+      "role": "AXGroup",
+      "depth": 4
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "title": "",
+      "depth": 5,
+      "role": "AXScrollArea",
+      "value": ""
+    },
+    {
+      "title": "",
+      "role": "AXWebArea",
+      "value": "",
+      "depth": 6,
+      "description": "Zoom Calendar",
+      "help": "",
+      "selected": false
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "help": "",
+      "description": "",
+      "role": "AXGroup",
+      "title": "",
+      "value": ""
+    },
+    {
+      "value": "You haven't connected your calendar yet. ",
+      "description": "",
+      "depth": 8,
+      "title": "",
+      "help": "",
+      "selected": false,
+      "role": "AXStaticText"
+    },
+    {
+      "description": "Connect now",
+      "role": "AXLink",
+      "title": "Connect now",
+      "value": "",
+      "selected": false,
+      "help": "",
+      "depth": 8
+    },
+    {
+      "depth": 9,
+      "help": "",
+      "value": "Connect now",
+      "description": "",
+      "role": "AXStaticText",
+      "selected": false,
+      "title": ""
+    },
+    {
+      "selected": false,
+      "help": "",
+      "title": "",
+      "value": " to manage all your meetings and events in one place.",
+      "depth": 8,
+      "description": "",
+      "role": "AXStaticText"
+    },
+    {
+      "help": "",
+      "depth": 7,
+      "title": "Dismiss banner message",
+      "description": "Dismiss banner message",
+      "selected": false,
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "role": "AXButton",
+      "help": "Create event",
+      "value": "",
+      "selected": false,
+      "description": "Create event",
+      "depth": 7,
+      "title": "Create event"
+    },
+    {
+      "description": "",
+      "role": "AXGroup",
+      "title": "",
+      "selected": false,
+      "help": "",
+      "value": "",
+      "depth": 7
+    },
+    {
+      "help": "",
+      "title": "Select calendar date: Today, Apr 25",
+      "value": "",
+      "description": "Select calendar date: Today, Apr 25",
+      "role": "AXPopUpButton",
+      "depth": 8,
+      "selected": false
+    },
+    {
+      "role": "AXButton",
+      "depth": 7,
+      "title": "Today",
+      "help": "Today",
+      "description": "Today",
+      "value": "",
+      "selected": false
+    },
+    {
+      "help": "Previous",
+      "selected": false,
+      "depth": 7,
+      "title": "Previous",
+      "description": "Previous",
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "role": "AXButton",
+      "depth": 7,
+      "title": "Next",
+      "value": "",
+      "description": "Next",
+      "help": "Next",
+      "selected": false
+    },
+    {
+      "role": "AXGroup",
+      "title": "",
+      "help": "",
+      "depth": 7,
+      "subrole": "AXApplicationGroup",
+      "value": "",
+      "description": "",
+      "selected": false
+    },
+    {
+      "value": "",
+      "help": "",
+      "description": "",
+      "depth": 8,
+      "role": "AXGroup",
+      "title": "",
+      "selected": false
+    },
+    {
+      "value": "",
+      "description": "More options",
+      "title": "More options",
+      "depth": 9,
+      "role": "AXButton",
+      "selected": false,
+      "help": ""
+    },
+    {
+      "value": "",
+      "selected": false,
+      "help": "",
+      "title": "",
+      "depth": 7,
+      "role": "AXGroup",
+      "description": ""
+    },
+    {
+      "description": "",
+      "value": "No meetings scheduled.",
+      "help": "",
+      "depth": 8,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText"
+    },
+    {
+      "value": "",
+      "help": "",
+      "title": "Schedule a meeting",
+      "depth": 7,
+      "role": "AXButton",
+      "description": "Schedule a meeting",
+      "selected": false
+    },
+    {
+      "selected": false,
+      "role": "AXButton",
+      "description": "Open recordings",
+      "help": "",
+      "depth": 7,
+      "value": "",
+      "title": "Open recordings"
+    },
+    {
+      "role": "AXSplitter",
+      "value": 638,
+      "depth": 3,
+      "selected": false
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "role": "AXGroup",
+      "depth": 4
+    },
+    {
+      "title": "",
+      "selected": false,
+      "role": "AXScrollArea",
+      "description": "",
+      "help": "",
+      "depth": 5,
+      "value": ""
+    },
+    {
+      "role": "AXWebArea",
+      "depth": 6,
+      "description": "Zoom AI Companion Plus",
+      "selected": false,
+      "title": "",
+      "value": "",
+      "help": ""
+    },
+    {
+      "subrole": "AXLandmarkBanner",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "selected": false,
+      "title": "",
+      "description": "",
+      "depth": 7
+    },
+    {
+      "value": 1,
+      "depth": 8,
+      "title": "AI CompanionBASIC",
+      "help": "",
+      "role": "AXHeading",
+      "selected": false,
+      "description": ""
+    },
+    {
+      "role": "AXStaticText",
+      "selected": false,
+      "depth": 9,
+      "value": "AI Companion",
+      "description": "",
+      "help": "",
+      "title": ""
+    },
+    {
+      "role": "AXStaticText",
+      "description": "",
+      "title": "",
+      "selected": false,
+      "help": "",
+      "depth": 9,
+      "value": "BASIC"
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "role": "AXGroup",
+      "value": "",
+      "depth": 8,
+      "title": ""
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "title": "",
+      "role": "AXGroup",
+      "value": "",
+      "depth": 9
+    },
+    {
+      "selected": false,
+      "help": "",
+      "role": "AXButton",
+      "description": "Open Notification Center",
+      "value": "",
+      "title": "Open Notification Center",
+      "depth": 10
+    },
+    {
+      "title": "Pop out window",
+      "description": "Pop out window",
+      "depth": 8,
+      "role": "AXButton",
+      "value": "",
+      "help": "",
+      "selected": false
+    },
+    {
+      "help": "",
+      "title": "",
+      "value": "",
+      "selected": false,
+      "subrole": "AXApplicationAlert",
+      "description": "",
+      "depth": 7,
+      "role": "AXGroup"
+    },
+    {
+      "help": "",
+      "depth": 8,
+      "selected": false,
+      "description": "See what’s included",
+      "title": "See what’s included",
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "help": "",
+      "selected": false,
+      "title": "Close",
+      "value": "",
+      "description": "Close",
+      "depth": 8,
+      "role": "AXButton"
+    },
+    {
+      "selected": false,
+      "depth": 7,
+      "help": "",
+      "subrole": "AXEmptyGroup",
+      "description": "",
+      "role": "AXGroup",
+      "value": "",
+      "title": ""
+    },
+    {
+      "description": "",
+      "value": 2,
+      "title": "Suggested prompts",
+      "help": "",
+      "depth": 7,
+      "role": "AXHeading",
+      "selected": false
+    },
+    {
+      "help": "",
+      "value": "Suggested prompts",
+      "depth": 8,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText",
+      "description": ""
+    },
+    {
+      "description": "",
+      "value": "",
+      "title": "",
+      "depth": 7,
+      "subrole": "AXApplicationGroup",
+      "help": "",
+      "role": "AXGroup",
+      "selected": false
+    },
+    {
+      "title": "What are some tips for running a Zoom meeting",
+      "selected": false,
+      "depth": 8,
+      "role": "AXButton",
+      "value": "What are some tips for running a Zoom meeting",
+      "description": "What are some tips for running a Zoom meeting",
+      "help": ""
+    },
+    {
+      "value": "Coordinate meetings with external contacts",
+      "description": "Coordinate meetings with external contacts",
+      "title": "Coordinate meetings with external contacts",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "description": "Schedule a meeting with contact",
+      "title": "Schedule a meeting with contact",
+      "selected": false,
+      "value": "Schedule a meeting with contact",
+      "role": "AXButton",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "title": "Tell me what I can do with AI Companion",
+      "role": "AXButton",
+      "help": "",
+      "depth": 8,
+      "selected": false,
+      "value": "Tell me what I can do with AI Companion",
+      "description": "Tell me what I can do with AI Companion"
+    },
+    {
+      "title": "",
+      "value": "",
+      "selected": false,
+      "help": "",
+      "description": "",
+      "depth": 7,
+      "role": "AXGroup"
+    },
+    {
+      "selected": false,
+      "depth": 8,
+      "description": "Try on the web",
+      "help": "",
+      "value": "",
+      "role": "AXLink",
+      "title": "Try on the web"
+    },
+    {
+      "description": "",
+      "help": "",
+      "depth": 9,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText",
+      "value": "Try on the web"
+    },
+    {
+      "value": "",
+      "help": "",
+      "role": "AXGroup",
+      "selected": false,
+      "description": "",
+      "title": "",
+      "depth": 7
+    },
+    {
+      "title": "Attach file",
+      "depth": 8,
+      "selected": false,
+      "value": "",
+      "help": "",
+      "role": "AXPopUpButton",
+      "description": "Attach file"
+    },
+    {
+      "role": "AXTextArea",
+      "selected": false,
+      "value": "\n",
+      "depth": 7,
+      "title": "Message AI Companion Write a message or type / for more",
+      "description": "Message AI Companion Write a message or type / for more",
+      "help": ""
+    },
+    {
+      "title": "",
+      "role": "AXGroup",
+      "subrole": "AXEmptyGroup",
+      "depth": 8,
+      "value": "",
+      "description": "",
+      "help": "",
+      "selected": false
+    },
+    {
+      "help": "",
+      "description": "",
+      "role": "AXGroup",
+      "depth": 7,
+      "selected": false,
+      "value": "",
+      "title": ""
+    },
+    {
+      "value": "",
+      "description": "Send message",
+      "title": "Send message",
+      "help": "",
+      "role": "AXButton",
+      "depth": 8,
+      "selected": false
+    },
+    {
+      "role": "AXGroup",
+      "value": "",
+      "selected": false,
+      "description": "",
+      "help": "",
+      "depth": 7,
+      "title": ""
+    },
+    {
+      "subrole": "AXApplicationGroup",
+      "description": "AI can make mistakes. Review for accuracy.",
+      "title": "AI can make mistakes. Review for accuracy.",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "selected": false,
+      "depth": 8
+    },
+    {
+      "depth": 9,
+      "selected": false,
+      "role": "AXStaticText",
+      "title": "",
+      "description": "",
+      "help": "",
+      "value": "AI can make mistakes. Review for accuracy."
+    },
+    {
+      "selected": false,
+      "title": "",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "depth": 7,
+      "description": "",
+      "subrole": "AXEmptyGroup"
+    },
+    {
+      "role": "AXGroup",
+      "subrole": "AXEmptyGroup",
+      "title": "",
+      "selected": false,
+      "value": "",
+      "description": "",
+      "depth": 7,
+      "help": ""
+    },
+    {
+      "title": "",
+      "subrole": "AXEmptyGroup",
+      "help": "",
+      "role": "AXGroup",
+      "depth": 7,
+      "description": "",
+      "selected": false,
+      "value": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "depth": 4,
+      "role": "AXGroup"
+    },
+    {
+      "value": "",
+      "title": "",
+      "help": "",
+      "description": "",
+      "depth": 5,
+      "role": "AXScrollArea",
+      "selected": false
+    },
+    {
+      "depth": 6,
+      "title": "",
+      "value": "",
+      "help": "",
+      "role": "AXWebArea",
+      "description": "Activity Center",
+      "selected": false
+    },
+    {
+      "title": "More options",
+      "help": "More",
+      "value": "",
+      "description": "More options",
+      "role": "AXPopUpButton",
+      "selected": false,
+      "depth": 7
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "subrole": "AXApplicationGroup",
+      "help": "",
+      "role": "AXGroup",
+      "title": "",
+      "description": "",
+      "value": ""
+    },
+    {
+      "description": "Filter",
+      "help": "Filter",
+      "value": "",
+      "selected": false,
+      "title": "Filter",
+      "depth": 8,
+      "role": "AXButton"
+    },
+    {
+      "role": "AXStaticText",
+      "title": "",
+      "value": "Activity",
+      "help": "",
+      "selected": false,
+      "description": "",
+      "depth": 7
+    },
+    {
+      "value": "",
+      "depth": 7,
+      "help": "",
+      "description": "Learn more about Close",
+      "title": "Learn more about Close",
+      "role": "AXButton",
+      "selected": false
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "help": "",
+      "description": "",
+      "title": "",
+      "role": "AXTabGroup",
+      "value": "<AXUIElement 0x98103d3e0> {pid=80247}"
+    },
+    {
+      "role": "AXRadioButton",
+      "value": true,
+      "description": "",
+      "selected": true,
+      "depth": 8,
+      "help": "",
+      "title": "Focus"
+    },
+    {
+      "value": false,
+      "title": "Others",
+      "depth": 8,
+      "help": "",
+      "selected": false,
+      "role": "AXRadioButton",
+      "description": ""
+    },
+    {
+      "depth": 7,
+      "role": "AXGroup",
+      "help": "",
+      "description": "Focus",
+      "subrole": "AXTabPanel",
+      "title": "Focus",
+      "value": "",
+      "selected": false
+    },
+    {
+      "title": "",
+      "value": "🎉 Activity Center 2.0 is here",
+      "role": "AXStaticText",
+      "selected": false,
+      "depth": 8,
+      "description": "",
+      "help": ""
+    },
+    {
+      "role": "AXGroup",
+      "selected": false,
+      "value": "",
+      "help": "",
+      "description": "",
+      "depth": 8,
+      "title": ""
+    },
+    {
+      "title": "",
+      "depth": 9,
+      "description": "",
+      "role": "AXStaticText",
+      "selected": false,
+      "value": "A smarter side panel for all your Zoom Workplace notifications with a new Focus tab for your most important notifications - easy to access, easy to act on!",
+      "help": ""
+    },
+    {
+      "selected": false,
+      "value": "",
+      "help": "",
+      "depth": 8,
+      "description": "Learn more, link",
+      "role": "AXButton",
+      "title": "Learn more, link"
+    },
+    {
+      "description": "Dismiss banner message",
+      "depth": 8,
+      "role": "AXButton",
+      "title": "Dismiss banner message",
+      "help": "",
+      "selected": false,
+      "value": ""
+    },
+    {
+      "help": "Mark All as Read",
+      "role": "AXGroup",
+      "description": "",
+      "depth": 8,
+      "title": "",
+      "value": "",
+      "selected": false
+    },
+    {
+      "selected": false,
+      "description": "",
+      "title": "",
+      "role": "AXImage",
+      "depth": 9,
+      "value": "",
+      "help": ""
+    },
+    {
+      "depth": 8,
+      "selected": false,
+      "value": "",
+      "subrole": "AXEmptyGroup",
+      "description": "",
+      "help": "",
+      "title": "",
+      "role": "AXGroup"
+    },
+    {
+      "value": "",
+      "title": "",
+      "selected": false,
+      "description": "",
+      "role": "AXGroup",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "depth": 9,
+      "help": "",
+      "role": "AXStaticText",
+      "title": "",
+      "value": "You've cleared your suggestions",
+      "description": "",
+      "selected": false
+    },
+    {
+      "description": "",
+      "value": "",
+      "help": "",
+      "selected": false,
+      "depth": 8,
+      "title": "",
+      "role": "AXGroup"
+    },
+    {
+      "description": "",
+      "depth": 9,
+      "title": "",
+      "value": "Check out the rest of your notifications in the Other tab.",
+      "help": "",
+      "role": "AXStaticText",
+      "selected": false
+    },
+    {
+      "help": "",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 8,
+      "description": "",
+      "value": "",
+      "title": "View other notifications"
+    },
+    {
+      "title": "",
+      "depth": 7,
+      "role": "AXImage",
+      "selected": false,
+      "description": "",
+      "help": "",
+      "value": ""
+    },
+    {
+      "help": "",
+      "depth": 8,
+      "role": "AXImage",
+      "selected": false,
+      "title": "",
+      "description": "",
+      "value": ""
+    },
+    {
+      "help": "",
+      "selected": false,
+      "role": "AXImage",
+      "title": "",
+      "description": "",
+      "depth": 7,
+      "value": ""
+    },
+    {
+      "role": "AXImage",
+      "depth": 8,
+      "value": "",
+      "selected": false,
+      "description": "",
+      "title": "",
+      "help": ""
+    },
+    {
+      "depth": 7,
+      "description": "",
+      "selected": false,
+      "role": "AXImage",
+      "title": "",
+      "value": "",
+      "help": ""
+    },
+    {
+      "depth": 7,
+      "help": "",
+      "selected": false,
+      "role": "AXImage",
+      "value": "",
+      "title": "",
+      "description": ""
+    },
+    {
+      "value": 0.58187435633367657,
+      "role": "AXSplitter",
+      "depth": 3
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "subrole": "AXCloseButton"
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "subrole": "AXFullScreenButton",
+      "help": "this button also has an action to zoom the window"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "subrole": "AXMinimizeButton",
+      "depth": 2,
+      "role": "AXButton"
+    },
+    {
+      "role": "AXWindow",
+      "depth": 1,
+      "subrole": "AXStandardWindow",
+      "title": "Zoom Meeting"
+    },
+    {
+      "role": "AXTabGroup",
+      "help": "",
+      "description": "Blackmyth, Computer audio unmuted",
+      "depth": 2
+    },
+    {
+      "description": "View Blackmyth's profile",
+      "role": "AXButton",
+      "depth": 3
+    },
+    {
+      "role": "AXTabGroup",
+      "description": "Teng Lin, Computer audio muted, Video off",
+      "depth": 2,
+      "help": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXImage"
+    },
+    {
+      "role": "AXButton",
+      "description": "View Teng Lin's profile",
+      "depth": 3
+    },
+    {
+      "role": "AXSplitter",
+      "depth": 2,
+      "value": 0.12862547288776796
+    },
+    {
+      "depth": 2,
+      "role": "AXScrollArea"
+    },
+    {
+      "role": "AXOutline",
+      "description": "Participants list",
+      "help": "Press tab for more options and to return to the main meeting window",
+      "depth": 3
+    },
+    {
+      "subrole": "AXTableRow",
+      "role": "AXRow",
+      "depth": 4,
+      "selected": false
+    },
+    {
+      "role": "AXCell",
+      "identifier": "ZMHCTableItemType_PANELIST",
+      "depth": 5
+    },
+    {
+      "depth": 6,
+      "value": "Teng Lin (me)",
+      "role": "AXStaticText"
+    },
+    {
+      "description": "More options for Teng Lin, collapsed",
+      "role": "AXMenuButton",
+      "help": "More",
+      "depth": 6
+    },
+    {
+      "depth": 6,
+      "help": "Start video",
+      "description": "Start video",
+      "role": "AXButton"
+    },
+    {
+      "role": "AXButton",
+      "help": "Unmute",
+      "depth": 6,
+      "description": "Unmute"
+    },
+    {
+      "subrole": "AXTableRow",
+      "selected": false,
+      "depth": 4,
+      "role": "AXRow"
+    },
+    {
+      "role": "AXCell",
+      "depth": 5,
+      "identifier": "ZMHCTableItemType_PANELIST"
+    },
+    {
+      "description": "Invite",
+      "role": "AXButton",
+      "depth": 2
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "description": "Unmute me"
+    },
+    {
+      "role": "AXUnknown",
+      "description": "Participants (2)",
+      "depth": 2
+    },
+    {
+      "help": "Close",
+      "depth": 3,
+      "title": "Close",
+      "role": "AXButton",
+      "description": "Button"
+    },
+    {
+      "role": "AXButton",
+      "description": "Button",
+      "title": "Pop out",
+      "help": "Pop out",
+      "depth": 3
+    },
+    {
+      "value": "Participants (2)",
+      "depth": 3,
+      "role": "AXStaticText"
+    },
+    {
+      "depth": 2,
+      "role": "AXSplitter",
+      "value": 0.71570121951219512
+    },
+    {
+      "role": "AXButton",
+      "subrole": "AXCloseButton",
+      "selected": false,
+      "depth": 2
+    },
+    {
+      "depth": 2,
+      "subrole": "AXMinimizeButton",
+      "role": "AXButton",
+      "selected": false
+    },
+    {
+      "subrole": "AXFullScreenButton",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 2
+    }
+  ],
+  "bundle_id": "us.zoom.xos",
+  "node_count": 165,
+  "pid": 80214,
+  "node_cap": 4096,
+  "max_depth": 12,
+  "scrubbed": "true: AXMenuBar/AXMenuBarItem/AXMenu/AXMenuItem subtrees removed because they incidentally captured personal email + recent document filenames during the spike (per coderabbit #94 review). The mute-state attribution contract — AXTabGroup at depth 2 with `<Name>, Computer audio (muted|unmuted)[, Video (off|on)]` — lives entirely outside those subtrees, so the trim preserves the spike evidence with zero loss of relevance."
+}

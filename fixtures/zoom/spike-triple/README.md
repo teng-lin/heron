@@ -69,3 +69,19 @@ header comment of `swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift`.
 - 2 participants in the meeting (laptop + phone, same Zoom account)
 - Active-speaker view (split layout — `ZMMTSideBySideSplitDivider`
   visible in both dumps), not gallery
+
+## Scrub
+
+The captures were trimmed before commit: every `AXMenuBar`,
+`AXMenuBarItem`, `AXMenu`, and `AXMenuItem` node was removed from
+both files. The full `ax_dump_tree` walk also visits the macOS
+menu-bar tree, which Zoom populates with the user's email address
+("Switch account" / "Sign out" submenus) and recent client document
+filenames ("Recent Items → Documents") — incidental capture that has
+nothing to do with the speaker-attribution contract under audit.
+
+Tile-level data (the `AXTabGroup` participant tiles whose
+`AXDescription` encodes mute state) lives entirely outside those
+subtrees, so the scrub preserves the spike evidence at zero loss of
+relevance. Each file's top-level object carries a `"scrubbed"` key
+documenting this for future readers.

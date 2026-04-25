@@ -82,8 +82,12 @@ private struct ParticipantState: Equatable {
 private final class ObserverState {
     let pid: pid_t
     let thread: PollingThread
-    /// Participant name → last known state. Read + written only from
-    /// the polling thread, so no per-field lock needed.
+    /// Participant name → last known state. Protected by `stateLock`:
+    /// the polling thread writes it from `PollingThread.main` and
+    /// `pollOnce`, and `ax_release_observer` reads/clears it during
+    /// teardown. The mutation pattern is "lock, clone-or-replace,
+    /// unlock" so the lock isn't held across the (longer) tree walks
+    /// that produce the new map.
     var states: [String: ParticipantState]
 
     init(pid: pid_t, thread: PollingThread) {
@@ -107,16 +111,37 @@ private var eventQueue: [String] = []
 // anchored end-to-end so a garbled description (e.g. a transient
 // "Connecting..." state) doesn't get parsed into a silent false
 // positive.
+//
+// English-only: this regex assumes the host's locale is English.
+// On a non-English Zoom client the AXDescription text is localized
+// (e.g. "<Name>, Computeraudio aus") and tiles silently fall through
+// the parser. The aligner's 30s ATTRIBUTION_GAP_THRESHOLD will
+// surface the resulting silence as `Event::AttributionDegraded`,
+// which is the right operator-visible signal — but a future
+// enhancement should localize this regex (or read mute state from
+// a non-string AX attribute, if one exists in a later Zoom build).
+// Tracked in `fixtures/zoom/spike-triple/README.md`.
+
+/// Compiled once at first use: the pattern is a compile-time literal
+/// verified against `fixtures/zoom/spike-triple/`, so an
+/// `NSRegularExpression(pattern:)` failure here is a programmer
+/// error, not a runtime condition. `try!` makes that explicit;
+/// hoisting out of `parseTileDescription` avoids re-compiling the
+/// pattern on every tile (called 4 Hz × N participants per second).
+private let tileDescriptionRegex: NSRegularExpression = {
+    // swiftlint:disable:next force_try
+    try! NSRegularExpression(
+        pattern: #"^(.+?), Computer audio (muted|unmuted)(?:, Video (off|on))?$"#
+    )
+}()
 
 /// Parsed tile description. `nil` when the description doesn't match
-/// the known Zoom shape — the caller skips that tile silently.
+/// the known Zoom shape — the caller skips that tile silently. See
+/// the section comment above on the English-only assumption.
 private func parseTileDescription(_ s: String) -> (name: String, state: ParticipantState)? {
-    // `(?:…)` for the optional video segment so the captures align:
-    //   group 1 = name, group 2 = mute state, group 3 = video state (optional)
-    let pattern = #"^(.+?), Computer audio (muted|unmuted)(?:, Video (off|on))?$"#
-    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    // Capture groups: 1 = name, 2 = mute state, 3 = video state (optional).
     let nsRange = NSRange(s.startIndex..<s.endIndex, in: s)
-    guard let match = regex.firstMatch(in: s, options: [], range: nsRange),
+    guard let match = tileDescriptionRegex.firstMatch(in: s, options: [], range: nsRange),
           match.numberOfRanges >= 3,
           let nameRange = Range(match.range(at: 1), in: s),
           let stateRange = Range(match.range(at: 2), in: s)
@@ -197,6 +222,13 @@ private func enumerateParticipantTiles(
 /// self from remote without the user's display name. The orchestrator
 /// applies that filter downstream once it has access to settings.
 private func emitMuteTransition(name: String, muted: Bool) {
+    // Bail before doing any work if our calling thread (the polling
+    // thread) was cancelled — `ax_release_observer` flips the flag
+    // and then drains `eventQueue` under `queueLock`, so an emit
+    // that completes after that drain would leak a stale event into
+    // the next registration's `ax_poll`.
+    if Thread.current.isCancelled { return }
+
     let speakerEvent: [String: Any] = [
         "t": 0.0,
         "name": name,
@@ -209,8 +241,13 @@ private func emitMuteTransition(name: String, muted: Bool) {
     else { return }
 
     queueLock.lock()
+    defer { queueLock.unlock() }
+    // Re-check after acquiring `queueLock`: `ax_release_observer`
+    // holds this same lock through cancel + drain, so by the time
+    // we get here on the cancellation race, `isCancelled` is true
+    // AND the drain has already run.
+    if Thread.current.isCancelled { return }
     eventQueue.append(json)
-    queueLock.unlock()
 }
 
 // MARK: - Polling thread
@@ -260,11 +297,32 @@ private final class PollingThread: Thread {
     /// One polling tick: re-walk the tree, diff against the stored
     /// state map, emit SpeakerEvents for every transition, and
     /// update the stored state.
+    ///
+    /// Same-name collision: the `observed` and stored `states` maps
+    /// are keyed by parsed display name. Two participants sharing a
+    /// name (uncommon in client meetings, possible with first-name-
+    /// only displays — e.g. two "Alex"es) collapse into one entry,
+    /// and only one of their mute transitions is observable. The
+    /// dominant 1:1 case isn't affected; full disambiguation lands
+    /// alongside `own_tile` detection (see `emitMuteTransition`'s
+    /// header comment) by switching to a (name, occurrence-index)
+    /// composite key.
     private func pollOnce() {
+        // Bail before walking the tree if release fired since we
+        // last slept — saves the AX-call bill on a doomed tick.
+        if isCancelled { return }
+
         var observed: [String: ParticipantState] = [:]
         enumerateParticipantTiles(root: appElement) { name, state in
             observed[name] = state
         }
+
+        // Bail before touching shared state if release fired during
+        // the walk. Combined with the queue-lock drain in
+        // `ax_release_observer` and the per-emit guard in
+        // `emitMuteTransition`, this keeps stale events out of the
+        // next registration's queue.
+        if isCancelled { return }
 
         stateLock.lock()
         let prior = currentState?.states ?? [:]
@@ -376,19 +434,18 @@ public func ax_release_observer() -> Int32 {
         return AX_OK
     }
 
-    // Cancel the polling thread and let it exit on its next sleep
-    // wake-up. `cancel()` only flips a flag — we don't join because
-    // Thread doesn't expose a join primitive; the worst case is
-    // POLL_INTERVAL_SECONDS of overlap with a follow-up registration,
-    // which the `currentState != nil` guard in `ax_register_observer`
-    // catches.
-    state.thread.cancel()
-
-    // Drain any leftover events so a fresh registration starts
-    // clean.
+    // Cancel and drain under `queueLock`: this serialises with
+    // `emitMuteTransition`'s lock-then-recheck-isCancelled pattern,
+    // so any in-flight `pollOnce` either appended before our drain
+    // (we clear it) or sees `isCancelled == true` once it acquires
+    // the lock (and skips the append). Without this serialisation,
+    // a `pollOnce` already past its own `isCancelled` check at
+    // teardown could append between our `cancel()` and our drain,
+    // leaking a stale event into the next registration's `ax_poll`.
     queueLock.lock()
+    defer { queueLock.unlock() }
+    state.thread.cancel()
     eventQueue.removeAll()
-    queueLock.unlock()
 
     return AX_OK
 }

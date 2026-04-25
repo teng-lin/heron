@@ -1,16 +1,31 @@
-//! `heron-zoom` — Zoom AXObserver-based speaker attribution.
+//! `heron-zoom` — speaker attribution from Zoom's AX tree.
 //!
-//! v0 surface from [`docs/implementation.md`](../../../docs/implementation.md)
-//! §9.1. Two backends ship in v1:
-//! - [`AxObserverBackend`] — registers an `AXObserver` on the Zoom
-//!   process and reads the `{role, subrole, identifier}` triple
-//!   recorded during the week-0 spike (the yellow path).
-//! - [`AxPollingBackend`] — polls `AXUIElementCopyAttributeValue` at
-//!   50 ms cadence (the red-fallback path).
+//! Surface per [`docs/implementation.md`](../../../docs/implementation.md)
+//! §9.1; the implementation reflects the §3.3 spike outcome
+//! recorded at `fixtures/zoom/spike-triple/README.md`. Two backends
+//! ship in v1:
 //!
-//! Real backend wires arrive weeks 6–7 (§9.2 + §9.3); the trait
-//! shape committed here lets the heron-session orchestrator wire
-//! event routing today.
+//! - [`AxObserverBackend`] — pairs with `swift/zoomax-helper`'s
+//!   polling enumerator (`ZoomAxHelper.swift`). The Swift side
+//!   walks Zoom's AX tree at 4 Hz, parses each participant tile's
+//!   `AXDescription` (the only mute-state signal Zoom 7.0.0
+//!   surfaces — the active-speaker frame is Metal-rendered outside
+//!   the AX tree), and queues a [`SpeakerEvent`] JSONL line for
+//!   every transition (mute/unmute, participant join/leave). The
+//!   Rust side here drains that queue at 50 ms and forwards parsed
+//!   events upstream.
+//! - [`AxPollingBackend`] — pure-Rust fallback that polls
+//!   `AXUIElementCopyAttributeValue` directly when the Swift bridge
+//!   is unavailable (red path). Stub today; lights up if the §9.2
+//!   selector ever picks it.
+//!
+//! The aligner ([`aligner::Aligner`]) intersects the resulting
+//! `started=true` / `started=false` intervals with tap-audio turns
+//! to attribute speakers; in the dominant 1:1 client-meeting case
+//! exactly one remote participant is unmuted, so attribution is
+//! exact. Free-for-all 3+ calls degrade to "best guess by overlap"
+//! per the §20 risk-reducer — see the Swift module header for the
+//! full rationale.
 
 use async_trait::async_trait;
 use heron_types::{Event, SessionClock, SessionId, SpeakerEvent};
@@ -23,9 +38,11 @@ use tokio::sync::mpsc;
 /// to locate the running Zoom process via NSRunningApplication.
 const ZOOM_BUNDLE_ID: &str = "us.zoom.xos";
 
-/// Polling cadence the Rust task uses to drain the Swift event queue.
-/// 50ms matches the polling backend (§9.2) and is a comfortable upper
-/// bound on AX callback latency without burning CPU.
+/// Cadence at which the Rust worker drains the Swift event queue.
+/// The Swift side polls Zoom's AX tree at 4 Hz (~250 ms) and
+/// queues transitions; this 50 ms drain interval keeps end-to-end
+/// detection latency bounded while leaving the bridge's own poll
+/// cadence as the dominant cost.
 const AX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub mod aligner;
@@ -214,11 +231,17 @@ impl AxBackend for AxObserverBackend {
                             // ZoomAxHelper.swift); stamp the receive
                             // time here so SpeakerEvent.t lands in
                             // session-secs as the aligner expects.
-                            // Worst-case skew is the polling cadence
-                            // (~250ms in the bridge + 50ms here),
-                            // well inside the aligner's 350ms default
-                            // event_lag prior.
-                            ev.t = clock.wall_to_session_secs(std::time::SystemTime::now());
+                            // `now_session_secs` is monotonic (mach
+                            // anchor on Apple) so a mid-meeting NTP
+                            // adjustment can't regress `t` below a
+                            // prior event and create a degenerate
+                            // `SpeakingInterval` (t0 >= t1) that the
+                            // aligner's interval_overlap silently
+                            // returns 0 for. Worst-case skew is the
+                            // polling cadence (~250 ms in the bridge
+                            // + 50 ms here), well inside the aligner's
+                            // 350 ms default event_lag prior.
+                            ev.t = clock.now_session_secs();
                             // `blocking_send` is the right primitive
                             // here: we're on a blocking thread and
                             // out's bounded channel must apply
