@@ -47,7 +47,9 @@ impl SttBackend for StubStt {
         // sides represented and the diarize-source heuristic exercises
         // the Hybrid branch when paired with the AX stub.
         let (text, speaker, source) = match channel {
-            Channel::Mic => ("hello from mic", "me".to_owned(), SpeakerSource::Self_),
+            Channel::Mic | Channel::MicClean => {
+                ("hello from mic", "me".to_owned(), SpeakerSource::Self_)
+            }
             Channel::Tap => ("hello from tap", "them".to_owned(), SpeakerSource::Channel),
         };
         let turn = Turn {
