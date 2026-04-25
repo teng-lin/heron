@@ -19,10 +19,14 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 pub mod backpressure;
+pub mod disk;
 pub mod ringbuffer;
 
 pub use backpressure::{BackpressureMonitor, SATURATION_THRESHOLD};
-pub use ringbuffer::{Ringbuffer, RingbufferError, RingbufferState, recover};
+pub use disk::{DiskError, MIN_FREE_BYTES_TO_RECORD, can_record, free_bytes};
+pub use ringbuffer::{
+    Ringbuffer, RingbufferError, RingbufferState, recover, scan_recoverable_sessions,
+};
 
 /// One PCM frame as emitted by the capture pipeline. After APM/AEC
 /// processing for the `Mic` channel, before any STT.
