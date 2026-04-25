@@ -99,6 +99,7 @@ fn round_cents(usd: f64, places: u32) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
