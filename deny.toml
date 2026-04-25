@@ -1,0 +1,62 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/.
+#
+# Run locally with `cargo deny check`. CI runs `advisories`, `bans`,
+# `licenses`, and `sources` per .github/workflows/rust.yml.
+
+[graph]
+all-features = false
+no-default-features = false
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+
+[output]
+feature-depth = 1
+
+[advisories]
+yanked = "deny"
+# `unmaintained = "workspace"` flags unmaintained crates we depend
+# on **directly** but stays quiet about transitive deps in third-
+# party crates' graphs (e.g. Tauri's urlpattern → unic-ucd-* chain
+# is unmaintained but we have no realistic path to fix it). We
+# still see vulnerabilities + yanks in transitive deps — those
+# are governed by the `vulnerability` and `yanked` settings.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    # Our own workspace crates declare `LicenseRef-Proprietary`
+    # because they're not yet open source. Allow it explicitly.
+    "LicenseRef-Proprietary",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path-dependencies declare themselves with no version
+# constraint, which would trip the wildcard ban. Allow them
+# explicitly.
+allow-wildcard-paths = true
+highlight = "all"
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

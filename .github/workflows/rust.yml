@@ -41,3 +41,19 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --workspace --release
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Run all four checks (advisories + bans + licenses +
+          # sources) per deny.toml. The action positions
+          # `arguments` BEFORE the subcommand, so flags like
+          # `--hide-inclusion-graph` (which only the subcommand
+          # accepts) can't be passed via `arguments` here. The full
+          # graph in CI logs is acceptable; failures are rare.
+          command: check
+          rust-version: stable
