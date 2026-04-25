@@ -47,9 +47,11 @@ allow = [
     # unrestricted; attribution is required and we already pass it
     # through dependency manifests.
     "CDLA-Permissive-2.0",
-    # Our own workspace crates declare `LicenseRef-Proprietary`
-    # because they're not yet open source. Allow it explicitly.
-    "LicenseRef-Proprietary",
+    # Our own workspace crates are AGPL-3.0-or-later. Both SPDX
+    # spellings are allowed so the expression parser is happy whether
+    # it emits `-only` or `-or-later`.
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
 

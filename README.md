@@ -161,6 +161,12 @@ transcripts always."
 
 ## License
 
-`LicenseRef-Proprietary`. Private project; not yet open source. Each
-crate carries the same license expression in its `Cargo.toml` and
+[GNU AGPL-3.0-or-later](./LICENSE). Each workspace crate inherits
+this expression from `[workspace.package]` in `Cargo.toml`, and
 `cargo-deny` is configured to allow it (`deny.toml`).
+
+AGPL was chosen so anyone running heron as a network service — a
+hosted note-taker, a hosted meeting agent — must publish their
+modifications under the same terms. A permissive license would
+let a SaaS competitor close-source a fork; AGPL prevents that
+without restricting personal or in-company use.

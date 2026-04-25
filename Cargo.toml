@@ -6,11 +6,12 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-# Proprietary, not yet open source. `LicenseRef-Proprietary` is a
-# valid SPDX expression (the "UNLICENSED" string Cargo accepts is
-# not). cargo-deny's licenses check rejects "UNLICENSED" as a
-# parse error.
-license = "LicenseRef-Proprietary"
+# AGPL-3.0-or-later. See LICENSE at the repo root for full text.
+# AGPL was chosen so that anyone running heron as a network service
+# (a hosted note-taker, a hosted meeting agent) must publish their
+# modifications — the alternative is a permissive license under which
+# a SaaS competitor could close-source a fork.
+license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
