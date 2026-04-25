@@ -55,9 +55,15 @@ pub fn samples_to_ms(samples: usize) -> u64 {
 /// needed at this entry point. The flooring case lives on the
 /// inverse [`samples_to_ms`], which drops the fractional ms when
 /// the sample count isn't a multiple of 16. Saturating math on
-/// the multiplication so a `u64::MAX` ms input doesn't panic.
+/// the multiplication so a `u64::MAX` ms input doesn't panic, and
+/// `try_into().unwrap_or(usize::MAX)` so a 32-bit target saturates
+/// instead of silently truncating to the low 32 bits (the bridge
+/// wouldn't realistically see >74 hr / 4 G samples in one call,
+/// but the cast should match the `saturating_mul` intent).
 pub fn ms_to_samples(ms: u64) -> usize {
-    (ms.saturating_mul(SAMPLE_RATE_HZ as u64) / 1_000) as usize
+    (ms.saturating_mul(SAMPLE_RATE_HZ as u64) / 1_000)
+        .try_into()
+        .unwrap_or(usize::MAX)
 }
 
 /// Helpers on top of [`PcmFrame`]. Implemented as an extension
@@ -101,7 +107,14 @@ impl PcmFrameExt for PcmFrame {
         // frame doesn't pay for a full-buffer scan. Equivalent to
         // `peak_amplitude() <= threshold` but linear-time worst-
         // case rather than always-linear.
-        !self.samples.iter().any(|&s| s.saturating_abs() > threshold)
+        //
+        // Widen to i32 before `.abs()` so `i16::MIN` (-32768) maps
+        // to its true magnitude 32768 rather than the saturated
+        // 32767 — otherwise a frame containing the loudest possible
+        // negative sample would be reported silent at the maximum
+        // threshold (32767).
+        let t = i32::from(threshold);
+        !self.samples.iter().any(|&s| i32::from(s).abs() > t)
     }
 
     fn peak_amplitude(&self) -> i16 {
@@ -185,6 +198,20 @@ mod tests {
     }
 
     #[test]
+    fn ms_to_samples_does_not_panic_on_huge_input() {
+        // u64::MAX ms must not panic. `saturating_mul` keeps the
+        // multiplication finite, then `try_into().unwrap_or(usize::MAX)`
+        // saturates the cast on 32-bit targets where the result
+        // wouldn't fit in `usize`. On 64-bit (the common case),
+        // `u64::MAX / 1000` fits in `usize` and round-trips.
+        let result = ms_to_samples(u64::MAX);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(result as u64, u64::MAX / 1_000);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(result, usize::MAX);
+    }
+
+    #[test]
     fn empty_frame_peak_is_zero() {
         assert_eq!(frame(vec![]).peak_amplitude(), 0);
     }
@@ -240,6 +267,17 @@ mod tests {
         assert!(!f.is_silence(0));
         let f = frame(vec![0, 0, 0]);
         assert!(f.is_silence(0));
+    }
+
+    #[test]
+    fn is_silence_at_max_threshold_with_i16_min() {
+        // The loudest possible negative sample (i16::MIN = -32768)
+        // has magnitude 32768, which exceeds the maximum threshold
+        // (i16::MAX = 32767), so it must be reported as speech.
+        // Earlier `saturating_abs()` shape mapped i16::MIN to 32767
+        // and would have called this frame silent.
+        let f = frame(vec![i16::MIN]);
+        assert!(!f.is_silence(i16::MAX));
     }
 
     #[test]
