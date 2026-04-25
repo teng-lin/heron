@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod keychain;
 pub mod notes;
 pub mod onboarding;
+pub mod resummarize;
 pub mod salvage;
 pub mod settings;
 pub mod tray;
@@ -148,6 +149,48 @@ async fn heron_write_note_atomic(
 #[tauri::command]
 async fn heron_list_sessions(vault_path: String) -> Result<Vec<String>, String> {
     notes::list_sessions(Path::new(&vault_path)).await
+}
+
+/// Tauri command: re-summarize an existing note in place.
+///
+/// Returns the merged note body the editor should re-mount against.
+/// The vault writer rotates the prior body into `<id>.md.bak` before
+/// overwriting, which is what makes `heron_restore_backup` a true
+/// rollback to pre-resummarize content.
+#[tauri::command]
+async fn heron_resummarize(vault_path: String, session_id: String) -> Result<String, String> {
+    resummarize::resummarize(Path::new(&vault_path), &session_id).await
+}
+
+/// Tauri command: report whether a `<id>.md.bak` exists. `Ok(None)` when
+/// no backup is on disk — the steady-state case after a save without
+/// a re-summarize.
+#[tauri::command]
+async fn heron_check_backup(
+    vault_path: String,
+    session_id: String,
+) -> Result<Option<resummarize::BackupInfo>, String> {
+    resummarize::check_backup(Path::new(&vault_path), &session_id).await
+}
+
+/// Tauri command: restore `<id>.md` from `<id>.md.bak`. Returns the
+/// restored body so the editor can re-mount immediately.
+#[tauri::command]
+async fn heron_restore_backup(vault_path: String, session_id: String) -> Result<String, String> {
+    resummarize::restore_backup(Path::new(&vault_path), &session_id).await
+}
+
+/// Tauri command: resolve the platform-default cache directory.
+///
+/// The Review UI's playback bar passes this back to
+/// `heron_resolve_recording` so the asset-protocol resolver can find
+/// the per-session WAV mixdown when the m4a hasn't been encoded yet.
+/// Mirrors [`heron_default_settings_path`]: lossy UTF-8 conversion +
+/// fallback to `./` if the platform's cache dir cannot be resolved
+/// (sandboxed test runners).
+#[tauri::command]
+fn heron_default_cache_root() -> String {
+    default_cache_root().to_string_lossy().into_owned()
 }
 
 /// Tauri command: §13.3 step 1 microphone Test button.
@@ -306,6 +349,21 @@ pub fn default_settings_path() -> PathBuf {
     base.join("com.heronnote.heron").join("settings.json")
 }
 
+/// Default cache root.
+///
+/// Resolves via [`dirs::cache_dir`]:
+/// - macOS: `~/Library/Caches/com.heronnote.heron`
+/// - Linux: `$XDG_CACHE_HOME/com.heronnote.heron`
+/// - Windows: `%LOCALAPPDATA%\com.heronnote.heron\cache`
+///
+/// Falls back to `./` so a sandboxed CI runner without a resolvable
+/// cache dir still produces a usable path. The §15.2 asset-protocol
+/// resolver expects `<cache_root>/sessions/<id>/{mic,tap}.raw`.
+pub fn default_cache_root() -> PathBuf {
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("com.heronnote.heron")
+}
+
 /// Entry point used by `main.rs` and (eventually) by Tauri's mobile
 /// build target. The function name + `#[cfg_attr(...)]` line below
 /// are required by Tauri 2's mobile entry point glue.
@@ -341,9 +399,13 @@ pub fn run() {
             heron_read_settings,
             heron_write_settings,
             heron_default_settings_path,
+            heron_default_cache_root,
             heron_read_note,
             heron_write_note_atomic,
             heron_list_sessions,
+            heron_resummarize,
+            heron_check_backup,
+            heron_restore_backup,
             heron_test_microphone,
             heron_test_audio_tap,
             heron_test_accessibility,
@@ -390,6 +452,18 @@ mod tests {
         let p = default_settings_path();
         assert_eq!(s, p.to_string_lossy());
         assert!(s.ends_with("com.heronnote.heron/settings.json"));
+    }
+
+    /// Same shape as the settings-path test: the string the Tauri
+    /// command exposes round-trips with [`default_cache_root`] so the
+    /// Review UI's playback bar can hand the value into
+    /// `heron_resolve_recording` without re-deriving it on the JS side.
+    #[test]
+    fn heron_default_cache_root_matches_pathbuf_form() {
+        let s = heron_default_cache_root();
+        let p = default_cache_root();
+        assert_eq!(s, p.to_string_lossy());
+        assert!(s.ends_with("com.heronnote.heron"));
     }
 
     /// `heron_status::audio_available` must reflect the real

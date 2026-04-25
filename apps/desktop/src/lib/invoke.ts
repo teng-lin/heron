@@ -64,6 +64,18 @@ export interface DiagnosticsView {
   errors: SessionLogError[];
 }
 
+/**
+ * Mirrors the Rust `BackupInfo` struct returned by `heron_check_backup`.
+ *
+ * `created_at` is the `<id>.md.bak` file's modification time as an
+ * RFC-3339 string in the system's local timezone. The Review UI feeds
+ * it through `Intl.DateTimeFormat` for the "Backup from <timestamp>"
+ * pill.
+ */
+export interface BackupInfo {
+  created_at: string;
+}
+
 export interface Settings {
   stt_backend: string;
   llm_backend: string;
@@ -163,6 +175,18 @@ export interface HeronCommands {
     args: Record<string, never>;
     returns: string;
   };
+  /**
+   * Phase 67 (PR-ε): platform default cache root
+   * (`~/Library/Caches/com.heronnote.heron` on macOS). The Review
+   * playback bar passes the returned string into
+   * `heron_resolve_recording` so the asset-protocol resolver can
+   * locate per-session WAV mixdowns when the m4a hasn't been encoded
+   * yet.
+   */
+  heron_default_cache_root: {
+    args: Record<string, never>;
+    returns: string;
+  };
   heron_read_note: {
     args: { vaultPath: string; sessionId: string };
     returns: string;
@@ -174,6 +198,33 @@ export interface HeronCommands {
   heron_list_sessions: {
     args: { vaultPath: string };
     returns: string[];
+  };
+  /**
+   * Phase 67 (PR-ε): re-summarize an existing note in place. The vault
+   * writer rotates the prior body into `<id>.md.bak` before
+   * overwriting; the rendered new note (frontmatter + body) is
+   * returned so the editor can re-mount immediately.
+   */
+  heron_resummarize: {
+    args: { vaultPath: string; sessionId: string };
+    returns: string;
+  };
+  /**
+   * Phase 67 (PR-ε): report whether a `<id>.md.bak` is present. `null`
+   * when there's no backup — the Review UI hides the Restore pill.
+   */
+  heron_check_backup: {
+    args: { vaultPath: string; sessionId: string };
+    returns: BackupInfo | null;
+  };
+  /**
+   * Phase 67 (PR-ε): restore `<id>.md` from `<id>.md.bak` and delete
+   * the backup. Returns the restored body so the editor re-mounts
+   * immediately.
+   */
+  heron_restore_backup: {
+    args: { vaultPath: string; sessionId: string };
+    returns: string;
   };
   heron_test_microphone: {
     args: Record<string, never>;

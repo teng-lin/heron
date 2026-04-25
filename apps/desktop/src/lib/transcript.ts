@@ -150,3 +150,27 @@ export function speakerInitial(name: string): string {
   if (tokens.length === 1) return tokens[0].charAt(0).toUpperCase();
   return (tokens[0].charAt(0) + tokens[1].charAt(0)).toUpperCase();
 }
+
+/**
+ * Parse a `HH:MM:SS` or `MM:SS` clock string into seconds.
+ *
+ * Returns `null` when the string is malformed so callers can ignore
+ * stray timestamps without throwing — the click handler in the Review
+ * route degrades to a no-op rather than an error toast.
+ *
+ * Used by PR-ε (phase 67) to wire transcript-row clicks → audio
+ * playback seeks. Not used by the read-only transcript renderer (PR-γ),
+ * which keeps the clock as text only.
+ */
+export function parseClockToSeconds(clock: string): number | null {
+  const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(clock);
+  if (!m) return null;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const c = m[3] === undefined ? null : Number(m[3]);
+  // Two-segment form is `MM:SS`; three-segment is `HH:MM:SS`.
+  if (c === null) {
+    return a * 60 + b;
+  }
+  return a * 3600 + b * 60 + c;
+}

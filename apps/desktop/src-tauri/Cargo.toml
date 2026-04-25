@@ -23,7 +23,12 @@ tauri-build = { version = "2", features = [] }
 # menubar tray; `image-png` lets `tauri::image::Image::from_bytes`
 # decode the PNG files in `icons/tray/` (without the feature, the
 # decoder is compiled out and `from_bytes` returns a runtime error).
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `protocol-asset` enables the built-in `asset:` protocol the §15.3
+# Review playback bar uses to stream the recorded m4a/wav from disk
+# into the webview's <audio> element via `convertFileSrc()` — without
+# the feature, `assetProtocol.enable: true` in `tauri.conf.json` is
+# rejected at build time.
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -43,6 +48,14 @@ heron-types = { workspace = true }
 heron-audio = { workspace = true }
 heron-zoom = { workspace = true }
 heron-vault = { workspace = true }
+# Phase 67 (PR-ε): the Re-summarize button in the Review UI calls
+# `heron_cli::summarize::re_summarize_in_vault`, which threads the
+# §10.5 ID-preservation contract + §10.3 merge through
+# `heron_vault::VaultWriter::re_summarize`. Pulling in `heron-llm`
+# alongside lets the Tauri command resolve a live `Summarizer` via
+# `select_summarizer(Preference::Auto)`.
+heron-cli = { workspace = true }
+heron-llm = { workspace = true }
 # Probes that hit TCC (mic, calendar) need `spawn_blocking`, and the
 # tap probe is async — pull `tokio` in for the shared runtime. The
 # `rt` + `time` features are the minimum the probes need (timeout +

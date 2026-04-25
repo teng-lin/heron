@@ -49,7 +49,7 @@ use uuid::{NoContext, Timestamp, Uuid};
 /// This is a basename policy, not a full path check —
 /// [`resolve_note_path`] canonicalizes and re-checks against the vault
 /// after this filter passes.
-fn validate_session_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_session_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("session id is empty".to_string());
     }
@@ -73,7 +73,7 @@ fn validate_session_id(id: &str) -> Result<(), String> {
 /// Splitting this out of [`resolve_note_path`] lets `list_sessions`
 /// reuse the same vetting logic — a renderer asking us to list
 /// `/etc` is just as much a footgun as one asking us to write there.
-async fn resolve_vault_path(vault: &Path) -> Result<PathBuf, String> {
+pub(crate) async fn resolve_vault_path(vault: &Path) -> Result<PathBuf, String> {
     if vault.as_os_str().is_empty() {
         return Err("vault path is empty".to_string());
     }
@@ -96,7 +96,7 @@ async fn resolve_vault_path(vault: &Path) -> Result<PathBuf, String> {
 /// canonicalize step requires the file to exist on read; for write we
 /// canonicalize the *parent* and re-attach the basename so a brand-new
 /// note still passes.
-async fn resolve_note_path(
+pub(crate) async fn resolve_note_path(
     vault: &Path,
     session_id: &str,
     must_exist: bool,
