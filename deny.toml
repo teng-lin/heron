@@ -54,6 +54,12 @@ allow = [
     "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
+# `AGPL-3.0-only` is intentionally allowed alongside `-or-later` so the
+# SPDX expression parser is happy regardless of which spelling it emits;
+# `Unicode-DFS-2016` is held in reserve for older Unicode-licensed deps.
+# Neither is matched today — silence the `license-not-encountered`
+# warning instead of removing the deliberate entries.
+unused-allowed-license = "allow"
 
 [bans]
 multiple-versions = "warn"

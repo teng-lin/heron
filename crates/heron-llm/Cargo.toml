@@ -21,3 +21,6 @@ tracing = { workspace = true }
 tempfile = "3"
 which = "6"
 wiremock = "0.6"
+
+[lints]
+workspace = true

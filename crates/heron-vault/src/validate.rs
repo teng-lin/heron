@@ -39,7 +39,8 @@ use crate::writer::{VaultError, read_note};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Issue {
     /// `read_note` failed; frontmatter is malformed or the YAML is
-    /// invalid. The wrapped error message comes from [`VaultError::Display`].
+    /// invalid. The wrapped error message is the `Display` form of
+    /// [`VaultError`].
     FrontmatterError {
         note: PathBuf,
         error: String,

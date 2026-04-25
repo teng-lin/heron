@@ -5,7 +5,7 @@
 //! The Tauri shell (week 11) calls [`free_bytes`] at app launch and
 //! before every record-arm; a return below
 //! [`MIN_FREE_BYTES_TO_RECORD`] disables the record button with a
-//! "free up <N>GB" affordance.
+//! "free up `<N>GB`" affordance.
 
 use std::path::Path;
 

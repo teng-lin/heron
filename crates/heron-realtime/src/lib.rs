@@ -87,7 +87,7 @@ pub enum RealtimeError {
 #[async_trait]
 pub trait RealtimeBackend: Send + Sync {
     /// Open a session. Returns immediately; observe lifecycle via
-    /// [`subscribe_events`]. Audio I/O is bound externally via
+    /// [`Self::subscribe_events`]. Audio I/O is bound externally via
     /// `heron-bridge` channels passed at construction.
     async fn session_open(&self, config: SessionConfig) -> Result<SessionId, RealtimeError>;
 

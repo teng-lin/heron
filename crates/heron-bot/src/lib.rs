@@ -190,7 +190,7 @@ pub trait MeetingBotDriver: Send + Sync {
     /// Spec §3, §4, §6, §8. Creates a bot and begins the FSM transition
     /// `init → loading_persona → tts_warming → joining → disclosing →
     /// in_meeting`. Returns immediately; observe lifecycle via
-    /// [`subscribe_state`].
+    /// [`Self::subscribe_state`].
     ///
     /// Errors:
     /// - [`BotError::BotAlreadyActive`] if singleton (Invariant 7) violated

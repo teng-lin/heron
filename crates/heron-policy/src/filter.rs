@@ -1,7 +1,7 @@
 //! Policy filter: decide whether a candidate utterance can leave
 //! the agent's mouth.
 //!
-//! The [`SpeechController`] consults [`evaluate`] before every
+//! The [`crate::SpeechController`] consults [`evaluate`] before every
 //! `speak()` emission with the rendered text + the active
 //! [`PolicyProfile`]. The matcher is pure (no I/O, no clock) so
 //! its decisions are reproducible from the audit log.
