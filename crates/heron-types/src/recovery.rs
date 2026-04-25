@@ -269,7 +269,8 @@ pub fn discover_unfinished(cache_root: &Path) -> Result<Vec<SessionStateRecord>,
         if !file_type.is_dir() {
             continue;
         }
-        let rec = match read_state(&entry.path()) {
+        let entry_path = entry.path();
+        let mut rec = match read_state(&entry_path) {
             Ok(Some(rec)) if rec.phase.is_unfinished() => rec,
             Ok(_) => continue,
             // Corrupt / unreadable / oversized: skip rather than
@@ -277,6 +278,13 @@ pub fn discover_unfinished(cache_root: &Path) -> Result<Vec<SessionStateRecord>,
             // startup on a stale partial directory.
             Err(_) => continue,
         };
+        // Per gemini's PR-34 review: rewrite `cache_dir` to the
+        // on-disk location we just walked. The record was originally
+        // written with whatever cache root the running binary chose,
+        // but the user may have moved the cache directory between
+        // sessions (e.g., a backup-and-restore). The walker's
+        // location is authoritative; the stored path may be stale.
+        rec.cache_dir = entry_path;
         by_id
             .entry(rec.session_id)
             .and_modify(|existing| {
@@ -591,6 +599,35 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".state-"))
             .collect();
         assert!(temps.is_empty(), "leaked tmps: {temps:?}");
+    }
+
+    #[test]
+    fn discover_unfinished_rewrites_cache_dir_to_on_disk_location() {
+        // Per gemini's PR review: a record whose stored cache_dir is
+        // stale (e.g., the user moved their cache root between
+        // sessions) should still be salvageable. discover_unfinished
+        // rewrites cache_dir to the directory we actually walked, so
+        // downstream salvage code finds the WAVs / transcript at the
+        // right path.
+        let root = tmpdir();
+        let real_dir = root.path().join("active-session");
+        std::fs::create_dir_all(&real_dir).expect("mkdir");
+
+        // Write a record whose stored cache_dir is a phantom path
+        // that no longer exists on disk.
+        let mut rec = rec_at(real_dir.clone(), SessionPhase::Recording, 30);
+        rec.cache_dir = PathBuf::from("/old/path/that/does/not/exist");
+        // Bypass write_state's `create_dir_all` of the stored path
+        // by writing directly to the real on-disk location.
+        let path = real_dir.join(STATE_FILE_NAME);
+        std::fs::write(&path, serde_json::to_vec_pretty(&rec).expect("ser")).expect("write state");
+
+        let found = discover_unfinished(root.path()).expect("walk");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].cache_dir, real_dir,
+            "cache_dir must be the walked location, not the stale stored path"
+        );
     }
 
     #[test]
