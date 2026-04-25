@@ -32,8 +32,8 @@ pub enum SttError {
     NotYetImplemented,
     #[error("model not found / not downloaded: {0}")]
     ModelMissing(String),
-    #[error("backend unavailable on this platform: {0}")]
-    Unavailable(&'static str),
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
     #[error("transcribe failed: {0}")]
     Failed(String),
     #[error(transparent)]
@@ -92,7 +92,7 @@ pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
         "sherpa" => Ok(Box::new(stub::SherpaStub)),
         other => {
             tracing::warn!(name = other, "unknown stt backend requested");
-            Err(SttError::Unavailable("unknown backend name"))
+            Err(SttError::Unavailable(format!("unknown backend: {other}")))
         }
     }
 }
