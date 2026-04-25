@@ -81,11 +81,15 @@ pub fn test_audio_tap(target_bundle_id: &str) -> TestOutcome {
     if id.is_empty() {
         return TestOutcome::fail("target bundle id is empty");
     }
-    if id.len() > MAX_IDENT_LEN {
-        return TestOutcome::fail(format!("bundle id exceeds {MAX_IDENT_LEN} chars"));
-    }
+    // Order: charset before length. The charset check rejects every
+    // non-ASCII byte first, so the subsequent `id.len()` check
+    // (which counts bytes) is also a meaningful char count for any
+    // string that survives. The error message stays accurate.
     if !id.chars().all(is_bundle_id_char) {
         return TestOutcome::fail("bundle id contains invalid characters; expected [A-Za-z0-9._-]");
+    }
+    if id.len() > MAX_IDENT_LEN {
+        return TestOutcome::fail(format!("bundle id exceeds {MAX_IDENT_LEN} chars"));
     }
     TestOutcome::skipped(format!(
         "would tap bundle {id} via heron_audio once §6.2 ships"
@@ -146,9 +150,11 @@ pub fn test_model_download(progress: f32) -> TestOutcome {
     if progress >= 1.0 {
         TestOutcome::pass("model download complete; WhisperKit will be selected next session")
     } else {
+        // Use floor() rather than `{:.0}` rounding so 0.999 doesn't
+        // surface as "100%" while we're still in the Skipped branch.
         TestOutcome::skipped(format!(
-            "model download at {pct:.0}%; ensure_model() not yet wired (§8.2 stub)",
-            pct = progress * 100.0
+            "model download at {pct}%; ensure_model() not yet wired (§8.2 stub)",
+            pct = (progress * 100.0).floor() as u32
         ))
     }
 }
