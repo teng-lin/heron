@@ -95,3 +95,79 @@ PATH=/usr/bin:/bin cargo test -p heron-llm --test live_api -- --nocapture
 ```
 
 All three tests should print `skipped: …` and pass.
+
+## Zoom AX observer (heron-zoom)
+
+This is the live-call runbook for the §9 AXObserver bridge. It is
+the human procedure that pins the placeholder
+`(role, subrole, identifier)` triple in
+`swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift` to
+real values, then exercises the full Rust + Swift wiring
+end-to-end against a Zoom call.
+
+### 1. Capture the speaker-indicator triple (one-time)
+
+Until this step is run, the placeholders in `ZoomAxHelper.swift`
+(`SPEAKER_INDICATOR_ROLE`, `SPEAKER_INDICATOR_SUBROLE`,
+`SPEAKER_INDICATOR_IDENTIFIER`) are guesses. They will not match
+anything in the real Zoom AX tree.
+
+1. Start a Zoom call (or join Zoom's "Test meeting" at
+   <https://zoom.us/test>) in gallery view with at least 2
+   participants.
+2. Launch Xcode → Open Developer Tool → Accessibility Inspector.
+3. In the Inspector's target picker, select the Zoom process.
+4. Activate the "inspection pointer" and hover the speaker
+   indicator (the colored frame around the active speaker's
+   tile).
+5. Read off the **Role**, **Subrole**, and **Identifier** fields
+   from the Basic panel. Note them down alongside the Zoom version
+   (`zoom.us → About Zoom`).
+6. Repeat in active-speaker view and paginated gallery; if the
+   triple changes between modes, file a follow-up — the bridge
+   currently expects one stable triple.
+7. Edit `swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift`,
+   replacing the three `SPEAKER_INDICATOR_*` constants with the
+   captured values, and remove the `TODO(spike-fixture)` comments.
+8. Confirm the matching notification: in Accessibility Inspector
+   click "Subscribe to Notifications" → toggle the speaker on/off
+   → confirm `AXValueChanged` fires (or note the actual
+   notification name and update `SPEAKER_INDICATOR_NOTIFICATION`).
+9. Capture the artifacts under `fixtures/zoom/spike-triple/` per
+   row #1 in the table above so the values are auditable.
+
+### 2. Grant Accessibility to the test binary (one-time)
+
+`AXIsProcessTrustedWithOptions` returns false until the binary is
+explicitly listed under System Settings → Privacy & Security →
+Accessibility.
+
+1. Build the test binary first so the path exists:
+   `cargo test -p heron-zoom --test ax_observer_real --no-run`.
+2. The binary lives at
+   `target/debug/deps/ax_observer_real-<hash>` — find the latest:
+   `ls -t target/debug/deps/ax_observer_real-*  | head -1`.
+3. System Settings → Privacy & Security → Accessibility →
+   `+` → navigate to that binary path → Enable.
+4. Re-run the test. Each `cargo test` rebuild produces a new hash;
+   you may need to re-grant or use a stable wrapper script.
+
+### 3. Run the live test
+
+With Zoom in a meeting and someone (probably you) talking:
+
+```sh
+HERON_ZOOM_RUNNING=1 cargo test -p heron-zoom \
+    --test ax_observer_real -- --ignored --nocapture
+```
+
+Pass criterion: at least one `SpeakerEvent` arrives within 5
+seconds, the test prints it via `--nocapture`, and `stop()`
+returns cleanly. Failure modes:
+
+- `Err(ZoomNotRunning)`: Zoom isn't running under bundle id
+  `us.zoom.xos`. Check `lsappinfo list | grep -i zoom`.
+- `Err(AccessibilityDenied)`: re-do step 2.
+- "no SpeakerEvent received in 5s": the AX triple is wrong (most
+  likely cause: step 1 hasn't been run since a Zoom update). Re-run
+  step 1 against the current Zoom version.
