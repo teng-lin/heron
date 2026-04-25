@@ -62,9 +62,12 @@ async fn process_tap_emits_at_least_one_frame() {
         Err(other) => panic!("AudioCapture::start failed: {other}"),
     };
 
-    // Give the IO proc a couple of seconds to fire. Real apps emit
-    // audio in 10 ms windows, so 2 s is ~200 frames of headroom.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    // Give the IO proc up to 5 s to fire. Real apps emit audio in
+    // ~10 ms windows, so 5 s is ~500 frames of headroom — comfortable
+    // even on a heavily loaded machine where the consumer task may
+    // not be drained on the first 1 ms tick. The IO-proc → broadcast
+    // pipe is now wired (§7), so a missing frame here is a real bug.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
     let mut got_frame = false;
     while tokio::time::Instant::now() < deadline {
@@ -80,19 +83,15 @@ async fn process_tap_emits_at_least_one_frame() {
         }
     }
 
-    // TODO(io-proc): once `process_tap::install_io_proc` actually
-    // fires the IO block, flip this back to a hard assert. While
-    // the proc is still a no-op (week-2 scaffolding) we only assert
-    // that nobody errored along the way — i.e. the tap + aggregate
-    // were created without TCC/permission failure.
-    if !got_frame {
-        eprintln!(
-            "process_tap_emits_at_least_one_frame: tap built successfully \
-             but no CaptureFrame arrived within 2s. Expected today — \
-             the IO-proc → broadcast pipe lands in week 3 (§7). \
-             Promote this to a hard assert once that ships."
-        );
-    }
+    assert!(
+        got_frame,
+        "no CaptureFrame arrived within 5s for bundle id {bundle_id:?}. \
+         Common causes: (1) TCC system-audio-recording not granted to the \
+         test runner — check System Settings → Privacy & Security → \
+         System Audio Recording; (2) the target app is not currently \
+         producing audio (join a meeting / start playback); \
+         (3) the bundle id is wrong — override via HERON_PROCESS_TAP_BUNDLE_ID."
+    );
 
     drop(handle);
 }

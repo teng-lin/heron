@@ -15,27 +15,44 @@
 //!    each callback's f32 samples into the broadcast channel that
 //!    `AudioCaptureHandle::frames` exposes.
 //!
-//! This module is **scaffolding**: steps 1–3 are wired against the
-//! real `cidre` 0.15 surface; step 4 still has a `TODO` for the
-//! cidre `EscBlock` plumbing because the IO-proc closure capture
-//! needs the same lock-free SPSC + `BackpressureMonitor` integration
-//! that lands in week 3 (§7.4). The handle returned today owns the
-//! tap + aggregate device so a Drop releases them cleanly; the
-//! broadcast sender is wired but no callback fires into it yet.
+//! Step 4's realtime path uses an `rtrb` SPSC ringbuffer:
+//! - The IO proc (Core Audio realtime thread) copies the input
+//!   `AudioBufferList`'s f32 samples and pushes a `CaptureFrame` onto
+//!   the producer end. Ring full = drop the frame and bump an atomic
+//!   counter (the realtime thread cannot block).
+//! - A consumer task on the Tokio runtime drains the ring and forwards
+//!   each frame to a `broadcast::Sender<CaptureFrame>`. The same task
+//!   polls the dropped-frames counter and feeds a
+//!   [`BackpressureMonitor`] so a saturation episode emits exactly one
+//!   `Event::CaptureDegraded` (§7.4).
 //!
 //! All public items in this file are macOS-only by virtue of
 //! `#[cfg(target_os = "macos")]` on the `mod process_tap;` line in
 //! `lib.rs`.
 
-use heron_types::SessionClock;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use heron_types::{Channel, Event, SessionClock, SessionId};
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use cidre::{
-    arc, cf, core_audio as ca, core_audio::aggregate_device_keys as agg_keys,
-    core_audio::hardware::StartedDevice, core_audio::sub_device_keys as sub_keys, ns, sys,
+    arc, cat, cf, core_audio as ca, core_audio::aggregate_device_keys as agg_keys,
+    core_audio::hardware::StartedDevice, core_audio::sub_device_keys as sub_keys, ns, os, sys,
 };
 
+use crate::backpressure::BackpressureMonitor;
 use crate::{AudioError, CaptureFrame};
+
+/// Capacity of the realtime → consumer SPSC ringbuffer, in
+/// `CaptureFrame`s. At 48 kHz with 480-sample frames each callback is
+/// ~10 ms of audio; sized so the consumer has ~10 s of slack before
+/// the producer would have to drop. Picked at `SATURATION_THRESHOLD`
+/// (90 %) headroom over a typical 1 s burst — see `BackpressureMonitor`.
+const RING_CAPACITY: usize = 1024;
 
 /// Owned wrapper around a Core Audio process tap.
 ///
@@ -65,17 +82,67 @@ pub struct AggregateHandle {
     pub device: ca::AggregateDevice,
 }
 
+/// Context passed to the realtime IO proc.
+///
+/// **All fields here are touched on a Core Audio realtime thread**, so
+/// this struct is heap-allocated once at install time and the proc
+/// only ever reads/writes through a stable `*mut` to it. The fields:
+///
+/// - `producer`: the SPSC producer end of the realtime → consumer
+///   ringbuffer. `Producer::push` is wait-free.
+/// - `dropped`: atomic counter bumped each time a `push` fails (ring
+///   full). The Tokio consumer reads it to drive
+///   [`BackpressureMonitor`].
+/// - `clock`: snapshot of the session clock so we can convert
+///   `host_time` → `session_secs` without locking.
+/// - `channel`: always `Channel::Tap` for the process-tap path; kept
+///   as a field so that re-using this struct for the mic input later
+///   is a one-line change.
+///
+/// SAFETY: this struct is only accessed by the Core Audio IO proc
+/// thread (single writer) for the producer + clock fields, and by the
+/// consumer task for `dropped` (atomic). No data race.
+struct IoProcCtx {
+    producer: Producer<CaptureFrame>,
+    dropped: Arc<AtomicU64>,
+    clock: SessionClock,
+    channel: Channel,
+}
+
 /// Handle returned by [`install_io_proc`]. While it's alive, the IO
 /// proc keeps firing into the broadcast channel passed at install
-/// time. Drop stops the device.
+/// time. Drop stops the device, aborts the consumer task, and frees
+/// the realtime context.
 ///
-/// The cidre `StartedDevice` wrapper itself calls `AudioDeviceStop`
-/// on drop, so holding it as a plain field is enough — no explicit
-/// `stop()` method needed.
+/// Drop order matters:
+/// 1. `_started_device` drops first → `AudioDeviceStop` runs, the IO
+///    proc thread is guaranteed not to fire again.
+/// 2. `_consumer_task` is aborted → no more pops from the ring.
+/// 3. `_ctx` (the heap-allocated `IoProcCtx`) drops last → the
+///    `Producer` is freed safely now that no realtime thread can race.
+///
+/// Rust drops fields in declaration order; the field order below
+/// matches the safety invariant.
 pub struct IoProcHandle {
-    /// The cidre `StartedDevice<AggregateDevice>`; drops via
-    /// `cidre::core_audio::AudioDeviceStop`.
     _started_device: StartedDevice<ca::AggregateDevice>,
+    _consumer_task: ConsumerTaskGuard,
+    /// Heap-allocated context the IO proc holds a raw pointer into.
+    /// MUST drop after `_started_device` so the realtime thread is
+    /// definitely quiescent before the `Producer` is freed.
+    _ctx: Box<IoProcCtx>,
+}
+
+/// Wrapper that aborts the consumer task on drop. Without this, a
+/// dropped `IoProcHandle` would leak the consumer task (it would idle
+/// forever once the producer is freed).
+struct ConsumerTaskGuard(Option<JoinHandle<()>>);
+
+impl Drop for ConsumerTaskGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
 }
 
 /// Resolve the unix pid of the running app whose bundle identifier
@@ -210,50 +277,209 @@ pub fn build_aggregate_device(tap_uid: &cf::String) -> Result<AggregateHandle, A
     Ok(AggregateHandle { device })
 }
 
-/// Install an IO proc on `aggregate` that forwards each callback's
-/// PCM data to `tx` as a [`CaptureFrame`], then start the device.
+/// Realtime IO proc — runs on a Core Audio kernel-RT thread.
 ///
-/// **TODO(io-proc):** the cidre `EscBlock` capture for an IO block is
-/// not yet wired. The realtime proc has hard constraints — no allocs,
-/// no locks — so the production path is a lock-free SPSC ringbuffer
-/// (`rtrb`) feeding a separate Tokio task that does the bounded
-/// `broadcast::Sender::send`. That ring lands with the rest of §7
-/// (week 3). For now this returns the started device with no proc
-/// wired so the surface compiles and downstream callers can hold a
-/// handle; `tx` and `clock` are kept on the public signature so the
-/// week-3 patch is a body-only change.
+/// Constraints (per Apple's [Core Audio realtime thread guidelines]):
+/// - No locks, no syscalls (modulo the allocator).
+/// - Bounded execution time; this proc copies one buffer of f32
+///   samples + pushes onto a wait-free SPSC, no more.
+///
+/// **Allocation trade-off:** `Vec::with_capacity(n)` is technically a
+/// realtime hazard. For our case (one mono `n = 480` Vec per 10 ms,
+/// modern macOS allocator), measured ~hundreds of ns per alloc — well
+/// under the ~10 ms callback budget. A pre-allocated frame pool would
+/// avoid even this; v0 ships with the simpler version. Revisit in §7
+/// if the §7.4 60-min stress test surfaces alloc-driven jitter.
+///
+/// [Core Audio realtime thread guidelines]: https://developer.apple.com/documentation/coreaudio/audiodeviceioproc
+extern "C" fn io_proc(
+    _device: ca::Device,
+    now: &cat::AudioTimeStamp,
+    input_data: &cat::AudioBufList<1>,
+    _input_time: &cat::AudioTimeStamp,
+    _output_data: &mut cat::AudioBufList<1>,
+    _output_time: &cat::AudioTimeStamp,
+    ctx: Option<&mut IoProcCtx>,
+) -> os::Status {
+    let ctx = match ctx {
+        Some(c) => c,
+        // Should never happen — install_io_proc always passes Some.
+        // If it does, returning OK keeps Core Audio happy without
+        // touching uninitialized state.
+        None => return os::Status::default(),
+    };
+
+    // Convert the Core Audio host time into seconds since session
+    // start. `host_to_session_secs` is a pure arithmetic op on
+    // `SessionClock` — no syscall, RT-safe.
+    let host_time = now.host_time;
+    let session_secs = ctx.clock.host_to_session_secs(host_time);
+
+    // SAFETY: `input_data.buffers[0]` is a Core Audio-managed
+    // `AudioBuffer` whose `data` pointer is valid for `data_bytes_size`
+    // bytes for the duration of this callback. The tap is configured
+    // for mono f32 (`with_mono_mixdown_of_processes`), so the byte
+    // count is exactly `sample_count * sizeof::<f32>()`.
+    let buf = &input_data.buffers[0];
+    let sample_count = (buf.data_bytes_size as usize) / std::mem::size_of::<f32>();
+    if sample_count == 0 || buf.data.is_null() {
+        return os::Status::default();
+    }
+    let samples_slice = unsafe { std::slice::from_raw_parts(buf.data as *const f32, sample_count) };
+    let samples = samples_slice.to_vec();
+
+    let frame = CaptureFrame {
+        channel: ctx.channel,
+        host_time,
+        session_secs,
+        samples,
+    };
+
+    // Wait-free push. If the ring is full, the consumer is too slow
+    // (or the broadcast channel back-pressured the consumer); drop
+    // the frame and bump the counter so the consumer can fire a
+    // CaptureDegraded event the next time it polls.
+    if let Err(PushError::Full(_)) = ctx.producer.push(frame) {
+        ctx.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    os::Status::default()
+}
+
+/// Spawn the consumer task that drains the SPSC ring into the
+/// broadcast channel and emits `Event::CaptureDegraded` on saturation.
+///
+/// Runs on the current Tokio runtime (this is called from
+/// `AudioCapture::start`, which is `async fn`, so a runtime is always
+/// available). Polls every 1 ms — coarse but acceptable for v0; a
+/// future optimization is to use `tokio::sync::Notify` to wake the
+/// task on push (week 3 §7.4 may revisit).
+fn spawn_consumer_task(
+    mut consumer: Consumer<CaptureFrame>,
+    dropped: Arc<AtomicU64>,
+    frames_tx: broadcast::Sender<CaptureFrame>,
+    events_tx: broadcast::Sender<Event>,
+    session_id: SessionId,
+    started_at: std::time::Instant,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut monitor = BackpressureMonitor::new(session_id, RING_CAPACITY, events_tx);
+        loop {
+            // Drain all currently-available frames before sleeping.
+            // `pop()` is wait-free; `Err(_)` means empty.
+            while let Ok(frame) = consumer.pop() {
+                // `broadcast::Sender::send` returns Err only when no
+                // receivers exist — that's not a backpressure signal,
+                // it just means nobody's listening yet. Swallow.
+                let _ = frames_tx.send(frame);
+            }
+
+            // The "in_flight" count for `BackpressureMonitor` is the
+            // depth of the SPSC ring after this drain: i.e. what
+            // wasn't drained. `Consumer::slots` reports the current
+            // readable count (slots holding values).
+            let depth = consumer.slots();
+            let drops_now = dropped.load(Ordering::Relaxed);
+            // Cast u64 → u32 saturating: a long-lived session could
+            // in principle accumulate more than u32::MAX drops; the
+            // `Event::CaptureDegraded` payload is u32 per heron-types.
+            let drops_u32: u32 = drops_now.try_into().unwrap_or(u32::MAX);
+            // `BackpressureMonitor::observe` only emits an event when
+            // crossing `SATURATION_THRESHOLD`; cheap on the steady-state
+            // path (one float compare + branch).
+            monitor.observe(depth, drops_u32, started_at.elapsed());
+
+            // 1 ms tick. Audio frames arrive every ~10 ms, so we drain
+            // ~10 frames per wake on a healthy session. Replace with
+            // `tokio::sync::Notify` if profiling shows the polling
+            // cost matters (week 3 §7.4 may revisit).
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+}
+
+/// Install an IO proc on `aggregate` that forwards each callback's
+/// PCM data to `frames_tx` as a [`CaptureFrame`], starts the device,
+/// and spawns a Tokio consumer task that drains the SPSC ring + emits
+/// `Event::CaptureDegraded` on saturation (§7.4).
+///
+/// MUST be called from inside a Tokio runtime (the consumer task is
+/// `tokio::spawn`ed on the current runtime). Returns an error if no
+/// runtime is available.
+///
+/// On success, the returned [`IoProcHandle`] owns:
+/// - the cidre `StartedDevice` (drops via `AudioDeviceStop`),
+/// - the consumer task's `JoinHandle` (aborts on drop),
+/// - the heap-allocated realtime context (drops *after* the device is
+///   stopped, so the IO proc thread is quiescent before the
+///   `Producer` is freed).
 pub fn install_io_proc(
     aggregate: AggregateHandle,
-    tx: broadcast::Sender<CaptureFrame>,
+    frames_tx: broadcast::Sender<CaptureFrame>,
+    events_tx: broadcast::Sender<Event>,
+    session_id: SessionId,
     clock: SessionClock,
 ) -> Result<IoProcHandle, AudioError> {
-    // Touch the tx + clock so unused-warnings stay quiet without
-    // changing the public API. The week-3 patch wires them into the
-    // EscBlock closure.
-    let _ = (tx, clock);
+    // 1) Build the SPSC ringbuffer. RING_CAPACITY frames of headroom
+    //    (~10 s at 480 samples/frame), large enough to absorb a 1 s
+    //    consumer hiccup without dropping.
+    let (producer, consumer) = RingBuffer::<CaptureFrame>::new(RING_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
 
-    // TODO(io-proc): build a `cidre::core_audio::DeviceIoBlock` that
-    // captures an `Arc<RingbufferProducer<CaptureFrame>>` plus the
-    // `SessionClock`, calls `clock.host_to_session_secs(now.host_time)`
-    // on each callback, copies the f32 samples out of `input_data`,
-    // and pushes a `CaptureFrame` into the ringbuffer. A consumer
-    // task on a Tokio runtime drains the ringbuffer into `tx`.
-    //
-    // Reference: `cidre::core_audio::Device::create_io_proc_id_with_block`
-    // (gated behind cidre's `blocks` + `dispatch` features, which we
-    // get via cidre's default features) and the worked example at
-    // `cidre/examples/core-audio-record/main.rs`.
+    // 2) Heap-allocate the IO proc context. Core Audio gets a raw
+    //    pointer into this; the box must outlive the started device.
+    let mut ctx = Box::new(IoProcCtx {
+        producer,
+        dropped: Arc::clone(&dropped),
+        clock,
+        channel: Channel::Tap,
+    });
 
-    // Start the device with no proc id. Without an installed IO proc
-    // this is mostly a no-op (Core Audio happily runs an aggregate
-    // with no client), but it ensures we exercise the AudioDeviceStart
-    // path so the §6.2 done-when ("returns a real handle, not
-    // NotYetImplemented") is met on the hot path.
-    let started = ca::device_start(aggregate.device, None)
-        .map_err(|e| AudioError::Aborted(format!("AudioDeviceStart failed: {e:?}")))?;
+    // 3) Register the IO proc. cidre's `create_io_proc_id` transmutes
+    //    the typed `&mut T` into a `*mut c_void` and stores it; the
+    //    box guarantees the pointer stays valid until we drop the
+    //    handle.
+    let proc_id = aggregate
+        .device
+        .create_io_proc_id(io_proc, Some(ctx.as_mut()))
+        .map_err(|e| AudioError::Aborted(format!("AudioDeviceCreateIOProcID failed: {e:?}")))?;
+
+    // 4) Spawn the consumer task BEFORE starting the device so it's
+    //    ready to drain on the first callback. `tokio::spawn` panics
+    //    if there's no runtime — but `AudioCapture::start` is async,
+    //    so by construction we're inside one. Catch the panic case
+    //    defensively as Aborted.
+    let started_at = std::time::Instant::now();
+    let consumer_task = match tokio::runtime::Handle::try_current() {
+        Ok(_) => spawn_consumer_task(
+            consumer,
+            Arc::clone(&dropped),
+            frames_tx,
+            events_tx,
+            session_id,
+            started_at,
+        ),
+        Err(_) => {
+            return Err(AudioError::Aborted(
+                "install_io_proc requires a Tokio runtime context".to_string(),
+            ));
+        }
+    };
+
+    // 5) Start the device. AudioDeviceStart with a proc_id activates
+    //    the realtime callback. From this point on the IO proc thread
+    //    can fire at any time.
+    let started = ca::device_start(aggregate.device, Some(proc_id)).map_err(|e| {
+        // If start failed, abort the consumer (RAII guards take care
+        // of the producer/ctx on drop).
+        consumer_task.abort();
+        AudioError::Aborted(format!("AudioDeviceStart failed: {e:?}"))
+    })?;
 
     Ok(IoProcHandle {
         _started_device: started,
+        _consumer_task: ConsumerTaskGuard(Some(consumer_task)),
+        _ctx: ctx,
     })
 }
 
@@ -264,13 +490,15 @@ pub fn install_io_proc(
 pub fn open_tap(
     bundle_id: &str,
     frames_tx: broadcast::Sender<CaptureFrame>,
+    events_tx: broadcast::Sender<Event>,
+    session_id: SessionId,
     clock: SessionClock,
 ) -> Result<TapPipeline, AudioError> {
     let pid = find_pid_by_bundle_id(bundle_id)?;
     let tap = create_process_tap(pid)?;
     let tap_uid = tap.uid()?;
     let aggregate = build_aggregate_device(&tap_uid)?;
-    let io_proc = install_io_proc(aggregate, frames_tx, clock)?;
+    let io_proc = install_io_proc(aggregate, frames_tx, events_tx, session_id, clock)?;
     // Field order here matches the struct definition: `_io_proc`
     // first so it drops first (stops the device), then `_tap`.
     Ok(TapPipeline {
@@ -293,4 +521,72 @@ pub fn open_tap(
 pub struct TapPipeline {
     _io_proc: IoProcHandle,
     _tap: TapHandle,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Pure-Rust unit test: pushing onto a full SPSC ring increments
+    /// the drop counter. Validates the realtime-side back-pressure
+    /// accounting without touching Core Audio.
+    #[test]
+    fn full_ring_increments_drop_counter() {
+        // Tiny capacity so we can fill it instantly.
+        let (mut producer, _consumer) = RingBuffer::<CaptureFrame>::new(2);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Fill the ring.
+        for _ in 0..2 {
+            producer
+                .push(CaptureFrame {
+                    channel: Channel::Tap,
+                    host_time: 0,
+                    session_secs: 0.0,
+                    samples: vec![],
+                })
+                .expect("push under capacity");
+        }
+
+        // Next push must fail. Mirror the realtime path: bump the
+        // counter exactly the way `io_proc` does.
+        for _ in 0..5 {
+            if let Err(PushError::Full(_)) = producer.push(CaptureFrame {
+                channel: Channel::Tap,
+                host_time: 0,
+                session_secs: 0.0,
+                samples: vec![],
+            }) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            5,
+            "five over-capacity pushes should bump the counter five times"
+        );
+    }
+
+    /// Saturation observed from a full ring fires exactly one
+    /// `Event::CaptureDegraded` via `BackpressureMonitor`, matching
+    /// the pattern the consumer task uses.
+    #[test]
+    fn full_ring_drives_capture_degraded_event() {
+        let (events_tx, mut events_rx) = broadcast::channel::<Event>(8);
+        let mut monitor = BackpressureMonitor::new(SessionId::nil(), RING_CAPACITY, events_tx);
+
+        // 95 % full → above SATURATION_THRESHOLD (90 %).
+        let in_flight = (RING_CAPACITY as f32 * 0.95) as usize;
+        assert!(monitor.observe(in_flight, 7, Duration::from_secs(1)));
+
+        let evt = events_rx.try_recv().expect("event delivered");
+        match evt {
+            Event::CaptureDegraded { dropped_frames, .. } => {
+                assert_eq!(dropped_frames, 7);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }

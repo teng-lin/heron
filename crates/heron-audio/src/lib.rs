@@ -112,18 +112,28 @@ impl AudioCapture {
         target_bundle_id: &str,
         cache_dir: &Path,
     ) -> Result<AudioCaptureHandle, AudioError> {
-        // Cache dir is unused until §7 (week-3 disk-spill ringbuffer);
-        // session id flows into events once the broadcast pipeline is
-        // populated. Touch them so clippy's unused_variables stays
-        // quiet without renaming the public API.
-        let _ = (session_id, cache_dir);
+        // Cache dir is unused until §7 (week-3 disk-spill ringbuffer).
+        // Touch it so clippy's unused_variables stays quiet without
+        // renaming the public API. `session_id` *is* used now —
+        // threaded into the IO-proc pipeline so `Event::CaptureDegraded`
+        // events carry the correct id.
+        let _ = cache_dir;
 
         #[cfg(target_os = "macos")]
         {
             let clock = SessionClock::new();
             let (frames_tx, frames_rx) = broadcast::channel::<CaptureFrame>(1024);
-            let (_events_tx, events_rx) = broadcast::channel::<Event>(256);
-            let pipeline = process_tap::open_tap(target_bundle_id, frames_tx.clone(), clock)?;
+            let (events_tx, events_rx) = broadcast::channel::<Event>(256);
+            // Pass `events_tx` + `session_id` through so the IO-proc
+            // consumer task can fire `Event::CaptureDegraded` when
+            // the SPSC ring saturates (§7.4).
+            let pipeline = process_tap::open_tap(
+                target_bundle_id,
+                frames_tx.clone(),
+                events_tx.clone(),
+                session_id,
+                clock,
+            )?;
             // Hold both the cidre resources (`pipeline`) and the
             // sender end of the broadcast channels alive for the
             // lifetime of the handle — once the sender is dropped,
@@ -136,7 +146,7 @@ impl AudioCapture {
                 _macos_pipeline: Some(MacosPipelineGuard {
                     _pipeline: pipeline,
                     _frames_tx: frames_tx,
-                    _events_tx,
+                    _events_tx: events_tx,
                 }),
             })
         }
@@ -146,7 +156,7 @@ impl AudioCapture {
             // No process tap off-Apple — Linux/Windows builds exist
             // only so that `cargo check` works on CI runners that
             // can't compile cidre. They never run heron in anger.
-            let _ = target_bundle_id;
+            let _ = (session_id, target_bundle_id);
             Err(AudioError::NotYetImplemented)
         }
     }
