@@ -16,8 +16,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod anthropic;
+pub mod claude_code;
+mod content;
 pub mod cost;
+pub mod transcript;
+
 pub use anthropic::{AnthropicClient, AnthropicClientConfig};
+pub use claude_code::{ClaudeCodeClient, ClaudeCodeClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
 
 /// Convenience alias so the public surface doesn't leak `String` for
@@ -126,7 +131,13 @@ pub fn build_summarizer(backend: Backend) -> Box<dyn Summarizer> {
                 Box::new(stub::AnthropicStub)
             }
         },
-        Backend::ClaudeCodeCli => Box::new(stub::ClaudeCodeStub),
+        Backend::ClaudeCodeCli => {
+            // Construct lazily — `claude` not being on PATH at
+            // launch shouldn't crash the orchestrator. The first
+            // summarize call will surface the spawn error if the
+            // binary actually goes missing.
+            Box::new(ClaudeCodeClient::new(ClaudeCodeClientConfig::default()))
+        }
         Backend::CodexCli => Box::new(stub::CodexStub),
     }
 }
@@ -206,22 +217,16 @@ mod stub {
     use super::{LlmError, Summarizer, SummarizerInput, SummarizerOutput};
     use async_trait::async_trait;
 
+    /// Returned by `build_summarizer(Anthropic)` when
+    /// `ANTHROPIC_API_KEY` is missing — the orchestrator can still
+    /// build, the failure surfaces at first summarize call.
     pub struct AnthropicStub;
-    pub struct ClaudeCodeStub;
+    /// Returned by `build_summarizer(CodexCli)` until phase 39 lands
+    /// the real subprocess wiring.
     pub struct CodexStub;
 
     #[async_trait]
     impl Summarizer for AnthropicStub {
-        async fn summarize(
-            &self,
-            _input: SummarizerInput<'_>,
-        ) -> Result<SummarizerOutput, LlmError> {
-            Err(LlmError::NotYetImplemented)
-        }
-    }
-
-    #[async_trait]
-    impl Summarizer for ClaudeCodeStub {
         async fn summarize(
             &self,
             _input: SummarizerInput<'_>,
@@ -346,23 +351,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_stub_backends_report_not_yet_implemented() {
-        for backend in [
-            Backend::Anthropic,
-            Backend::ClaudeCodeCli,
-            Backend::CodexCli,
-        ] {
-            let s = build_summarizer(backend);
-            let path = PathBuf::from("/tmp/x.jsonl");
-            let result = s
-                .summarize(SummarizerInput {
-                    transcript: &path,
-                    meeting_type: MeetingType::Client,
-                    existing_action_items: None,
-                    existing_attendees: None,
-                })
-                .await;
-            assert!(matches!(result, Err(LlmError::NotYetImplemented)));
+    async fn codex_cli_backend_still_stubs() {
+        // CodexCli stays a stub until phase 39 lands the real
+        // subprocess wiring.
+        let s = build_summarizer(Backend::CodexCli);
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let result = s
+            .summarize(SummarizerInput {
+                transcript: &path,
+                meeting_type: MeetingType::Client,
+                existing_action_items: None,
+                existing_attendees: None,
+            })
+            .await;
+        assert!(matches!(result, Err(LlmError::NotYetImplemented)));
+    }
+
+    #[tokio::test]
+    async fn claude_code_cli_backend_attempts_real_spawn() {
+        // ClaudeCodeCli now wires a real ClaudeCodeClient. Without
+        // a real `claude` on PATH, the call surfaces a spawn error
+        // (Backend variant) rather than NotYetImplemented. We point
+        // at a known-missing path to make the test deterministic.
+        use crate::claude_code::ClaudeCodeClientConfig;
+        let cfg = ClaudeCodeClientConfig {
+            binary: std::path::PathBuf::from("/nonexistent/claude-binary"),
+            timeout: std::time::Duration::from_secs(2),
+            ..ClaudeCodeClientConfig::default()
+        };
+        let client: Box<dyn Summarizer> = Box::new(crate::ClaudeCodeClient::new(cfg));
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let result = client
+            .summarize(SummarizerInput {
+                transcript: &path,
+                meeting_type: MeetingType::Client,
+                existing_action_items: None,
+                existing_attendees: None,
+            })
+            .await;
+        // Two possible failures depending on order of operations:
+        // (a) read_transcript_capped on /tmp/x.jsonl fails first
+        //     with Backend("open transcript ..."), or
+        // (b) spawn fails first with Backend("spawn ...").
+        // Either is fine — they're both Backend variants, neither
+        // is NotYetImplemented.
+        match result {
+            Err(LlmError::Backend(_)) => {}
+            other => panic!("expected Backend, got {other:?}"),
         }
     }
 

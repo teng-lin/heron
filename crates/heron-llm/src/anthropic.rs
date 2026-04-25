@@ -23,17 +23,23 @@
 //! [`crate::cost::RATE_TABLE`] from the response's `usage` block —
 //! the API is the source of truth, not the dashboard (per §11.4).
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use heron_types::{ActionItem, Attendee, MeetingType};
+use heron_types::MeetingType;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::content::parse_content_json;
+use crate::transcript::{build_user_content, read_transcript_capped};
 use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
+
+// Re-export the transcript-cap constants at their historical names
+// so downstream callers (heron-cli status, the diagnostics tab) keep
+// importing them from `heron_llm::anthropic::*`.
+pub use crate::transcript::{
+    MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_LINE_BYTES, TRANSCRIPT_WARN_BYTES,
+};
 
 /// Default API origin. Tests inject a wiremock URL via
 /// [`AnthropicClientConfig::base_url`].
@@ -47,23 +53,6 @@ pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// [`AnthropicClientConfig::model`]; the per-session config in the
 /// orchestrator (week 11) ultimately wins.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-
-/// Hard cap on transcript file size when assembling the prompt. ~4
-/// MiB easily covers a 4-hour meeting at 200 wpm and protects against
-/// a runaway writer dumping the entire WAV stream into the JSONL.
-pub const MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Hard cap on a single transcript JSONL line. CONTRIBUTING.md
-/// "stream + cap line length" — anything longer is treated as a
-/// malformed entry and dropped from the prompt.
-pub const MAX_TRANSCRIPT_LINE_BYTES: u64 = 64 * 1024;
-
-/// Soft pre-flight warning threshold. Transcripts larger than this
-/// approach the model's input-token limit (Sonnet 4.6 caps at 200K
-/// tokens ≈ ~800 KiB of dense JSONL). The Messages API will return
-/// 400 once it bumps the limit; warning here lets the user catch it
-/// before paying for the round-trip.
-pub const TRANSCRIPT_WARN_BYTES: u64 = 600 * 1024;
 
 /// Hard cap on the body snippet we paste into a non-2xx error
 /// message. Misbehaving proxies could echo unbounded responses; bound
@@ -160,9 +149,7 @@ impl Summarizer for AnthropicClient {
                  consider chunked summarize or a higher-context model"
             );
         }
-        let user_content = format!(
-            "{prompt}\n\nTranscript JSONL (one turn per line):\n```\n{transcript_text}\n```"
-        );
+        let user_content = build_user_content(&prompt, &transcript_text);
 
         let body = MessagesRequest {
             model: &self.config.model,
@@ -267,13 +254,7 @@ pub fn parse_messages_response(
             ContentBlock::Other => None,
         })
         .ok_or_else(|| LlmError::Parse("response had no `text` content block".to_owned()))?;
-    let body: ContentJson = serde_json::from_str(text).map_err(|e| {
-        LlmError::Parse(format!(
-            "content[0].text was not the JSON shape we asked for: {e}; \
-             first 120 chars: {snippet:?}",
-            snippet = text.chars().take(120).collect::<String>()
-        ))
-    })?;
+    let body = parse_content_json(text)?;
 
     // Per §11.4: the API is the source of truth for token counts,
     // including prompt-cache fields. Fold cache_creation +
@@ -300,101 +281,6 @@ pub fn parse_messages_response(
         attendees: body.attendees.unwrap_or_default(),
         cost,
     })
-}
-
-/// Read a transcript JSONL file with size + per-line caps.
-///
-/// **Trust model.** The transcript path is supplied by the
-/// orchestrator from heron's own writer, so the file is treated as
-/// trusted: `File::open` follows symlinks and `metadata().len()` is
-/// inspected before the open completes the stream. Callers that
-/// might receive untrusted paths (third-party CLI consumers, future
-/// MCP server inputs) should validate the path against the vault
-/// root + cache root before invoking this.
-fn read_transcript_capped(path: &Path) -> Result<String, LlmError> {
-    let file = File::open(path)
-        .map_err(|e| LlmError::Backend(format!("open transcript {p:?}: {e}", p = path)))?;
-    let len = file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(MAX_TRANSCRIPT_BYTES + 1);
-    if len > MAX_TRANSCRIPT_BYTES {
-        return Err(LlmError::Backend(format!(
-            "transcript {path:?} is {len} bytes, exceeds {cap}-byte cap",
-            cap = MAX_TRANSCRIPT_BYTES
-        )));
-    }
-
-    let mut reader = BufReader::new(file);
-    let mut out = String::with_capacity(len as usize);
-    // Reuse one buffer across iterations: `read_until` appends, so a
-    // `clear()` at the top of each loop reuses the existing
-    // allocation rather than dropping/re-allocating per line.
-    let mut line: Vec<u8> = Vec::with_capacity(MAX_TRANSCRIPT_LINE_BYTES as usize + 1);
-    let mut total = 0u64;
-    loop {
-        line.clear();
-        let n = reader
-            .by_ref()
-            .take(MAX_TRANSCRIPT_LINE_BYTES + 1)
-            .read_until(b'\n', &mut line)
-            .map_err(LlmError::Io)?;
-        if n == 0 {
-            break;
-        }
-        // Always count what we *consumed* from disk toward the cap,
-        // even when we drop the line. Otherwise a file made entirely
-        // of over-cap lines could read its way past MAX_TRANSCRIPT_BYTES
-        // by the back door.
-        total = total.saturating_add(n as u64);
-        if line.len() as u64 > MAX_TRANSCRIPT_LINE_BYTES {
-            // Skip the over-cap line and seek past its newline so
-            // we don't fold the tail into the next read. The
-            // transcript writer should never emit such a line; this
-            // is purely defensive.
-            let drained = consume_until_newline(&mut reader)?;
-            total = total.saturating_add(drained);
-            if total >= MAX_TRANSCRIPT_BYTES {
-                break;
-            }
-            continue;
-        }
-        let s = std::str::from_utf8(&line)
-            .map_err(|e| LlmError::Backend(format!("transcript {path:?} non-UTF-8: {e}")))?;
-        out.push_str(s);
-        if total >= MAX_TRANSCRIPT_BYTES {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-/// Drain the rest of the current line without allocating, returning
-/// the byte count consumed so the caller can keep its
-/// [`MAX_TRANSCRIPT_BYTES`] tally accurate. Mirrors the canonical
-/// pattern in `heron_doctor::log_reader`: a `fill_buf`/`consume`
-/// loop walks the BufReader's internal buffer one chunk at a time,
-/// so memory stays bounded at the buffer size regardless of how
-/// long the over-cap line is.
-fn consume_until_newline<R: BufRead>(reader: &mut R) -> Result<u64, LlmError> {
-    let mut total_consumed: u64 = 0;
-    loop {
-        let (consumed, found_newline) = {
-            let buf = reader.fill_buf().map_err(LlmError::Io)?;
-            if buf.is_empty() {
-                return Ok(total_consumed);
-            }
-            match buf.iter().position(|&b| b == b'\n') {
-                Some(idx) => (idx + 1, true),
-                None => (buf.len(), false),
-            }
-        };
-        reader.consume(consumed);
-        total_consumed = total_consumed.saturating_add(consumed as u64);
-        if found_newline {
-            return Ok(total_consumed);
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -445,21 +331,6 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentJson {
-    body: String,
-    #[serde(default)]
-    company: Option<String>,
-    #[serde(default)]
-    meeting_type: Option<MeetingType>,
-    #[serde(default)]
-    tags: Option<Vec<String>>,
-    #[serde(default)]
-    action_items: Option<Vec<ActionItem>>,
-    #[serde(default)]
-    attendees: Option<Vec<Attendee>>,
 }
 
 #[cfg(test)]
