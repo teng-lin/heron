@@ -606,6 +606,16 @@ impl AudioCaptureHandle {
             // longer implies a hung consumer; abort the task so
             // we don't leak it past `stop()` returning.
             if let Some(handle) = aec_task {
+                // Take an `AbortHandle` BEFORE moving `handle` into
+                // the timeout future. `tokio::time::timeout` consumes
+                // its inner future, so by the time the timeout error
+                // arm fires the JoinHandle is gone — and dropping a
+                // JoinHandle does NOT abort the task in tokio
+                // (unlike `tokio::task::JoinSet`). Without an explicit
+                // abort the worker keeps running after `stop()`
+                // returns, holding the WAV writers and broadcast
+                // receiver past the session boundary.
+                let abort_handle = handle.abort_handle();
                 match tokio::time::timeout(Duration::from_secs(2), handle).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) if e.is_cancelled() => {}
@@ -613,20 +623,13 @@ impl AudioCaptureHandle {
                         tracing::warn!(error = %e, "AEC task join error during stop");
                     }
                     Err(_) => {
-                        // Re-acquire the guard wrapper to abort
-                        // since we already extracted the handle.
-                        // Can't abort directly here because `handle`
-                        // was awaited and is consumed; use
-                        // `aec_task_guard` to hold whatever's left
-                        // (which should be empty — the abort is via
-                        // Drop below as a belt-and-suspenders).
-                        tracing::warn!("AEC task drain exceeded 2s timeout");
+                        tracing::warn!("AEC task drain exceeded 2s timeout; aborting");
+                        abort_handle.abort();
                     }
                 }
             }
-            // The guard wrapper is dropped here regardless — the
-            // wrapper's Drop impl aborts any leftover handle as a
-            // safety net.
+            // Drop the guard wrapper. Its Drop impl is a safety net
+            // for paths that don't reach the timeout block above.
             drop(aec_task_guard);
 
             // Step 5: finalize the writers. This closes each open
