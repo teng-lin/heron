@@ -69,10 +69,19 @@ jobs:
       - name: install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      # The `test-sherpa` shared-key busts the `test` cache that was
+      # populated before sherpa-rs-sys joined the workspace. The cached
+      # `target/` carried sherpa-rs-sys's build-script output but the
+      # prebuilt dylibs live in `~/Library/Caches/sherpa-rs/`, which
+      # isn't part of the default rust-cache scope. Adding the cache
+      # directory here keeps the prebuilt onnxruntime + sherpa-onnx
+      # dylibs alongside `target/` so subsequent runs avoid re-downloading.
       - name: cargo registry + target cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test
+          shared-key: test-sherpa
+          cache-directories: |
+            ~/Library/Caches/sherpa-rs
 
       - name: select Xcode 16 (Swift 6 toolchain)
         run: sudo xcode-select -s /Applications/Xcode_16.2.app
