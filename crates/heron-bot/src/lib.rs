@@ -24,21 +24,32 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod fsm;
+pub mod ids;
 pub use fsm::{BotEvent, BotFsm, TransitionError};
+pub use ids::IdParseError;
 
 // ── identity ──────────────────────────────────────────────────────────
 
-/// Stripe-style prefixed UUID for a bot. Internal canonical identity
-/// per spec §2 Invariant 4. Composite keys / URLs are resolver inputs,
-/// never primary identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BotId(pub Uuid);
+prefixed_id! {
+    /// Stripe-style prefixed UUID for a bot. Wire form `bot_<uuid>`.
+    /// Spec §2 Invariant 4: internal canonical identity. Composite
+    /// keys / URLs are resolver inputs, never primary identity.
+    pub BotId, "bot"
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PersonaId(pub Uuid);
+prefixed_id! {
+    /// Stripe-style prefixed UUID for a persona. Wire form
+    /// `persona_<uuid>`. A misrouted JSON parse (persona ID into a
+    /// BotId field) fails at deserialize time rather than running
+    /// through the system as a wrong-typed UUID.
+    pub PersonaId, "persona"
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MeetingId(pub Uuid);
+prefixed_id! {
+    /// Stripe-style prefixed UUID for a meeting. Wire form
+    /// `meeting_<uuid>`.
+    pub MeetingId, "meeting"
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
