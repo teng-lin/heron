@@ -36,3 +36,53 @@ Schema: `# | Section | Test name | Owner | When | Pass criterion | Artifact loca
 Every PR that introduces a `[needs-human]` test must also add a row
 here. CI does not enforce this — code review does. The row goes in
 section order.
+
+## Live LLM smoke tests (heron-llm)
+
+`crates/heron-llm/tests/live_api.rs` is a live smoke harness that
+exercises each summarizer backend against the real upstream when
+prerequisites are present, and skips cleanly otherwise. The harness
+uses **runtime skip** (early `return` with `eprintln!("skipped: …")`),
+not `#[ignore]`, so `cargo test` is always green and gets richer as
+the developer's machine becomes more capable.
+
+### Prerequisites
+
+| Test | Prereq | Skip when |
+|---|---|---|
+| `live_anthropic_summarize_returns_non_empty` | `ANTHROPIC_API_KEY` env var | unset or empty |
+| `live_claude_cli_summarize_returns_non_empty` | `claude` on `PATH` **and** `claude --version` exits 0 | binary missing or unauthenticated |
+| `live_codex_cli_summarize_returns_non_empty` | `codex` on `PATH` **and** `codex --version` exits 0 | binary missing or unauthenticated |
+
+### Running
+
+```sh
+cargo test -p heron-llm --test live_api -- --nocapture
+```
+
+`--nocapture` is what surfaces the per-test `skipped: …` / `live …
+ok: …` log lines. Without it the tests still pass; you just don't see
+which path was exercised.
+
+### Cost note
+
+The Anthropic test issues a single Messages API call against the
+default model (`claude-sonnet-4-6`) with a two-line synthetic
+transcript. Real cost is on the order of a fraction of a cent per
+run (well under $0.01). The user opts in by exporting the key — the
+test will not silently spend money on a machine where the key is
+absent.
+
+The CLI tests consume the user's Claude Code / Codex subscription
+quota rather than API credits.
+
+### Verifying the skip path
+
+On a machine with no key and no CLIs:
+
+```sh
+unset ANTHROPIC_API_KEY
+PATH=/usr/bin:/bin cargo test -p heron-llm --test live_api -- --nocapture
+```
+
+All three tests should print `skipped: …` and pass.
