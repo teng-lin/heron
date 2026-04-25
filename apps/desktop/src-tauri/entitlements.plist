@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- See docs/implementation.md §0.6. -->
+
+  <!-- Sandbox is OFF: Core Audio process taps require unsandboxed
+       access to AudioHALD's mach service. Hardened runtime is still
+       on, gated by the entitlements below. -->
+  <key>com.apple.security.app-sandbox</key>
+  <false/>
+
+  <!-- WhisperKit + Tauri WebView use JIT compilation. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Required for loading dynamically-linked components under
+       hardened runtime: WhisperKit's CoreML model bundles, the Tauri
+       sidecar binaries, and any plug-in dylibs. Static libs (like the
+       EventKitHelper Swift package) link into the main binary and do
+       not themselves require this entitlement, but the v1 audio +
+       speech path does. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- Microphone capture for the user's own voice. Paired with the
+       NSMicrophoneUsageDescription string in Info.plist (see Tauri
+       config — wired up in week 11 per §13). -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+
+  <!-- Reach AudioHALD via mach lookup so Core Audio process taps
+       can be created (audio capture path arrives week 2 per §6). -->
+  <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+  <array>
+    <string>com.apple.audio.audiohald</string>
+  </array>
+</dict>
+</plist>
