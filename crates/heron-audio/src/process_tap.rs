@@ -93,21 +93,13 @@ pub fn find_pid_by_bundle_id(bundle_id: &str) -> Result<i32, AudioError> {
     let bundle_ns = ns::String::with_str(bundle_id);
     let apps = ns::RunningApp::with_bundle_id(&bundle_ns);
 
-    // Iterate through the array and pick the first non-zero pid.
-    // ns::Array exposes `len()` + `get()`. Pid 0 is the "no
-    // associated process" sentinel — observed when an app is
-    // listed but already terminated mid-poll.
-    for i in 0..apps.len() {
-        // ns::Array::get returns Result<Retained, &Exception> rather
-        // than Option, because Foundation array indexing throws
-        // NSRangeException out of bounds. We've just bounded the
-        // index by `len()`, so the Err branch should be unreachable;
-        // skip it defensively.
-        if let Ok(app) = apps.get(i) {
-            let pid: sys::Pid = app.pid();
-            if pid > 0 {
-                return Ok(pid);
-            }
+    // Pick the first non-zero pid. Pid 0 is the "no associated
+    // process" sentinel — observed when an app is listed but already
+    // terminated mid-poll.
+    for app in apps.iter() {
+        let pid: sys::Pid = app.pid();
+        if pid > 0 {
+            return Ok(pid);
         }
     }
 
