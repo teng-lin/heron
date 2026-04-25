@@ -150,6 +150,7 @@ pub fn select_backend<P: Platform>(platform: &P, baseline: &WerBaseline) -> Box<
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
