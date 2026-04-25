@@ -53,9 +53,13 @@ fn heron_status() -> HeronStatus {
     HeronStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
         fsm_state: fsm.state(),
-        // Once heron-audio's real capture lands, this will probe the
-        // process tap permissions; v0 reports the stub state.
-        audio_available: false,
+        // Capability check (NOT session liveness): `true` iff this
+        // host can in principle start a capture session — macOS with
+        // a default cpal input device. TCC denial / target-app-not-
+        // running surface as `Event::CaptureDegraded` on a real
+        // session start, not here. See `heron_audio::audio_capture_available`
+        // for the exact predicate, latency budget, and rationale.
+        audio_available: heron_audio::audio_capture_available(),
         ax_backend: "ax-observer".into(),
     }
 }
@@ -191,5 +195,36 @@ mod tests {
         // only the tail we control. (macOS adds `Application Support`,
         // Linux adds `.config`, Windows adds `AppData/Roaming`, etc.)
         assert!(p.ends_with("com.heronnote.heron/settings.json"));
+    }
+
+    /// `heron_status::audio_available` must reflect the real
+    /// [`heron_audio::audio_capture_available`] probe — not the v0
+    /// hardcode it replaced. The probe's return is host-dependent so
+    /// we don't pin a specific bool; we pin the *equality* with the
+    /// probe to guarantee a future regression that reintroduces a
+    /// hardcode (or wires up a different signal) gets caught.
+    ///
+    /// On non-macOS this test still runs — `audio_capture_available`
+    /// is hardcoded to `false` off-Apple, and so should
+    /// `audio_available` be.
+    #[test]
+    fn heron_status_audio_available_matches_probe() {
+        let status = heron_status();
+        assert_eq!(
+            status.audio_available,
+            heron_audio::audio_capture_available()
+        );
+    }
+
+    /// Off-Apple, `heron_status::audio_available` must be `false`.
+    /// The cidre process tap doesn't compile off-Apple and cpal is
+    /// gated to macOS, so `false` is the only honest answer. Locked
+    /// down so a future patch that drops the `cfg` gate in
+    /// `heron_audio::audio_capture_available` (or reintroduces a
+    /// hardcode here) gets caught.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn heron_status_audio_available_is_false_off_apple() {
+        assert!(!heron_status().audio_available);
     }
 }

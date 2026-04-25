@@ -38,6 +38,63 @@ pub use ringbuffer::{
     Ringbuffer, RingbufferError, RingbufferState, recover, scan_recoverable_sessions,
 };
 
+/// Quick capability probe for the desktop shell's `heron_status` view.
+///
+/// Returns `true` when the host *could* start an
+/// [`AudioCapture::start`] session — i.e. the binary is built for a
+/// platform with the Core Audio process tap (macOS 14.2+, gated at
+/// compile time by `Cargo.toml`'s `cidre` `macos_14_2` feature) AND
+/// at least one default cpal input device is currently connected.
+///
+/// **Capability, not session liveness.** A `true` return does NOT
+/// guarantee that `AudioCapture::start` will succeed at this exact
+/// moment — TCC denial, the target meeting app not running, or a
+/// transient device disconnect can still produce session-time errors.
+/// Those are surfaced via [`heron_types::Event::CaptureDegraded`] on a
+/// real session, NOT via this status field. The probe answers the
+/// onboarding question "is this a host where heron's audio path is
+/// usable in principle?", which is a strict superset of "is a session
+/// running right now?".
+///
+/// **Platform predicate.**
+/// - Non-macOS (Linux / Windows / iOS / etc.): always `false`. The
+///   process tap is macOS-only — `process_tap.rs` doesn't even compile
+///   off-Apple — and `cpal` is gated to macOS in our `Cargo.toml` for
+///   v0 (§6).
+/// - macOS: `cpal::default_host().default_input_device().is_some()`.
+///   On a built binary the cidre / process-tap symbols are
+///   compile-time-gated by the `macos_14_2` feature in
+///   `crates/heron-audio/Cargo.toml`, so the runtime predicate
+///   collapses to "is there a default mic?".
+///
+/// **Latency.** Must stay under ~50 ms — `heron_status` is polled
+/// frequently by the frontend status pane. `cpal::default_host()` is
+/// a no-op constructor on macOS (returns a `Host` referencing the
+/// global Core Audio HAL), and `default_input_device()` is a single
+/// `AudioObjectGetPropertyData` call against
+/// `kAudioHardwarePropertyDefaultInputDevice` — sub-millisecond on
+/// every macOS release we target. We deliberately do NOT cache the
+/// result: a user plugging or unplugging an external mic should be
+/// reflected in the status pane within one poll cycle, and the call
+/// is already cheap enough to skip the cache invalidation complexity.
+///
+/// **NOT touched here:** TCC microphone authorization status, the
+/// running-process list, or the user's settings. Those are
+/// session-start concerns; surfacing them through this probe would
+/// turn a 1 ms property fetch into a ~hundred-ms permissions / process
+/// scan and bring the same UX cost as just trying `AudioCapture::start`.
+pub fn audio_capture_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use cpal::traits::HostTrait;
+        cpal::default_host().default_input_device().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// One PCM frame as emitted by the capture pipeline. After APM/AEC
 /// processing for the `Mic` channel, before any STT.
 #[derive(Debug, Clone)]
@@ -856,6 +913,41 @@ mod tests {
         assert!(
             matches!(join, Ok(Ok(()))),
             "AEC task must drain within 1s of all senders dropping; got {join:?}"
+        );
+    }
+
+    /// Off-Apple, [`audio_capture_available`] is hard-wired to `false`.
+    /// The cidre process tap doesn't compile off-Apple and cpal is
+    /// gated to macOS in `Cargo.toml`, so the only honest answer is
+    /// "no". Locked down so a future patch that accidentally drops
+    /// the `cfg` gate gets caught.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn audio_capture_available_is_false_off_apple() {
+        assert!(!audio_capture_available());
+    }
+
+    /// On macOS the probe must complete fast — `heron_status` is
+    /// polled often by the frontend. 50 ms is the budget called out
+    /// in the function docs; pick a generous 200 ms ceiling for the
+    /// test so a loaded CI runner doesn't flake. The actual call is
+    /// a single Core Audio property fetch (sub-millisecond in
+    /// practice).
+    ///
+    /// The return value is host-dependent — CI runners and dev
+    /// laptops may or may not have a default input device — so we
+    /// only assert on latency, not on the bool itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_capture_available_is_fast_on_macos() {
+        let start = std::time::Instant::now();
+        let _ = audio_capture_available();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "audio_capture_available took {elapsed:?}; \
+             must stay under the 50 ms budget called out in its docstring \
+             (200 ms ceiling here for CI noise)"
         );
     }
 }

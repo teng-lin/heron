@@ -26,6 +26,12 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 dirs = "5"
 heron-types = { workspace = true }
+# `heron_status::audio_available` calls `heron_audio::audio_capture_available()`
+# to derive the field from a real capability probe (cpal default input
+# device + cfg-gated cidre process tap symbols) instead of the v0
+# hardcode. The probe is sub-millisecond on macOS and returns `false`
+# unconditionally off-Apple — see `crates/heron-audio/src/lib.rs`.
+heron-audio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

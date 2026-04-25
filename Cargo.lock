@@ -1823,6 +1823,7 @@ name = "heron-desktop"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "heron-audio",
  "heron-types",
  "serde",
  "serde_json",
