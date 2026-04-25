@@ -15,6 +15,7 @@
 
 pub mod asset_protocol;
 pub mod diagnostics;
+pub mod notes;
 pub mod onboarding;
 pub mod settings;
 pub mod tray;
@@ -117,6 +118,33 @@ fn heron_default_settings_path() -> String {
 #[tauri::command]
 fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(), String> {
     write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
+}
+
+/// Tauri command: read `<vault>/<session_id>.md`.
+///
+/// `vault_path` and `session_id` are passed as separate strings so the
+/// path policy enforced by `notes::read_note` (validate basename,
+/// canonicalize, reject vault escapes) cannot be bypassed by
+/// constructing the joined path on the renderer side.
+#[tauri::command]
+async fn heron_read_note(vault_path: String, session_id: String) -> Result<String, String> {
+    notes::read_note(Path::new(&vault_path), &session_id).await
+}
+
+/// Tauri command: atomic-write `<vault>/<session_id>.md` (editor blur / ⌘S).
+#[tauri::command]
+async fn heron_write_note_atomic(
+    vault_path: String,
+    session_id: String,
+    contents: String,
+) -> Result<(), String> {
+    notes::write_note_atomic(Path::new(&vault_path), &session_id, &contents).await
+}
+
+/// Tauri command: list `.md` session basenames in the vault directory.
+#[tauri::command]
+async fn heron_list_sessions(vault_path: String) -> Result<Vec<String>, String> {
+    notes::list_sessions(Path::new(&vault_path)).await
 }
 
 /// Tauri command: §13.3 step 1 microphone Test button.
@@ -234,6 +262,9 @@ pub fn run() {
             heron_read_settings,
             heron_write_settings,
             heron_default_settings_path,
+            heron_read_note,
+            heron_write_note_atomic,
+            heron_list_sessions,
             heron_test_microphone,
             heron_test_audio_tap,
             heron_test_accessibility,

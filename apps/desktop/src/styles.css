@@ -1,6 +1,15 @@
 @import "tailwindcss";
 
 /*
+ * Tailwind v4 plugin imports. The Typography plugin is what gives the
+ * Review UI's TipTap editor its `prose` styling so headings / lists /
+ * code blocks render with sane defaults — without it the editor body
+ * is unstyled. PR-δ (Settings) may add `@tailwindcss/forms` next to
+ * this line.
+ */
+@plugin "@tailwindcss/typography";
+
+/*
  * Tailwind v4 uses a CSS-first config. The `@theme` block below
  * declares the design tokens the React tree references via Tailwind
  * utility classes (`bg-background`, `text-foreground`, etc.).
