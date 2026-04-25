@@ -18,6 +18,7 @@ use heron_types::{Channel, Event, SessionClock, SessionId};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+pub mod aec;
 pub mod backpressure;
 pub mod disk;
 pub mod mic_capture;
@@ -25,6 +26,7 @@ pub mod mic_capture;
 pub mod process_tap;
 pub mod ringbuffer;
 
+pub use aec::{APM_FRAME_SAMPLES, APM_SAMPLE_RATE_HZ, EchoCanceller};
 pub use backpressure::{BackpressureMonitor, SATURATION_THRESHOLD};
 pub use disk::{DiskError, MIN_FREE_BYTES_TO_RECORD, can_record, free_bytes};
 pub use ringbuffer::{

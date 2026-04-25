@@ -321,3 +321,34 @@ runner with a virtual audio loopback (BlackHole or equivalent) is
 available, this test gets a non-ignored counterpart that pumps a
 known sine wave through the loopback and asserts on FFT energy.
 Until then it stays here.
+
+## AEC processor smoke (heron-audio)
+
+Row #5 in the table above tracks the **end-to-end** AEC correctness
+gate per [`docs/implementation.md`](implementation.md) §6.3 — engineer
+on Mac A, partner on Mac B, real Zoom call, correlation < 0.15
+between `mic_clean.wav` and `tap.wav`. That test rig is intentionally
+unchanged.
+
+Independent of that, the standalone AEC processor itself
+(`crates/heron-audio/src/aec.rs`) is exercised by **CI-resident unit
+tests** that don't need a partner machine or a Zoom call:
+
+```sh
+cargo test -p heron-audio aec
+```
+
+These tests cover (a) APM construction succeeds, (b) RMS shrinks
+after AEC convergence on synthetic 1 kHz speaker bleed, and (c) the
+wrong-channel / wrong-frame-size guards reject mis-routed input
+loudly. They link against the bundled WebRTC C++ source (built once
+per CI run via `meson + ninja`, see `.github/workflows/rust.yml`).
+
+**End-to-end gate is still §6.3** — the unit tests cannot replace it
+because (a) APM's adaptive filter behaves differently against
+synthetic tones than real speech, and (b) the §6.3 metric is the
+contract with downstream STT. Once the live-pipeline wiring PR lands
+(mic + tap → APM → cleaned broadcast), the §6.3 test becomes
+runnable end-to-end. Until then, the unit tests catch wiring
+regressions in the AEC processor without blocking on partner
+availability.

@@ -47,6 +47,13 @@ jobs:
       - name: select Xcode 16 (Swift 6 toolchain)
         run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
+      # `webrtc-audio-processing` 2.x with the `bundled` feature compiles
+      # the upstream C++ source via meson + ninja. macos-14 runners ship
+      # neither by default; install via Homebrew (already on the runner).
+      # See `crates/heron-audio/Cargo.toml` for the version-pin rationale.
+      - name: install webrtc-audio-processing build deps (meson + ninja)
+        run: brew install meson ninja
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 

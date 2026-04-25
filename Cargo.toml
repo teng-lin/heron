@@ -37,7 +37,7 @@ core-foundation = "0.10"
 
 # audio processing
 hound = "3.5"
-webrtc-audio-processing = "0.4"
+webrtc-audio-processing = "=2.0.4"
 rtrb = "0.3"
 rubato = "0.16"
 symphonia = "0.5"
