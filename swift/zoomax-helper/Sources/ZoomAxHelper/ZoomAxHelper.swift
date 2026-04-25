@@ -225,13 +225,18 @@ public func ax_register_observer(_ bundle_id: UnsafePointer<CChar>?) -> Int32 {
         return AX_NO_PERMISSION
     }
 
-    // Reject double-registration (no leak; ax_release first).
+    // Hold stateLock for the whole registration. Without this, two
+    // concurrent callers can both pass the `currentState != nil` check
+    // and race to allocate observer + worker thread, leaking the
+    // loser's resources when the assignment below overwrites them.
+    // The 5s worst case (the thread.ready.wait below) is acceptable —
+    // a second concurrent caller should fail fast anyway.
     stateLock.lock()
+    defer { stateLock.unlock() }
+
     if currentState != nil {
-        stateLock.unlock()
         return AX_INTERNAL
     }
-    stateLock.unlock()
 
     // 3. Build the application AX element.
     let appElement = AXUIElementCreateApplication(pid)
@@ -268,9 +273,15 @@ public func ax_register_observer(_ bundle_id: UnsafePointer<CChar>?) -> Int32 {
     // 7. Spin up a thread that owns a CFRunLoop and adds the
     // observer's source to it. We block until that thread reports
     // `ready` so we can safely stash the runLoop ref for shutdown.
+    // If `ready` doesn't fire within 5s, the worker is wedged and we
+    // can't capture its runLoop — which means ax_release_observer
+    // would have no way to stop it. Best-effort `cancel` and bail.
     let thread = ObserverThread(observer: observer)
     thread.start()
-    _ = thread.ready.wait(timeout: .now() + .seconds(5))
+    if thread.ready.wait(timeout: .now() + .seconds(5)) == .timedOut {
+        thread.cancel()
+        return AX_INTERNAL
+    }
 
     let state = ObserverState(
         pid: pid,
@@ -280,10 +291,7 @@ public func ax_register_observer(_ bundle_id: UnsafePointer<CChar>?) -> Int32 {
         thread: thread
     )
     state.runLoop = thread.capturedRunLoop
-
-    stateLock.lock()
     currentState = state
-    stateLock.unlock()
 
     return AX_OK
 }
