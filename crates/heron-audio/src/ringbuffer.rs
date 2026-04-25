@@ -112,10 +112,19 @@ impl Ringbuffer {
     /// Updates the in-memory frame counters; `flush` persists them
     /// to `session.json`. Callers should `flush` on every state
     /// transition (mute toggle, device change, etc.) per §7.2.
+    ///
+    /// [`Channel::MicClean`] frames are intentionally ignored here —
+    /// the disk-spill format only stores the two raw inputs (so AEC
+    /// can be re-run offline against `mic.raw` + `tap.raw` if the APM
+    /// config changes). The cleaned mic stream is written separately
+    /// to `mic_clean.wav` at session stop by [`crate::wav_writer`].
     pub fn push(&mut self, frame: &CaptureFrame) -> Result<(), RingbufferError> {
         let writer = match frame.channel {
             Channel::Mic => &mut self.mic,
             Channel::Tap => &mut self.tap,
+            // §7.2 ringbuffer is for raw inputs only; MicClean lives
+            // in the broadcast → wav_writer path. Skip silently.
+            Channel::MicClean => return Ok(()),
         };
         for sample in &frame.samples {
             writer.write_all(&sample.to_le_bytes())?;
@@ -123,6 +132,9 @@ impl Ringbuffer {
         match frame.channel {
             Channel::Mic => self.state.mic_frames += frame.samples.len() as u64,
             Channel::Tap => self.state.tap_frames += frame.samples.len() as u64,
+            // Unreachable due to early return above, but spelled out
+            // for the exhaustiveness checker.
+            Channel::MicClean => {}
         }
         Ok(())
     }

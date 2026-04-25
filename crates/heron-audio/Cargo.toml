@@ -21,6 +21,11 @@ chrono = { workspace = true }
 # pushes into it today, but the dep is unconditional so non-macOS
 # builds compile the consumer-side surface unchanged.
 rtrb = "0.3"
+# WAV writer used at session stop (`wav_writer.rs`) to finalize
+# `mic.wav` / `tap.wav` / `mic_clean.wav` from the broadcast frame
+# stream. Pure Rust, no system deps, cross-platform — same crate the
+# week-9 archival encode pass will read these files back through.
+hound = { workspace = true }
 # WebRTC AudioProcessing (APM) — used by `aec.rs` for echo cancellation
 # only (`process_capture_frame` / `process_render_frame`). The `bundled`
 # feature compiles the upstream C++ library statically via

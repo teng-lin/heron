@@ -53,13 +53,21 @@ pub struct Turn {
     pub confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
-    /// User's own voice, captured from the input device.
+    /// User's own voice, captured from the input device. Raw, **before**
+    /// AEC processing — what `mic.wav` holds on disk for the §6.3 AEC
+    /// regression. STT consumes [`Channel::MicClean`], not this.
     Mic,
     /// Remote audio, captured via Core Audio process tap on the meeting app.
     Tap,
+    /// User's own voice **after** WebRTC APM echo cancellation has
+    /// removed speaker bleed of the meeting client's audio. This is the
+    /// channel STT (week 4–5, §8) consumes — `mic.wav` and `tap.wav`
+    /// are kept only for the §6.3 AEC test rig and offline
+    /// re-processing if the AEC config changes.
+    MicClean,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +290,24 @@ mod tests {
         ] {
             let s = serde_json::to_string(&variant).expect("serialize");
             assert_eq!(s, expected, "{variant:?} should serialize to {expected}");
+        }
+    }
+
+    #[test]
+    fn channel_variants_serialize_snake_case() {
+        // Load-bearing: transcript JSONL and ringbuffer state files
+        // round-trip these as snake_case strings. Adding `MicClean`
+        // (post-AEC mic) must not silently change the wire shape of
+        // `Mic` / `Tap`.
+        for (variant, expected) in [
+            (Channel::Mic, r#""mic""#),
+            (Channel::Tap, r#""tap""#),
+            (Channel::MicClean, r#""mic_clean""#),
+        ] {
+            let s = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(s, expected, "{variant:?} should serialize to {expected}");
+            let round: Channel = serde_json::from_str(expected).expect("deserialize");
+            assert_eq!(round, variant);
         }
     }
 
