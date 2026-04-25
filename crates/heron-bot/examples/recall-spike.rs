@@ -974,12 +974,30 @@ async fn cmd_disclosure_inject(
             placeholder_audio_b64: Some(&b64),
         })
         .await;
+    let join_ms = join_started.elapsed().as_millis();
+    // Record the dispatch failure as a Finding before propagating —
+    // the JSONL is the spike's primary diagnostic artifact, and a
+    // 429/507/auth failure on create_bot is exactly the kind of data
+    // the spike exists to capture.
+    if let Err(e) = &dispatch_result {
+        let (http_status, body, outcome) = classify(&dispatch_result);
+        findings::append(&Finding {
+            timestamp: Utc::now(),
+            operation: "disclosure-inject",
+            bot_id: None,
+            duration_ms: join_ms,
+            outcome,
+            http_status,
+            response_body: &body,
+            spec_invariants_relevant: &["spec §3 (FSM)", "spec §11 (real http_status captured)"],
+            notes: format!("dispatch failed before in_call wait: {e:#}"),
+        })?;
+    }
     let dispatch = dispatch_result?;
     // Register IMMEDIATELY before any other await — Ctrl-C between
     // create-success and registration would orphan the new bot.
     let bot_id = dispatch.body.id.clone();
     *active.lock().await = Some(bot_id.clone());
-    let join_ms = join_started.elapsed().as_millis();
     println!("bot {bot_id} dispatched in {join_ms}ms");
 
     // Everything after dispatch wraps in cleanup-on-error. Recall bills
@@ -1193,14 +1211,22 @@ async fn cmd_terminate(client: &recall_api::Client, bot_id: &str) -> Result<()> 
     let (http_status, body, _) = classify(&result);
     // For this op, an error after join is the *expected* spec-§3
     // outcome: Recall enforces "DELETE only legal pre-join."
+    // Only typed ApiError (HTTP-status carrying) counts as the
+    // spec-validating "DELETE rejected post-join" outcome. Network
+    // / decode errors stay Failure so a flaky run doesn't masquerade
+    // as a clean validation in the JSONL.
     let (outcome, notes) = match &result {
         Ok(_) => (
             Outcome::Success,
             "DELETE accepted (bot was pre-join)".to_string(),
         ),
-        Err(e) => (
+        Err(e) if e.downcast_ref::<ApiError>().is_some() => (
             Outcome::Success,
             format!("DELETE rejected (bot was post-join — validates spec §3): {e:#}"),
+        ),
+        Err(e) => (
+            Outcome::Failure,
+            format!("DELETE failed (network/transport, not a spec validation): {e:#}"),
         ),
     };
     findings::append(&Finding {
