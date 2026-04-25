@@ -97,6 +97,20 @@ fn heron_read_settings(settings_path: String) -> Result<Settings, String> {
     read_settings(Path::new(&settings_path)).map_err(|e| e.to_string())
 }
 
+/// Tauri command: resolve the platform-default settings.json path.
+///
+/// Returned as a `String` so the frontend can thread it back into
+/// `heron_read_settings` / `heron_write_settings` without needing its
+/// own `dirs::config_dir` resolver. Lossy UTF-8 conversion mirrors the
+/// other path-returning surfaces — non-UTF-8 paths replace the offending
+/// bytes with U+FFFD rather than fail. v1 ships macOS-only where this
+/// can't happen in practice; the lossy fallback is belt-and-suspenders
+/// for portability.
+#[tauri::command]
+fn heron_default_settings_path() -> String {
+    default_settings_path().to_string_lossy().into_owned()
+}
+
 /// Tauri command: persist user settings.
 #[tauri::command]
 fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(), String> {
@@ -171,6 +185,11 @@ pub fn default_settings_path() -> PathBuf {
 #[allow(clippy::expect_used)]
 pub fn run() {
     tauri::Builder::default()
+        // The Settings pane vault-path picker calls
+        // `@tauri-apps/plugin-dialog::open({ directory: true })` to
+        // surface the native folder picker. Registering the plugin
+        // here wires up the IPC handler the JS bridge talks to.
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // No-op for v0; week 11 wires the capture + status
             // pipelines here.
@@ -183,6 +202,7 @@ pub fn run() {
             heron_diagnostics,
             heron_read_settings,
             heron_write_settings,
+            heron_default_settings_path,
             heron_test_microphone,
             heron_test_audio_tap,
             heron_test_accessibility,
@@ -204,6 +224,19 @@ mod tests {
         // only the tail we control. (macOS adds `Application Support`,
         // Linux adds `.config`, Windows adds `AppData/Roaming`, etc.)
         assert!(p.ends_with("com.heronnote.heron/settings.json"));
+    }
+
+    /// `heron_default_settings_path` exposes [`default_settings_path`]
+    /// to the renderer. The string round-trip must agree with the
+    /// `PathBuf` form (modulo lossy UTF-8) so the frontend can hand the
+    /// returned value back into `heron_read_settings` /
+    /// `heron_write_settings` without round-trip drift.
+    #[test]
+    fn heron_default_settings_path_matches_pathbuf_form() {
+        let s = heron_default_settings_path();
+        let p = default_settings_path();
+        assert_eq!(s, p.to_string_lossy());
+        assert!(s.ends_with("com.heronnote.heron/settings.json"));
     }
 
     /// `heron_status::audio_available` must reflect the real
