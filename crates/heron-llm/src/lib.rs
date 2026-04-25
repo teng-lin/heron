@@ -20,12 +20,16 @@ pub mod claude_code;
 pub mod codex;
 mod content;
 pub mod cost;
+pub mod select;
 pub mod transcript;
 
 pub use anthropic::{AnthropicClient, AnthropicClientConfig};
 pub use claude_code::{ClaudeCodeClient, ClaudeCodeClientConfig};
 pub use codex::{CodexClient, CodexClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
+pub use select::{
+    Availability, Preference, SelectError, SelectionReason, select_backend, select_summarizer,
+};
 
 /// Convenience alias so the public surface doesn't leak `String` for
 /// tag fields. Not a newtype yet; v1.1 may tighten.
