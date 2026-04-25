@@ -55,10 +55,7 @@ pub enum IdleReason {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransitionError {
     #[error("invalid transition from {from:?} for event {event}")]
-    Invalid {
-        from: RecordingState,
-        event: &'static str,
-    },
+    Invalid { from: RecordingState, event: String },
 }
 
 /// Cooldown period after a `remind` while armed before the banner
@@ -99,6 +96,10 @@ impl RecordingFsm {
     pub fn on_hotkey(&mut self) -> Result<RecordingState, TransitionError> {
         match self.state {
             RecordingState::Idle => {
+                // Clear any prior IdleReason on the Idle→Armed edge
+                // so the banner doesn't show "summary done" while a
+                // new flow is being armed.
+                self.last_idle_reason = None;
                 self.state = RecordingState::Armed;
                 Ok(self.state)
             }
@@ -110,7 +111,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "hotkey",
+                event: "hotkey".into(),
             }),
         }
     }
@@ -124,7 +125,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "yes",
+                event: "yes".into(),
             }),
         }
     }
@@ -138,7 +139,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "remind",
+                event: "remind".into(),
             }),
         }
     }
@@ -152,7 +153,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "cooldown_tick",
+                event: "cooldown_tick".into(),
             }),
         }
     }
@@ -167,7 +168,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "cancel",
+                event: "cancel".into(),
             }),
         }
     }
@@ -183,7 +184,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "window_close",
+                event: "window_close".into(),
             }),
         }
     }
@@ -197,7 +198,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "transcribe_done",
+                event: "transcribe_done".into(),
             }),
         }
     }
@@ -218,7 +219,7 @@ impl RecordingFsm {
             }
             other => Err(TransitionError::Invalid {
                 from: other,
-                event: "summary",
+                event: "summary".into(),
             }),
         }
     }
