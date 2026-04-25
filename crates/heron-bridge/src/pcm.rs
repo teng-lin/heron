@@ -49,8 +49,13 @@ pub fn samples_to_ms(samples: usize) -> u64 {
 }
 
 /// Convert milliseconds to sample count at [`SAMPLE_RATE_HZ`].
-/// Rounds down — a 7.5 ms request returns 120 samples (7 ms), not
-/// 121 (rounding up would push past the requested duration).
+///
+/// 16 kHz / 1000 = exactly 16 samples per ms, so any integer-ms
+/// input maps to an exact multiple of 16 samples — no rounding
+/// needed at this entry point. The flooring case lives on the
+/// inverse [`samples_to_ms`], which drops the fractional ms when
+/// the sample count isn't a multiple of 16. Saturating math on
+/// the multiplication so a `u64::MAX` ms input doesn't panic.
 pub fn ms_to_samples(ms: u64) -> usize {
     (ms.saturating_mul(SAMPLE_RATE_HZ as u64) / 1_000) as usize
 }
@@ -92,7 +97,11 @@ impl PcmFrameExt for PcmFrame {
     }
 
     fn is_silence(&self, threshold: i16) -> bool {
-        self.peak_amplitude() <= threshold
+        // Short-circuit on the first non-silent sample so a noisy
+        // frame doesn't pay for a full-buffer scan. Equivalent to
+        // `peak_amplitude() <= threshold` but linear-time worst-
+        // case rather than always-linear.
+        !self.samples.iter().any(|&s| s.saturating_abs() > threshold)
     }
 
     fn peak_amplitude(&self) -> i16 {
@@ -148,13 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn ms_to_samples_rounds_down() {
-        // 7.5 ms isn't representable at 16 kHz (would be 120
-        // samples = 7.5 ms). Pin that we don't overshoot.
-        // 7 ms = 112 samples; 8 ms = 128 samples. ms_to_samples(7)
-        // should give 112.
+    fn ms_to_samples_is_exact_at_16khz() {
+        // 16 kHz / 1000 = exactly 16 samples per ms, so every
+        // integer ms input maps to an exact multiple of 16. No
+        // rounding lives here — the flooring case is on the
+        // inverse (`samples_to_ms`).
         assert_eq!(ms_to_samples(7), 112);
         assert_eq!(ms_to_samples(8), 128);
+    }
+
+    #[test]
+    fn samples_to_ms_floors_when_not_a_multiple_of_16() {
+        // 120 samples = 7.5 ms; the floor is 7. Pin so a future
+        // refactor that rounds (rather than floors) surfaces here.
+        assert_eq!(samples_to_ms(120), 7);
+        assert_eq!(samples_to_ms(119), 7);
+        // 128 samples is exactly 8 ms; no flooring needed.
+        assert_eq!(samples_to_ms(128), 8);
     }
 
     #[test]

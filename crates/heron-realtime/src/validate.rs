@@ -51,7 +51,7 @@ pub const MAX_TOOL_COUNT: usize = 64;
 /// 1:1 onto the existing [`RealtimeError`] variants so the
 /// orchestrator can `?` through to a single error type.
 pub fn validate(config: &SessionConfig) -> Result<(), RealtimeError> {
-    if config.system_prompt.is_empty() {
+    if config.system_prompt.trim().is_empty() {
         return Err(RealtimeError::BadConfig(
             "system_prompt is empty; pass a persona prompt".to_owned(),
         ));
@@ -71,8 +71,11 @@ pub fn validate(config: &SessionConfig) -> Result<(), RealtimeError> {
         validate_tool(idx, tool)?;
     }
 
+    // `RangeInclusive::contains` returns `false` for NaN (NaN
+    // comparisons always fail), so the explicit `is_nan` check
+    // would be redundant.
     let v = config.turn_detection.vad_threshold;
-    if !(0.0..=1.0).contains(&v) || v.is_nan() {
+    if !(0.0..=1.0).contains(&v) {
         return Err(RealtimeError::BadConfig(format!(
             "turn_detection.vad_threshold = {v} must be in [0.0, 1.0]"
         )));
@@ -168,6 +171,17 @@ mod tests {
         c.system_prompt.clear();
         let err = validate(&c).expect_err("empty prompt");
         assert!(matches!(err, RealtimeError::BadConfig(s) if s.contains("system_prompt is empty")));
+    }
+
+    #[test]
+    fn whitespace_only_system_prompt_rejected() {
+        // Consistency with voice + tool.name. A spaces-only prompt
+        // would be rejected by every realtime backend; catch it
+        // locally instead.
+        let mut c = config();
+        c.system_prompt = "   \n\t  ".to_owned();
+        let err = validate(&c).expect_err("ws prompt");
+        assert!(matches!(err, RealtimeError::BadConfig(_)));
     }
 
     #[test]

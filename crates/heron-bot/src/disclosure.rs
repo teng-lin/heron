@@ -102,7 +102,10 @@ pub fn render_disclosure(
     template: &str,
     vars: &DisclosureVars<'_>,
 ) -> Result<String, TemplateError> {
-    let mut out = String::with_capacity(template.len());
+    // Add 64 bytes of slack so a typical "{user_name}" → "Alex"
+    // expansion (or a longer name) doesn't trigger a realloc on
+    // the first push past the template length.
+    let mut out = String::with_capacity(template.len() + 64);
     let mut rest = template;
 
     while let Some(open) = rest.find('{') {
