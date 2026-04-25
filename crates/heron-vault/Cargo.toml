@@ -8,3 +8,12 @@ build = "build.rs"
 links = "EventKitHelper"
 
 [dependencies]
+heron-types = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+pulldown-cmark = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+uuid = { workspace = true }
