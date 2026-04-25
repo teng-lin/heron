@@ -59,11 +59,70 @@ rather than forks.
 
 ## Status
 
-Pre-implementation. The repository contains only design documents.
-v1 is planned as a 17-week solo build: macOS only, Zoom only, English
-only. Mobile (iOS / Android), other meeting apps (Meet / Teams /
-Webex), other desktop operating systems (Windows / Linux), ambient
-session detection, and an MCP server are deferred to v1.1+.
+Implementation in progress. v1 is a 17-week solo build: macOS only,
+Zoom only, English only. Mobile (iOS / Android), other meeting apps
+(Meet / Teams / Webex), other desktop operating systems (Windows /
+Linux), ambient session detection, and an MCP server are deferred
+to v1.1+.
+
+The Rust workspace is the agent-friendly scaffold for the live
+implementation: every backend behind a typed trait, every Swift
+bridge in the canonical `swift/<helper>/` shape, every public surface
+exercised by unit tests against deterministic stubs. The week-N work
+in `docs/implementation.md` drops the real implementation into the
+trait body without changing the surface.
+
+## Repository layout
+
+```text
+.
+├── apps/desktop/src-tauri/      # Tauri v2 desktop shell (week 11+)
+├── crates/
+│   ├── heron-types/             # shared serde types, SessionClock, FSM
+│   ├── heron-audio/             # process tap + ringbuffer + backpressure
+│   ├── heron-speech/            # SttBackend trait + WhisperKit bridge
+│   ├── heron-zoom/              # AxBackend trait + AXObserver bridge + aligner
+│   ├── heron-llm/               # Summarizer trait + meeting.hbs + cost calibration
+│   ├── heron-vault/             # markdown writer + merge + EventKit bridge
+│   ├── heron-cli/               # `heron` CLI (record / summarize / synthesize)
+│   └── heron-doctor/            # `heron-doctor` log-anomaly CLI
+├── swift/
+│   ├── eventkit-helper/         # @_cdecl bridge — calendar (§5.4)
+│   ├── whisperkit-helper/       # @_cdecl bridge — STT (§4)
+│   └── zoomax-helper/           # @_cdecl bridge — AX observer (§9)
+├── docs/                        # plan + implementation + architecture
+├── fixtures/                    # ax / speech / zoom / manual-validation
+└── scripts/                     # setup-dev.sh + reset-onboarding.sh + bench-wer.sh
+```
+
+Binaries:
+
+- **`heron`** — main CLI. `record` / `summarize` / `status` / `verify-m4a` / `synthesize`.
+- **`heron-doctor`** — offline diagnostics over `~/Library/Logs/heron/<date>.log`.
+- **`validate-vault`** — walks an Obsidian vault and reports integrity issues.
+- **`heron-desktop`** — Tauri v2 shell (UI lands week 11+).
+
+## Quick start
+
+```sh
+# Install toolchain + system deps (macOS only).
+./scripts/setup-dev.sh
+
+# Build everything.
+cargo build --workspace
+
+# Run the test suite.
+cargo test --workspace
+
+# Smoke the CLI scaffold.
+cargo run --bin heron -- status
+
+# Generate a stub fixture for offline regression.
+cargo run --bin heron -- synthesize /tmp/fixture-demo
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the polish + pr-workflow
+conventions every change goes through.
 
 ## Documents
 
@@ -102,4 +161,6 @@ transcripts always."
 
 ## License
 
-UNLICENSED. Private project; not yet open source.
+`LicenseRef-Proprietary`. Private project; not yet open source. Each
+crate carries the same license expression in its `Cargo.toml` and
+`cargo-deny` is configured to allow it (`deny.toml`).
