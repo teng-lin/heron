@@ -17,10 +17,12 @@ pub mod asset_protocol;
 pub mod diagnostics;
 pub mod onboarding;
 pub mod settings;
+pub mod tray;
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use tauri::{Emitter, Manager};
 
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
@@ -155,6 +157,30 @@ fn heron_test_model_download() -> TestOutcome {
     test_model_download()
 }
 
+/// Tauri command: navigate the frontend to the named target.
+///
+/// The frontend owns the router (`react-router-dom`), so the Rust side
+/// can't push a route directly. Instead, this command:
+///
+///   1. focuses the main webview window (showing + un-minimising it
+///      if the user had pushed it offscreen),
+///   2. emits a `nav:<target>` event that `App.tsx`'s
+///      `hooks/useTrayNav.ts` listens for and converts to a
+///      `useNavigate()` call.
+///
+/// Returning a `Result<(), String>` lets unknown targets surface as a
+/// JS rejection (caller bug) rather than silently no-op.
+#[tauri::command]
+fn heron_open_window(app: tauri::AppHandle, target: String) -> Result<(), String> {
+    let event = tray::open_window_event_name(&target)?;
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+    app.emit(event, ()).map_err(|e| e.to_string())
+}
+
 /// Default settings location.
 ///
 /// Resolves via [`dirs::config_dir`] so the path is correct on every
@@ -191,9 +217,14 @@ pub fn run() {
         // here wires up the IPC handler the JS bridge talks to.
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // No-op for v0; week 11 wires the capture + status
-            // pipelines here.
-            let _ = app;
+            // Phase 64: install the menubar tray. The tray's polling
+            // task lives on the Tauri async runtime, so it shuts down
+            // cleanly when the app exits — no manual handle to track.
+            //
+            // We log + propagate a setup error rather than swallowing
+            // it: a missing tray on macOS is a regression worth
+            // surfacing in CI logs, not silently degrading.
+            tray::install(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -208,6 +239,7 @@ pub fn run() {
             heron_test_accessibility,
             heron_test_calendar,
             heron_test_model_download,
+            heron_open_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");

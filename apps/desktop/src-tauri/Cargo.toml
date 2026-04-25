@@ -19,7 +19,11 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` enables the `tauri::tray::*` API used by phase 64's
+# menubar tray; `image-png` lets `tauri::image::Image::from_bytes`
+# decode the PNG files in `icons/tray/` (without the feature, the
+# decoder is compiled out and `from_bytes` returns a runtime error).
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

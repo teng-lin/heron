@@ -3,17 +3,39 @@
  *
  * Acts as a smoke test for the React tree: clicking "Status" calls
  * the `heron_status` Tauri command via the typed `invoke` wrapper and
- * stores the response in Zustand. PR-γ replaces this with the real
- * recording controls; today it exists to prove the plumbing.
+ * stores the response in Zustand.
+ *
+ * Phase 64 (PR-β) adds the "Start recording" entry point: it routes
+ * through the consent gate (`useConsentStore.requestConsent()`) and,
+ * on confirm, seeds `useRecordingStore` with `Date.now()` and
+ * navigates to `/recording`. The actual capture pipeline still lives
+ * in `heron-cli` and gets wired through Tauri in a later phase — this
+ * button only exercises the UI affordance.
  */
 
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 import { Button } from "../components/ui/button";
+import { useConsentStore } from "../store/consent";
+import { useRecordingStore } from "../store/recording";
 import { useStatusStore } from "../store/status";
 
 export default function Home() {
   const { status, error, loading, refresh } = useStatusStore();
+  const requestConsent = useConsentStore((s) => s.requestConsent);
+  const startRecording = useRecordingStore((s) => s.start);
+  const navigate = useNavigate();
+
+  const onStart = async () => {
+    const decision = await requestConsent();
+    if (decision === "confirmed") {
+      // Seed the UI store before navigating so the Recording page's
+      // first paint shows `00:00:00` rather than reading a stale
+      // `recordingStart` from a previous session.
+      startRecording();
+      navigate("/recording");
+    }
+  };
 
   return (
     <main className="p-6 space-y-4">
@@ -21,8 +43,9 @@ export default function Home() {
       <p className="text-muted-foreground">
         Foundation scaffold. The recording UX lands in PR-γ.
       </p>
-      <div className="flex gap-2">
-        <Button onClick={() => void refresh()} disabled={loading}>
+      <div className="flex gap-2 flex-wrap">
+        <Button onClick={() => void onStart()}>Start recording</Button>
+        <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
           {loading ? "Refreshing…" : "Status"}
         </Button>
         <Button variant="outline" asChild>
