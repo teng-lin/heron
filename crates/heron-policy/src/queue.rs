@@ -469,7 +469,7 @@ mod tests {
         // Property-style sanity: append → replace → interrupt → fin.
         let mut q = SpeechQueue::new();
         let first = enqueue(&mut q, "first", Priority::Append).new;
-        assert_eq!(q.current().unwrap().id, first);
+        assert_eq!(q.current().expect("current").id, first);
 
         let second = enqueue(&mut q, "second", Priority::Append).new;
         assert_eq!(q.queue_len(), 1);
@@ -505,10 +505,10 @@ mod tests {
         a.finish_current();
         // a now has current=second, queue=[]
         // b should still have current=first, queue=[second]
-        assert_eq!(b.current().unwrap().text, "first");
+        assert_eq!(b.current().expect("current").text, "first");
         assert_eq!(b.queue_len(), 1);
         // While a has advanced.
-        assert_eq!(a.current().unwrap().text, "second");
+        assert_eq!(a.current().expect("current").text, "second");
         assert_eq!(a.queue_len(), 0);
     }
 }
