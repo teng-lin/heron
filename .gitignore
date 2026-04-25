@@ -5,6 +5,9 @@ target/
 Cargo.lock.user
 *.rs.bk
 
+# Swift package build artifacts (per swift/eventkit-helper/.build etc.)
+swift/*/.build/
+
 # Tauri
 apps/*/src-tauri/target/
 apps/*/dist/
