@@ -288,9 +288,19 @@ async fn probe_audio_tap(target_bundle_id: &str) -> TestOutcome {
     let cache = std::env::temp_dir();
     let session = SessionId::nil();
 
-    // Bound the call. `AudioCapture::start` itself is fast (~tens of
-    // ms on a warm host), but the cidre tap-build can hang if the
-    // CoreAudio HAL is wedged.
+    // Bound the call. `AudioCapture::start` is async but its body is
+    // mostly synchronous Core Audio FFI without `.await` points — so
+    // `tokio::time::timeout` can only preempt between await points,
+    // not during a wedged HAL call. The cleaner fix would be to drive
+    // the future on the blocking pool via `spawn_blocking` +
+    // `Handle::block_on`, but the future returned by
+    // `AudioCapture::start` is `!Send` (cpal's `Stream` and
+    // intermediate construction state aren't Send), so it can't cross
+    // a `spawn_blocking` boundary. In practice each cidre call
+    // (`AudioHardwareCreateProcessTap`, aggregate-device build) is
+    // bounded internally and returns in tens of ms on a healthy host;
+    // the only realistic stall is HAL daemon wedge, which is rare and
+    // outside the probe's contract.
     let fut = AudioCapture::start(session, target_bundle_id, &cache);
     let result = tokio::time::timeout(PROBE_TIMEOUT, fut).await;
 
@@ -382,11 +392,27 @@ async fn probe_accessibility() -> TestOutcome {
             TestOutcome::skipped("accessibility bridge not implemented on this platform")
         }
         Ok(Ok(Err(other))) => TestOutcome::fail(format!("accessibility probe failed: {other}")),
-        Ok(Err(join_err)) => TestOutcome::fail(format!("accessibility probe panicked: {join_err}")),
-        Err(_elapsed) => TestOutcome::fail(format!(
-            "accessibility probe timed out after {} ms",
-            PROBE_TIMEOUT.as_millis()
-        )),
+        Ok(Err(join_err)) => {
+            // Best-effort release in case the panicked thread had
+            // registered an observer before unwinding. ax_release is
+            // documented as idempotent on the Swift side.
+            let release_fut = tokio::task::spawn_blocking(ax_release);
+            let _ = tokio::time::timeout(PROBE_TIMEOUT, release_fut).await;
+            TestOutcome::fail(format!("accessibility probe panicked: {join_err}"))
+        }
+        Err(_elapsed) => {
+            // Best-effort release in case `ax_register` eventually
+            // succeeds on the still-running blocking thread —
+            // dropping the JoinHandle does NOT cancel the
+            // spawn_blocking thread, so the observer + its CFRunLoop
+            // would otherwise leak for the lifetime of the process.
+            let release_fut = tokio::task::spawn_blocking(ax_release);
+            let _ = tokio::time::timeout(PROBE_TIMEOUT, release_fut).await;
+            TestOutcome::fail(format!(
+                "accessibility probe timed out after {} ms",
+                PROBE_TIMEOUT.as_millis()
+            ))
+        }
     }
 }
 
@@ -518,9 +544,20 @@ fn probe_model_presence(model_dir: Option<std::ffi::OsString>) -> TestOutcome {
     // A well-formed WhisperKit-compiled model dir contains one or
     // more `.mlmodelc` bundles. We don't validate the bundle shape —
     // ensure_model owns that — but a totally empty directory is a
-    // sign the download was interrupted.
+    // sign the download was interrupted. Filter out hidden/system
+    // entries (`.DS_Store`, `._*` AppleDouble files, `.fseventsd`)
+    // so a directory the user just opened in Finder before populating
+    // doesn't false-Pass.
     let entry_count = match std::fs::read_dir(&path) {
-        Ok(iter) => iter.count(),
+        Ok(iter) => iter
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+            .count(),
         Err(err) => {
             return TestOutcome::fail(format!("model directory unreadable ({display}): {err}"));
         }
