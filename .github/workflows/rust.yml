@@ -77,6 +77,14 @@ jobs:
       - name: select Xcode 16 (Swift 6 toolchain)
         run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
+      # `webrtc-audio-processing` 2.x with the `bundled` feature
+      # compiles upstream C++ via meson + ninja. macos-14 ships
+      # neither by default. The `lint` job has the same step; this
+      # mirrors it so a cold-cache `test` job (no rust-cache hit on
+      # `target/`) can build the sys crate from scratch.
+      - name: install webrtc-audio-processing build deps (meson + ninja)
+        run: brew install meson ninja
+
       - name: cargo test
         run: cargo test --workspace
 
