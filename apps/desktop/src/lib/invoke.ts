@@ -155,6 +155,15 @@ export interface HeronCommands {
     args: Record<string, never>;
     returns: TestOutcome;
   };
+  /**
+   * Phase 64 (PR-β): focus the main window and emit `nav:<target>` so
+   * the React tree can navigate. Recognised targets: `"settings"`,
+   * `"recording"`. Unknown targets reject the promise.
+   */
+  heron_open_window: {
+    args: { target: string };
+    returns: void;
+  };
 }
 
 export type HeronCommand = keyof HeronCommands;
