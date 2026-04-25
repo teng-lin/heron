@@ -87,16 +87,22 @@ fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(),
     write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
 }
 
-/// Default settings location: `~/Library/Preferences/com.heronnote.heron/settings.json`.
-/// Pure helper so tests can stub it out — the real Tauri shell calls
-/// this once at startup and threads the path through commands.
+/// Default settings location.
+///
+/// Resolves via [`dirs::config_dir`] so the path is correct on every
+/// platform Tauri targets:
+/// - macOS: `~/Library/Application Support/com.heronnote.heron/settings.json`
+/// - Linux: `$XDG_CONFIG_HOME/com.heronnote.heron/settings.json`
+/// - Windows: `%APPDATA%\com.heronnote.heron\settings.json`
+///
+/// v1 ships macOS-only, but keeping this portable means `cargo test`
+/// runs the same path-resolution code on Linux CI runners and on a
+/// future Windows build without surprise. Falls back to `./` if the
+/// platform's config dir cannot be resolved (sandboxed test runners,
+/// minimal containers).
 pub fn default_settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-    PathBuf::from(home)
-        .join("Library")
-        .join("Preferences")
-        .join("com.heronnote.heron")
-        .join("settings.json")
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("com.heronnote.heron").join("settings.json")
 }
 
 /// Entry point used by `main.rs` and (eventually) by Tauri's mobile
@@ -133,10 +139,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_path_lands_under_library_preferences() {
+    fn default_settings_path_ends_in_app_id_and_filename() {
         let p = default_settings_path();
-        // The HOME-driven prefix changes per machine, but the tail of
-        // the path is stable and what we actually care about.
-        assert!(p.ends_with("Library/Preferences/com.heronnote.heron/settings.json"));
+        // The `dirs::config_dir()` prefix is platform-specific; assert
+        // only the tail we control. (macOS adds `Application Support`,
+        // Linux adds `.config`, Windows adds `AppData/Roaming`, etc.)
+        assert!(p.ends_with("com.heronnote.heron/settings.json"));
     }
 }

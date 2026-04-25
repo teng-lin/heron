@@ -51,7 +51,7 @@ pub enum AssetError {
     PartialCache {
         session_id: String,
         present: PathBuf,
-        missing: &'static str,
+        missing: String,
     },
 }
 
@@ -89,12 +89,12 @@ pub fn resolve_recording_uri(
         (true, false) => Err(AssetError::PartialCache {
             session_id: session_id.to_owned(),
             present: mic,
-            missing: TAP_FILENAME,
+            missing: TAP_FILENAME.to_owned(),
         }),
         (false, true) => Err(AssetError::PartialCache {
             session_id: session_id.to_owned(),
             present: tap,
-            missing: MIC_FILENAME,
+            missing: MIC_FILENAME.to_owned(),
         }),
         (false, false) => Err(AssetError::NotFound {
             session_id: session_id.to_owned(),
@@ -189,6 +189,25 @@ mod tests {
         match err {
             AssetError::PartialCache { missing, .. } => assert_eq!(missing, TAP_FILENAME),
             other => panic!("expected PartialCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_cache_carries_owned_missing_string() {
+        // Regression: gemini PR-24 finding — `missing` was previously
+        // &'static str, which couldn't carry dynamic filenames if the
+        // ringbuffer schema ever grew a third channel. The owned String
+        // also matches the convention of every other field in
+        // AssetError.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let m4a = tmp.path().join("nope.m4a");
+        seed_cache(tmp.path(), "abc", 0, 100);
+
+        let err = resolve_recording_uri("abc", &m4a, tmp.path()).expect_err("partial");
+        if let AssetError::PartialCache { missing, .. } = err {
+            assert_eq!(missing, "mic.raw");
+        } else {
+            panic!("expected PartialCache");
         }
     }
 }

@@ -93,15 +93,23 @@ impl From<SessionLog> for DiagnosticsView {
 }
 
 /// Read `heron_session.json` at `path` and return its diagnostics view.
+///
+/// Single `fs::read`; we map ENOENT to [`DiagnosticsError::NotFound`]
+/// with the path in the message so a TOCTOU race between an `exists()`
+/// pre-check and the read can't drop us into an opaque
+/// [`DiagnosticsError::Io`]. Bytes are parsed via
+/// [`serde_json::from_slice`] to skip the intermediate `String` copy.
 pub fn read_diagnostics(path: &Path) -> Result<DiagnosticsView, DiagnosticsError> {
-    if !path.exists() {
-        return Err(DiagnosticsError::NotFound {
-            path: path.display().to_string(),
-        });
-    }
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8(bytes)?;
-    let log: SessionLog = serde_json::from_str(&text)?;
+    let bytes = fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            DiagnosticsError::NotFound {
+                path: path.display().to_string(),
+            }
+        } else {
+            DiagnosticsError::Io(e)
+        }
+    })?;
+    let log: SessionLog = serde_json::from_slice(&bytes)?;
     Ok(DiagnosticsView::from(log))
 }
 

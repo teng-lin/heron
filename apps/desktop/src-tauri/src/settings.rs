@@ -84,13 +84,15 @@ impl Default for Settings {
 /// Read settings from `path`. Returns `Settings::default()` if the
 /// file does not exist — first-run state is "everything default".
 pub fn read_settings(path: &Path) -> Result<Settings, SettingsError> {
-    if !path.exists() {
-        return Ok(Settings::default());
+    // Single `fs::read`: dispatching off `std::io::ErrorKind::NotFound`
+    // sidesteps the TOCTOU window an `exists()` pre-check would open
+    // (the file could be deleted between the check and the read), and
+    // `from_slice` skips the intermediate `String` copy.
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(SettingsError::Io(e)),
     }
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let s: Settings = serde_json::from_str(&text)?;
-    Ok(s)
 }
 
 /// Atomically write `settings` to `path`. Creates parent directories
