@@ -204,9 +204,10 @@ mod tests {
     /// probe to guarantee a future regression that reintroduces a
     /// hardcode (or wires up a different signal) gets caught.
     ///
-    /// On non-macOS this test still runs — `audio_capture_available`
-    /// is hardcoded to `false` off-Apple, and so should
-    /// `audio_available` be.
+    /// Together with `heron_audio::audio_capture_available_is_false_off_apple`
+    /// (which anchors the probe to `false` off-Apple), this transitively
+    /// proves `heron_status::audio_available == false` on non-macOS —
+    /// no separate off-Apple assertion needed here.
     #[test]
     fn heron_status_audio_available_matches_probe() {
         let status = heron_status();
@@ -214,17 +215,5 @@ mod tests {
             status.audio_available,
             heron_audio::audio_capture_available()
         );
-    }
-
-    /// Off-Apple, `heron_status::audio_available` must be `false`.
-    /// The cidre process tap doesn't compile off-Apple and cpal is
-    /// gated to macOS, so `false` is the only honest answer. Locked
-    /// down so a future patch that drops the `cfg` gate in
-    /// `heron_audio::audio_capture_available` (or reintroduces a
-    /// hardcode here) gets caught.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn heron_status_audio_available_is_false_off_apple() {
-        assert!(!heron_status().audio_available);
     }
 }

@@ -83,6 +83,7 @@ pub use ringbuffer::{
 /// session-start concerns; surfacing them through this probe would
 /// turn a 1 ms property fetch into a ~hundred-ms permissions / process
 /// scan and bring the same UX cost as just trying `AudioCapture::start`.
+#[must_use]
 pub fn audio_capture_available() -> bool {
     #[cfg(target_os = "macos")]
     {
