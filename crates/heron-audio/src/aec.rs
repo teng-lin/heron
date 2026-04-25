@@ -92,6 +92,18 @@ pub const APM_SAMPLE_RATE_HZ: u32 = 48_000;
 /// [`process_near_end`]: Self::process_near_end
 pub struct EchoCanceller {
     inner: Processor,
+    /// Reusable scratch buffer for the far-end path. APM's
+    /// `process_render_frame` takes `AsMut<[f32]>` even though it
+    /// doesn't actually mutate the buffer (the in-place contract is
+    /// only for symmetry with `process_capture_frame` — the upstream
+    /// `examples/simple.rs` asserts that the render buffer is
+    /// unchanged after the call). Owning a single pre-allocated
+    /// 480-sample `Vec` lets `process_far_end` `copy_from_slice` into
+    /// it instead of allocating a fresh `Vec` per 10 ms call. At
+    /// 100 calls/s that's a hot allocator path even though APM runs
+    /// off the realtime callback (per `docs/implementation.md` §6.2's
+    /// "realtime → SPSC → APM thread" topology).
+    far_end_scratch: Vec<f32>,
 }
 
 impl EchoCanceller {
@@ -134,7 +146,10 @@ impl EchoCanceller {
         };
         inner.set_config(config);
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            far_end_scratch: vec![0.0; APM_FRAME_SAMPLES],
+        })
     }
 
     /// Feed a far-end (tap / reference) frame to APM via
@@ -166,23 +181,17 @@ impl EchoCanceller {
             )));
         }
 
-        // APM expects non-interleaved per-channel slices. For mono that
-        // is a single inner slice. We clone the samples because APM's
-        // `process_render_frame` takes `AsMut<[f32]>` even though it
-        // doesn't modify the render buffer (the in-place contract is
-        // for symmetry with `process_capture_frame` — see the upstream
-        // example at `examples/simple.rs`, which asserts the render
-        // buffer is unchanged after the call).
-        //
-        // TODO(perf): replace with a reusable scratch buffer owned by
-        // `EchoCanceller` once the wire-up PR lands. APM runs on a
-        // dedicated worker thread (per `docs/implementation.md` §6.2's
-        // "realtime → SPSC → APM thread" topology), so this allocation
-        // is off the realtime path, but it's still wasted work — every
-        // 10 ms we ask the global allocator for ~1.9 KiB.
-        let mut buf = frame.samples.clone();
+        // APM expects non-interleaved per-channel slices. For mono
+        // that is a single inner slice. `copy_from_slice` into the
+        // pre-allocated `far_end_scratch` rather than allocating a
+        // fresh `Vec` every call — see the field-level docs on
+        // `far_end_scratch` for the rationale. The `Vec` is sized at
+        // construction to exactly `APM_FRAME_SAMPLES`; the runtime
+        // length check above guarantees the source slice matches, so
+        // `copy_from_slice` will not panic.
+        self.far_end_scratch.copy_from_slice(&frame.samples);
         self.inner
-            .process_render_frame([buf.as_mut_slice()])
+            .process_render_frame([self.far_end_scratch.as_mut_slice()])
             .map_err(|e| AudioError::Aborted(format!("APM process_render_frame failed: {e}")))?;
         Ok(())
     }
