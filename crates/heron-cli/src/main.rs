@@ -102,8 +102,13 @@ mod duration {
         type Err = String;
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             let s = s.trim();
+            // Tolerate "30 m" (whitespace) and "30M" (uppercase) per
+            // gemini's PR-14 comment — common CLI typos that
+            // shouldn't surface a parse error.
             let (num, unit) = match s.chars().last() {
-                Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c),
+                Some(c) if c.is_ascii_alphabetic() => {
+                    (s[..s.len() - 1].trim(), c.to_ascii_lowercase())
+                }
                 _ => (s, 's'),
             };
             let n: u64 = num
@@ -116,6 +121,49 @@ mod duration {
                 _ => return Err(format!("unknown unit {unit:?} in {s:?}")),
             };
             Ok(Duration(StdDuration::from_secs(secs)))
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod tests {
+        use super::*;
+        use std::str::FromStr;
+
+        #[test]
+        fn parses_bare_seconds() {
+            let d = Duration::from_str("30").expect("30");
+            assert_eq!(d.0, StdDuration::from_secs(30));
+        }
+        #[test]
+        fn parses_with_unit() {
+            assert_eq!(
+                Duration::from_str("30s").expect("s").0,
+                StdDuration::from_secs(30)
+            );
+            assert_eq!(
+                Duration::from_str("5m").expect("m").0,
+                StdDuration::from_secs(300)
+            );
+            assert_eq!(
+                Duration::from_str("2h").expect("h").0,
+                StdDuration::from_secs(7200)
+            );
+        }
+        #[test]
+        fn tolerates_whitespace_and_uppercase() {
+            assert_eq!(
+                Duration::from_str(" 30 m ").expect("ws").0,
+                StdDuration::from_secs(1800)
+            );
+            assert_eq!(
+                Duration::from_str("2H").expect("upper").0,
+                StdDuration::from_secs(7200)
+            );
+        }
+        #[test]
+        fn rejects_unknown_unit() {
+            assert!(Duration::from_str("5d").is_err());
         }
     }
 }
