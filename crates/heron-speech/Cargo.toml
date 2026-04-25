@@ -11,17 +11,23 @@ links = "WhisperKitHelper"
 [dependencies]
 heron-types = { workspace = true }
 async-trait = { workspace = true }
+dirs = { workspace = true }
+hound = { workspace = true }
+rubato = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sherpa-rs = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+ureq = { workspace = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
 dirs = { workspace = true }
 
 [dev-dependencies]
+hound = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 

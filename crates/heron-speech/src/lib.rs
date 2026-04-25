@@ -24,6 +24,7 @@ use tokio::sync::OnceCell;
 
 pub mod partial_writer;
 pub mod selection;
+pub mod sherpa;
 pub mod whisperkit_bridge;
 
 pub use partial_writer::{
@@ -33,6 +34,7 @@ pub use selection::{
     Platform, RealPlatform, WER_THRESHOLDS, WerBaseline, WerThreshold, lookup_threshold,
     select_backend,
 };
+pub use sherpa::SherpaBackend;
 pub use whisperkit_bridge::{
     DEFAULT_WK_VARIANT, WkError, WkStatus, whisperkit_fetch, whisperkit_init, whisperkit_transcribe,
 };
@@ -116,14 +118,19 @@ pub trait SttBackend: Send + Sync {
 /// Off Apple, `"whisperkit"` continues to return the test stub since
 /// the Swift bridge isn't compiled there.
 ///
-/// `"sherpa"` is still wired to its v0 stub. Real Sherpa lands in §8.3.
+/// `"sherpa"` returns the production [`SherpaBackend`] per §8.3. Same
+/// pattern as WhisperKit: model directory resolves at `ensure_model`
+/// time (`HERON_SHERPA_MODEL_DIR` override; default
+/// `~/Library/Caches/heron/sherpa/`), so a missing-model failure
+/// surfaces inside the orchestrator's progress UI rather than at
+/// flag-parse.
 pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
     match name {
         #[cfg(target_vendor = "apple")]
         "whisperkit" => Ok(Box::new(WhisperKitBackend::from_env())),
         #[cfg(not(target_vendor = "apple"))]
         "whisperkit" => Ok(Box::new(stub::WhisperKitStub)),
-        "sherpa" => Ok(Box::new(stub::SherpaStub)),
+        "sherpa" => Ok(Box::new(sherpa::SherpaBackend::from_env())),
         other => {
             tracing::warn!(name = other, "unknown stt backend requested");
             Err(SttError::Unavailable(format!("unknown backend: {other}")))
@@ -441,7 +448,6 @@ pub(crate) mod stub {
     use std::path::Path;
 
     pub struct WhisperKitStub;
-    pub struct SherpaStub;
 
     #[async_trait]
     impl SttBackend for WhisperKitStub {
@@ -468,37 +474,12 @@ pub(crate) mod stub {
             false
         }
     }
-
-    #[async_trait]
-    impl SttBackend for SherpaStub {
-        async fn ensure_model(&self, _on_progress: ProgressFn) -> Result<(), SttError> {
-            Err(SttError::NotYetImplemented)
-        }
-        async fn transcribe(
-            &self,
-            _wav_path: &Path,
-            _channel: Channel,
-            _session_id: SessionId,
-            _partial_jsonl_path: &Path,
-            _on_turn: TurnFn,
-        ) -> Result<TranscribeSummary, SttError> {
-            Err(SttError::NotYetImplemented)
-        }
-        fn name(&self) -> &'static str {
-            "sherpa"
-        }
-        fn is_available(&self) -> bool {
-            // Sherpa bundles its ONNX runtime; always available.
-            true
-        }
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[tokio::test]
     async fn whisperkit_backend_with_missing_model_dir_errors() {
@@ -587,19 +568,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sherpa_stub_returns_not_yet_implemented() {
+    async fn sherpa_backend_is_real_and_available() {
+        // Pre-§8.3 this slot held a `NotYetImplemented` stub. The real
+        // backend reports `name() == "sherpa"`, claims availability
+        // unconditionally (sherpa-onnx bundles its ONNX runtime), and
+        // declines to transcribe before `ensure_model` has populated
+        // the cache directory — that last shape gives the orchestrator
+        // a `ModelMissing` to drive its first-run download UI off of.
         let b = build_backend("sherpa").expect("build");
         assert_eq!(b.name(), "sherpa");
-        let result = b
+        assert!(b.is_available());
+
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let model_dir = tmp.path().join("empty-model-dir");
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        // Build a backend pointed at an empty cache dir so the missing-
+        // model path is exercised deterministically.
+        let backend = SherpaBackend::new(model_dir);
+        let wav = tmp.path().join("input.wav");
+        write_silent_wav(&wav, 16_000, 800);
+        let result = backend
             .transcribe(
-                &PathBuf::from("/tmp/x.wav"),
+                &wav,
                 Channel::Mic,
                 SessionId::nil(),
-                &PathBuf::from("/tmp/x.jsonl"),
+                &tmp.path().join("p.jsonl"),
                 Box::new(|_t| {}),
             )
             .await;
-        assert!(matches!(result, Err(SttError::NotYetImplemented)));
+        assert!(
+            matches!(result, Err(SttError::ModelMissing(_))),
+            "expected ModelMissing, got {result:?}",
+        );
+    }
+
+    fn write_silent_wav(path: &std::path::Path, rate: u32, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).expect("wav create");
+        for _ in 0..samples {
+            w.write_sample(0i16).expect("wav write");
+        }
+        w.finalize().expect("wav finalize");
     }
 
     #[test]

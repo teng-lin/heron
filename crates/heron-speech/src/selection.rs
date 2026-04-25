@@ -12,7 +12,8 @@
 //! to read it back from a YAML.
 
 use crate::SttBackend;
-use crate::stub::{SherpaStub, WhisperKitStub};
+use crate::sherpa::SherpaBackend;
+use crate::stub::WhisperKitStub;
 
 /// Published WER threshold: a backend's WER on a fixture must stay
 /// at or below `max_wer_pct` to ship.
@@ -191,10 +192,10 @@ fn macos_major_version() -> Option<u32> {
 /// doesn't oscillate the choice on every install.
 pub fn select_backend<P: Platform>(platform: &P, baseline: &WerBaseline) -> Box<dyn SttBackend> {
     if !platform.is_apple_silicon() || !platform.is_macos_14_plus() {
-        return Box::new(SherpaStub);
+        return Box::new(SherpaBackend::from_env());
     }
     match (baseline.whisperkit_avg(), baseline.sherpa_avg()) {
-        (Some(wk), Some(sh)) if wk > sh * 1.05 => Box::new(SherpaStub),
+        (Some(wk), Some(sh)) if wk > sh * 1.05 => Box::new(SherpaBackend::from_env()),
         _ => Box::new(WhisperKitStub),
     }
 }
