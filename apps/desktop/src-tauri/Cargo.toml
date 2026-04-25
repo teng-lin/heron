@@ -61,5 +61,21 @@ tauri-plugin-dialog = "2.7.0"
 tempfile = "3"
 tokio = { workspace = true }
 
+# macOS Keychain integration (PR-θ / phase 70). The crate is broadly
+# used (rustls, reqwest, cargo) and dual-licensed MIT/Apache-2.0 (already
+# in `deny.toml`'s allowlist via the existing transitive dep on it). The
+# `cfg(target_os = "macos")` gate keeps Linux/Windows builds clean — the
+# `keychain` module ships a stub for those platforms.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[features]
+# Opt-in flag for tests that hit the real macOS login keychain. Off by
+# default so CI (where the login keychain is locked) and routine
+# developer test runs don't spawn keychain unlock prompts. Enable with
+# `cargo test -p heron-desktop --features test_real_keychain`.
+default = []
+test_real_keychain = []
+
 [lints]
 workspace = true

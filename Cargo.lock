@@ -1915,6 +1915,7 @@ dependencies = [
  "heron-types",
  "heron-vault",
  "heron-zoom",
+ "security-framework",
  "serde",
  "serde_json",
  "tauri",
