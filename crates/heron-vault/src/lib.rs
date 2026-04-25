@@ -3,7 +3,7 @@
 //! - [`writer::VaultWriter`] — finalize a session into
 //!   `<vault>/meetings/<date> <slug>.md` and re-summarize an existing
 //!   note while preserving user edits via the §10 merge.
-//! - [`merge`] — merge-on-write algorithm shipped in week 8 (the §10
+//! - [`mod@merge`] — merge-on-write algorithm shipped in week 8 (the §10
 //!   spike) ahead of the writer.
 //! - [`calendar`] — EventKit Swift bridge from week 1 (§5.4); the
 //!   reference shape every other Swift bridge follows.

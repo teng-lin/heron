@@ -24,3 +24,6 @@ path = "src/bin/validate-vault.rs"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

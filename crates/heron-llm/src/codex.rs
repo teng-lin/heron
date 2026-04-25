@@ -3,10 +3,10 @@
 //!
 //! Spawns `codex exec` as a subprocess with the rendered prompt +
 //! the transcript on stdin and parses the structured JSON it emits
-//! on stdout. Mirrors the [`crate::claude_code`] shape — the
-//! pipeline itself lives in [`crate::claude_code::run_cli_summarize`]
-//! so adding a third subprocess backend (e.g. `gemini`) is one new
-//! file, not a duplicated spawn-and-wait loop.
+//! on stdout. Mirrors the [`crate::claude_code`] shape — the shared
+//! spawn-and-wait pipeline lives in that module so adding a third
+//! subprocess backend (e.g. `gemini`) is one new file, not a
+//! duplicated loop.
 
 use std::path::PathBuf;
 use std::time::Duration;

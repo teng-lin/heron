@@ -70,3 +70,14 @@ heron-realtime = { path = "crates/heron-realtime" }
 
 [profile.dev]
 opt-level = 1
+
+# Lints applied to every workspace crate via `[lints] workspace = true`.
+# Mirrors the flags the `rust` CI workflow enforces with `cargo clippy`,
+# so violations fail a local `cargo clippy` instead of waiting for CI.
+# Note: clippy lints do not fire under plain `cargo check` — they only
+# kick in for `cargo clippy`. The CI workflow keeps the equivalent CLI
+# `-D` flags as belt-and-suspenders for any future crate that forgets
+# `[lints] workspace = true`.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

@@ -84,7 +84,7 @@ pub struct SessionSummaryFields {
 /// to an empty Vec — first-run state is "no logs yet."
 ///
 /// Streaming + **bounded read**: we read up to [`MAX_LINE_LEN`] + 1
-/// bytes per attempted line via [`BufRead::take`]. A line whose
+/// bytes per attempted line via [`Read::take`]. A line whose
 /// length exceeds the cap is consumed up to the next newline and
 /// discarded *without* allocating the full content, so a multi-GB
 /// pathological line cannot OOM the process. We never hold more than

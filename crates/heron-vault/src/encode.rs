@@ -86,8 +86,8 @@ pub fn encode_to_m4a(wav_mic: &Path, wav_tap: &Path, out_m4a: &Path) -> Result<(
 /// - the file exists and is non-empty
 /// - ffprobe reports a duration within ±1 % of `expected_sec`
 ///
-/// Used by [`crate::ringbuffer`] purge logic — only delete the
-/// session's `.raw` files if `verify_m4a` returns `Ok(true)`.
+/// Used by [`crate::purge`] logic — only delete the session's
+/// `.raw` files if `verify_m4a` returns `Ok(true)`.
 pub fn verify_m4a(path: &Path, expected_sec: f64) -> Result<bool, EncodeError> {
     if !is_on_path("ffprobe") {
         return Err(EncodeError::FfprobeMissing);
