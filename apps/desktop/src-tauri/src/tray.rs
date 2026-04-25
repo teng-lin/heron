@@ -4,8 +4,10 @@
 //! FSM (`heron_types::RecordingState`) and exposes a small dropdown
 //! menu for the most-used affordances:
 //!
-//!   - **Open last note…** — placeholder, logs to stdout for now;
-//!     wired up once the vault writer lands a `last_note` accessor.
+//!   - **Open last note…** — picks the newest `*.md` in the vault,
+//!     emits `nav:review` with the basename so the React tree
+//!     navigates to `/review/<id>`. Phase 69 (PR-η) replaced the
+//!     PR-β stub.
 //!   - **Settings…**       — focuses the main window and emits a
 //!     `nav:settings` event the React tree converts to `useNavigate()`.
 //!   - **Quit**            — terminates the Tauri app.
@@ -47,6 +49,15 @@ const MENU_QUIT: &str = "quit";
 /// `react-router::useNavigate()`.
 const EVENT_NAV_SETTINGS: &str = "nav:settings";
 const EVENT_NAV_RECORDING: &str = "nav:recording";
+/// Phase 69: payload `{ sessionId: string }` so the listener can
+/// navigate to `/review/<id>`. Pure-route events (settings/recording)
+/// stay payloadless to avoid disturbing PR-β's hook.
+pub const EVENT_NAV_REVIEW: &str = "nav:review";
+/// Phase 69: emitted when "Open last note…" runs and the vault is
+/// empty. The frontend pops a Sonner toast — keeps the tray's
+/// system-notification line free of platform-specific plumbing while
+/// still surfacing the "no notes yet" affordance to the user.
+pub const EVENT_NO_LAST_NOTE: &str = "nav:no_last_note";
 
 /// Embedded icon bytes — 22×22 PNGs (44×44 @2x). The `@2x` files exist
 /// for HiDPI but tray-icon on macOS picks the right variant by hash,
@@ -141,10 +152,15 @@ fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
     match event.id().as_ref() {
         MENU_OPEN_LAST => {
-            // Placeholder — the vault writer doesn't expose a
-            // "last note" cursor yet. Logging makes the tray click
-            // visible during local dev without crashing the process.
-            println!("[heron-tray] Open last note: not yet wired (phase 64 follow-up).");
+            // Phase 69 (PR-η): resolve the newest `*.md` in the user's
+            // configured vault and route the frontend to its review
+            // page. Reading settings / walking the vault must not
+            // block the tray's UI thread, so we spawn onto Tauri's
+            // async runtime — the lookup is bounded to one `read_dir`.
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                open_last_note_dispatch(&app_handle);
+            });
         }
         MENU_SETTINGS => {
             focus_main_window(app);
@@ -255,7 +271,146 @@ pub fn open_window_event_name(target: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Pick the newest `*.md` file directly under `vault_root` and return
+/// its basename minus the `.md` extension.
+///
+/// Returns `Ok(None)` when:
+/// - `vault_root` is empty / not a directory, or
+/// - the directory has no `*.md` children.
+///
+/// Failures during `read_dir` / `metadata` for an individual entry
+/// are skipped (best-effort) rather than aborting — the tray's
+/// "Open last note" should not error out because of one unreadable
+/// file. Unrecoverable IO at the directory level surfaces as `Err`.
+pub(crate) fn newest_note_basename(
+    vault_root: &std::path::Path,
+) -> std::io::Result<Option<String>> {
+    if vault_root.as_os_str().is_empty() || !vault_root.is_dir() {
+        return Ok(None);
+    }
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(vault_root)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".md") else {
+            continue;
+        };
+        // Skip hidden / empty stems — `.md` alone or `.foo.md` are
+        // not valid heron note ids and would route the frontend to a
+        // `/review/` URL with a leading dot that breaks the slug.
+        if stem.is_empty() || stem.starts_with('.') {
+            continue;
+        }
+        let Ok(modified) = meta.modified().or_else(|_| meta.created()) else {
+            continue;
+        };
+        match best {
+            Some((ref best_time, _)) if *best_time >= modified => {}
+            _ => best = Some((modified, stem.to_owned())),
+        }
+    }
+    Ok(best.map(|(_, stem)| stem))
+}
+
+/// Tauri command: return the newest note's basename (no extension), or
+/// `None` if the vault is empty / unset. Reads `Settings.vault_root`
+/// from the platform-default settings.json — wired so the renderer
+/// can drive the same lookup the tray uses without re-deriving the
+/// vault path on the JS side.
+#[tauri::command]
+pub fn heron_last_note_session_id() -> Result<Option<String>, String> {
+    let settings_path = crate::default_settings_path();
+    let settings = crate::read_settings(&settings_path).map_err(|e| e.to_string())?;
+    if settings.vault_root.is_empty() {
+        return Ok(None);
+    }
+    let vault = std::path::Path::new(&settings.vault_root);
+    newest_note_basename(vault).map_err(|e| e.to_string())
+}
+
+/// Pick the newest note in the user's vault and either:
+/// - emit `nav:review` with the session id payload (frontend
+///   navigates to `/review/<id>`), or
+/// - emit `nav:no_last_note` so the React tree pops a "no notes yet"
+///   toast.
+///
+/// Settled on a frontend-toast over a true system notification so we
+/// avoid pulling in `tauri-plugin-notification` for a single string —
+/// the tray click already focuses the main window, so the user sees
+/// the toast immediately.
+fn open_last_note_dispatch<R: Runtime>(app: &AppHandle<R>) {
+    // Always focus the main window so the user sees the toast or
+    // navigates to a route — kept up-front so every code path below
+    // shares the same UX (no "tray click did nothing" tail).
+    focus_main_window(app);
+
+    let settings_path = crate::default_settings_path();
+    let settings = match crate::read_settings(&settings_path) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("[heron-tray] open last note: failed to read settings: {err}");
+            emit_no_last_note(app);
+            return;
+        }
+    };
+
+    if settings.vault_root.is_empty() {
+        emit_no_last_note(app);
+        return;
+    }
+
+    let vault = std::path::Path::new(&settings.vault_root);
+    let newest = match newest_note_basename(vault) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("[heron-tray] walking vault failed: {err}");
+            emit_no_last_note(app);
+            return;
+        }
+    };
+
+    let Some(session_id) = newest else {
+        emit_no_last_note(app);
+        return;
+    };
+
+    // The payload is a typed object so the JS listener can
+    // destructure `payload.sessionId` without parsing a string.
+    // Empty payload would force the listener to re-do the lookup on
+    // every tray click.
+    //
+    // `tauri::Emitter::emit` requires `Serialize + Clone`; an owned
+    // `String` carries the cheapest `Clone` impl (single allocation,
+    // refcount-free) without forcing a bespoke wrapper.
+    #[derive(serde::Serialize, Clone)]
+    struct ReviewPayload {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    }
+    let payload = ReviewPayload { session_id };
+    if let Err(e) = app.emit(EVENT_NAV_REVIEW, payload) {
+        eprintln!("[heron-tray] failed to emit {EVENT_NAV_REVIEW}: {e}");
+    }
+}
+
+/// Emit the `nav:no_last_note` event so the React tree pops a Sonner
+/// toast. Logs (without panicking) on emit failure so the tray's
+/// caller doesn't have to repeat the boilerplate.
+fn emit_no_last_note<R: Runtime>(app: &AppHandle<R>) {
+    if let Err(e) = app.emit(EVENT_NO_LAST_NOTE, ()) {
+        eprintln!("[heron-tray] failed to emit {EVENT_NO_LAST_NOTE}: {e}");
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -326,5 +481,73 @@ mod tests {
             err.contains("review"),
             "error should mention the target: {err}"
         );
+    }
+
+    #[test]
+    fn newest_note_basename_returns_none_when_vault_root_is_empty_string() {
+        let p = std::path::Path::new("");
+        let out = newest_note_basename(p).expect("call");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn newest_note_basename_returns_none_when_no_md_files() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join("not-a-note.txt"), b"x").expect("write");
+        let out = newest_note_basename(tmp.path()).expect("call");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn newest_note_basename_returns_none_when_path_does_not_exist() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let phantom = tmp.path().join("does-not-exist");
+        let out = newest_note_basename(&phantom).expect("call");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn newest_note_basename_picks_most_recent_md_file() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let older = tmp.path().join("2024-01-01-meeting.md");
+        let newer = tmp.path().join("2026-04-25-meeting.md");
+        std::fs::write(&older, b"older").expect("older");
+        // Sleep long enough to clear typical FS mtime resolution
+        // (HFS+ is ~1 s; APFS is sub-second but rounds; ext4 + xfs
+        // depend on `noatime` mount opts). 50 ms covers APFS in
+        // practice and keeps the suite under 1 s.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&newer, b"newer").expect("newer");
+
+        let out = newest_note_basename(tmp.path())
+            .expect("call")
+            .expect("should pick a note");
+        assert_eq!(out, "2026-04-25-meeting");
+    }
+
+    #[test]
+    fn newest_note_basename_skips_dotfile_md_and_extensionless_files() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join(".hidden.md"), b"x").expect("hidden");
+        std::fs::write(tmp.path().join("README"), b"x").expect("readme");
+        std::fs::write(tmp.path().join("notes.md"), b"x").expect("notes");
+        let out = newest_note_basename(tmp.path())
+            .expect("call")
+            .expect("notes.md should win");
+        assert_eq!(out, "notes");
+    }
+
+    #[test]
+    fn newest_note_basename_strips_md_extension_only() {
+        // A file named `foo.bar.md` has stem `foo.bar`. We strip
+        // exactly the `.md` suffix — the stem is the slug the
+        // VaultWriter wrote, hyphens / dots inside it are part of
+        // the session id.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join("foo.bar.md"), b"x").expect("write");
+        let out = newest_note_basename(tmp.path())
+            .expect("call")
+            .expect("should pick");
+        assert_eq!(out, "foo.bar");
     }
 }

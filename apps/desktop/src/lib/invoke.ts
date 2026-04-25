@@ -98,6 +98,18 @@ export type TestOutcome =
  */
 export type KeychainAccount = "anthropic_api_key" | "openai_api_key";
 
+/**
+ * One row in the crash-recovery salvage list. Mirrors the Rust
+ * `UnfinalizedSession` struct in `salvage.rs`.
+ */
+export interface UnfinalizedSession {
+  session_id: string;
+  /** ISO 8601 / RFC 3339 timestamp string. */
+  started_at: string;
+  audio_bytes: number;
+  has_partial_transcript: boolean;
+}
+
 // ---- Command surface ----------------------------------------------
 
 /**
@@ -236,6 +248,41 @@ export interface HeronCommands {
   heron_keychain_list: {
     args: Record<string, never>;
     returns: KeychainAccount[];
+  };
+  /**
+   * Phase 69 (PR-η): walk the cache root for unfinalized sessions.
+   * Missing cache root resolves as an empty list, not a rejection.
+   */
+  heron_scan_unfinalized: {
+    args: Record<string, never>;
+    returns: UnfinalizedSession[];
+  };
+  /**
+   * Phase 69 (PR-η): re-run finalize on a salvaged session and write
+   * the resulting `.md` into `vaultPath`. Currently rejects with
+   * "recovery is not yet wired through the orchestrator" — the
+   * orchestrator's re-finalize entry point lands in a follow-up.
+   */
+  heron_recover_session: {
+    args: { sessionId: string; vaultPath: string };
+    returns: string;
+  };
+  /**
+   * Phase 69 (PR-η): recursively delete the session's cache
+   * directory. Refuses to follow symlinks. Validates the session id
+   * is a basename (no `..`, no path separators).
+   */
+  heron_purge_session: {
+    args: { sessionId: string };
+    returns: void;
+  };
+  /**
+   * Phase 69 (PR-η): basename of the newest `*.md` in the user's
+   * configured vault, or `null` when the vault is empty / unset.
+   */
+  heron_last_note_session_id: {
+    args: Record<string, never>;
+    returns: string | null;
   };
 }
 
