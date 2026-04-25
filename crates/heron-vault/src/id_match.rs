@@ -58,6 +58,16 @@ pub fn match_action_items_by_text(
     use std::collections::HashSet;
 
     let base_ids: HashSet<ItemId> = base.iter().map(|a| a.id).collect();
+    // Pre-normalize every base item once (rather than re-normalizing
+    // for every theirs candidate inside the inner loop). Levenshtein
+    // already runs over `Vec<char>`, so collecting into a Vec<char>
+    // lets the inner loop skip both `to_lowercase` and the per-char
+    // collect — turning O(M·N) normalize work into O(M+N).
+    let base_norm: Vec<Vec<char>> = base
+        .iter()
+        .map(|b| normalize(&b.text).chars().collect())
+        .collect();
+
     let mut consumed: HashSet<ItemId> = HashSet::new();
     let mut out = Vec::new();
 
@@ -67,14 +77,13 @@ pub fn match_action_items_by_text(
         if base_ids.contains(&t.id) {
             continue;
         }
-        let t_norm = normalize(&t.text);
+        let t_norm: Vec<char> = normalize(&t.text).chars().collect();
         let mut best: Option<(f64, &ActionItem)> = None;
-        for b in base {
+        for (b_idx, b) in base.iter().enumerate() {
             if consumed.contains(&b.id) {
                 continue;
             }
-            let b_norm = normalize(&b.text);
-            let dist = normalized_levenshtein(&t_norm, &b_norm);
+            let dist = normalized_levenshtein_chars(&t_norm, &base_norm[b_idx]);
             match best {
                 None => best = Some((dist, b)),
                 Some((cur, _)) if dist < cur => best = Some((dist, b)),
@@ -151,17 +160,19 @@ fn collapse_whitespace(s: &str) -> String {
 /// 1.0 = nothing in common. Implemented with a single-row buffer, no
 /// allocations beyond the buffer itself, so the §10.5 fallback path
 /// stays cheap even on hundreds of action items.
-fn normalized_levenshtein(a: &str, b: &str) -> f64 {
+///
+/// Takes pre-collected `&[char]` slices so the matcher's hot loop can
+/// pre-normalize the base side once and skip the `chars().collect()`
+/// per inner-loop iteration.
+fn normalized_levenshtein_chars(a: &[char], b: &[char]) -> f64 {
     if a == b {
         return 0.0;
     }
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let max_len = a_chars.len().max(b_chars.len());
+    let max_len = a.len().max(b.len());
     if max_len == 0 {
         return 0.0;
     }
-    let dist = levenshtein_chars(&a_chars, &b_chars);
+    let dist = levenshtein_chars(a, b);
     dist as f64 / max_len as f64
 }
 
@@ -201,14 +212,18 @@ mod tests {
         }
     }
 
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
     #[test]
     fn identical_text_distance_is_zero() {
-        assert!(normalized_levenshtein("hello", "hello") < 1e-9);
+        assert!(normalized_levenshtein_chars(&chars("hello"), &chars("hello")) < 1e-9);
     }
 
     #[test]
     fn disjoint_text_distance_is_one() {
-        let d = normalized_levenshtein("abc", "xyz");
+        let d = normalized_levenshtein_chars(&chars("abc"), &chars("xyz"));
         assert!((d - 1.0).abs() < 1e-9);
     }
 

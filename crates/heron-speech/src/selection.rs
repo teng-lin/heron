@@ -120,11 +120,61 @@ impl Platform for RealPlatform {
         cfg!(all(target_os = "macos", target_arch = "aarch64"))
     }
     fn is_macos_14_plus(&self) -> bool {
-        // Real impl reads kern.osproductversion via sysctl. v0 returns
-        // false off-mac and `true` on aarch64-darwin so the §8.6
-        // selection routes the same way the live runtime would.
-        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        // Runtime check (matters: an Apple-Silicon Mac running macOS
+        // 13 must route to Sherpa, but cfg!() can't see the OS
+        // *version*). Reads `kern.osproductversion` via libc::sysctl
+        // and parses the major-version prefix.
+        macos_major_version().is_some_and(|v| v >= 14)
     }
+}
+
+/// Read `kern.osproductversion` and return the major-version integer
+/// (`14` for "14.6.1", `13` for "13.7"). Returns `None` on non-Apple
+/// platforms or if the sysctl call fails for any reason — caller
+/// treats that as "not 14+" so the fallback routes safely to Sherpa.
+#[cfg(target_vendor = "apple")]
+fn macos_major_version() -> Option<u32> {
+    use std::ffi::CString;
+
+    // Two-step sysctl idiom: first call with a NULL buffer to get the
+    // required length, then call again with a real buffer of that
+    // length. See sysctlbyname(3).
+    let name = CString::new("kern.osproductversion").ok()?;
+    let mut len: libc::size_t = 0;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // Result is a NUL-terminated C string; trim the NUL before parsing.
+    let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..nul]).ok()?;
+    s.split('.').next()?.parse::<u32>().ok()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn macos_major_version() -> Option<u32> {
+    None
 }
 
 /// Pick a backend per §8.6:
