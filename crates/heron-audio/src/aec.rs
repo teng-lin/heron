@@ -28,10 +28,12 @@
 //! the cpal mic, both arriving in parallel PRs) emit 480-sample frames
 //! by construction.
 //!
-//! We **debug-assert** that incoming frames are exactly 480 samples
-//! and return [`AudioError::Aborted`] otherwise. Buffering / resampling
-//! to 480 samples is intentionally out of scope for this PR — that's
-//! real DSP work and the upstream pipeline already handles it.
+//! Both entry points runtime-check the frame size and return
+//! [`AudioError::Aborted`] on a mismatch (APM itself panics on a
+//! length-mismatched frame, so we pre-check to keep the error
+//! recoverable). Buffering / resampling to 480 samples is intentionally
+//! out of scope for this PR — that's real DSP work and the upstream
+//! pipeline already handles it.
 //!
 //! ## Why NS / AGC are off
 //!
@@ -114,14 +116,20 @@ impl EchoCanceller {
         // tap (ring 1) and the mic (ring 2); they enter APM via two
         // independent SPSC queues whose relative latency depends on
         // scheduler jitter and Core Audio buffer sizes.
+        //
+        // NS and AGC are spelled out as `None` instead of relying on
+        // `Default::default()` so a future patch-version bump of
+        // `webrtc-audio-processing` (which the upstream README warns
+        // can carry breaking changes inside the 2.x major) cannot
+        // silently turn either of them on. The high-pass filter,
+        // capture amplifier, and pipeline still pick up WebRTC's
+        // out-of-the-box defaults via `..Default::default()`.
         let config = Config {
             echo_canceller: Some(ApmEchoCanceller::Full {
                 stream_delay_ms: None,
             }),
-            // NS and AGC explicitly None per module-level rationale.
-            // Leaving the rest at Default::default() keeps the high-pass
-            // filter, capture amplifier, and pipeline at WebRTC's
-            // out-of-the-box defaults.
+            noise_suppression: None,
+            gain_controller: None,
             ..Default::default()
         };
         inner.set_config(config);
@@ -165,6 +173,13 @@ impl EchoCanceller {
         // for symmetry with `process_capture_frame` — see the upstream
         // example at `examples/simple.rs`, which asserts the render
         // buffer is unchanged after the call).
+        //
+        // TODO(perf): replace with a reusable scratch buffer owned by
+        // `EchoCanceller` once the wire-up PR lands. APM runs on a
+        // dedicated worker thread (per `docs/implementation.md` §6.2's
+        // "realtime → SPSC → APM thread" topology), so this allocation
+        // is off the realtime path, but it's still wasted work — every
+        // 10 ms we ask the global allocator for ~1.9 KiB.
         let mut buf = frame.samples.clone();
         self.inner
             .process_render_frame([buf.as_mut_slice()])
@@ -241,6 +256,23 @@ mod tests {
         }
         let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
         (sum_sq / samples.len() as f32).sqrt()
+    }
+
+    /// Assert that `err` is `AudioError::Aborted` and its message
+    /// (case-insensitive) contains at least one of `needles`. Folds the
+    /// repeated `match err { Aborted(msg) => assert!(msg.contains(...)) }`
+    /// pattern in the rejection tests below into one place.
+    fn assert_aborted_contains(err: AudioError, needles: &[&str]) {
+        match err {
+            AudioError::Aborted(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    needles.iter().any(|n| lower.contains(*n)),
+                    "Aborted message must mention one of {needles:?}, got: {msg}"
+                );
+            }
+            other => panic!("expected AudioError::Aborted, got {other:?}"),
+        }
     }
 
     /// Sanity: APM constructs and drops without panicking. This catches
@@ -336,15 +368,7 @@ mod tests {
         let err = aec
             .process_far_end(&mic)
             .expect_err("Mic into far-end must be rejected");
-        match err {
-            AudioError::Aborted(msg) => {
-                assert!(
-                    msg.to_lowercase().contains("channel"),
-                    "error must mention channel, got: {msg}"
-                );
-            }
-            other => panic!("expected Aborted, got {other:?}"),
-        }
+        assert_aborted_contains(err, &["channel"]);
     }
 
     /// Symmetric guard: a Tap frame fed into the near-end path is also
@@ -357,15 +381,7 @@ mod tests {
         let err = aec
             .process_near_end(&mut tap)
             .expect_err("Tap into near-end must be rejected");
-        match err {
-            AudioError::Aborted(msg) => {
-                assert!(
-                    msg.to_lowercase().contains("channel"),
-                    "error must mention channel, got: {msg}"
-                );
-            }
-            other => panic!("expected Aborted, got {other:?}"),
-        }
+        assert_aborted_contains(err, &["channel"]);
     }
 
     /// Wrong-frame-size rejection on the far-end path. APM's
@@ -378,16 +394,7 @@ mod tests {
         let err = aec
             .process_far_end(&short)
             .expect_err("short far-end frame must be rejected");
-        match err {
-            AudioError::Aborted(msg) => {
-                let m = msg.to_lowercase();
-                assert!(
-                    m.contains("frame size") || m.contains("480"),
-                    "error must mention frame size or 480, got: {msg}"
-                );
-            }
-            other => panic!("expected Aborted, got {other:?}"),
-        }
+        assert_aborted_contains(err, &["frame size", "480"]);
     }
 
     /// Wrong-frame-size rejection on the near-end path. Symmetric to
@@ -399,15 +406,6 @@ mod tests {
         let err = aec
             .process_near_end(&mut short)
             .expect_err("short near-end frame must be rejected");
-        match err {
-            AudioError::Aborted(msg) => {
-                let m = msg.to_lowercase();
-                assert!(
-                    m.contains("frame size") || m.contains("480"),
-                    "error must mention frame size or 480, got: {msg}"
-                );
-            }
-            other => panic!("expected Aborted, got {other:?}"),
-        }
+        assert_aborted_contains(err, &["frame size", "480"]);
     }
 }
