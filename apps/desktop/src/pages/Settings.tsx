@@ -1000,7 +1000,7 @@ function SummarizerTab() {
         account="openai_api_key"
         label="OpenAI API key"
         placeholder="sk-…"
-        helpText="Used by the Codex CLI summarizer backend. Stored in the macOS login Keychain — never written to disk."
+        helpText="Used by the OpenAI Realtime backend during meetings and by the Codex CLI summarizer. Stored in the macOS login Keychain — never written to settings.json or any other file on disk."
       />
 
       <div className="flex items-start justify-between gap-4">

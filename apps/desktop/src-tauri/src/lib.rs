@@ -463,6 +463,15 @@ fn parse_account(label: &str) -> Result<KeychainAccount, String> {
 /// here as well as in the renderer's Save button. A misbehaving
 /// renderer can't write empties and turn the slot into a user-visible
 /// "set" status with no real value behind it.
+///
+/// Gap #2 (this PR): on success, also mirror the new value into the
+/// process env via [`keychain::sync_env_for_account`] so the in-process
+/// `herond` daemon — and any subprocess it spawns (the Codex / Claude
+/// Code summarizer backends, eventually `OpenAiRealtime` once the
+/// orchestrator wires it) — picks up the edit without an app restart.
+/// The env-mirror step runs only after the keychain write succeeded,
+/// so a backend failure leaves both surfaces consistent ("nothing
+/// changed").
 #[tauri::command]
 fn heron_keychain_set(account: String, secret: String) -> Result<(), String> {
     let account = parse_account(&account)?;
@@ -471,7 +480,13 @@ fn heron_keychain_set(account: String, secret: String) -> Result<(), String> {
         // *shape* ("empty"), never any of its content.
         return Err("keychain secret must not be empty".into());
     }
-    keychain::keychain_set(account, &secret).map_err(|e| e.to_string())
+    keychain::keychain_set(account, &secret).map_err(|e| e.to_string())?;
+    // Mirror the same value into the process env so the daemon's
+    // `OPENAI_API_KEY` lookup succeeds without an app restart. We pass
+    // exactly what was written to the keychain (no extra trim) so the
+    // two surfaces stay byte-identical.
+    keychain::sync_env_for_account(account, Some(secret.as_str()));
+    Ok(())
 }
 
 /// Tauri command: report whether the named account currently has a
@@ -488,10 +503,20 @@ fn heron_keychain_has(account: String) -> Result<bool, String> {
 
 /// Tauri command: delete the entry for the named account. Idempotent —
 /// deleting a missing entry returns `Ok(())`.
+///
+/// Gap #2 (this PR): mirror the deletion into the process env via
+/// [`keychain::sync_env_for_account`]. We only touch the env after the
+/// keychain delete succeeded, so a backend failure leaves the env
+/// alone (the orchestrator will continue to use the value the daemon
+/// hydrated at startup). Idempotency is preserved: a delete of a
+/// missing entry is `Ok(())` from the keychain, and clearing an
+/// already-unset env var is a no-op.
 #[tauri::command]
 fn heron_keychain_delete(account: String) -> Result<(), String> {
     let account = parse_account(&account)?;
-    keychain::keychain_delete(account).map_err(|e| e.to_string())
+    keychain::keychain_delete(account).map_err(|e| e.to_string())?;
+    keychain::sync_env_for_account(account, None);
+    Ok(())
 }
 
 /// Tauri command: enumerate the wire-format labels of accounts that
@@ -648,6 +673,31 @@ pub fn run() {
         // affordance from the tray click without any error.
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Gap #2 (this PR): bridge the macOS login Keychain into the
+            // process env *before* anything that might read
+            // `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` runs. The
+            // in-process daemon constructed below — and the
+            // `OpenAiRealtime` backend the orchestrator will eventually
+            // build from it — both consume those env vars via
+            // `std::env::var`. Hydrating here means the user can
+            // configure their key entirely from Settings → Summarizer
+            // and never need to export anything in their shell. Env
+            // already-set wins; an empty / unset env falls through to
+            // the keychain. See `keychain::hydrate_env_from_keychain`
+            // for the full precedence + safety contract.
+            //
+            // The hydration result is logged via `tracing` (count of
+            // slots populated, never the secret content). A failure
+            // here is non-fatal — the function logs warnings for any
+            // backend errors and returns the count it did manage to
+            // populate. The daemon will surface a clearer "missing
+            // key" error if a meeting tries to start without one.
+            let hydrated = keychain::hydrate_env_from_keychain();
+            tracing::info!(
+                hydrated_count = hydrated,
+                "keychain hydration: environment ready for in-process daemon",
+            );
+
             // Phase 64: install the menubar tray. The tray's polling
             // task lives on the Tauri async runtime, so it shuts down
             // cleanly when the app exits — no manual handle to track.
