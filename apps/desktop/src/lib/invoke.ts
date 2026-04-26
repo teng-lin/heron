@@ -96,7 +96,7 @@ export interface Settings {
   audio_retention_days: number | null;
   /**
    * PR-ι (phase 71). `true` once the user has finished the §13.3
-   * §13.3 onboarding wizard. The Rust struct's container-level
+   * onboarding wizard. The Rust struct's container-level
    * `#[serde(default)]` deserializes pre-PR-71 settings.json files
    * with `onboarded = false` so the wizard runs once after upgrade —
    * no migration ceremony needed on the JS side. `App.tsx`'s
@@ -355,9 +355,13 @@ export interface HeronCommands {
   };
   /**
    * Gap #5: structured daemon status for surfaces that want
-   * "running / version / error" without going through `TestOutcome`.
-   * Currently unused on the JS side but kept on the IPC surface so a
-   * future menubar/status pill can subscribe without a Rust round-trip.
+   * "running / version / error" without the `TestOutcome` lossy
+   * collapse. Currently unused on the JS side but kept on the IPC
+   * surface so a future menubar/status pill (or a status hook polling
+   * on a timer) has a typed entry point and the Rust registration is
+   * mirrored in the TS command map. Like every Tauri command this is
+   * a request/response round-trip; a true push-based status feed
+   * would ship as a separate Tauri event.
    */
   heron_daemon_status: {
     args: Record<string, never>;
