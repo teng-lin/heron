@@ -14,19 +14,25 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
+# `RecallDriver` (src/recall/) calls Recall.ai's REST surface; previously
+# only the `examples/recall-spike.rs` harness needed reqwest. Promoted to
+# a primary dep when the impl landed (per docs/spike-findings.md
+# "Outstanding action items").
+reqwest = { workspace = true }
+# Encodes the placeholder MP3 fixture for `automatic_audio_output`. See
+# docs/spike-findings.md §"Recommendations" item 5.
+base64 = "0.22"
 
-# `examples/recall-spike.rs` only — exercises the Recall.ai REST surface
-# directly to validate which spec invariants the driver can honor before
-# we commit to a `RecallDriver: MeetingBotDriver` impl. See
-# docs/build-vs-buy-decision.md.
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-base64 = "0.22"
+# Wiremock-driven Recall API tests live under `src/recall/`; the
+# `examples/recall-spike.rs` harness still uses `reqwest` (now a primary
+# dep) for live runs.
+wiremock = "0.6"
 
 [lints]
 workspace = true
