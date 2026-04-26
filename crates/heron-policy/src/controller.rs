@@ -83,6 +83,24 @@ struct InFlight {
     words_seen: u32,
 }
 
+/// Trait-object handle the listener uses to drive the next utterance
+/// when one finishes naturally. We can't carry `Arc<B: RealtimeBackend>`
+/// through `Inner` without parameterizing it, so the constructor wraps
+/// the backend in an adapter that closes over the concrete type.
+type StartFn = dyn Fn(QueuedUtterance) -> StartFuture + Send + Sync + 'static;
+type StartFuture = std::pin::Pin<Box<dyn std::future::Future<Output = StartResult> + Send>>;
+
+#[derive(Debug)]
+enum StartResult {
+    Started {
+        response: ResponseId,
+        started_at: chrono::DateTime<Utc>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
 struct Inner {
     profile: Mutex<PolicyProfile>,
     queue: Mutex<SpeechQueue>,
@@ -97,6 +115,15 @@ struct Inner {
     /// Fan-out for [`SpeechEvent`]s. Cloned on each
     /// `subscribe_events` call.
     events: broadcast::Sender<SpeechEvent>,
+    /// Adapter that calls `backend.response_create` for the supplied
+    /// utterance, wrapped in a trait object so the listener task can
+    /// drive promoted queue heads without parameterizing `Inner` over
+    /// the backend type. Set once at construction; never mutated.
+    start_response: Box<StartFn>,
+    /// Same speak-lock as on `DefaultSpeechController` (clone of the
+    /// inner `Arc`) so the listener task and the user-facing methods
+    /// serialize against each other.
+    speak_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Production [`SpeechController`] over a [`RealtimeBackend`]. Spec §9.
@@ -114,8 +141,11 @@ pub struct DefaultSpeechController<B: RealtimeBackend + 'static> {
     inner: Arc<Inner>,
     /// Serializes `speak`, `cancel`, `cancel_all_queued`, and
     /// `cancel_current_and_clear` so concurrent callers can't race on
-    /// the `inner.current` slot. See module-level concurrency notes.
-    speak_lock: tokio::sync::Mutex<()>,
+    /// the `inner.current` slot. The same lock is held inside `Inner`
+    /// so the listener task can serialize against user-facing
+    /// methods when promoting a queued utterance on `ResponseDone`.
+    /// See module-level concurrency notes.
+    speak_lock: Arc<tokio::sync::Mutex<()>>,
     listener: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -141,19 +171,39 @@ impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
         event_capacity: usize,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(event_capacity);
+        let speak_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let start_response: Box<StartFn> = {
+            let backend = Arc::clone(&backend);
+            Box::new(move |utt: QueuedUtterance| {
+                let backend = Arc::clone(&backend);
+                Box::pin(async move {
+                    match backend.response_create(session, &utt.text, None).await {
+                        Ok(response) => StartResult::Started {
+                            response,
+                            started_at: Utc::now(),
+                        },
+                        Err(e) => StartResult::Failed {
+                            error: e.to_string(),
+                        },
+                    }
+                }) as StartFuture
+            })
+        };
         let inner = Arc::new(Inner {
             profile: Mutex::new(profile),
             queue: Mutex::new(SpeechQueue::new()),
             current: Mutex::new(None),
             response_to_utterance: Mutex::new(HashMap::new()),
             events: events_tx,
+            start_response,
+            speak_lock: Arc::clone(&speak_lock),
         });
         let listener = spawn_listener(Arc::clone(&backend), session, Arc::clone(&inner));
         Self {
             backend,
             session,
             inner,
-            speak_lock: tokio::sync::Mutex::new(()),
+            speak_lock,
             listener: Mutex::new(Some(listener)),
         }
     }
@@ -164,61 +214,58 @@ impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
         *lock(&self.inner.profile) = profile;
     }
 
-    /// Drive the next utterance from the queue against the backend.
-    /// Caller must hold `self.inner.current.lock()` empty (i.e.
-    /// nothing in flight) and the queue's `current()` should be the
-    /// supplied utterance.
+    /// Drive `utt` against the backend's `response_create`. Caller
+    /// must hold the speak-lock and the queue's `current()` must
+    /// already be `utt`.
     ///
-    /// On `response_create` failure, rolls the queue back so the
-    /// failed utterance isn't left as the model's `current` —
-    /// otherwise the next `speak()` would think the failed utterance
-    /// was still speaking and try to cancel a `ResponseId` that was
-    /// never assigned.
+    /// On backend failure: emit `Failed`, drain the queue past the
+    /// failed utterance, and promote+start the next queued head if
+    /// any. Without the recursive start the queue would be left
+    /// "stuck" (model says `current = next`, backend has no in-flight
+    /// response, the next `speak(Append)` queues behind a phantom).
     async fn start_utterance(
         &self,
         utt: QueuedUtterance,
         voice_override: Option<VoiceId>,
     ) -> Result<(), SpeechError> {
         let voice = voice_override.map(|v| v.to_string());
-        let response_id = match self
+        match self
             .backend
             .response_create(self.session, &utt.text, voice)
             .await
         {
-            Ok(id) => id,
+            Ok(response_id) => {
+                let started_at = Utc::now();
+                let _ = self.inner.events.send(SpeechEvent::Started {
+                    id: utt.id,
+                    started_at,
+                });
+                *lock(&self.inner.current) = Some(InFlight {
+                    utterance: utt.id,
+                    response: response_id,
+                    started_at,
+                    words_seen: 0,
+                });
+                lock(&self.inner.response_to_utterance).insert(response_id, utt.id);
+                Ok(())
+            }
             Err(e) => {
-                // Roll the queue forward past the failed utterance.
-                // `cancel` removes it from `current` and promotes
-                // the next queued utterance (if any). We don't try
-                // to recursively start the next one — the caller is
-                // already past the speak-lock guard, and a Failed
-                // event for the current utterance is the honest
-                // signal; users can re-issue if they want.
-                let mut queue = lock(&self.inner.queue);
-                let _ = queue.cancel(utt.id);
-                drop(queue);
                 let err = e.to_string();
                 let _ = self.inner.events.send(SpeechEvent::Failed {
                     id: utt.id,
                     error: err.clone(),
                 });
-                return Err(SpeechError::Backend(err));
+                let promoted = {
+                    let mut queue = lock(&self.inner.queue);
+                    let _ = queue.cancel(utt.id);
+                    queue.current().cloned()
+                };
+                if let Some(next) = promoted {
+                    promote_and_start(&self.inner, next).await;
+                }
+                Err(SpeechError::Backend(err))
             }
-        };
-
-        let started_at = Utc::now();
-        let _ = self.inner.events.send(SpeechEvent::Started {
-            id: utt.id,
-            started_at,
-        });
-        *lock(&self.inner.current) = Some(InFlight {
-            utterance: utt.id,
-            response: response_id,
-            started_at,
-            words_seen: 0,
-        });
-        lock(&self.inner.response_to_utterance).insert(response_id, utt.id);
-        Ok(())
+        }
     }
 
     /// Fire `Cancelled { reason }` for `ids` in iteration order.
@@ -529,12 +576,12 @@ fn spawn_listener<B: RealtimeBackend + 'static>(
                     continue;
                 }
             };
-            handle_realtime_event(&inner, event);
+            handle_realtime_event(&inner, event).await;
         }
     })
 }
 
-fn handle_realtime_event(inner: &Inner, event: RealtimeEvent) {
+async fn handle_realtime_event(inner: &Inner, event: RealtimeEvent) {
     match event {
         RealtimeEvent::ResponseAudioStarted { .. } => {
             // `Started` was already emitted synchronously from
@@ -560,38 +607,74 @@ fn handle_realtime_event(inner: &Inner, event: RealtimeEvent) {
             }
         }
         RealtimeEvent::ResponseDone { response, at, .. } => {
+            // Snapshot the in-flight, emit Completed, then promote
+            // the queue head and start its TTS via the backend
+            // adapter. Acquires the same speak_lock as user-facing
+            // methods so a concurrent `speak`/`cancel` can't race
+            // with the listener over `inner.current`.
+            let _guard = inner.speak_lock.lock().await;
             let utt_id = lock(&inner.response_to_utterance).remove(&response);
             if let Some(id) = utt_id {
-                let mut current = lock(&inner.current);
-                let duration_ms = current
-                    .as_ref()
-                    .filter(|c| c.utterance == id)
-                    .map(|c| {
-                        let delta = at.signed_duration_since(c.started_at);
-                        u64::try_from(delta.num_milliseconds().max(0)).unwrap_or(0)
-                    })
-                    .unwrap_or(0);
-                if current.as_ref().is_some_and(|c| c.utterance == id) {
-                    *current = None;
-                }
-                drop(current);
+                let duration_ms = {
+                    let mut current = lock(&inner.current);
+                    let dur = current
+                        .as_ref()
+                        .filter(|c| c.utterance == id)
+                        .map(|c| {
+                            let delta = at.signed_duration_since(c.started_at);
+                            u64::try_from(delta.num_milliseconds().max(0)).unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    if current.as_ref().is_some_and(|c| c.utterance == id) {
+                        *current = None;
+                    }
+                    dur
+                };
                 let _ = inner
                     .events
                     .send(SpeechEvent::Completed { id, duration_ms });
+
+                // Promote the next queued utterance and start it.
+                let promoted = {
+                    let mut queue = lock(&inner.queue);
+                    queue.finish_current()
+                };
+                if let Some(next) = promoted {
+                    promote_and_start(inner, next).await;
+                }
             }
         }
         RealtimeEvent::Error { error, .. } => {
             // Backend errors aren't tied to a specific response;
             // attribute to the in-flight utterance if any. This
             // matches the spec's `Failed { id, error }` shape.
-            let mut current = lock(&inner.current);
-            if let Some(c) = current.take() {
-                lock(&inner.response_to_utterance).remove(&c.response);
-                drop(current);
+            let _guard = inner.speak_lock.lock().await;
+            let to_fail = {
+                let mut current = lock(&inner.current);
+                let taken = current.take();
+                if let Some(c) = &taken {
+                    lock(&inner.response_to_utterance).remove(&c.response);
+                }
+                taken
+            };
+            if let Some(c) = to_fail {
                 let _ = inner.events.send(SpeechEvent::Failed {
                     id: c.utterance,
                     error,
                 });
+                // Drop the failed utterance from the queue model + start
+                // the next one if any. Without this, the queue would
+                // think `c.utterance` is still current and the next
+                // `speak()` would queue behind a dead utterance.
+                let promoted = {
+                    let mut queue = lock(&inner.queue);
+                    let _ = queue.cancel(c.utterance);
+                    // `cancel` already promoted the head; surface it.
+                    queue.current().cloned()
+                };
+                if let Some(next) = promoted {
+                    promote_and_start(inner, next).await;
+                }
             }
         }
         RealtimeEvent::ResponseCreated { .. }
@@ -601,6 +684,56 @@ fn handle_realtime_event(inner: &Inner, event: RealtimeEvent) {
         | RealtimeEvent::ToolCall { .. } => {
             // Not part of the speech-control vocabulary; the policy
             // layer handles barge-in / turn-taking elsewhere.
+        }
+    }
+}
+
+/// Drive `next` through the backend's `response_create`, emitting
+/// `Started` on success and `Failed` on backend error. Caller must
+/// hold `inner.speak_lock` and the queue must already have promoted
+/// `next` to `current()`. On failure, drains the queue past `next`
+/// and recursively starts the new head — otherwise a single backend
+/// hiccup would freeze the queue forever.
+async fn promote_and_start(inner: &Inner, next: QueuedUtterance) {
+    // Defensively bound the recursion: if every queued utterance
+    // fails to start, we still need to terminate. `MAX_PROMOTE_RETRIES`
+    // is well beyond any realistic queue depth in this layer.
+    const MAX_PROMOTE_RETRIES: usize = 16;
+    let mut current_utt = next;
+    for _ in 0..MAX_PROMOTE_RETRIES {
+        match (inner.start_response)(current_utt.clone()).await {
+            StartResult::Started {
+                response,
+                started_at,
+            } => {
+                let _ = inner.events.send(SpeechEvent::Started {
+                    id: current_utt.id,
+                    started_at,
+                });
+                *lock(&inner.current) = Some(InFlight {
+                    utterance: current_utt.id,
+                    response,
+                    started_at,
+                    words_seen: 0,
+                });
+                lock(&inner.response_to_utterance).insert(response, current_utt.id);
+                return;
+            }
+            StartResult::Failed { error } => {
+                let _ = inner.events.send(SpeechEvent::Failed {
+                    id: current_utt.id,
+                    error,
+                });
+                let promoted = {
+                    let mut queue = lock(&inner.queue);
+                    let _ = queue.cancel(current_utt.id);
+                    queue.current().cloned()
+                };
+                match promoted {
+                    Some(p) => current_utt = p,
+                    None => return,
+                }
+            }
         }
     }
 }
@@ -1252,6 +1385,70 @@ mod tests {
             .await
             .expect_err("muted after set_profile");
         assert!(matches!(err, SpeechError::PolicyDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn response_done_promotes_and_starts_next_queued_utterance() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let first_resp = ResponseId::now_v7();
+        let second_resp = ResponseId::now_v7();
+        backend.queue_response_id(second_resp);
+        backend.queue_response_id(first_resp);
+
+        let controller =
+            DefaultSpeechController::new(Arc::clone(&backend) as _, session, open_profile());
+        let mut events = controller.subscribe_events();
+
+        let first = controller
+            .speak("first", Priority::Append, None)
+            .await
+            .expect("first");
+        let second = controller
+            .speak("second", Priority::Append, None)
+            .await
+            .expect("second");
+
+        // Drain Started(first); second is queued.
+        let _ = drain_events(&mut events, 1, Duration::from_millis(50)).await;
+
+        // Backend reports first done. The listener should:
+        //   1. emit Completed(first)
+        //   2. promote `second` to current
+        //   3. call backend.response_create("second")
+        //   4. emit Started(second)
+        backend.emit(RealtimeEvent::ResponseDone {
+            session,
+            response: first_resp,
+            at: Utc::now(),
+        });
+
+        let evs = drain_events(&mut events, 2, Duration::from_millis(500)).await;
+        let mut saw_completed_first = false;
+        let mut saw_started_second = false;
+        for e in &evs {
+            match e {
+                SpeechEvent::Completed { id, .. } if *id == first => saw_completed_first = true,
+                SpeechEvent::Started { id, .. } if *id == second => saw_started_second = true,
+                _ => {}
+            }
+        }
+        assert!(saw_completed_first, "missing Completed(first): {evs:?}");
+        assert!(
+            saw_started_second,
+            "listener must drive next queued utterance: {evs:?}"
+        );
+
+        // Backend received two response_create calls — one for each.
+        let creates: Vec<_> = backend
+            .record_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                BackendCall::ResponseCreate { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, vec!["first", "second"]);
     }
 
     #[tokio::test]
