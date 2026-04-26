@@ -71,10 +71,10 @@ without the local STT artifact and the first capture fails opaquely.
 
 ### 4. Pre-meeting context wiring still needs orchestrator hand-off
 
-(*Was previously listed as "`attach_context` returns 501". That part is closed:
+(_Was previously listed as "`attach_context` returns 501". That part is closed:
 `crates/heron-orchestrator/src/lib.rs:1308` now persists context into an
 in-memory map keyed by `calendar_event_id`, and `start_capture` consumes the
-staged entry at `lib.rs:1047–1062`.*)
+staged entry at `lib.rs:1047–1062`._)
 
 What remains is the consumer side once item 1 lands: the staged context must
 flow into `LiveSessionOwner` (system prompt / tool wiring / persona) so the
