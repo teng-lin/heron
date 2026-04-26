@@ -6,6 +6,7 @@
 
 pub mod daemon;
 pub mod pipeline;
+pub mod record_delegate;
 pub mod salvage;
 pub mod session;
 pub mod session_log;
