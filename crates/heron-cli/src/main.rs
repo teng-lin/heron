@@ -138,6 +138,14 @@ struct DaemonMeetingStartArgs {
     /// window title, meeting URL). Not a primary identifier.
     #[arg(long)]
     hint: Option<String>,
+    /// Optional EventKit calendar event id to correlate this capture
+    /// with a previously `attach_context`-supplied
+    /// `PreMeetingContext`. When set and a context is pending for
+    /// this id, the daemon consumes it as part of session
+    /// materialization. Resolver-input shape per Invariant 4 — never
+    /// a heron primary key.
+    #[arg(long)]
+    calendar_event_id: Option<String>,
     #[command(flatten)]
     common: DaemonCommonArgs,
 }
@@ -474,6 +482,7 @@ async fn daemon_meeting_start(args: DaemonMeetingStartArgs) -> Result<()> {
         .start_capture(StartCaptureArgs {
             platform: args.platform.into(),
             hint: args.hint,
+            calendar_event_id: args.calendar_event_id,
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

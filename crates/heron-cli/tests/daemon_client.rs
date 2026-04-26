@@ -111,6 +111,7 @@ async fn start_capture_sends_bearer_and_decodes_meeting() {
         .start_capture(StartCaptureArgs {
             platform: Platform::Zoom,
             hint: Some("Daily standup".into()),
+            calendar_event_id: None,
         })
         .await
         .expect("start_capture");
@@ -140,6 +141,7 @@ async fn missing_bearer_yields_typed_api_error() {
         .start_capture(StartCaptureArgs {
             platform: Platform::Zoom,
             hint: None,
+            calendar_event_id: None,
         })
         .await
         .expect_err("should fail");

@@ -216,6 +216,8 @@ struct StartCaptureBody<'a> {
     platform: Platform,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calendar_event_id: Option<&'a str>,
 }
 
 impl DaemonClient {
@@ -303,6 +305,7 @@ impl DaemonClient {
         let body = StartCaptureBody {
             platform: args.platform,
             hint: args.hint.as_deref(),
+            calendar_event_id: args.calendar_event_id.as_deref(),
         };
         let resp = self
             .http
