@@ -14,7 +14,7 @@
 //! - [`SessionClock::wall_to_session_secs`] converts a `SystemTime`
 //!   into seconds since session start.
 //!
-//! See `docs/implementation.md` §0.9 and §5.3.
+//! See `docs/archives/implementation.md` §0.9 and §5.3.
 
 use std::time::SystemTime;
 

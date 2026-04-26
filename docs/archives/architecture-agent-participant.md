@@ -29,7 +29,7 @@ user can either be there too or not. The note-taker becomes a side effect.
 - **`heron-zoom`** — Zoom AXObserver attribution gets *more* valuable: the agent needs to know who is currently speaking, when it's being addressed by name, and when there's a turn-taking gap to fill.
 - **`heron-vault`** — demoted from primary product to **agent memory**: prior meeting transcripts and summaries become the long-term context the agent draws on ("here's what Alice said last week about this PR").
 - **`heron-types`, `heron-cli`, `heron-doctor`** — orchestrator + diagnostics carry over, scope grows.
-- **Swift bridge pattern** (`docs/swift-bridge-pattern.md`) — re-used for any new Apple-native capability.
+- **Swift bridge pattern** (`docs/archives/swift-bridge-pattern.md`) — re-used for any new Apple-native capability.
 
 ## What we add
 

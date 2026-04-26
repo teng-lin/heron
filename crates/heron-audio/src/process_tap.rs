@@ -1,7 +1,7 @@
 //! macOS Core Audio process tap pipeline.
 //!
-//! Per [`docs/plan.md`](../../../docs/plan.md) §6.2 and
-//! [`docs/implementation.md`](../../../docs/implementation.md) §6, the
+//! Per [`docs/archives/plan.md`](../../../docs/archives/plan.md) §6.2 and
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §6, the
 //! tap path looks roughly like:
 //!
 //! 1. Resolve the meeting client's pid via `NSRunningApplication`.

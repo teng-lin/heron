@@ -1,10 +1,10 @@
 //! `heron-policy` — speech-control contract + agent policy.
 //!
 //! Layer 3 of the four-layer v2 architecture per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §1.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §1.
 //! The load-bearing middle layer that protects product behavior from
 //! vendor quirks. **No vendor ships this layer**; it is heron's
-//! contribution per [`docs/api-design-research.md`](../../../docs/api-design-research.md)
+//! contribution per [`docs/archives/api-design-research.md`](../../../docs/archives/api-design-research.md)
 //! "Layer 2: Policy / Turn vendors."
 //!
 //! Owns three concerns the realtime backend can't make for itself:
@@ -209,7 +209,7 @@ mod prefix_tests {
     //! Per-consumer wire-shape regression guards for phase-48 IDs.
     //! The `heron-types::prefixed_id!` macro's own tests cover
     //! macro codegen; these pin that the *consumers* still get the
-    //! prefixes documented in `docs/api-design-spec.md`.
+    //! prefixes documented in `docs/archives/api-design-spec.md`.
 
     use super::*;
 

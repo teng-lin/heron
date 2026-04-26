@@ -2,13 +2,13 @@
 # Reset all heron-relevant TCC grants and local state, simulating a
 # first-run install for onboarding validation.
 #
-# Per docs/implementation.md §0.4 + §5.5. Run between onboarding
+# Per docs/archives/implementation.md §0.4 + §5.5. Run between onboarding
 # walkthroughs in week 1 (smoke test) and week 11 (full validation).
 #
 # Coverage: this is NOT a fresh user account or fresh Mac. The author's
 # laptop has dev tools, network access, hardware peripherals, and an
 # existing Apple ID session. Real naive-user coverage moves to the
-# week-16 exec dogfood per docs/manual-test-matrix.md.
+# week-16 exec dogfood per docs/archives/manual-test-matrix.md.
 
 set -euo pipefail
 

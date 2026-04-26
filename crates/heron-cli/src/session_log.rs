@@ -1,4 +1,4 @@
-//! Per-session summary writer per §19.2 + `docs/observability.md`.
+//! Per-session summary writer per §19.2 + `docs/archives/observability.md`.
 //!
 //! When a session ends, heron emits one JSON line summarizing the
 //! whole capture. The session-level log consumer (a future
@@ -30,7 +30,7 @@ use thiserror::Error;
 pub const LOG_VERSION: u32 = 1;
 
 /// One-line session summary record. Field set matches
-/// `docs/observability.md`.
+/// `docs/archives/observability.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSummary {
     pub log_version: u32,
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn no_pii_field_names_appear() {
-        // Privacy invariant from docs/observability.md: counts only,
+        // Privacy invariant from docs/archives/observability.md: counts only,
         // never raw text. Any future drift that adds a `transcript` or
         // `attendees` field should fail this test loudly.
         // Test against full field names rather than short prefixes

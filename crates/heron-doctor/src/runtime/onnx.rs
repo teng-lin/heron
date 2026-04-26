@@ -1,6 +1,6 @@
 //! ONNX runtime health check.
 //!
-//! `docs/plan.md` §8 calls out sherpa-onnx as the always-available
+//! `docs/archives/plan.md` §8 calls out sherpa-onnx as the always-available
 //! fallback (vs. the WhisperKit happy path). The crate ships its own
 //! `libonnxruntime.dylib` via the `download-binaries` cargo feature on
 //! `sherpa-rs`; the dylib is what `crates/heron-speech/src/sherpa.rs`

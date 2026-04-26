@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- See docs/implementation.md §0.6. -->
+  <!-- See docs/archives/implementation.md §0.6. -->
 
   <!-- Sandbox is OFF: Core Audio process taps require unsandboxed
        access to AudioHALD's mach service. Hardened runtime is still

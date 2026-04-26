@@ -278,9 +278,9 @@ These don't block the spike but should be answered before v2.1:
 
 ## References
 
-- [`docs/architecture-agent-participant.md`](./architecture-agent-participant.md) — the v2 architecture this decision serves
-- [`docs/api-design-spec.md`](./api-design-spec.md) — the invariants the chosen driver must honor
-- [`docs/api-design-research.md`](./api-design-research.md) — vendor capability matrices
-- [`docs/agent-participation-research.md`](./agent-participation-research.md) — product-category survey
+- [`docs/archives/architecture-agent-participant.md`](./architecture-agent-participant.md) — the v2 architecture this decision serves
+- [`docs/archives/api-design-spec.md`](./api-design-spec.md) — the invariants the chosen driver must honor
+- [`docs/archives/api-design-research.md`](./api-design-research.md) — vendor capability matrices
+- [`docs/archives/agent-participation-research.md`](./agent-participation-research.md) — product-category survey
 - `crates/heron-bot/src/lib.rs` — trait surface the driver implements
 - Conversation thread (turn: "should we roll our own instead of using Recall.ai or attendee's API?") — full audit + tradeoffs

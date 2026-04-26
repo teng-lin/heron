@@ -1,5 +1,5 @@
 //! Recording-flow state machine per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §14.2.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §14.2.
 //!
 //! Lives in `heron-types` rather than the Tauri shell so the
 //! orchestrator + CLI + future test harnesses can drive the same

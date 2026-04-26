@@ -2,7 +2,7 @@
 //! impl that wires a [`heron_realtime::RealtimeBackend`] to the
 //! pure-logic [`crate::SpeechQueue`] + [`crate::PolicyProfile`]
 //! filter from [`crate::filter::evaluate`] per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §9.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §9.
 //!
 //! The controller is the load-bearing seam between layer-3 (policy)
 //! and layer-4 (realtime backend). Per spec §9 / Invariant 11 it
@@ -618,7 +618,7 @@ impl<B: RealtimeBackend + 'static> Drop for DefaultSpeechController<B> {
 /// Translate [`RealtimeCapabilities`] into the speech-contract
 /// [`SpeechCapabilities`] surface per spec §9.
 ///
-/// Mapping (rationale per `docs/api-design-research.md` "Layer 3"):
+/// Mapping (rationale per `docs/archives/api-design-research.md` "Layer 3"):
 /// - `atomic_response_cancel` → `atomic_replace`: the atomic-cancel
 ///   primitive is exactly what makes `Priority::Replace` race-free.
 /// - `server_vad` → `barge_in_detect`: server VAD is the only way
@@ -1617,7 +1617,7 @@ mod tests {
     // [`DefaultSpeechController`] runs `speak()`, the filter fires,
     // emits the spec-required `Cancelled { reason: PolicyDenied }`
     // audit event, and (for `Escalate`) drives the configured
-    // [`EscalationHook`]. Closing gap #8 from `docs/codebase-gaps.md`:
+    // [`EscalationHook`]. Closing gap #8 from `docs/archives/codebase-gaps.md`:
     // "policy filter is defined but never invoked" through the
     // controller's user-facing surface — the previous controller path
     // returned the right Err but skipped the audit event entirely.

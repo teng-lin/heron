@@ -1,13 +1,13 @@
 //! `heron-realtime` — bidirectional realtime LLM session.
 //!
 //! Layer 4 of the four-layer v2 architecture per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §1.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §1.
 //! Audio in / audio out / tool calls, low latency.
 //!
-//! Implementations wrap a realtime backend: `OpenAiRealtime` (the
-//! cleanest reference vocabulary; this trait mirrors it where possible),
-//! `GeminiLive`, `LiveKitAgent`, `Pipecat`. Choice deferred per spec
-//! §13 "Next steps."
+//! Implementations wrap a realtime backend. `OpenAiRealtime` is the
+//! production WebSocket backend; `MockRealtimeBackend` remains the
+//! deterministic test backend. Other backends (`GeminiLive`,
+//! `LiveKitAgent`, `Pipecat`) can implement the same trait later.
 //!
 //! Audio I/O does not flow through this crate's surface — it flows
 //! through `heron-bridge` channels owned by the orchestrator. This
@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 
 pub mod fallback;
 pub mod mock;
+pub mod openai;
 pub mod validate;
 pub use fallback::{
     BargeInStrategy, CancelStrategy, StrategyPlan, TextDeltaStrategy, ToolResultStrategy,
@@ -29,6 +30,7 @@ pub use fallback::{
 };
 pub use heron_types::prefixed_id::IdParseError;
 pub use mock::MockRealtimeBackend;
+pub use openai::{OpenAiRealtime, OpenAiRealtimeConfig};
 pub use validate::{MAX_SYSTEM_PROMPT_BYTES, MAX_TOOL_COUNT, validate as validate_session};
 
 heron_types::prefixed_id! {
@@ -231,7 +233,7 @@ pub enum RealtimeEvent {
 }
 
 /// Spec §9. The capability matrix `heron-policy` consults.
-/// See [`docs/api-design-research.md`](../../../docs/api-design-research.md)
+/// See [`docs/archives/api-design-research.md`](../../../docs/archives/api-design-research.md)
 /// "Layer 3" matrix for vendor-by-vendor truth values.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealtimeCapabilities {
@@ -250,7 +252,7 @@ mod prefix_tests {
     //! Per-consumer wire-shape regression guards for phase-48 IDs.
     //! The macro's own tests in `heron-types` cover codegen; these
     //! pin that the realtime crate still gets the prefixes
-    //! documented in `docs/api-design-spec.md`.
+    //! documented in `docs/archives/api-design-spec.md`.
 
     use super::*;
 

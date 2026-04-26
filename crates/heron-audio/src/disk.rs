@@ -1,5 +1,5 @@
 //! Disk-space gate per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §14.1:
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §14.1:
 //! "Disk-space gate (<2GB free → record disabled)."
 //!
 //! The Tauri shell (week 11) calls [`free_bytes`] at app launch and

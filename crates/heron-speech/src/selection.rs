@@ -1,4 +1,4 @@
-//! WER thresholds + backend selection per `docs/implementation.md`
+//! WER thresholds + backend selection per `docs/archives/implementation.md`
 //! §8.5 + §8.6.
 //!
 //! - [`WerThreshold`] — published threshold table with one row per

@@ -1,4 +1,4 @@
-//! Backend selection per `docs/plan.md` §5 weeks 7–8 + §11.1.
+//! Backend selection per `docs/archives/plan.md` §5 weeks 7–8 + §11.1.
 //!
 //! Three backends are available: the Anthropic API, the Claude Code
 //! CLI, and the Codex CLI. The user expresses a [`Preference`]; the
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
 use crate::{Backend, LlmError, Summarizer, build_summarizer_with_resolver};
 
-/// User-expressed preference. Maps to `docs/plan.md` §5 weeks 7–8's
+/// User-expressed preference. Maps to `docs/archives/plan.md` §5 weeks 7–8's
 /// "user can pick the cheapest viable option per session".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preference {

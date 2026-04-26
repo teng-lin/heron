@@ -5,7 +5,7 @@
 //! [`heron_audio::AudioCapture`], [`heron_speech::SttBackend`],
 //! [`heron_zoom::AxBackend`], [`heron_llm::Summarizer`], and
 //! [`heron_vault::VaultWriter`] into the §4.1 data flow described in
-//! `docs/plan.md`.
+//! `docs/archives/plan.md`.
 //!
 //! Two entry points are exposed:
 //!

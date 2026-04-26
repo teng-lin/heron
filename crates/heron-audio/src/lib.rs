@@ -1,7 +1,7 @@
 //! `heron-audio` — per-app audio capture, AEC, and recording.
 //!
 //! This crate exposes the v0 surface from
-//! [`docs/implementation.md`](../../../docs/implementation.md) §6.2.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §6.2.
 //! The real implementation (Core Audio process tap, WebRTC APM AEC,
 //! disk-spill ringbuffer) lands across weeks 2–3 (§6 + §7).
 //!

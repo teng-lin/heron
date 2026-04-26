@@ -1,6 +1,6 @@
 //! Disk-backed ringbuffer for live audio sessions.
 //!
-//! Per [`docs/implementation.md`](../../../docs/implementation.md) §7.2:
+//! Per [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §7.2:
 //! every captured frame lands in
 //! `~/Library/Caches/heron/sessions/<id>/{mic,tap}.raw` (mode 0600),
 //! and `session.json` is updated on every state transition so a

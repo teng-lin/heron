@@ -1,8 +1,8 @@
 //! Vault writer: finalize a session into `<vault>/meetings/<date>.md`
 //! and re-summarize an existing note while preserving user edits.
 //!
-//! Per [`docs/implementation.md`](../../../docs/implementation.md) §12
-//! and [`docs/plan.md`](../../../docs/plan.md) §3.2 path conventions:
+//! Per [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §12
+//! and [`docs/archives/plan.md`](../../../docs/archives/plan.md) §3.2 path conventions:
 //!
 //! ```text
 //! <vault_root>/
@@ -75,7 +75,7 @@ impl VaultWriter {
     /// this, a user who edits the note between finalize and the first
     /// re-summarize would silently lose the edit (base == ours
     /// collapses every llm_inferred decision to "user untouched,
-    /// theirs wins"). See `docs/merge-model.md`.
+    /// theirs wins"). See `docs/archives/merge-model.md`.
     pub fn finalize_session(
         &self,
         date_str: &str,
@@ -102,7 +102,7 @@ impl VaultWriter {
     /// algorithm sets `base = ours`, which collapses every
     /// `llm_inferred` decision to "user untouched, theirs wins" and
     /// the body to "no semantic change, theirs wins" — the natural
-    /// behavior for a fresh summarize. See `docs/merge-model.md`.
+    /// behavior for a fresh summarize. See `docs/archives/merge-model.md`.
     pub fn re_summarize(
         &self,
         note_path: &Path,

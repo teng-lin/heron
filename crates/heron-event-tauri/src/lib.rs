@@ -6,7 +6,7 @@
 //! framecasts onto SSE for browser/CLI subscribers, this one re-emits
 //! envelopes as Tauri IPC events for the desktop frontend.
 //!
-//! Per `docs/api-design-spec.md` Invariant 13 (transports are
+//! Per `docs/archives/api-design-spec.md` Invariant 13 (transports are
 //! projections), the canonical `heron_event::EventSink` trait stays
 //! the only contract publishers care about. This crate adds one
 //! concrete implementor: [`TauriEventSink`].

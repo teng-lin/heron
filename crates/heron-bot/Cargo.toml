@@ -18,14 +18,14 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 # `RecallDriver` (src/recall/) calls Recall.ai's REST surface; previously
 # only the `examples/recall-spike.rs` harness needed reqwest. Promoted to
-# a primary dep when the impl landed (per docs/spike-findings.md
+# a primary dep when the impl landed (per docs/archives/spike-findings.md
 # "Outstanding action items").
 reqwest = { workspace = true }
 # Stream-cap the response body in `recall::client` so a runaway vendor
 # error page can't OOM the driver (gemini-code-assist review on PR #121).
 futures-util = { workspace = true }
 # Encodes the placeholder MP3 fixture for `automatic_audio_output`. See
-# docs/spike-findings.md §"Recommendations" item 5.
+# docs/archives/spike-findings.md §"Recommendations" item 5.
 base64 = "0.22"
 
 [dev-dependencies]

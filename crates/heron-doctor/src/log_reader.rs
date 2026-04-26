@@ -1,6 +1,6 @@
 //! JSONL session-summary reader for `~/Library/Logs/heron/`.
 //!
-//! The schema mirrors `docs/observability.md` `log_version: 1`. We
+//! The schema mirrors `docs/archives/observability.md` `log_version: 1`. We
 //! redefine the field set locally rather than depending on
 //! `heron-cli` to avoid pulling the audio / LLM / Tauri stack into a
 //! diagnostics binary that just reads JSON.
@@ -35,13 +35,13 @@ pub enum LogReadError {
 }
 
 /// One parsed session-summary line. Keep the field set in sync with
-/// `docs/observability.md` and `heron_cli::session_log::SessionSummary`.
+/// `docs/archives/observability.md` and `heron_cli::session_log::SessionSummary`.
 ///
 /// `serde` already treats `Option<T>` as default-`None` when the key
 /// is absent, so most fields don't carry an explicit `#[serde(default)]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSummaryRecord {
-    /// Stable schema marker per `docs/observability.md`. `0` = the
+    /// Stable schema marker per `docs/archives/observability.md`. `0` = the
     /// field was absent in the source line; treat as legacy.
     #[serde(default)]
     pub log_version: u32,
@@ -53,7 +53,7 @@ pub struct SessionSummaryRecord {
     pub fields: Option<SessionSummaryFields>,
 }
 
-/// Counts + cost only — never user content (per `docs/observability.md`
+/// Counts + cost only — never user content (per `docs/archives/observability.md`
 /// privacy invariant). All fields are optional so a partial record
 /// from a future schema version still parses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

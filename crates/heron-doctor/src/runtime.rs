@@ -15,13 +15,13 @@
 //!
 //! | Check                       | Why                                                      |
 //! |-----------------------------|----------------------------------------------------------|
-//! | [`OnnxRuntimeCheck`]        | `docs/plan.md` §8 promises sherpa-onnx is the bundled    |
+//! | [`OnnxRuntimeCheck`]        | `docs/archives/plan.md` §8 promises sherpa-onnx is the bundled    |
 //! |                             | fallback; if the dylib doesn't load there's no transcript|
 //! |                             | path at all.                                             |
 //! | [`ZoomProcessCheck`]        | `heron-zoom`'s AXObserver wires against `us.zoom.xos`    |
 //! |                             | (`crates/heron-zoom/src/lib.rs:39`). Without Zoom        |
 //! |                             | running speaker attribution silently degrades.           |
-//! | [`KeychainAclCheck`]        | `docs/security.md` §3.3 requires bundle-ID ACLs on the   |
+//! | [`KeychainAclCheck`]        | `docs/archives/security.md` §3.3 requires bundle-ID ACLs on the   |
 //! |                             | API-key entries — without it any signed app can read.    |
 //! | [`NetworkReachabilityCheck`]| Whisper model download + LLM summarize call both go      |
 //! |                             | over HTTPS; preflight catches a captive-portal wifi      |

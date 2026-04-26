@@ -8,7 +8,7 @@
 //! That's good enough to verify the rest of the pipeline (resample
 //! correctness, jitter ordering, channel teardown, health reporting)
 //! without dragging in `webrtc-audio-processing`. The production
-//! impl per [`docs/api-design-spec.md`](../../../../docs/api-design-spec.md)
+//! impl per [`docs/archives/api-design-spec.md`](../../../../docs/archives/api-design-spec.md)
 //! §1 is `WebRtcAecBridge`, which lives behind the same trait.
 //!
 //! ## Topology
@@ -394,7 +394,7 @@ impl AecReference {
 /// jitter buffer for tests and pipeline development.
 ///
 /// **Not** broadcast-quality echo cancellation. See module docs.
-/// Per [`docs/api-design-spec.md`](../../../../docs/api-design-spec.md)
+/// Per [`docs/archives/api-design-spec.md`](../../../../docs/archives/api-design-spec.md)
 /// §1 the production impl is `WebRtcAecBridge`.
 pub struct NaiveBridge {
     meeting_in_tx: mpsc::Sender<PcmFrame>,

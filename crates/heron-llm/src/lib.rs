@@ -1,6 +1,6 @@
 //! `heron-llm` — meeting summarization.
 //!
-//! v0 surface from [`docs/implementation.md`](../../../docs/implementation.md)
+//! v0 surface from [`docs/archives/implementation.md`](../../../docs/archives/implementation.md)
 //! §11.1 + §11.2. The real backends (Anthropic API, Claude Code CLI,
 //! Codex CLI) plug into the [`Summarizer`] trait in week 9; the trait
 //! shape and the `meeting.hbs` template ship now so `heron_vault`
@@ -99,7 +99,7 @@ pub enum LlmError {
     Io(#[from] std::io::Error),
 }
 
-/// Backends per `plan.md` §5 weeks 7–8 + `docs/implementation.md`
+/// Backends per `plan.md` §5 weeks 7–8 + `docs/archives/implementation.md`
 /// §11.1. Selection is runtime-configurable so the user can pick the
 /// cheapest viable option per session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

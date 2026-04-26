@@ -129,7 +129,7 @@ export type DiskCheckOutcome =
 /**
  * Discriminator for the `tray:degraded` event payload. Mirrors the
  * Rust `DegradedKind` enum — three failure modes documented in
- * `docs/plan.md` week 12.
+ * `docs/archives/plan.md` week 12.
  */
 export type DegradedKind = "tap_lost" | "ax_unavailable" | "aec_overflow";
 

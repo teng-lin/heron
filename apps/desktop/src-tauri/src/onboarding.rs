@@ -1,4 +1,4 @@
-//! Per-step Test-button backends per `docs/implementation.md` §13.3.
+//! Per-step Test-button backends per `docs/archives/implementation.md` §13.3.
 //!
 //! Each onboarding step (mic, audio-tap, accessibility, calendar,
 //! model-download) ships a Tauri command the frontend can call to
@@ -821,7 +821,7 @@ mod tests {
     /// thread keeps the test runtime's blocking pool from draining
     /// at shutdown — tokio waits indefinitely. Tested locally on
     /// dev macs (where `tccd` is healthy) and via the runbook in
-    /// `docs/manual-test-matrix.md`.
+    /// `docs/archives/manual-test-matrix.md`.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn calendar_probe_surfaces_real_outcome_on_macos() {

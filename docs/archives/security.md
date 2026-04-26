@@ -52,7 +52,7 @@ Application: …"` of the two test binaries.
 
 ## Logs and PII
 
-Per [`docs/observability.md`](observability.md):
+Per [`docs/archives/observability.md`](observability.md):
 
 - No audio bytes in logs.
 - No transcript text in logs.

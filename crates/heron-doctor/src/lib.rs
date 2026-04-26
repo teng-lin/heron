@@ -4,9 +4,9 @@
 //!
 //! - **Offline log parsing.** Reads
 //!   `~/Library/Logs/heron/<YYYY-MM-DD>.log` (one daily JSONL file
-//!   per `docs/observability.md`), parses each `kind:
+//!   per `docs/archives/observability.md`), parses each `kind:
 //!   "session_summary"` record, and reports anomalies against the v1
-//!   ship-criteria thresholds in `docs/implementation.md` §18.2.
+//!   ship-criteria thresholds in `docs/archives/implementation.md` §18.2.
 //!   Pure offline: no network, no model loads, no auth. The §15.4
 //!   diagnostics tab consumes a single session's record; this is the
 //!   *cross-session* counterpart for the user (and for the eventual

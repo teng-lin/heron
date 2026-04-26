@@ -1,7 +1,7 @@
 //! End-to-end session pipeline.
 //!
 //! Implements [`run_pipeline`], the body of [`crate::session::Orchestrator::run`].
-//! Stages mirror `docs/plan.md` §4.1 (data flow):
+//! Stages mirror `docs/archives/plan.md` §4.1 (data flow):
 //!
 //! 1. Walk the FSM `idle → armed → recording`, persisting state to
 //!    `<cache>/state.json` per §14.3 so a SIGKILL leaves a salvage
@@ -57,7 +57,7 @@ const CALENDAR_WINDOW_SLOP_SECS: i64 = 30 * 60;
 /// prevent a wedged TCC daemon from hanging session finalize.
 const CALENDAR_READ_TIMEOUT_SECS: u64 = 5;
 
-/// 48 kHz f32 mono per `docs/implementation.md` §6 (capture sample rate).
+/// 48 kHz f32 mono per `docs/archives/implementation.md` §6 (capture sample rate).
 const SAMPLE_RATE_HZ: u32 = 48_000;
 
 /// Channel size for the AX → aligner mpsc. 256 events is ~1 minute of

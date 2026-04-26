@@ -38,7 +38,7 @@
 //! ```
 //!
 //! `--nocapture` is what surfaces the per-test skip / success log
-//! lines. See `docs/manual-test-matrix.md` § "Live LLM smoke tests
+//! lines. See `docs/archives/manual-test-matrix.md` § "Live LLM smoke tests
 //! (heron-llm)" for the operator-facing matrix.
 
 use std::io::Write;

@@ -1,5 +1,5 @@
 //! m4a encode + verify pipeline per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §11.3.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §11.3.
 //!
 //! After STT consumes the per-channel `mic.wav` / `tap.wav` files,
 //! the writer encodes them into a single stereo m4a:
@@ -12,7 +12,7 @@
 //!
 //! Both calls shell out to `ffmpeg` / `ffprobe`. Real-world v1
 //! installs ship ffmpeg via Homebrew (per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §0.1)
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §0.1)
 //! and the binary is on PATH.
 
 use std::io;

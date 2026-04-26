@@ -1,5 +1,5 @@
 // WhisperKitHelper — Swift bridge for the §4 WhisperKit integration.
-// Mirrors the swift-bridge convention in docs/swift-bridge-pattern.md
+// Mirrors the swift-bridge convention in docs/archives/swift-bridge-pattern.md
 // (canonical: eventkit-helper). Owned by crates/heron-speech.
 //
 // The @_cdecl surface — `wk_init`, `wk_transcribe`, `wk_free_string` —
@@ -26,7 +26,7 @@ private let WK_TIMEOUT: Int32 = -4
 /// Default WhisperKit variant downloaded by `wk_fetch_model` when the
 /// caller passes a NULL `variant`. Mirrors the Rust-side default in
 /// `whisperkit_bridge.rs::DEFAULT_WK_VARIANT`. ~1GB CoreML bundle per
-/// `docs/plan.md` week-9 onboarding step 5.
+/// `docs/archives/plan.md` week-9 onboarding step 5.
 private let WK_DEFAULT_VARIANT = "openai_whisper-small.en"
 
 /// Per-call deadlines for the async→sync semaphore bridge.

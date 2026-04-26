@@ -1,6 +1,6 @@
 //! Back-pressure detection for the realtime → APM → STT pipeline.
 //!
-//! Per [`docs/implementation.md`](../../../docs/implementation.md) §7.4
+//! Per [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §7.4
 //! the §7.6 done-when bar requires that a 60-min run with a fake-STT
 //! that lags 3s emits exactly one [`Event::CaptureDegraded`] when the
 //! STT queue saturates, while the disk ringbuffer keeps ≥ 99 % of

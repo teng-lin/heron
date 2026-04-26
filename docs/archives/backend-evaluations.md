@@ -1,6 +1,6 @@
 # Backend evaluations
 
-heron has three swappable LLM backends ([`docs/implementation.md`](implementation.md)
+heron has three swappable LLM backends ([`docs/archives/implementation.md`](implementation.md)
 §11.1) and two STT backends ([§8.1](implementation.md)). This document records the
 evaluation criteria, the per-fixture WER / cost / latency numbers, and the
 selection logic.

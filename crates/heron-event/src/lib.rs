@@ -3,7 +3,7 @@
 //! The bus that every other crate publishes through and that every
 //! consumer (in-proc Rust subscriber, Tauri IPC, MCP notifications,
 //! HTTP/SSE on `herond`, outbound webhook) projects from. Per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §10
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §10
 //! and Invariants 12–13:
 //!
 //! - **Invariant 12.** All events flow through `heron-event` first. No

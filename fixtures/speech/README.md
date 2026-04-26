@@ -28,7 +28,7 @@ client-3person-gallery/
 ```
 
 `ground-truth.jsonl` follows the `heron_types::Turn` schema (see
-`docs/implementation.md` §3.4 + §5.2). Text is verbatim, including
+`docs/archives/implementation.md` §3.4 + §5.2). Text is verbatim, including
 filler words; capitalization matches what the LLM sees.
 
 ## Running the regression

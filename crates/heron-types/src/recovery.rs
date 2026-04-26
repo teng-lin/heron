@@ -1,5 +1,5 @@
 //! Crash-recovery state persistence per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §14.3.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §14.3.
 //!
 //! While a session is live, the orchestrator drops a small JSON file
 //! at `<cache_dir>/<session_id>/state.json`. On launch, the desktop

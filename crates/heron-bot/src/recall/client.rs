@@ -298,7 +298,7 @@ pub(crate) enum HttpError {
     #[error("recall rate limited; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
-    /// 507 — capacity exhausted. Per [`docs/spike-findings.md`]
+    /// 507 — capacity exhausted. Per [`docs/archives/spike-findings.md`]
     /// §"Recommendations" item 7, Recall reserves this code for
     /// "warm-bot pool depleted on Create Bot" only and recommends
     /// polling every 30s. We default to 30s if `Retry-After` is

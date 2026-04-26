@@ -2,7 +2,7 @@
  * Session basename helpers for the Review sidebar.
  *
  * The vault writer in `crates/heron-vault/src/writer.rs` formats
- * filenames as `YYYY-MM-DD-HHMM <slug>.md` (per `docs/plan.md` §3.2).
+ * filenames as `YYYY-MM-DD-HHMM <slug>.md` (per `docs/archives/plan.md` §3.2).
  * PR-κ (phase 72) parses this prefix in the renderer rather than
  * shelling out to the filesystem so the sidebar stays offline,
  * IPC-free, and survives sessions whose mtime drifted (e.g. a vault

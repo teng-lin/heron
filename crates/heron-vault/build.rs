@@ -1,8 +1,8 @@
 // Builds swift/eventkit-helper as a static library and links it into
 // heron-vault, along with the EventKit and Foundation system frameworks.
 //
-// See docs/swift-bridge-pattern.md for the convention this build script
-// is the canonical implementation of (per docs/implementation.md §5.4).
+// See docs/archives/swift-bridge-pattern.md for the convention this build script
+// is the canonical implementation of (per docs/archives/implementation.md §5.4).
 
 // Build scripts panic on infrastructure failure; the workspace clippy
 // deny list ("no expect/unwrap") only makes sense for runtime code.

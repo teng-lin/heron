@@ -1,13 +1,13 @@
 # Zoom AX speaker-indicator spike (§3.3 outcome)
 
-This directory holds the artifacts from the `docs/plan.md` §3.3 spike:
+This directory holds the artifacts from the `docs/archives/plan.md` §3.3 spike:
 two `heron ax-dump` captures of the Zoom AX tree taken against a live
 2-participant call (laptop + phone), with the phone toggled between
 muted and unmuted between captures.
 
 ## Why these files exist
 
-The original spike plan (per `docs/manual-test-matrix.md` row #1) was
+The original spike plan (per `docs/archives/manual-test-matrix.md` row #1) was
 to capture a stable `(role, subrole, identifier)` triple for the
 active-speaker indicator — the colored frame that highlights the
 person currently speaking — so `swift/zoomax-helper/.../ZoomAxHelper.swift`
@@ -59,7 +59,7 @@ unverified, polling is bounded CPU, and the aligner's 350 ms default
 
 The full design rationale (and the limitations — degrades on 3+
 free-for-all calls; documented as the `speaker: "them"` risk-reducer
-fallback per `docs/implementation.md` §20) lives in the module
+fallback per `docs/archives/implementation.md` §20) lives in the module
 header comment of `swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift`.
 
 ## Capture environment

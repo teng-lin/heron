@@ -6,7 +6,7 @@ Recorded artifacts that test cases consume. Most fixtures are gated on
 
 ## Layout
 
-Per `docs/implementation.md` §19.5:
+Per `docs/archives/implementation.md` §19.5:
 
 ```text
 fixtures/
@@ -34,7 +34,7 @@ Each leaf fixture directory contains:
 
 1. Capture `mic.wav` + `tap.wav` from a real or fixture session.
 2. Run `ax-probe` if zoom/ax case → emit `ax-events.jsonl`.
-3. Hand-label `ground-truth.jsonl` per `docs/implementation.md` §3.4.
+3. Hand-label `ground-truth.jsonl` per `docs/archives/implementation.md` §3.4.
 4. Drop a `README.md` documenting the case (date, devices, edge cases).
 5. Commit; CI's WER + aligner regression suites pick it up
    automatically once they iterate over the directory.
@@ -42,6 +42,6 @@ Each leaf fixture directory contains:
 ## Privacy
 
 Real meetings only commit if every participant has signed off — see
-`docs/manual-test-matrix.md` for the consent gate. The default
+`docs/archives/manual-test-matrix.md` for the consent gate. The default
 fallback is **synthesized** input (`fixtures/synthetic/`) which has no
 PII.

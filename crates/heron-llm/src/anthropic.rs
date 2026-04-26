@@ -1,5 +1,5 @@
 //! Real Anthropic Messages-API backend per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §11.1.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §11.1.
 //!
 //! Wraps `reqwest` with a strict request/response shape and a
 //! configurable base URL so the unit tests can substitute a mock

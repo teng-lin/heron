@@ -1,6 +1,6 @@
 //! `heron-zoom` — speaker attribution from Zoom's AX tree.
 //!
-//! Surface per [`docs/implementation.md`](../../../docs/implementation.md)
+//! Surface per [`docs/archives/implementation.md`](../../../docs/archives/implementation.md)
 //! §9.1; the implementation reflects the §3.3 spike outcome
 //! recorded at `fixtures/zoom/spike-triple/README.md`. Two backends
 //! ship in v1:

@@ -186,7 +186,7 @@ fn humanize_duration(d: chrono::Duration) -> String {
     }
 }
 
-/// Default cache-root location per `docs/plan.md` §3 + §11.3 (the
+/// Default cache-root location per `docs/archives/plan.md` §3 + §11.3 (the
 /// ringbuffer lives under Application Support; per-session state is
 /// inside that). Falls back to the current working directory when
 /// `HOME` is unset (CI / sandbox), mirroring `heron-doctor`'s same
