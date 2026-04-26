@@ -2463,6 +2463,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "futures-util",
+ "heron-bridge",
  "heron-event",
  "heron-event-http",
  "heron-orchestrator",
