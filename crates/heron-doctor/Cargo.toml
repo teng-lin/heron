@@ -20,6 +20,23 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+# Runtime preflight checks (gap #6 / `runtime` module). `sysinfo`
+# enumerates running processes for the Zoom check; `reqwest` does the
+# HTTPS reachability probe (blocking client — one short call per
+# backend host, so dragging tokio in just for `runtime_checks` would
+# be overkill); `security-framework` reads keychain item ACLs on
+# macOS; `dirs` resolves the platform cache dir so the ONNX check
+# inspects exactly the same path `heron-speech::sherpa::ensure_model`
+# writes to (no path drift between writer and probe). `reqwest` and
+# `dirs` are workspace-pinned; `sysinfo` is doctor-local (nothing
+# else uses it today).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+dirs = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
