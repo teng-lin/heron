@@ -7,7 +7,7 @@
  *   notes) or `/home`. While settings load, renders a small Loading
  *   placeholder so a remount under React StrictMode doesn't flash
  *   the wizard for already-onboarded users (PR-ι / phase 71).
- * - `/onboarding` — five-step Test-button walkthrough (PR-ι).
+ * - `/onboarding` — six-step Test-button walkthrough (PR-ι + gap #5).
  * - `/home` — dashboard with the `heron_status` smoke test +
  *   "Start recording" entry point (PR-β).
  * - `/recording` — full-window in-progress recording view (PR-β).

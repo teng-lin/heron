@@ -96,7 +96,7 @@ export interface Settings {
   audio_retention_days: number | null;
   /**
    * PR-ι (phase 71). `true` once the user has finished the §13.3
-   * five-step onboarding wizard. The Rust struct's container-level
+   * onboarding wizard. The Rust struct's container-level
    * `#[serde(default)]` deserializes pre-PR-71 settings.json files
    * with `onboarded = false` so the wizard runs once after upgrade —
    * no migration ceremony needed on the JS side. `App.tsx`'s
@@ -168,6 +168,20 @@ export type TestOutcome =
   | { status: "fail"; details: string }
   | { status: "needs_permission"; details: string }
   | { status: "skipped"; details: string };
+
+/**
+ * Wire-format reply from `heron_daemon_status`. Mirrors the Rust
+ * `apps/desktop/src-tauri/src/daemon.rs::DaemonStatus` struct:
+ * `running` is the boolean liveness gate; `version` carries the
+ * daemon's reported semver when it answered with a parseable body;
+ * `error` carries the reqwest/parse error string when the probe could
+ * not classify the response as a healthy daemon.
+ */
+export interface DaemonStatus {
+  running: boolean;
+  version: string | null;
+  error: string | null;
+}
 
 /**
  * Wire-format labels for the macOS-Keychain accounts heron knows
@@ -328,6 +342,30 @@ export interface HeronCommands {
   heron_test_model_download: {
     args: Record<string, never>;
     returns: TestOutcome;
+  };
+  /**
+   * Gap #5: probe the in-process / loopback `herond` at `/v1/health`.
+   * Pass when the daemon answered with a parseable health body; fail
+   * with a human-readable reason otherwise. The onboarding wizard's
+   * 6th step calls this and gates "Finish setup" on a pass.
+   */
+  heron_test_daemon: {
+    args: Record<string, never>;
+    returns: TestOutcome;
+  };
+  /**
+   * Gap #5: structured daemon status for surfaces that want
+   * "running / version / error" without the `TestOutcome` lossy
+   * collapse. Currently unused on the JS side but kept on the IPC
+   * surface so a future menubar/status pill (or a status hook polling
+   * on a timer) has a typed entry point and the Rust registration is
+   * mirrored in the TS command map. Like every Tauri command this is
+   * a request/response round-trip; a true push-based status feed
+   * would ship as a separate Tauri event.
+   */
+  heron_daemon_status: {
+    args: Record<string, never>;
+    returns: DaemonStatus;
   };
   /**
    * Phase 71 (PR-ι): persist the "wizard finished" flag on the

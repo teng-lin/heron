@@ -1,12 +1,12 @@
 /**
- * Onboarding wizard (§13.3 / PR-ι, phase 71).
+ * Onboarding wizard (§13.3 / PR-ι, phase 71; gap #5 added the daemon step).
  *
- * Five-step Test-button walkthrough that exercises the §13.3 probes
+ * Six-step Test-button walkthrough that exercises the §13.3 probes
  * (mic, audio-tap, accessibility, calendar, WhisperKit-model presence)
- * before the user starts recording. The wizard is one-shot per
- * install — `Finish setup` calls `heron_mark_onboarded`, which the
- * `App.tsx` first-run detector reads to skip the route on subsequent
- * launches.
+ * plus a final daemon-liveness check before the user starts recording.
+ * The wizard is one-shot per install — `Finish setup` calls
+ * `heron_mark_onboarded`, which the `App.tsx` first-run detector reads
+ * to skip the route on subsequent launches.
  *
  * State is held in `store/onboarding.ts` (Zustand) so Back navigation
  * preserves each step's outcome without re-running its probe. The
@@ -117,6 +117,10 @@ const STEP_COPY: Record<StepId, { title: string; body: string }> = {
     title: "Speech-to-text model",
     body: "heron downloads ~1 GB of WhisperKit models for on-device transcription. Connect to wifi if you're on a metered link — the actual download lands in a future release; this Test only checks whether a model is already in place.",
   },
+  daemon: {
+    title: "Background service",
+    body: "heron's local daemon (herond) routes audio, transcripts, and meeting events between the desktop app and the recording pipeline. This step verifies it is reachable on the loopback port the daemon listens on. You cannot skip this one — without the daemon, recording cannot start.",
+  },
 };
 
 export default function Onboarding() {
@@ -132,10 +136,10 @@ export default function Onboarding() {
   const [finishing, setFinishing] = useState(false);
 
   const stepId = STEPS[current];
-  // STEPS is a fixed five-element tuple, but TS narrows to `StepId |
-  // undefined` when indexed with a `number`. The guard is runtime +
-  // type-narrowing belt-and-suspenders; it should never fire in
-  // practice (the store clamps `current` to `[0, STEPS.length - 1]`).
+  // STEPS is a fixed-size tuple, but TS narrows to `StepId | undefined`
+  // when indexed with a `number`. The guard is runtime + type-narrowing
+  // belt-and-suspenders; it should never fire in practice (the store
+  // clamps `current` to `[0, STEPS.length - 1]`).
   if (stepId === undefined) {
     return null;
   }
@@ -216,7 +220,7 @@ export default function Onboarding() {
       <header className="space-y-2">
         <h1 className="text-2xl font-semibold">Set up heron</h1>
         <p className="text-sm text-muted-foreground">
-          Five quick checks before your first recording. Each step has a
+          Six quick checks before your first recording. Each step has a
           Test button — heron only records when you ask it to.
         </p>
       </header>
@@ -287,13 +291,15 @@ export default function Onboarding() {
           Back
         </Button>
         <div className="flex items-center gap-2">
-          <Button type="button" variant="ghost" onClick={requestSkip}>
-            Skip step
-          </Button>
+          {stepId !== "daemon" && (
+            <Button type="button" variant="ghost" onClick={requestSkip}>
+              Skip step
+            </Button>
+          )}
           <Button
             type="button"
             onClick={() => void advance()}
-            disabled={!canAdvance(step) || finishing}
+            disabled={!canAdvance(stepId, step) || finishing}
           >
             {finishing
               ? "Finishing…"
@@ -357,7 +363,7 @@ function ProgressDots({
     <ol className="flex items-center justify-center gap-3" aria-label="Steps">
       {STEPS.map((id, idx) => {
         const isActive = idx === current;
-        const isVisited = canAdvance(steps[id]);
+        const isVisited = canAdvance(id, steps[id]);
         const Icon = isVisited ? CheckCircle2 : Circle;
         // Human-readable label rendered as `sr-only` text inside the
         // <li> rather than only as `aria-label`. VoiceOver on macOS
@@ -465,5 +471,7 @@ async function invokeProbe(step: StepId) {
       return invoke("heron_test_calendar");
     case "model_download":
       return invoke("heron_test_model_download");
+    case "daemon":
+      return invoke("heron_test_daemon");
   }
 }
