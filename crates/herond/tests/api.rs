@@ -52,7 +52,7 @@ async fn health_returns_200_without_bearer() {
     // regresses, this test catches it.
     let app = build_app(stub_state());
     let res = app
-        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -67,7 +67,7 @@ async fn health_response_serializes_health_shape() {
     // that wire form matches `components.schemas.Health` exactly.
     let app = build_app(stub_state());
     let res = app
-        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let body = body_json(res).await;
@@ -82,7 +82,7 @@ async fn health_response_serializes_health_shape() {
 async fn protected_endpoint_rejects_missing_bearer() {
     let app = build_app(stub_state());
     let res = app
-        .oneshot(Request::get("/meetings").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/v1/meetings").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -96,7 +96,7 @@ async fn protected_endpoint_rejects_wrong_bearer() {
     let app = build_app(stub_state());
     let res = app
         .oneshot(
-            Request::get("/meetings")
+            Request::get("/v1/meetings")
                 .header(header::AUTHORIZATION, "Bearer wrong")
                 .body(Body::empty())
                 .unwrap(),
@@ -114,7 +114,7 @@ async fn protected_endpoint_with_correct_bearer_reaches_handler() {
     let app = build_app(stub_state());
     let res = app
         .oneshot(
-            Request::get("/meetings")
+            Request::get("/v1/meetings")
                 .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -134,7 +134,7 @@ async fn origin_header_is_rejected_even_for_health() {
     let app = build_app(stub_state());
     let res = app
         .oneshot(
-            Request::get("/health")
+            Request::get("/v1/health")
                 .header(header::ORIGIN, "http://evil.example.com")
                 .body(Body::empty())
                 .unwrap(),
@@ -150,11 +150,11 @@ async fn origin_header_is_rejected_even_for_health() {
 async fn unimpl_endpoints_all_return_501() {
     let app = build_app(stub_state());
     let cases = [
-        ("GET", "/meetings/mtg_x"),
-        ("GET", "/meetings/mtg_x/transcript"),
-        ("GET", "/meetings/mtg_x/summary"),
-        ("GET", "/meetings/mtg_x/audio"),
-        ("GET", "/calendar/upcoming"),
+        ("GET", "/v1/meetings/mtg_x"),
+        ("GET", "/v1/meetings/mtg_x/transcript"),
+        ("GET", "/v1/meetings/mtg_x/summary"),
+        ("GET", "/v1/meetings/mtg_x/audio"),
+        ("GET", "/v1/calendar/upcoming"),
     ];
     for (method, path) in cases {
         let res = build_app(stub_state())
@@ -188,7 +188,7 @@ async fn events_emits_published_envelope_in_sse_framing() {
     // receivers. We deterministically wait for the SSE handler to
     // reach `bus.subscribe()` by polling `subscriber_count` rather
     // than racing on a fixed sleep.
-    let req = Request::get("/events")
+    let req = Request::get("/v1/events")
         .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
         .body(Body::empty())
         .unwrap();
@@ -240,7 +240,7 @@ async fn events_replays_from_replay_cache_then_takes_live_tail() {
     // for asserting the replay path is wired.
     let resume_from = EventId::now_v7();
     let bus_handle = orch.event_bus();
-    let req = Request::get(format!("/events?since_event_id={resume_from}"))
+    let req = Request::get(format!("/v1/events?since_event_id={resume_from}"))
         .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
         .body(Body::empty())
         .unwrap();
@@ -276,7 +276,7 @@ async fn events_returns_410_when_resume_window_exceeded() {
     let resume_from = EventId::now_v7();
     let res = app
         .oneshot(
-            Request::get(format!("/events?since_event_id={resume_from}"))
+            Request::get(format!("/v1/events?since_event_id={resume_from}"))
                 .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -289,11 +289,109 @@ async fn events_returns_410_when_resume_window_exceeded() {
 }
 
 #[tokio::test]
+async fn unprefixed_path_returns_404_after_v1_nest() {
+    // The router lives under /v1; bare /health predates the
+    // post-review fix and a regression that drops the nest would
+    // silently route to bare /health again. Pin the new shape.
+    //
+    // We send a valid bearer so we're testing the router's
+    // not-found, not the auth middleware's not-`/v1/health`
+    // 401-by-default — those are different signals and bundling
+    // them confuses the regression check.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::get("/health")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn origin_pre_empts_auth_on_protected_endpoint() {
+    // Layer order regression check: `Origin` denial must run BEFORE
+    // bearer auth. Pre-fix, axum's last-added-is-outermost made
+    // `require_bearer` the outer layer, so a hostile-origin + no-
+    // bearer request returned 401 (revealing that the endpoint
+    // requires creds) instead of the 403 the OpenAPI mandates.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::get("/v1/meetings")
+                .header(header::ORIGIN, "http://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = body_json(res).await;
+    assert_eq!(body["code"], "HERON_E_ORIGIN_DENIED");
+}
+
+#[tokio::test]
+async fn bearer_scheme_is_case_insensitive() {
+    // RFC 7235 §2.1: auth-scheme is case-insensitive. Pre-fix the
+    // strict `strip_prefix("Bearer ")` rejected `bearer xyz`.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::get("/v1/meetings")
+                .header(header::AUTHORIZATION, format!("bearer {TEST_BEARER}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn events_last_event_id_header_wins_over_query() {
+    // Spec contract: `Last-Event-ID` header beats `?since_event_id`
+    // when both are present. The cache below records which `since`
+    // it was asked about so the test asserts the header (not the
+    // query) reached `replay_since`.
+    let header_marker = EventId::now_v7();
+    let query_marker = EventId::now_v7();
+    assert_ne!(header_marker, query_marker);
+
+    let cache = Arc::new(RecordingCache::default());
+    let orch = Arc::new(WithCache::new(cache.clone()));
+    let app = build_app(test_state(orch));
+
+    let res = app
+        .oneshot(
+            Request::get(format!("/v1/events?since_event_id={query_marker}"))
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .header("last-event-id", header_marker.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The handler returns 200 with an SSE body; the body itself
+    // doesn't matter here, only that we hit the replay path.
+    assert_eq!(res.status(), StatusCode::OK);
+    drop(res);
+    let observed = *cache.last_seen.lock().await;
+    assert_eq!(
+        observed,
+        Some(header_marker),
+        "replay_since received the wrong resume marker — Last-Event-ID should win"
+    );
+}
+
+#[tokio::test]
 async fn events_rejects_malformed_resume_marker() {
     let app = build_app(stub_state());
     let res = app
         .oneshot(
-            Request::get("/events?since_event_id=garbage")
+            Request::get("/v1/events?since_event_id=garbage")
                 .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -437,6 +535,25 @@ impl ReplayCache<EventPayload> for InMemoryCache {
     }
     fn window(&self) -> Duration {
         Duration::from_secs(3600)
+    }
+}
+
+/// Cache that records which `since` marker `replay_since` was
+/// invoked with, then returns an empty replay. Used to pin the
+/// Last-Event-ID-vs-query precedence contract.
+#[derive(Default)]
+struct RecordingCache {
+    last_seen: Mutex<Option<EventId>>,
+}
+
+#[async_trait]
+impl ReplayCache<EventPayload> for RecordingCache {
+    async fn replay_since(
+        &self,
+        since: EventId,
+    ) -> Result<Vec<Envelope<EventPayload>>, ReplayError> {
+        *self.last_seen.lock().await = Some(since);
+        Ok(Vec::new())
     }
 }
 

@@ -26,9 +26,21 @@ use crate::error::WireError;
 /// Configuration for the bearer-token check. The token is read once
 /// at daemon startup; rotation is "delete the file and restart" per
 /// the OpenAPI `securitySchemes.bearerAuth.description`.
-#[derive(Debug, Clone)]
+///
+/// Manual `Debug` impl that redacts the bearer field — a stray
+/// `tracing::debug!(state = ?state)` would otherwise write the live
+/// token to stdout/syslog with no recovery.
+#[derive(Clone)]
 pub struct AuthConfig {
     pub bearer: String,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("bearer", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Errors surfaced when loading / minting the token file.
@@ -70,11 +82,14 @@ pub fn load_or_mint(path: &std::path::Path) -> Result<AuthConfig, TokenError> {
         if !bearer.is_empty() {
             return Ok(AuthConfig { bearer });
         }
-        // Empty file — fall through to mint, then truncate-and-write.
-        // `create_new(true)` would fail because the file exists, so
-        // remove first and let the mint path recreate it with mode
-        // 0600.
-        std::fs::remove_file(path)?;
+        // Empty file — fall through to mint. We DON'T `remove_file`
+        // first: that would race against another daemon process that
+        // also saw the empty file (or against a half-finished edit
+        // by the user). Instead the mint path uses
+        // `create(true).truncate(true)` which atomically replaces
+        // the contents, and chmods after open so the perms on the
+        // resulting file are 0600 even if it pre-existed with looser
+        // perms.
     }
 
     if let Some(parent) = path.parent() {
@@ -87,15 +102,22 @@ pub fn load_or_mint(path: &std::path::Path) -> Result<AuthConfig, TokenError> {
 
 #[cfg(unix)]
 fn create_dir_all_with_mode_0700(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(path)?;
-    // `create_dir_all` honors the process umask; explicitly tighten
-    // to 0700 so a permissive umask doesn't leak the token directory
-    // to other local users. Idempotent — safe to call on an
-    // already-tight directory.
+    // `DirBuilder::mode(0o700)` sets perms ATOMICALLY at creation
+    // time (no umask-permissive window like `create_dir_all` +
+    // `set_permissions` would have). The chmod-on-existing branch
+    // below tightens an already-extant directory to 0700 in case a
+    // pre-cleanup install left it 0755.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
     let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(path, perms)?;
+    if perms.mode() & 0o777 != 0o700 {
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)?;
+    }
     Ok(())
 }
 
@@ -108,12 +130,26 @@ fn create_dir_all_with_mode_0700(path: &std::path::Path) -> std::io::Result<()> 
 fn write_with_mode_0600(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    // `create(true).truncate(true)` atomically replaces the
+    // contents of an existing file (the empty-token-file
+    // self-heal path) and creates it fresh otherwise — no
+    // remove-then-create race with a concurrent starter.
+    // `.mode(0o600)` only fires when the file is created NEW;
+    // for the truncate-existing case we explicitly chmod after
+    // open to drop any looser permissions a previous owner left.
     let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .write(true)
         .mode(0o600)
         .open(path)?;
     f.write_all(contents.as_bytes())?;
+    let mut perms = f.metadata()?.permissions();
+    if perms.mode() & 0o777 != 0o600 {
+        perms.set_mode(0o600);
+        f.set_permissions(perms)?;
+    }
     Ok(())
 }
 
@@ -155,15 +191,25 @@ pub async fn require_bearer_except_health(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if req.uri().path() == "/health" {
+    if req.uri().path() == "/v1/health" {
         return next.run(req).await;
     }
 
+    // Auth-scheme is case-insensitive per RFC 7235 §2.1, so accept
+    // `Bearer`, `bearer`, `BEARER` as the prefix. We split on the
+    // first whitespace, lowercase the scheme word, and compare;
+    // anything malformed (no whitespace, wrong scheme) falls through
+    // to a 401.
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
+        .and_then(|s| {
+            let (scheme, rest) = s.split_once(char::is_whitespace)?;
+            scheme
+                .eq_ignore_ascii_case("Bearer")
+                .then_some(rest.trim_start())
+        });
 
     let ok = match presented {
         Some(token) => bearer_eq(token, &state.auth.bearer),

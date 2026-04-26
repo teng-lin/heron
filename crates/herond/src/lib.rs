@@ -54,18 +54,35 @@ pub struct AppState {
     pub auth: Arc<AuthConfig>,
 }
 
+/// API version prefix. The OpenAPI server URL is
+/// `http://127.0.0.1:7384/v1`, so every endpoint listed under
+/// `paths:` is mounted under this prefix in the actual router.
+/// Pull-out as a const so a future v2 (`api-bot-openapi.yaml`)
+/// nest can use a different one without searching for string
+/// literals.
+pub const API_PREFIX: &str = "/v1";
+
 /// Build the axum app. Used by `main.rs` to bind, and by the
 /// integration tests to drive requests in-process via
 /// `tower::ServiceExt::oneshot` — no port binding required.
+///
+/// Middleware ordering note: axum's `.layer()` is "last-added is
+/// outermost", so to make `Origin`-rejection pre-empt
+/// bearer-auth (the security expectation: a hostile browser page
+/// gets a 403 before the daemon even considers its credentials),
+/// `require_bearer_except_health` is added FIRST and
+/// `reject_browser_origin` is added LAST.
 pub fn build_app(state: AppState) -> Router {
-    Router::new()
+    let v1 = Router::new()
         .merge(routes::health::router())
         .merge(routes::events::router())
-        .merge(routes::unimpl::router())
-        .layer(axum::middleware::from_fn(auth::reject_browser_origin))
+        .merge(routes::unimpl::router());
+    Router::new()
+        .nest(API_PREFIX, v1)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer_except_health,
         ))
+        .layer(axum::middleware::from_fn(auth::reject_browser_origin))
         .with_state(state)
 }

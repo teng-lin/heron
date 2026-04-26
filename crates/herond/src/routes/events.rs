@@ -116,9 +116,10 @@ async fn get_events(
     let replayed = if let Some(since) = resume {
         match state.orchestrator.replay_cache() {
             Some(cache) => {
-                if let Some(window) = window_secs(cache.window()) {
-                    headers_out.insert("x-heron-replay-window-seconds", HeaderValue::from(window));
-                }
+                headers_out.insert(
+                    "x-heron-replay-window-seconds",
+                    HeaderValue::from(cache.window().as_secs()),
+                );
                 match cache.replay_since(since).await {
                     Ok(events) => events,
                     Err(ReplayError::WindowExceeded { .. }) => {
@@ -174,20 +175,41 @@ async fn get_events(
     });
     let merged = replay_stream.chain(live_stream);
 
-    let event_stream = merged.map(|res| {
-        res.map(|env| {
-            // event_type rides flattened on the envelope; surface it
-            // up so the SSE framing carries a typed `event:` field
-            // that matches the OpenAPI taxonomy. Match the enum
-            // directly rather than round-tripping the payload
-            // through `serde_json::Value` just to read the tag —
-            // that saves a heap allocation per event on the SSE
-            // hot path.
-            let event_type = event_type_of(&env.payload);
-            let id = env.event_id.to_string();
-            let data = serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_owned());
-            Event::default().id(id).event(event_type).data(data)
-        })
+    // Map (and drop) — if envelope serialization fails (which is
+    // infallible for the typed `EventPayload` variants today, but
+    // we don't want a future variant introducing a `serde_json::Error`
+    // to silently emit a `{}` frame that violates the
+    // `EventEnvelope` shape on the wire), we skip the frame entirely
+    // and log the failure so the daemon's stream contract is never
+    // corrupted. Subscribers notice gaps via `event_id`
+    // discontinuity, which is recoverable; a malformed envelope is
+    // not.
+    //
+    // NOTE for future authors: any per-event filter (the `topics`
+    // query param will route through here) MUST be applied to BOTH
+    // `replay_stream` and `live_stream`. The current chain shape
+    // makes it tempting to filter only `live`; that would silently
+    // leak filtered events through replay. Apply the filter on
+    // `merged` to guarantee uniformity.
+    let event_stream = merged.filter_map(|res| async move {
+        let env = res.ok()?;
+        let event_type = event_type_of(&env.payload);
+        let id = env.event_id.to_string();
+        let data = match serde_json::to_string(&env) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    event_id = %env.event_id,
+                    event_type,
+                    "envelope serialization failed; dropping SSE frame",
+                );
+                return None;
+            }
+        };
+        Some(Ok::<_, Infallible>(
+            Event::default().id(id).event(event_type).data(data),
+        ))
     });
 
     let pinned: Pinned<Result<Event, Infallible>> = Box::pin(event_stream);
@@ -205,10 +227,6 @@ async fn get_events(
 /// the upstream stream pipeline doesn't propagate into a type
 /// signature explosion.
 type Pinned<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
-
-fn window_secs(d: Duration) -> Option<u64> {
-    Some(d.as_secs())
-}
 
 /// Map an `EventPayload` variant to its OpenAPI `event_type` literal.
 /// Hand-coded match: keeps the SSE projection on the hot path
