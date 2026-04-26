@@ -1,6 +1,6 @@
 # Observability
 
-Per [`docs/implementation.md`](implementation.md) §5.7 + §19.2.
+Per [`docs/archives/implementation.md`](implementation.md) §5.7 + §19.2.
 
 ## Logging
 

@@ -1,5 +1,5 @@
 //! Manage `herond` as an in-process axum service co-tenanted with the
-//! Tauri runtime — Gap #7 from `docs/codebase-gaps.md`.
+//! Tauri runtime — Gap #7 from `docs/archives/codebase-gaps.md`.
 //!
 //! Before this module shipped, the onboarding wizard's five Test
 //! buttons verified TCC permissions in isolation and then the user

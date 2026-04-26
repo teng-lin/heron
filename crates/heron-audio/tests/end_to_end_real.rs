@@ -18,7 +18,7 @@
 //! On non-Apple platforms the file compiles to an empty test binary —
 //! there is no Core Audio process tap off-Apple in v0.
 //!
-//! Runbook: see `docs/manual-test-matrix.md` — the §6.3 AEC test rig
+//! Runbook: see `docs/archives/manual-test-matrix.md` — the §6.3 AEC test rig
 //! row is now actually runnable end-to-end via this harness.
 
 #![cfg(target_os = "macos")]
@@ -32,7 +32,7 @@ use heron_types::SessionId;
 use hound::WavReader;
 
 #[tokio::test]
-#[ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/manual-test-matrix.md"]
+#[ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/archives/manual-test-matrix.md"]
 async fn end_to_end_session_writes_three_wavs() {
     if std::env::var_os("HERON_PROCESS_TAP_REAL").is_none() {
         eprintln!(

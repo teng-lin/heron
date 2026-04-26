@@ -4,7 +4,7 @@
 //! Tauri app and pipes its [`SessionEventBus`] into a
 //! [`TauriEventSink`]. Today the wiring is **dormant** — there are
 //! no in-process publishers in the desktop app yet (every domain
-//! event flows over herond's HTTP/SSE per `docs/codebase-gaps.md`
+//! event flows over herond's HTTP/SSE per `docs/archives/codebase-gaps.md`
 //! gap #11). The slot exists so that when an in-process publisher
 //! lands (e.g. a future `heron-cli` v2 command path that ran
 //! locally instead of round-tripping through herond, or an
@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_publish_fans_out_to_tauri_and_sse_subscribers() {
-        // Invariant 13 (`docs/api-design-spec.md` §10) says every
+        // Invariant 13 (`docs/archives/api-design-spec.md` §10) says every
         // transport is a projection of the canonical
         // `heron_event::EventBus`; no transport invents its own
         // event types or its own publish path. Pin that property
@@ -429,7 +429,7 @@ mod tests {
         // [`LocalSessionOrchestrator`]'s bus. A single publish must
         // reach both sinks.
         //
-        // Closes `docs/codebase-gaps.md` gap #11's underlying concern
+        // Closes `docs/archives/codebase-gaps.md` gap #11's underlying concern
         // (multi-subscriber fan-out works once v2 frontends multiply)
         // — the integration coverage was missing even though both
         // sinks shipped in phases 80 / 82.

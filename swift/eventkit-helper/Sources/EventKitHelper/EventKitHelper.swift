@@ -1,6 +1,6 @@
 // EventKitHelper — Swift bridge for calendar access. See
-// docs/implementation.md §5.4 (canonical bridge pattern) and
-// docs/swift-bridge-pattern.md for the cross-bridge conventions.
+// docs/archives/implementation.md §5.4 (canonical bridge pattern) and
+// docs/archives/swift-bridge-pattern.md for the cross-bridge conventions.
 
 import EventKit
 import Foundation

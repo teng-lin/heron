@@ -1,4 +1,4 @@
-//! Per `docs/implementation.md` §10.7 — the 12-case merge-on-write
+//! Per `docs/archives/implementation.md` §10.7 — the 12-case merge-on-write
 //! matrix. Each test constructs a (base, ours, theirs) triple from a
 //! shared baseline `Frontmatter`, runs `merge()`, and asserts on the
 //! field that scenario is testing.
@@ -73,7 +73,7 @@ fn case_1_user_adds_tag_and_llm_tags_merged() {
 
     assert!(merged.frontmatter.tags.contains(&"priority".into()));
     // ours wins entirely under llm_inferred-on-edit; LLM's "revenue"
-    // does not survive. Documented in docs/merge-model.md.
+    // does not survive. Documented in docs/archives/merge-model.md.
     assert!(!merged.frontmatter.tags.contains(&"revenue".into()));
 }
 
@@ -193,7 +193,7 @@ fn case_10_cost_overwrites_unconditionally() {
 #[test]
 fn case_11_user_edit_to_disclosed_is_overwritten() {
     // disclosed is heron_managed → user edits to it are *intentionally*
-    // dropped. Documented in docs/merge-model.md.
+    // dropped. Documented in docs/archives/merge-model.md.
     let base = baseline();
     let mut ours = baseline();
     ours.disclosed.when = Some("99:99".into()); // user edit

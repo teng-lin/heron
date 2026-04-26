@@ -65,7 +65,7 @@ function isNotFoundError(message: string): boolean {
 /**
  * Build the platform path the diagnostics command expects.
  * Mirrors the Rust side's `<cache>/sessions/<id>/heron_session.json`
- * layout per `docs/observability.md`.
+ * layout per `docs/archives/observability.md`.
  */
 function diagnosticsPath(cacheRoot: string, sessionId: string): string {
   return `${cacheRoot}/sessions/${sessionId}/heron_session.json`;

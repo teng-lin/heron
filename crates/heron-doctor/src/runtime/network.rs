@@ -1,7 +1,7 @@
 //! Network reachability check.
 //!
 //! Heron makes exactly two outbound network classes (per
-//! `docs/security.md` "What heron deliberately does NOT do"):
+//! `docs/archives/security.md` "What heron deliberately does NOT do"):
 //!
 //! 1. **Whisper / sherpa-onnx model download** — one-shot at first
 //!    run, hits `github.com` (`crates/heron-speech/src/sherpa.rs:89`).

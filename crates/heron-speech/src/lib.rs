@@ -1,6 +1,6 @@
 //! `heron-speech` — speech-to-text.
 //!
-//! v0 surface from [`docs/implementation.md`](../../../docs/implementation.md)
+//! v0 surface from [`docs/archives/implementation.md`](../../../docs/archives/implementation.md)
 //! §8.1. Two backends ship in v1: WhisperKit (the §4 spike, primary)
 //! and Sherpa (`sherpa-onnx` parakeet, fallback). Both implement
 //! [`SttBackend`]; `heron-session` picks one at session start per

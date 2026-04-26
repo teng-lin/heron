@@ -1,7 +1,7 @@
 //! `heron-bridge` — audio I/O bridge between `heron-bot` and `heron-realtime`.
 //!
 //! Layer 2 of the four-layer v2 architecture per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §1.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §1.
 //! The hardest engineering surface in v2: getting 16kHz PCM out of
 //! whatever the driver exposes (Recall WebSocket bytes, Attendee live
 //! PCM, native callbacks) into the realtime backend's input stream,

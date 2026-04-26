@@ -14,7 +14,7 @@
 //! On non-Apple platforms the file compiles to an empty test
 //! binary — there is no cpal mic capture off-Apple in v0.
 //!
-//! Runbook: see `docs/manual-test-matrix.md` — search for the
+//! Runbook: see `docs/archives/manual-test-matrix.md` — search for the
 //! "mic capture real" row.
 
 #![cfg(target_os = "macos")]
@@ -27,7 +27,7 @@ use heron_types::{Channel, Event, SessionClock, SessionId};
 use tokio::sync::broadcast;
 
 #[tokio::test]
-#[ignore = "needs HERON_MIC_CAPTURE_REAL=1 + TCC microphone + a working input device; see docs/manual-test-matrix.md"]
+#[ignore = "needs HERON_MIC_CAPTURE_REAL=1 + TCC microphone + a working input device; see docs/archives/manual-test-matrix.md"]
 async fn mic_capture_emits_at_least_one_mic_frame() {
     if std::env::var_os("HERON_MIC_CAPTURE_REAL").is_none() {
         eprintln!(

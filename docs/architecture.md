@@ -1,266 +1,290 @@
-# heron-style meeting capture: architecture notes
+# Heron Architecture
 
-Design exploration for decomposing a private, on-device meeting capture system
-(à la `char` / `oh-my-whisper`) into reusable libraries with a clean agent
-integration surface.
+This document describes the current codebase, not the archived build
+plans. Historical planning, research, and spike notes live in
+[`docs/archives/`](archives/). The active wire contracts that remain at
+the root of `docs/` are:
 
-## Starting decomposition (as given)
+- [`api-desktop-openapi.yaml`](api-desktop-openapi.yaml) for the local
+  desktop daemon.
+- [`api-bot-openapi.yaml`](api-bot-openapi.yaml) for the meeting-bot
+  driver boundary.
 
-1. Audio capture
-2. Transcribe
-3. Note organization
-4. Meeting integration / contact management
+## Product Shape
 
-## Gaps worth naming explicitly
+Heron has two related product paths.
 
-- **Session lifecycle / detection.** The "when to start, when to stop, what
-  audio belongs to which meeting" state machine. `char` buries this in the
-  listener actor; `oh-my-whisper` punts it to the user
-  (`whisper record --app us.zoom.xos`). This is the component that makes
-  "behind the scenes" actually work — calendar + running-process +
-  audio-activity fusion into a state machine. It is not part of capture, not
-  part of notes.
-- **Diarization / speaker attribution.** Separating mic vs. speaker channels
-  (what `char` does today) gives you "me vs. them" — not "Alice vs. Bob within
-  them." Different model, different library (pyannote / wespeaker), and most
-  downstream features (who-said-what summaries, per-person action items)
-  depend on it.
-- **Summarization / LLM orchestration.** Often lumped into "note
-  organization," but the LLM layer (prompt templates, model routing local ↔
-  cloud, BYO-LLM, caching) is its own concern. `char`'s BYO-LLM + templates
-  logic is really this layer.
-- **Storage / indexing / retrieval.** Once you have 500 meetings, "AI chat
-  over notes" needs a vector index and cross-meeting query. Separate from the
-  editor.
-- **Consent / disclosure.** Legally load-bearing in two-party-consent
-  jurisdictions. TCC plumbing is technical; the disclosure / recording-notice
-  UX is a product concern that belongs in a reusable library so every
-  consumer handles it the same way.
-- **Agent integration surface.** The events/query API that external tools
-  (GUIs, CLIs, MCP servers, agent loops) consume. See below.
+The v1 path is a private meeting note-taker for macOS and Zoom. It
+captures the native meeting app without joining as a visible bot,
+transcribes locally where possible, uses meeting-app signals for
+speaker attribution, summarizes through the selected LLM backend, and
+writes Markdown notes plus audio sidecars into a user-owned vault.
 
-## Target decomposition
+The v2 path turns Heron into an agent participant. It joins a meeting
+through a bot driver, receives realtime meeting state, gates speech
+through policy, and sends speech/audio through a realtime backend. The
+v2 code exists as explicit layers today, with Recall.ai as the first
+concrete bot driver. The realtime speech path is still incomplete.
 
-```
-heron-types        [shipped] shared types (Event, SessionId, SpeakerEvent, …)
-heron-audio        [shipped] capture (tap + mic + AEC, ringbuffer, backpressure)
-heron-speech       [shipped] transcribe (pluggable: WhisperKit Swift bridge, others)
-heron-zoom         [shipped] speaker attribution via Zoom AXObserver + aligner
-heron-llm          [shipped] summarize / extract / template (local ↔ cloud ↔ BYO)
-heron-vault        [shipped] markdown-vault writer (Obsidian-style notes,
-                              EventKit calendar bridge, merge-on-write,
-                              m4a encode + verify, ringbuffer purge, validator)
-heron-cli          [shipped] `heron` orchestrator binary + lib (session,
-                              session_log, synthesize subcommands)
-heron-doctor       [shipped] offline diagnostics CLI
+## Process Topology
 
-heron-diarize      [planned] within-channel speaker attribution
-                              (Alice/Bob, beyond mic-vs-speaker)
-heron-session      [planned] full lifecycle hub
-                              (calendar + running app + audio fusion);
-                              currently the orchestrator role is split
-                              between heron-cli and heron-zoom
-heron-index        [planned] semantic search across sessions
-heron-events       [planned] event stream + query API; today consumers
-                              wire crates directly via heron-cli
-```
-
-Everything outside the core libraries — the Tauri desktop app
-(`apps/desktop`), the `heron` CLI, an MCP server, a hypothetical Raycast
-extension — should eventually be a thin client over `heron-events`. Today
-the desktop app and CLI both wire the crates directly; collapsing that to
-a single event surface is still future work.
-
-**Storage model deviation.** Earlier drafts of this doc named `heron-store`
-as a SQLite-backed persistence layer. The shipped design replaces it with
-`heron-vault` — a plain-markdown vault (YAML frontmatter + Obsidian-style
-notes) with merge-on-write semantics. SQLite + a vector index (`heron-index`)
-are still on the table for cross-meeting query, but the canonical store is
-files on disk so the user owns the data in a tool-agnostic format.
-
-## Ideal agent integration
-
-As a meeting participant the human wants zero involvement. That pushes the
-agent-facing API toward **events, not commands**:
-
-1. **Ambient subscribe, not manual poll.** A local IPC / socket (or FSEvents
-   over a known directory, à la `oh-my-whisper` but with a proper event fd)
-   that emits: `session.detected`, `session.started`, `transcript.partial`,
-   `transcript.final`, `session.ended`, `summary.ready`,
-   `action_items.ready`. The agent never polls. The agent never asks "is a
-   meeting happening?"
-2. **Read-only query for history.** SQLite file or gRPC — "give me all action
-   items assigned to me this week," "find the meeting where we discussed X."
-   This is where the index earns its keep.
-3. **Context injection back in.** Before the meeting, push: "here's the
-   agenda, here's the relevant PR, here's what this person said last time."
-   `heron-session` should accept pre-meeting context keyed to the calendar
-   event so summaries come out better.
-4. **Post-meeting hooks.** `on(summary.ready) → draft follow-up email`,
-   `on(action_items.ready) → create Linear tickets`. The service should not
-   ship those integrations; it should expose the event so the agent can.
-5. **No `start` / `stop` API in the happy path.** If the agent ever has to
-   call `record_start()`, session detection failed. Manual trigger exists as
-   an escape hatch, not the primary interface.
-
-**Tradeoff.** Making `heron-session` this smart is the hardest piece by far
-(calendar ACLs, per-app audio heuristics, false-positive handling when you
-play a YouTube video during lunch), and it is the piece that most determines
-whether the product feels ambient or feels like yet another "hit record"
-app. Build everything else to be trivially replaceable and sink the design
-effort there.
-
-## Architecture diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        CONSUMERS (thin clients)                              │
-│                                                                              │
-│   Tauri desktop      heron CLI         heron-doctor      MCP server          │
-│   (apps/desktop)     (heron-cli)       (diagnostics)     (planned)           │
-└────────┬─────────────────┬──────────────────┬──────────────────┬─────────────┘
-         │                 │                  │                  │
-         ▼                 ▼                  ▼                  ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                  heron-events  [planned: see §"invariant"]                   │
-│  subscribe()  query()  inject_context()  on(summary.ready) …                 │
-│                                                                              │
-│  session.detected ─ started ─ transcript.partial ─ transcript.final          │
-│                ─ ended ─ summary.ready ─ action_items.ready                  │
-│                                                                              │
-│  Today: consumers wire heron-cli + crates directly. The event surface is     │
-│  the next consolidation.                                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                     ▲
-          ┌──────────────────────────┼──────────────────────────┐
-          │                          │                          │
-          │        ┌─────────────────┴──────────────────┐       │
-          │        │   heron-session  [planned hub]     │       │
-          │        │   today: orchestration split       │       │
-          │        │   between heron-cli (sessions,     │       │
-          │        │   session_log) + heron-zoom        │       │
-          │        │   (AXObserver-driven detection)    │       │
-          │        │                                    │       │
-          │        │  calendar + running app + audio    │       │
-          │        │  activity  →  DETECTED → ARMED     │       │
-          │        │  → RECORDING → ENDED → DONE        │       │
-          │        └──┬──────────┬─────────────┬────────┘       │
-          │           │arms      │triggers     │emits events    │
-          │           ▼          ▼             │                │
-          │  ┌──────────────┐  ┌─────────────────────────────┐  │
-          │  │ heron-audio  │─▶│ heron-speech                │  │
-          │  │              │  │ (WhisperKit Swift bridge,   │  │
-          │  │ tap + mic    │  │  others pluggable)          │  │
-          │  │ + AEC +      │  └──────────────┬──────────────┘  │
-          │  │ ringbuffer   │                 │                 │
-          │  └──────────────┘                 ▼                 │
-          │                   ┌──────────────────────────────┐  │
-          │                   │  heron-zoom                  │  │
-          │                   │  (Zoom AXObserver speaker    │  │
-          │                   │   attribution + aligner)     │  │
-          │                   │                              │  │
-          │                   │  heron-diarize  [planned]    │  │
-          │                   │  (within-channel: Alice/Bob) │  │
-          │                   └──────────────┬───────────────┘  │
-          │                                  ▼                  │
-          │                   ┌──────────────────────────────┐  │
-          │                   │  heron-llm                   │  │
-          │                   │  summarize · extract actions │  │
-          │                   │  · templates · routing       │  │
-          │                   │  (local ↔ cloud ↔ BYO)       │  │
-          │                   └──────────────┬───────────────┘  │
-          │                                  ▼                  │
-          │                   ┌──────────────────────────────┐  │
-          │                   │  heron-vault                 │  │
-          │                   │  markdown vault writer       │  │
-          │                   │  (Obsidian-style notes,      │  │
-          │                   │   merge-on-write,            │  │
-          │                   │   m4a encode + verify,       │  │
-          │                   │   ringbuffer purge,          │  │
-          │                   │   EventKit Swift bridge,     │  │
-          │                   │   vault validator)           │  │
-          │                   └──────────────┬───────────────┘  │
-          │                                  │                  │
-          │                                  ▼                  │
-          │                   ┌──────────────────────────────┐  │
-          │                   │  heron-index   [planned]     │  │
-          │                   │  semantic search across      │  │
-          │                   │  meetings                    │  │
-          │                   └──────────────────────────────┘  │
-          │                                                     │
-          └────────────── consent / TCC / disclosure ───────────┘
-                          (cross-cutting; will live with heron-session)
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                       Swift bridge layer (swift/)                            │
-│                                                                              │
-│  whisperkit-helper       eventkit-helper        zoomax-helper                │
-│  (heron-speech)          (heron-vault)          (heron-zoom)                 │
-│                                                                              │
-│  Each crate links a static library produced by a sibling Swift package via   │
-│  swift-rs + a build.rs `links =` directive. See docs/swift-bridge-pattern.md.│
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                       macOS primitives                                       │
-│                                                                              │
-│  Core Audio         CPAL /          EventKit         AXObserver /            │
-│  Process Taps       AVAudioEngine   (Calendar)       NSWorkspace             │
-│  (system audio)     (mic)                            (running apps + UI)     │
-│                                                                              │
-│  TCC: kTCCServiceAudioCapture · kTCCServiceMicrophone · Calendar             │
-│       · Accessibility (AXObserver)                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
+```text
+                         +----------------------+
+                         |      User / UI       |
+                         +----------+-----------+
+                                    |
+                                    v
+                 +------------------+-------------------+
+                 | apps/desktop React renderer          |
+                 | onboarding, recording, review,       |
+                 | salvage, settings                    |
+                 +------------------+-------------------+
+                                    |
+                         Tauri invoke + events
+                                    |
+                                    v
+                 +------------------+-------------------+
+                 | apps/desktop/src-tauri               |
+                 | settings, keychain, tray, notes,     |
+                 | probes, daemon startup, IPC events   |
+                 +------------+----------------+--------+
+                              |                |
+                              | shared         | Tauri IPC
+                              | orchestrator   v
+                              |       +--------+---------+
+                              |       | WebView listeners|
+                              |       +------------------+
+                              v
+        +---------------------+----------------------+
+        | crates/heron-orchestrator                  |
+        | SessionOrchestrator impl, event bus,       |
+        | replay cache, vault reads, calendar reads, |
+        | manual capture FSM events                  |
+        +----------+----------------------+----------+
+                   |                      |
+                   | HTTP projection      | v1 pipeline helpers
+                   v                      v
+        +----------+-----------+   +------+----------------------+
+        | crates/herond        |   | capture / speech / LLM /    |
+        | localhost HTTP + SSE |   | vault crates                |
+        +----------+-----------+   +-----------------------------+
+                   |
+                   v
+        +----------+-----------+
+        | CLI / local clients  |
+        | bearer auth + SSE    |
+        +----------------------+
 ```
 
-### Reading the diagram
+The desktop shell and `herond` share the same domain model through
+`heron-session`. `herond` is intentionally localhost-only. Browser-origin
+requests are rejected, `/health` is unauthenticated, and other endpoints
+use a bearer token loaded from `~/.heron/cli-token`.
 
-- **Vertical axis is trust / abstraction.** OS primitives at the bottom,
-  Swift bridges and reusable Rust libraries in the middle, consumer UIs at
-  the top. The eventual rule is that every consumer goes through
-  `heron-events` — no consumer pokes `heron-audio` or `heron-speech` directly.
-  This is not yet true: today the Tauri shell and `heron-cli` wire crates
-  directly. See "the one invariant to defend" below.
-- **Swift bridges are first-class, not an implementation detail.** Three
-  capabilities — WhisperKit transcription, EventKit calendar reads, and
-  Zoom AX observation — only have stable Apple-native APIs in Swift, so each
-  consuming crate (`heron-speech`, `heron-vault`, `heron-zoom`) compiles a
-  Swift package into a static library and links it via `swift-rs` plus a
-  `build.rs` with `links = "…Helper"`. The pattern is documented once in
-  `docs/swift-bridge-pattern.md` and copy-pasted with deliberate uniformity.
-- **`heron-session` is the hub, not `heron-audio`** — but it does not exist
-  as its own crate yet. Today the orchestration role is split:
-  `heron-cli::session` owns the `DETECTED → ARMED → RECORDING → ENDED → DONE`
-  state machine and `heron-zoom` owns the AXObserver-driven attribution
-  signal. The intent is still to consolidate into a `heron-session` hub
-  wired to calendar + running apps + audio activity.
-- **Horizontal flow is the data pipeline.**
-  `audio → speech → zoom (attribution) → llm → vault (+ planned index)`.
-  Each stage is pluggable: swap WhisperKit for SenseVoice, swap local LLM
-  for Claude, swap the markdown vault for something else — nothing else
-  should change because all stages will talk through `heron-events`.
-- **`heron-vault` is files on disk, not a database.** Sessions become
-  Obsidian-style markdown notes with YAML frontmatter, merged into existing
-  notes via `heron-vault::merge`, audio sidecars are encoded to m4a +
-  verified, and a validator (`validate-vault` binary) sanity-checks the tree.
-  The user owns the data in a tool-agnostic format. A SQLite-backed
-  `heron-index` for cross-meeting query is still planned but is additive,
-  not a replacement.
-- **`heron-events` is the agent surface.** Once it lands it will carry both
-  the realtime event stream (subscribe) and the historical query API
-  (query). An agent should never touch anything else. The CLI's
-  `session_log` writer is the closest thing today; an MCP server and a
-  proper subscribe socket are the next steps.
-- **Consent lives on the session boundary** because that is where "a
-  recording is about to start" is a meaningful moment — not at the audio
-  layer, which is too low, and not in the UI, which is too client-specific.
+The CLI is a separate entry point. `crates/heron-cli` wires direct v1
+recording and summarization paths and exposes operational subcommands
+such as `status`, `salvage`, `synthesize`, `verify-m4a`, and `ax-dump`.
 
-### The one invariant to defend
+## Crate Map
 
-**Consumers must eventually talk to `heron-events`, never to internal
-libraries.** Today the Tauri desktop shell and the `heron` CLI both reach
-directly into `heron-audio`, `heron-speech`, `heron-vault`, etc. — that is
-expected for a pre-`heron-events` codebase, but every additional consumer
-that takes the shortcut increases the cost of introducing the event layer
-later. New consumers (MCP server, additional UIs) should be designed
-against the planned event surface, not against the current crate graph.
+### Shared Domain
+
+`heron-types` contains shared IDs, recording FSM types, recovery state,
+session clocks, channels, turns, and typed prefixes such as `mtg_*` and
+`evt_*`.
+
+`heron-session` defines the desktop daemon's domain model:
+`Meeting`, `Transcript`, `Summary`, `CalendarEvent`, health types,
+event payloads, and the `SessionOrchestrator` trait. The OpenAPI file is
+a projection of this contract.
+
+### Eventing And Transports
+
+`heron-event` owns the canonical event envelope, `EventBus`, `EventSink`,
+and `ReplayCache` traits. Domain payloads do not live here; the crate is
+transport-agnostic.
+
+`heron-event-http` provides HTTP/SSE support pieces: replay cache,
+topic filtering, replay-window headers, and SSE formatting helpers.
+
+`heron-event-tauri` projects event envelopes into Tauri IPC events for
+the desktop WebView.
+
+### Desktop API
+
+`herond` is the Axum daemon. It serves:
+
+- `GET /v1/health`
+- `GET /v1/events` as Server-Sent Events with heartbeat and resume
+- `/v1/meetings*`
+- `/v1/calendar/upcoming`
+- `/v1/context`
+
+Handlers are thin projections over `SessionOrchestrator`.
+
+`heron-orchestrator` is the current local implementation. It has a live
+event bus, in-memory replay cache, vault-backed read paths, EventKit
+calendar reads, and manual capture lifecycle events. Capture lifecycle
+methods currently drive a recording FSM and publish meeting events; they
+do not yet run the full live audio -> STT -> LLM pipeline behind the
+daemon.
+
+### v1 Capture And Notes
+
+`heron-audio` captures audio on macOS. It owns the Core Audio process tap,
+mic capture, WebRTC APM/AEC hooks, WAV writing, disk ringbuffer,
+backpressure tracking, and recovery scanning.
+
+`heron-speech` owns speech-to-text backends. WhisperKit is the Apple
+primary path through a Swift bridge, and Sherpa/ONNX is the bundled
+fallback path. The common interface is `SttBackend`.
+
+`heron-zoom` owns Zoom-specific speaker attribution. It uses the macOS
+accessibility tree through a Swift helper and aligns speaker events with
+transcript turns.
+
+`heron-llm` owns summary generation. It contains transcript/content
+conversion, provider selection, Anthropic, Claude Code, Codex, cost
+tracking, and the meeting summary template.
+
+`heron-vault` is the storage boundary. It writes Obsidian-style Markdown
+notes, preserves user edits during re-summarization, reads EventKit
+calendar data through a Swift bridge, encodes and verifies audio
+sidecars, purges cached audio after verification, and validates vault
+integrity.
+
+### Desktop Shell
+
+`apps/desktop/src` is the React renderer. It contains the onboarding,
+home, recording, review, salvage, and settings pages plus shared stores
+and UI components.
+
+`apps/desktop/src-tauri` is the Rust side of the Tauri app. It provides
+commands for settings, keychain access, onboarding probes, diagnostics,
+note reads/writes, re-summarization, salvage, disk checks, tray
+navigation, asset resolution, the in-process event bus, and daemon
+startup.
+
+### Diagnostics And Operations
+
+`heron-doctor` has two roles:
+
+- offline log parsing and anomaly detection for session summaries
+- runtime preflight checks for ONNX, Zoom process availability,
+  Keychain ACLs, and network reachability
+
+`validate-vault` is a binary from `heron-vault` that walks a vault and
+reports note integrity issues.
+
+### v2 Participant Layers
+
+The participant stack is split into four crates:
+
+- `heron-bot`: meeting-bot driver boundary and first Recall.ai driver
+- `heron-bridge`: PCM, jitter buffer, resampling, mixing, and bridge
+  health primitives
+- `heron-policy`: speech-control contract, filtering, queues,
+  controller state, validation, and escalation handling
+- `heron-realtime`: realtime LLM session boundary with mock and fallback
+  implementations
+
+The intended flow is:
+
+```text
+Meeting platform
+  -> heron-bot
+  -> heron-bridge
+  -> heron-realtime
+  -> heron-policy
+  -> heron-bot
+  -> Meeting platform
+```
+
+The Recall driver can create and track bot lifecycle state against the
+Recall API. Real TTS output, webhook ingestion, and the end-to-end
+speech loop still need to be completed.
+
+## v1 Data Flow
+
+```text
+Zoom on macOS
+  -> heron-audio
+       tap.wav, mic.wav, mic_clean.wav, capture events
+  -> heron-speech
+       partial JSONL and final turns
+  -> heron-zoom
+       speaker attribution and turn alignment
+  -> heron-llm
+       Markdown summary and structured frontmatter
+  -> heron-vault
+       note, transcript sidecar, audio sidecar, merge/recovery metadata
+```
+
+Crash recovery is file-based. Session state is written under the cache
+root, `heron salvage` discovers unfinished sessions, and the desktop
+salvage UI can finalize or purge candidates.
+
+## Desktop API Flow
+
+```text
+Client
+  -> herond HTTP route
+  -> SessionOrchestrator method
+  -> LocalSessionOrchestrator
+  -> vault/calendar/FSM/event bus
+  -> HTTP JSON response or SSE event
+```
+
+For live event consumption:
+
+```text
+Publisher
+  -> heron_event::EventBus
+  -> InMemoryReplayCache
+  -> herond /v1/events
+  -> SSE client with Last-Event-ID resume
+```
+
+The Tauri path uses the same bus concept but projects events into WebView
+IPC rather than SSE. Replay is available on the HTTP path; Tauri IPC
+listeners should treat missed events as lost.
+
+## Swift Bridge Pattern
+
+Three macOS capabilities are implemented through Swift packages:
+
+- `swift/whisperkit-helper` for WhisperKit transcription
+- `swift/eventkit-helper` for EventKit calendar access
+- `swift/zoomax-helper` for Zoom accessibility observation
+
+Rust crates link these helpers through `swift-rs` and `build.rs`.
+Swift-facing code should stay isolated behind the owning crate's Rust
+API so non-Apple builds can compile stubs or return platform-specific
+unavailable errors.
+
+## Storage Model
+
+The canonical user store is a Markdown vault on disk, not a service
+database. Notes use YAML frontmatter and Markdown bodies. Audio sidecars
+are encoded to m4a and verified before cached WAVs are purged. User edits
+are preserved by merge-on-write rather than overwriting the note with a
+fresh LLM response.
+
+The daemon read side can derive meeting resources from vault files.
+In-memory state is used for active captures, event replay, and daemon
+runtime coordination.
+
+## Current Boundaries And Gaps
+
+The current codebase has a real desktop shell, local daemon, event bus,
+vault read side, v1 CLI recording path, v1 summary path, and the first v2
+bot driver.
+
+The main unfinished areas are:
+
+- full daemon-backed live capture through `LocalSessionOrchestrator`
+- end-to-end v2 speech loop across bridge, realtime, policy, and bot
+- production TTS and webhook handling for Recall
+- cross-platform capture backends beyond macOS
+- meeting app support beyond Zoom
+- long-term semantic indexing across meetings

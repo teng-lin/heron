@@ -6,7 +6,7 @@ LLM's fresh output, and produces a new `<note>.md` that respects user
 edits while pulling in new LLM-derived content.
 
 This document is the single source of truth for which fields belong
-to which side. Source: [`docs/implementation.md`](implementation.md)
+to which side. Source: [`docs/archives/implementation.md`](implementation.md)
 §10. Implementation: [`crates/heron-vault/src/merge.rs`](../crates/heron-vault/src/merge.rs).
 
 ## Inputs

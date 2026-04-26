@@ -79,7 +79,7 @@ fn warn_on_unknown_versions(records: &[SessionSummaryRecord]) {
     if count > 0 {
         eprintln!(
             "warning: {count} record(s) have a non-1 log_version; \
-             schema may have drifted (see docs/observability.md §field-stability)"
+             schema may have drifted (see docs/archives/observability.md §field-stability)"
         );
     }
 }

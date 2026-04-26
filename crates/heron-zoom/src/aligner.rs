@@ -2,8 +2,8 @@
 //! emitted by [`crate::AxBackend`] to attribute speaker names with
 //! a confidence score.
 //!
-//! Algorithm per `docs/plan.md` §5 weeks 5–6 (5-step) and
-//! `docs/implementation.md` §9.3:
+//! Algorithm per `docs/archives/plan.md` §5 weeks 5–6 (5-step) and
+//! `docs/archives/implementation.md` §9.3:
 //!
 //! 1. Hold a sliding window of recent [`SpeakerEvent`]s (start/end
 //!    pairs become "speaker on the air for `[t0, t1]`" intervals).

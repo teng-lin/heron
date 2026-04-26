@@ -1,7 +1,7 @@
 //! `heron-event-http` — HTTP/SSE projection building blocks for the
 //! `/events` endpoint.
 //!
-//! Per `docs/api-design-spec.md` Invariant 13, every transport is a
+//! Per `docs/archives/api-design-spec.md` Invariant 13, every transport is a
 //! projection of the canonical [`heron_event`] bus. This crate ships
 //! the building blocks the desktop daemon (`herond`) needs to project
 //! the bus onto Server-Sent Events:

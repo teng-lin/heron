@@ -2,7 +2,7 @@
 //! offline regression of the aligner / STT once the real backends
 //! land.
 //!
-//! Per `docs/implementation.md` §19.5, each fixture under
+//! Per `docs/archives/implementation.md` §19.5, each fixture under
 //! `fixtures/<crate>/<case>/` is:
 //!
 //! - `mic.wav`  — 48 kHz mono, post-AEC user audio

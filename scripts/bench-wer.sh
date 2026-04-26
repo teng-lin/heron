@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bench-wer.sh — measure WER per backend on a `fixtures/speech/<case>/`
-# fixture and assert thresholds per `docs/implementation.md` §8.5.
+# fixture and assert thresholds per `docs/archives/implementation.md` §8.5.
 #
 # Until the WhisperKit + Sherpa wires land in weeks 4–5, this script
 # is a placeholder that:

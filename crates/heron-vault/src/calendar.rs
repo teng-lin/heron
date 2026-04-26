@@ -2,8 +2,8 @@
 //!
 //! The Swift side lives at `swift/eventkit-helper/` and exports three
 //! `@_cdecl` symbols (`ek_request_access`, `ek_read_window_json`,
-//! `ek_free_string`) — see `docs/implementation.md` §5.4 and
-//! `docs/swift-bridge-pattern.md`.
+//! `ek_free_string`) — see `docs/archives/implementation.md` §5.4 and
+//! `docs/archives/swift-bridge-pattern.md`.
 //!
 //! Functions in this module trigger a TCC prompt the first time they
 //! are called on a clean machine. Call `calendar_has_access` once at
@@ -139,7 +139,7 @@ pub fn calendar_read_one_shot(
     // SAFETY: `ek_read_window_json` writes a malloc'd C string into
     // `*out` and returns the event count. We hand ownership back via
     // `ek_free_string` below — the contract is documented in
-    // EventKitHelper.swift and `docs/swift-bridge-pattern.md`.
+    // EventKitHelper.swift and `docs/archives/swift-bridge-pattern.md`.
     let count = unsafe { ffi::ek_read_window_json(start, end, &mut buf) };
 
     if buf.is_null() {

@@ -1,5 +1,5 @@
 //! Codex CLI summarizer per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §11.1.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §11.1.
 //!
 //! Spawns `codex exec` as a subprocess with the rendered prompt +
 //! the transcript on stdin and parses the structured JSON it emits

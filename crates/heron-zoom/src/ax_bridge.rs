@@ -193,7 +193,7 @@ fn bundle_id_to_cstring(s: &str) -> Result<CString, AxBridgeError> {
 /// JSON document describing every visited node. Used by the
 /// `heron ax-dump` subcommand to capture the speaker-indicator
 /// `(role, subrole, identifier)` triple during a live Zoom call (per
-/// `docs/plan.md` §3.3 — the week-0 spike deliverable).
+/// `docs/archives/plan.md` §3.3 — the week-0 spike deliverable).
 ///
 /// `max_nodes` caps the walk; pass `0` to use the bridge's internal
 /// default (4096 — enough for a fully-populated 49-tile gallery).

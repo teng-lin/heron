@@ -272,9 +272,9 @@ itself, which should be its own follow-on PR per the migration plan.
 - `crates/heron-bot/examples/recall-spike.rs` — the harness
 - `spike-findings.jsonl` — gitignored, this run's output
 - `disclosure.mp3` — gitignored, the disclosure audio
-- [`docs/api-design-spec.md`](./api-design-spec.md) — the
+- [`docs/archives/api-design-spec.md`](./api-design-spec.md) — the
   invariants this spike validates against
-- [`docs/build-vs-buy-decision.md`](./build-vs-buy-decision.md) —
+- [`docs/archives/build-vs-buy-decision.md`](./build-vs-buy-decision.md) —
   the decision this spike informs
 - PR #85 — original spike harness
 - PR #99 — prefix-fix from this spike's first run

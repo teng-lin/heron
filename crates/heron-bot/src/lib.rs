@@ -1,7 +1,7 @@
 //! `heron-bot` — meeting-bot driver trait.
 //!
 //! Layer 1 of the four-layer v2 architecture per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §1.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §1.
 //! The boundary between heron-the-app and the meeting platform.
 //!
 //! Real implementations wrap a vendor: Recall.ai, Attendee, MeetingBaaS,

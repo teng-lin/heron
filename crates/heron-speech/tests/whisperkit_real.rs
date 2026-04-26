@@ -2,7 +2,7 @@
 //!
 //! Skipped unless `HERON_WHISPERKIT_MODEL_DIR` is set to a directory
 //! with a WhisperKit-compiled model bundle (see
-//! `docs/manual-test-matrix.md` "WhisperKit STT backend"). When the
+//! `docs/archives/manual-test-matrix.md` "WhisperKit STT backend"). When the
 //! env var is unset the test prints a notice and returns Ok — this is
 //! the contract `cargo test -p heron-speech` relies on so the unit
 //! suite stays clean on machines that haven't downloaded a model.
@@ -72,7 +72,7 @@ async fn whisperkit_real_smoke() {
             eprintln!(
                 "skipping whisperkit_real_smoke: set HERON_WHISPERKIT_MODEL_DIR to a \
                  WhisperKit model folder to run this test (see \
-                 docs/manual-test-matrix.md > 'WhisperKit STT backend')."
+                 docs/archives/manual-test-matrix.md > 'WhisperKit STT backend')."
             );
             return;
         }

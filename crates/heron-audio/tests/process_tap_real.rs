@@ -14,7 +14,7 @@
 //! On non-Apple platforms the file compiles to an empty test
 //! binary — there is no Core Audio process tap off-Apple.
 //!
-//! Runbook: see `docs/manual-test-matrix.md` — search for the
+//! Runbook: see `docs/archives/manual-test-matrix.md` — search for the
 //! "process tap real" row.
 
 #![cfg(target_os = "macos")]
@@ -26,7 +26,7 @@ use heron_audio::{AudioCapture, AudioError};
 use heron_types::SessionId;
 
 #[tokio::test]
-#[ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/manual-test-matrix.md"]
+#[ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/archives/manual-test-matrix.md"]
 async fn process_tap_emits_at_least_one_frame() {
     if std::env::var_os("HERON_PROCESS_TAP_REAL").is_none() {
         eprintln!(

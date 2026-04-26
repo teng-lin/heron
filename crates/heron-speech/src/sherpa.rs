@@ -1,4 +1,4 @@
-//! Production Sherpa-ONNX backend per `docs/implementation.md` §8.3.
+//! Production Sherpa-ONNX backend per `docs/archives/implementation.md` §8.3.
 //!
 //! Cross-platform fallback to the Apple-only WhisperKit path. Wraps
 //! `sherpa-rs` (the prebuilt-binaries Rust binding to `sherpa-onnx`)

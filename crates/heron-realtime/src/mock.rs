@@ -9,7 +9,7 @@
 //! `heron-orchestrator::LocalSessionOrchestrator`) would observe from
 //! a real backend.
 //!
-//! See [`docs/api-design-spec.md`](../../../docs/api-design-spec.md)
+//! See [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md)
 //! §6 (session lifecycle) and §9 (speech-control contract / capability
 //! matrix) for the contract being modelled. The real `OpenAiRealtime`
 //! backend ships in a follow-up PR; until then, every consumer of the

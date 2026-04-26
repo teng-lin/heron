@@ -3,7 +3,7 @@
 Every Swift helper that ships in v1 (`whisperkit-bridge`, `zoom-ax-backend`,
 `keychain-helper`) follows the same shape, established by
 `swift/eventkit-helper/` and documented here. The canonical source of
-truth is [`docs/implementation.md`](implementation.md) §5.4 — this
+truth is [`docs/archives/implementation.md`](implementation.md) §5.4 — this
 document is the condensed checklist.
 
 ## Layout

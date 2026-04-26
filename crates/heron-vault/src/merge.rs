@@ -1,5 +1,5 @@
-//! Merge-on-write per [`docs/implementation.md`](../../../docs/implementation.md) §10
-//! and [`docs/merge-model.md`](../../../docs/merge-model.md).
+//! Merge-on-write per [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §10
+//! and [`docs/archives/merge-model.md`](../../../docs/archives/merge-model.md).
 //!
 //! The vault writer takes three inputs on every re-summarize:
 //!

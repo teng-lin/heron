@@ -1,7 +1,7 @@
 //! Anomaly detection over parsed session summaries.
 //!
 //! Thresholds are **advisory** — they're tighter than the
-//! `docs/implementation.md` §18.2 hard ship criteria so the doctor
+//! `docs/archives/implementation.md` §18.2 hard ship criteria so the doctor
 //! surfaces drift well before it becomes a blocker. The user can
 //! override every threshold via [`Thresholds`] or the CLI flags.
 //!

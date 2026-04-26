@@ -23,7 +23,7 @@ The §3.3 spike workflow applies:
 1. Open Zoom Test Meeting (or rehearsed call with a trusted partner).
 2. Run `cargo run --bin ax-probe -- --bundle us.zoom.xos > ax-events.jsonl`.
 3. Capture `mic.wav` + `tap.wav` via `cargo run --bin heron capture` (when it lands).
-4. Hand-label `ground-truth.jsonl` per `docs/implementation.md` §3.4.
+4. Hand-label `ground-truth.jsonl` per `docs/archives/implementation.md` §3.4.
 
 ## Aligner regression invariants
 

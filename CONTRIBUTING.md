@@ -7,10 +7,11 @@ against.
 
 ## Where to start
 
-Read `docs/plan.md` for the v1 product/architecture decisions, then
-`docs/implementation.md` for the week-by-week build plan. Every PR
-in this repo references a section of `implementation.md` (e.g. §6.2,
-§13.3) and reproducing that mapping in commit messages is the norm.
+Read `docs/architecture.md` for the current codebase shape. Historical
+phase references live in `docs/archives/plan.md` and
+`docs/archives/implementation.md`; older PRs reference those sections
+(e.g. §6.2, §13.3), so preserve the mapping when touching code that
+still cites them.
 
 ## Tooling
 
@@ -87,7 +88,7 @@ skills (`/polish`, `/pr-workflow`).
 ## Swift bridges
 
 Three live in `swift/`. New bridges mirror the canonical
-`eventkit-helper` shape per `docs/swift-bridge-pattern.md`:
+`eventkit-helper` shape per `docs/archives/swift-bridge-pattern.md`:
 
 - A `Package.swift` declaring a static library, no external Swift-
   package deps unless absolutely required (so `swift build` runs
@@ -110,7 +111,7 @@ Three live in `swift/`. New bridges mirror the canonical
   contracts; gate anything heavy with `#[ignore]`.
 - `// [needs-human]` tests record their artifact under
   `fixtures/manual-validation/<test-name>/<date>.{mov,wav,png}` and
-  appear in `docs/manual-test-matrix.md`.
+  appear in `docs/archives/manual-test-matrix.md`.
 - `cargo test` must pass with **zero** flaky tests. If timing is
   involved, prefer lower bounds (`>= X`) over upper bounds (`<= Y`)
   so CI's GitHub Actions runner doesn't false-fail on scheduler jitter.

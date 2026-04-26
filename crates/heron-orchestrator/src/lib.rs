@@ -653,7 +653,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         } = entry;
 
         // recording → transcribing. The `on_hotkey` from `Recording`
-        // is the FSM's stop edge per `docs/implementation.md` §14.2.
+        // is the FSM's stop edge per `docs/archives/implementation.md` §14.2.
         // The FSM rejects this from any other state via
         // `TransitionError`, which `transition_to_session_error`
         // surfaces as `Validation` — that's the safety net for the
@@ -966,7 +966,7 @@ fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionErr
         })
         .map(|e| e.path())
         .collect();
-    // Note filenames are `YYYY-MM-DD-HHMM <slug>.md` per `docs/plan.md`
+    // Note filenames are `YYYY-MM-DD-HHMM <slug>.md` per `docs/archives/plan.md`
     // §3.2, so a lex-descending sort IS a date-descending sort.
     entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     Ok(entries)

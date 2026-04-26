@@ -1,7 +1,7 @@
 //! WebRTC APM-based Acoustic Echo Cancellation (AEC).
 //!
-//! Per [`docs/plan.md`] §6.3 and
-//! [`docs/implementation.md`](../../../docs/implementation.md) §6.3, the
+//! Per [`docs/archives/plan.md`] §6.3 and
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §6.3, the
 //! mic captures both the user's voice **and** speaker bleed of the
 //! meeting client's audio (we run with speakers on, not headphones, so
 //! the call is audible). The Core Audio process tap (`process_tap.rs`,
@@ -101,7 +101,7 @@ pub struct EchoCanceller {
     /// 480-sample `Vec` lets `process_far_end` `copy_from_slice` into
     /// it instead of allocating a fresh `Vec` per 10 ms call. At
     /// 100 calls/s that's a hot allocator path even though APM runs
-    /// off the realtime callback (per `docs/implementation.md` §6.2's
+    /// off the realtime callback (per `docs/archives/implementation.md` §6.2's
     /// "realtime → SPSC → APM thread" topology).
     far_end_scratch: Vec<f32>,
 }

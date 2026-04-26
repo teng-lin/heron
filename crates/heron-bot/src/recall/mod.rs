@@ -2,10 +2,10 @@
 //!
 //! Ports the validated Recall.ai REST surface from
 //! `examples/recall-spike.rs` into a real driver. Per
-//! [`docs/build-vs-buy-decision.md`](../../../../docs/build-vs-buy-decision.md),
+//! [`docs/archives/build-vs-buy-decision.md`](../../../../docs/archives/build-vs-buy-decision.md),
 //! Recall is the explicitly chosen v2.0 path and the spike (run on
 //! 2026-04-26) exercised every operation against a live Zoom
-//! meeting; see [`docs/spike-findings.md`](../../../../docs/spike-findings.md)
+//! meeting; see [`docs/archives/spike-findings.md`](../../../../docs/archives/spike-findings.md)
 //! for what we learned.
 //!
 //! ## Module layout
@@ -23,7 +23,7 @@
 //! 1. **Real TTS.** The placeholder MP3 below is a 0.5s silent frame
 //!    so Recall accepts the bot. Real disclosure audio + the
 //!    `output_audio` POST live in a follow-up — heron has no TTS
-//!    today (see `docs/build-vs-buy-decision.md` audit table).
+//!    today (see `docs/archives/build-vs-buy-decision.md` audit table).
 //! 2. **Webhook receiver.** Recall pushes status_changes via webhook
 //!    for low-latency updates. This driver polls every 3s — fine for
 //!    the first PR; webhook endpoint lands later.
@@ -69,7 +69,7 @@ use projection::{Projection, project_status_change};
 /// out-of-the-box without a sidecar file. Recall requires
 /// `automatic_audio_output.in_call_recording.data` at create time
 /// before `output_audio` will work later (see
-/// `docs/spike-findings.md` §"Recommendations" item 5). Once real
+/// `docs/archives/spike-findings.md` §"Recommendations" item 5). Once real
 /// TTS lands the disclosure audio replaces this fixture.
 const PLACEHOLDER_AUDIO: &[u8] = include_bytes!("disclosure-placeholder.mp3");
 

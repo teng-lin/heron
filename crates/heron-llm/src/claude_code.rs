@@ -1,5 +1,5 @@
 //! Claude Code CLI summarizer per
-//! [`docs/implementation.md`](../../../docs/implementation.md) §11.1.
+//! [`docs/archives/implementation.md`](../../../docs/archives/implementation.md) §11.1.
 //!
 //! Spawns `claude` as a subprocess with the rendered prompt + the
 //! transcript contents on stdin, parses the JSON it emits on stdout

@@ -3,10 +3,10 @@
 // `argmaxinc/WhisperKit` Swift package (pinned in
 // swift/whisperkit-helper/Package.swift); `swift build` therefore
 // requires network access on first run. CI implications are tracked
-// in docs/manual-test-matrix.md "WhisperKit STT backend".
+// in docs/archives/manual-test-matrix.md "WhisperKit STT backend".
 //
 // Pattern mirrors crates/heron-vault/build.rs (canonical Swift bridge,
-// see docs/swift-bridge-pattern.md).
+// see docs/archives/swift-bridge-pattern.md).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

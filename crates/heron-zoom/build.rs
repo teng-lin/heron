@@ -3,7 +3,7 @@
 // links only ApplicationServices + Foundation (Apple-only).
 //
 // Pattern mirrors crates/heron-vault/build.rs (canonical Swift bridge,
-// see docs/swift-bridge-pattern.md). Real AX-tree walking lands week 6 / §9;
+// see docs/archives/swift-bridge-pattern.md). Real AX-tree walking lands week 6 / §9;
 // v0 ships the bridge surface returning NotYetImplemented.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]

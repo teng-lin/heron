@@ -5,7 +5,7 @@ the development machine; `scripts/reset-onboarding.sh` (per §0.4)
 drops TCC grants and local state to simulate a first-run experience
 between walkthroughs.
 
-Source-of-truth is [`docs/implementation.md`](implementation.md) §5.5
+Source-of-truth is [`docs/archives/implementation.md`](implementation.md) §5.5
 (week 1 smoke test) and §13.5 (full week-11 validation).
 
 ## What "onboarding" covers
@@ -65,7 +65,7 @@ network model download). Each ~3 min + ~1 min reset overhead.
 
 Each walkthrough produces a screencast committed to
 `fixtures/manual-validation/onboarding/<date>-<test>.mov`. The
-matrix lives in [`docs/manual-test-matrix.md`](manual-test-matrix.md)
+matrix lives in [`docs/archives/manual-test-matrix.md`](manual-test-matrix.md)
 row 11.
 
 ## Coverage limits — explicitly accepted

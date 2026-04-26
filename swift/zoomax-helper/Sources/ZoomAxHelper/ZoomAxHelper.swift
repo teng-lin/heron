@@ -1,6 +1,6 @@
 // ZoomAxHelper — Swift bridge for the §9 AXObserver integration.
 // Same pattern as eventkit-helper / whisperkit-helper per
-// docs/swift-bridge-pattern.md.
+// docs/archives/swift-bridge-pattern.md.
 //
 // ============================================================
 // MUTE-STATE ATTRIBUTION (Path C, post-§3.3 spike)
@@ -22,7 +22,7 @@
 // arrive at attribution. In a 1:1 call (the dominant case for client
 // meetings) this is reliable: only one remote participant can be
 // unmuted ↔ they're the speaker. In free-for-all 3+ calls it
-// degrades to "best guess by overlap" — see docs/implementation.md
+// degrades to "best guess by overlap" — see docs/archives/implementation.md
 // §20 risk-reducer for the documented `speaker: "them"` fallback.
 //
 // Polling-only: subscribing to AX notifications (kAXValueChanged,
@@ -455,7 +455,7 @@ public func ax_free_string(_ p: UnsafeMutablePointer<CChar>?) {
     if let p = p { free(p) }
 }
 
-// MARK: - Tree-dump helper for the docs/plan.md §3.3 spike
+// MARK: - Tree-dump helper for the docs/archives/plan.md §3.3 spike
 //
 // Retained from the original spike workflow: `heron ax-dump` walks
 // the AX tree and emits a JSON document per node. Useful for re-

@@ -98,7 +98,7 @@ pub const EVENT_TRAY_DEGRADED: &str = "tray:degraded";
 
 /// Discriminator for the `tray:degraded` payload's `kind` field. The
 /// three variants cover the failure modes documented in
-/// `docs/plan.md` week 12: tap-lost (process tap couldn't follow the
+/// `docs/archives/plan.md` week 12: tap-lost (process tap couldn't follow the
 /// target app), AX-unavailable (Accessibility went away mid-call), and
 /// AEC-overflow (echo canceller's input ringbuffer fell behind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

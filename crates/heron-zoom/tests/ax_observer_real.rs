@@ -18,7 +18,7 @@
 //! 3. Someone — usually the user — is talking during the 5-second
 //!    capture window so the speaker indicator actually changes value.
 //!
-//! See `docs/manual-test-matrix.md` → "Zoom AX observer (heron-zoom)".
+//! See `docs/archives/manual-test-matrix.md` → "Zoom AX observer (heron-zoom)".
 
 use heron_types::{SessionClock, SessionId};
 use heron_zoom::{AxBackend, AxObserverBackend};
@@ -31,7 +31,7 @@ async fn observer_emits_speaker_event_on_live_zoom_call() {
     if std::env::var_os("HERON_ZOOM_RUNNING").is_none() {
         eprintln!(
             "skipping: HERON_ZOOM_RUNNING is unset. \
-             See docs/manual-test-matrix.md → 'Zoom AX observer (heron-zoom)'."
+             See docs/archives/manual-test-matrix.md → 'Zoom AX observer (heron-zoom)'."
         );
         return;
     }
@@ -63,7 +63,7 @@ async fn observer_emits_speaker_event_on_live_zoom_call() {
             "no SpeakerEvent received in 5s. Check that someone is \
              talking, Accessibility is granted, and the (role, subrole, \
              identifier) triple in ZoomAxHelper.swift matches the live \
-             Zoom AX tree (see docs/plan.md §3.3)"
+             Zoom AX tree (see docs/archives/plan.md §3.3)"
         ),
     }
 }

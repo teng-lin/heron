@@ -28,7 +28,7 @@ schemars = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
 
-# macOS bindings — VERSION-PINNED, see docs/implementation.md §1.3
+# macOS bindings — VERSION-PINNED, see docs/archives/implementation.md §1.3
 cidre = "=0.5.3"
 cpal = "0.15"
 swift-rs = "1.0"
@@ -42,7 +42,7 @@ rtrb = "0.3"
 rubato = "0.16"
 symphonia = "0.5"
 
-# speech-to-text — see docs/implementation.md §8.3. Pinned exact per
+# speech-to-text — see docs/archives/implementation.md §8.3. Pinned exact per
 # §1.3 because the bundled sherpa-onnx C ABI shifts between point
 # releases and the prebuilt dylibs the `download-binaries` feature
 # fetches are matched 1:1 to the binding version.
@@ -94,7 +94,7 @@ heron-zoom = { path = "crates/heron-zoom" }
 heron-llm = { path = "crates/heron-llm" }
 heron-vault = { path = "crates/heron-vault" }
 heron-cli = { path = "crates/heron-cli" }
-# v2 trait sketches per docs/api-design-spec.md §13. Not yet wired
+# v2 trait sketches per docs/archives/api-design-spec.md §13. Not yet wired
 # into heron-cli; they ship trait surfaces only until the spike.
 heron-bot = { path = "crates/heron-bot" }
 heron-bridge = { path = "crates/heron-bridge" }

@@ -10,7 +10,7 @@
 //! of HTTP/transport dependencies and lets each call site (desktop
 //! shell, server, integration test) wire the appropriate handler.
 //!
-//! Per [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §9
+//! Per [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §9
 //! the controller still emits the same
 //! [`crate::SpeechEvent::Cancelled`] +
 //! [`crate::CancelReason::PolicyDenied`] for an escalated utterance —

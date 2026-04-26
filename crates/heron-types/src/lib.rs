@@ -3,7 +3,7 @@
 //! Invariant: **no event types are invented outside this crate.** Any
 //! new variant in any other crate is a PR against `heron-types` first.
 //!
-//! Surface mirrors `docs/implementation.md` §5.2 (types) and §5.3
+//! Surface mirrors `docs/archives/implementation.md` §5.2 (types) and §5.3
 //! (`SessionClock`).
 
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ pub type ItemId = uuid::Uuid;
 
 prefixed_id! {
     /// Stripe-style prefixed UUIDv7 for a captured meeting. Wire form
-    /// `mtg_<uuid>`, per `docs/api-design-spec.md` §2 and the
+    /// `mtg_<uuid>`, per `docs/archives/api-design-spec.md` §2 and the
     /// `MeetingId` schema in `docs/api-desktop-openapi.yaml`.
     ///
     /// Lives in `heron-types` so that the v1 desktop hub
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn speaker_source_self_round_trips_to_string_self() {
         // Load-bearing: transcript JSONL writes `"speaker_source": "self"`
-        // (per docs/plan.md §3.4). The Rust variant has to be `Self_`
+        // (per docs/archives/plan.md §3.4). The Rust variant has to be `Self_`
         // because `self` is a keyword.
         let json = serde_json::to_string(&SpeakerSource::Self_).expect("Self_ must serialize");
         assert_eq!(json, r#""self""#);
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn turn_round_trips_jsonl_shape() {
-        // Mirrors the JSONL example in docs/plan.md §3.4.
+        // Mirrors the JSONL example in docs/archives/plan.md §3.4.
         let line = r#"{"t0":12.4,"t1":18.9,"text":"We need...","channel":"tap","speaker":"Alice","speaker_source":"ax","confidence":0.92}"#;
         let turn: Turn = serde_json::from_str(line).expect("deserialize");
         assert_eq!(turn.t0, 12.4);

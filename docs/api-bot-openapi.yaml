@@ -322,7 +322,7 @@ paths:
                     Free-text attestation that the speaker in the
                     samples is the user themselves and has consented
                     to voice cloning. Stored in the vault audit log
-                    (`docs/api-design-spec.md` §4 / consent surface).
+                    (`docs/archives/api-design-spec.md` §4 / consent surface).
       responses:
         "202":
           description: Enrollment accepted; backend is processing.

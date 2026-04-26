@@ -1,6 +1,6 @@
 //! Keychain ACL scope check (macOS-only).
 //!
-//! `docs/security.md` §3.3 ("Keychain ACL — `swift/keychain-helper`")
+//! `docs/archives/security.md` §3.3 ("Keychain ACL — `swift/keychain-helper`")
 //! requires that secrets stored in the login keychain by heron are
 //! scoped to the heron bundle ID (`com.heronnote.heron`) — i.e. no
 //! arbitrary other signed app on the user's machine can read the

@@ -1,7 +1,7 @@
 //! `heron-realtime` — bidirectional realtime LLM session.
 //!
 //! Layer 4 of the four-layer v2 architecture per
-//! [`docs/api-design-spec.md`](../../../docs/api-design-spec.md) §1.
+//! [`docs/archives/api-design-spec.md`](../../../docs/archives/api-design-spec.md) §1.
 //! Audio in / audio out / tool calls, low latency.
 //!
 //! Implementations wrap a realtime backend: `OpenAiRealtime` (the
@@ -231,7 +231,7 @@ pub enum RealtimeEvent {
 }
 
 /// Spec §9. The capability matrix `heron-policy` consults.
-/// See [`docs/api-design-research.md`](../../../docs/api-design-research.md)
+/// See [`docs/archives/api-design-research.md`](../../../docs/archives/api-design-research.md)
 /// "Layer 3" matrix for vendor-by-vendor truth values.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealtimeCapabilities {
@@ -250,7 +250,7 @@ mod prefix_tests {
     //! Per-consumer wire-shape regression guards for phase-48 IDs.
     //! The macro's own tests in `heron-types` cover codegen; these
     //! pin that the realtime crate still gets the prefixes
-    //! documented in `docs/api-design-spec.md`.
+    //! documented in `docs/archives/api-design-spec.md`.
 
     use super::*;
 

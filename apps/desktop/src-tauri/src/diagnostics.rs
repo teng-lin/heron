@@ -1,7 +1,7 @@
 //! Diagnostics tab backend per §15.4.
 //!
 //! Reads `heron_session.json` (the per-session log line schema in
-//! `docs/observability.md`) and renders AX hit rate, dropped frames,
+//! `docs/archives/observability.md`) and renders AX hit rate, dropped frames,
 //! STT wall time, cost, and the error log.
 //!
 //! Today this module ships the parser + summary computation with
@@ -9,7 +9,7 @@
 //! The Tauri command wraps `read_diagnostics` and exposes it to the
 //! frontend.
 //!
-//! The wire shape matches what `docs/observability.md` calls
+//! The wire shape matches what `docs/archives/observability.md` calls
 //! `log_version: 1` and is intentionally tolerant: unknown fields are
 //! accepted (and ignored) rather than causing the diagnostics tab to
 //! fail to render — a missing-field bug should surface as a "—" in

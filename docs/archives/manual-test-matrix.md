@@ -1,7 +1,7 @@
 # Manual test matrix
 
 Every needs-human gate in v1 lives here. Tests tagged `[needs-human]`
-are not run by CI (per [`docs/implementation.md`](implementation.md)
+are not run by CI (per [`docs/archives/implementation.md`](implementation.md)
 §19.6); this file is the single source of truth for what they are,
 when they happen, who runs them, and where the artifact lives.
 
@@ -337,7 +337,7 @@ Until then it stays here.
 ## AEC processor smoke (heron-audio)
 
 Row #5 in the table above tracks the **end-to-end** AEC correctness
-gate per [`docs/implementation.md`](implementation.md) §6.3 — engineer
+gate per [`docs/archives/implementation.md`](implementation.md) §6.3 — engineer
 on Mac A, partner on Mac B, real Zoom call, correlation < 0.15
 between `mic_clean.wav` and `tap.wav`. That test rig is intentionally
 unchanged.

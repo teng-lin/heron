@@ -29,7 +29,7 @@ use thiserror::Error;
 
 /// Default WhisperKit model variant. Mirrors the Swift constant
 /// `WK_DEFAULT_VARIANT`. ~1GB CoreML bundle (English-only small),
-/// matches `docs/plan.md` week-9 step 5.
+/// matches `docs/archives/plan.md` week-9 step 5.
 pub const DEFAULT_WK_VARIANT: &str = "openai_whisper-small.en";
 
 #[cfg(target_vendor = "apple")]

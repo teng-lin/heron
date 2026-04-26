@@ -10,7 +10,7 @@
 //! - a direct terminal-state synthesis when Recall reports a fatal
 //!   path that doesn't have a clean FSM event mapping.
 //!
-//! Per [`docs/spike-findings.md`](../../../../docs/spike-findings.md)
+//! Per [`docs/archives/spike-findings.md`](../../../../docs/archives/spike-findings.md)
 //! §"Major API-shape discovery", the REST surface returns codes
 //! WITHOUT the `bot.` prefix the webhook docs use. This module
 //! normalizes both forms — a `bot.` prefix is stripped on read so

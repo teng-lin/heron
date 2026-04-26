@@ -1,6 +1,6 @@
 //! `heron` CLI scaffold.
 //!
-//! Subcommands per `docs/implementation.md` weeks 9–13. Each command
+//! Subcommands per `docs/archives/implementation.md` weeks 9–13. Each command
 //! returns `Err(anyhow::anyhow!("not yet implemented"))` until the
 //! corresponding crate's real implementation lands; the scaffolding
 //! is here so the user can already run `heron --help` and the
@@ -26,7 +26,7 @@ use heron_cli::synthesize::{SynthOptions, synthesize_fixture};
     long_about = "heron records native meeting calls, transcribes locally, \
                   attributes speakers via the meeting app's accessibility \
                   surface, and writes a markdown summary into your Obsidian \
-                  vault. See docs/plan.md for the full architecture."
+                  vault. See docs/architecture.md for the current architecture."
 )]
 struct Cli {
     /// Increase log verbosity. `-v` = debug, `-vv` = trace.
@@ -63,7 +63,7 @@ enum Commands {
     /// parsing stdout.
     Salvage(SalvageArgs),
     /// Dump the AX tree of a running app (e.g. Zoom) to stdout as
-    /// JSON. Used during the `docs/plan.md` §3.3 spike to capture the
+    /// JSON. Used during the `docs/archives/plan.md` §3.3 spike to capture the
     /// speaker-indicator `(role, subrole, identifier)` triple — diff
     /// two dumps (one with someone speaking, one with everyone muted)
     /// to identify the indicator element.

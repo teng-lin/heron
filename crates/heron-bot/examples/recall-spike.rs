@@ -2,8 +2,8 @@
 //! six-operation contract to discover which spec invariants the
 //! `RecallDriver: MeetingBotDriver` impl can honor.
 //!
-//! Per [`docs/build-vs-buy-decision.md`](../../../../docs/build-vs-buy-decision.md)
-//! and [`docs/api-design-spec.md`](../../../../docs/api-design-spec.md) §13.
+//! Per [`docs/archives/build-vs-buy-decision.md`](../../../../docs/archives/build-vs-buy-decision.md)
+//! and [`docs/archives/api-design-spec.md`](../../../../docs/archives/api-design-spec.md) §13.
 //!
 //! Reads `RECALL_API_KEY`, `RECALL_REGION` (one of `us-west-2`,
 //! `us-east-1`, `eu-central-1`, `ap-northeast-1`) and (optionally)

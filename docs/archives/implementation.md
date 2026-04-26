@@ -20,7 +20,7 @@ The authoritative scope is `plan.md`. If this file conflicts with
   audited and fixed; §10.4 whitespace-in-codeblock normalization;
   partner schedule extended to weeks 2 and 7; §0.8 Accessibility
   permission and Inspector walkthrough; manual test matrix
-  consolidated into `docs/manual-test-matrix.md`; ship criteria
+  consolidated into `docs/archives/manual-test-matrix.md`; ship criteria
   reconciled across plan.md and implementation.md.
 - v3.1: dropped Tart VM in favor of TCC-reset workflow on the
   development laptop. Onboarding test environment is the author's
@@ -316,11 +316,11 @@ opt-level = 1
   `process_tap.rs` consumes (`TapDesc::with_mono_mixdown_of_processes`,
   `core_audio::aggregate_device_keys`, `Device::create_io_proc_id_with_block`).
   Treat any minor bump as a half-day re-validation: re-run the
-  `tests/process_tap_real.rs` runbook in `docs/manual-test-matrix.md`.
+  `tests/process_tap_real.rs` runbook in `docs/archives/manual-test-matrix.md`.
 - `webrtc-audio-processing`: known macOS arm64 build issues with
   certain `webrtc-audio-processing-sys` versions. **Build verified at
   v0.4.x in week 1**; if broken, fall back to `webrtc-audio-processing-rs`
-  fork. Document in `docs/backend-evaluations.md`.
+  fork. Document in `docs/archives/backend-evaluations.md`.
 - Anthropic Rust SDK does not exist at production-grade 0.x. **Decide
   in week 9** between (a) bare `reqwest` + thin wrapper, (b) the
   `anthropic-sdk-rs` community crate, (c) `misanthropic`. Default
@@ -524,7 +524,7 @@ The load-bearing time sink in week 0.
 budget 6 hours (tooling friction); subsequent fixtures 3–4 hours.
 
 **Human-in-loop tag.** Final `ground-truth.jsonl` files committed to
-git as proof of completion. See `docs/manual-test-matrix.md` for the
+git as proof of completion. See `docs/archives/manual-test-matrix.md` for the
 canonical artifact list.
 
 ### 3.5 Sync pulse for clock alignment
@@ -862,7 +862,7 @@ not a Package — it's a single-file binary built directly with
 bridges that link into Rust code. Use this carve-out only for
 exploratory tools, never for v1 production bridges.
 
-Document the pattern at `docs/swift-bridge-pattern.md` (~50 lines,
+Document the pattern at `docs/archives/swift-bridge-pattern.md` (~50 lines,
 referencing this section as canonical).
 
 ### 5.5 Onboarding test workflow (laptop, TCC reset)
@@ -888,7 +888,7 @@ If `tccutil reset` produces an error or the TCC prompt fails to
 re-appear after reset, fix in week 1 — week 11 cannot validate
 onboarding without this.
 
-Document the reset script + smoke test at `docs/onboarding-tests.md`.
+Document the reset script + smoke test at `docs/archives/onboarding-tests.md`.
 
 ### 5.6 Code-signing identity check (no notarization yet)
 
@@ -904,8 +904,8 @@ If this fails, fix before week 2 notarization work.
 ### 5.7 `claude -p` smoke + observability spec
 
 - Run smoke per `plan.md` §5 week 1. Document at
-  `docs/backend-evaluations.md`.
-- Commit `docs/observability.md` with the per-session log line schema.
+  `docs/archives/backend-evaluations.md`.
+- Commit `docs/archives/observability.md` with the per-session log line schema.
 
 ### 5.8 Week 1 done-when
 
@@ -916,9 +916,9 @@ If this fails, fix before week 2 notarization work.
 - Hello-world signs with the real Developer ID.
 - EventKit bridge: `cargo test -p heron-vault calendar_smoke` proves
   Rust→Swift FFI works.
-- `docs/observability.md`, `docs/security.md`,
-  `docs/backend-evaluations.md`, `docs/swift-bridge-pattern.md`,
-  `docs/onboarding-tests.md`, `docs/manual-test-matrix.md` (initial)
+- `docs/archives/observability.md`, `docs/archives/security.md`,
+  `docs/archives/backend-evaluations.md`, `docs/archives/swift-bridge-pattern.md`,
+  `docs/archives/onboarding-tests.md`, `docs/archives/manual-test-matrix.md` (initial)
   committed.
 
 Commit: `week 1: heron-types + clock + entitlements + TCC reset workflow + EventKit bridge`.
@@ -1083,7 +1083,7 @@ Budget 1 day. Common log: `xcrun notarytool log <submission-id>`.
 Build twice with different bundle IDs (`com.heronnote.heron`,
 `com.heronnote.test-foreign`); confirm cross-bundle reads fail.
 
-Document in `docs/security.md`.
+Document in `docs/archives/security.md`.
 
 ### 6.6 Week 2 done-when
 
@@ -1479,7 +1479,7 @@ against a 10-call fixture corpus to decide.
 
 - All 12 matrix tests pass.
 - ID-preservation rate ≥80% on the 10-fixture re-summarize corpus.
-- `docs/merge-model.md` committed with the ownership model.
+- `docs/archives/merge-model.md` committed with the ownership model.
 - Re-summarize round-trips a non-trivial fixture without data loss.
 
 Commit: `week 8: merge-on-write spike with ownership model + LLM ID contract + 12-case matrix`.
@@ -1642,7 +1642,7 @@ open /Applications/heron.app   # launches as if first run
 cases — paginated gallery, slow-network model download). Each
 ~3 min + ~1 min reset overhead = ~1 day.
 
-**Coverage caveat (recorded in `docs/manual-test-matrix.md`):** the
+**Coverage caveat (recorded in `docs/archives/manual-test-matrix.md`):** the
 laptop has dev tools, hardware peripherals, and existing user state.
 Onboarding paper-cuts that only surface on a stock Mac (default
 fonts, no Xcode-installed certificates, slow public wifi) are
@@ -1808,7 +1808,7 @@ Commit: `week 16: exec dogfood; v1.0 tag`.
 Reference: `swift/eventkit-helper/` (see §5.4 for actual files).
 All bridges (whisperkit, zoom-ax, keychain) follow that exact shape.
 Single-file `swiftc` binaries (`ax-probe`) are for spike tools only.
-Pattern documented at `docs/swift-bridge-pattern.md`.
+Pattern documented at `docs/archives/swift-bridge-pattern.md`.
 
 ### 19.4 File atomicity
 `heron-vault::atomic_write` (UUID-named temp + rename, mode 0600).
@@ -1825,7 +1825,7 @@ Tagged `// [needs-human]` and require a recorded artifact at
 does not run these tests; they are manual gates per relevant week's
 done-when.
 
-### 19.7 `docs/manual-test-matrix.md`
+### 19.7 `docs/archives/manual-test-matrix.md`
 
 Single source of truth for every needs-human gate. Committed end of
 week 1 with a row per test. Schema:
