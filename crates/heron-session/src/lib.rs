@@ -56,29 +56,13 @@ pub use heron_types::prefixed_id::IdParseError;
 
 // ── identity ──────────────────────────────────────────────────────────
 
-heron_types::prefixed_id! {
-    /// Stripe-style prefixed UUIDv7 for a captured meeting. Wire form
-    /// `mtg_<uuid>`, per the OpenAPI `MeetingId` schema and spec §2.
-    ///
-    /// **Two outstanding wire-format follow-ups.** Both apply
-    /// workspace-wide, not just here:
-    ///
-    /// 1. `heron-bot::MeetingId` (v2 vendor-bot layer) still uses
-    ///    the prefix `meeting_` — that predates the spec rename to
-    ///    `mtg_`. The two MeetingId types are kept distinct for
-    ///    now: v1 desktop hub (this crate) and v2 driver layer
-    ///    (`heron-bot`) cross via explicit handoff per Invariant 2.
-    ///    Eventual home is probably `heron-types` once the prefix
-    ///    is reconciled.
-    /// 2. The OpenAPI `MeetingId` pattern is
-    ///    `^mtg_[0-9A-HJKMNP-TV-Z]+$` (Crockford base32) but the
-    ///    `prefixed_id!` macro emits lowercase hyphenated UUIDs
-    ///    (`mtg_550e8400-e29b-…`). Real heron IDs would fail the
-    ///    YAML regex; either the macro grows a base32 codec or the
-    ///    YAML regex relaxes. See the matching note on
-    ///    [`heron_event::EventId`].
-    pub MeetingId, "mtg"
-}
+/// `MeetingId` is canonical in `heron-types`; this crate
+/// re-exports it so consumers can `use heron_session::MeetingId`
+/// without learning the layout. The same physical type that
+/// `heron_bot` re-exports — a v1 desktop ID flowing into a v2
+/// driver field is fine by construction now (used to be a
+/// typed-handle gap that crossed the layer boundary).
+pub use heron_types::MeetingId;
 
 // ── enums ─────────────────────────────────────────────────────────────
 
