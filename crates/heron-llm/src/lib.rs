@@ -20,15 +20,34 @@ pub mod claude_code;
 pub mod codex;
 mod content;
 pub mod cost;
+pub mod key_resolver;
 pub mod select;
 pub mod transcript;
+
+/// Crate-wide test helpers. Today this only ships `ENV_LOCK` — the
+/// single mutex that every test that mutates `ANTHROPIC_API_KEY` /
+/// `OPENAI_API_KEY` MUST hold. Multiple modules (`anthropic`,
+/// `key_resolver`) touch the same env vars; two module-private mutexes
+/// would race each other and produce flaky CI. PR-μ / phase 74.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::Mutex;
+
+    /// Single source of truth for env-mutation serialization across
+    /// the crate. Locking this mutex MUST happen before any
+    /// `std::env::set_var` / `std::env::remove_var` so two tests don't
+    /// stomp on each other's view of the same env var.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
 
 pub use anthropic::{AnthropicClient, AnthropicClientConfig};
 pub use claude_code::{ClaudeCodeClient, ClaudeCodeClientConfig};
 pub use codex::{CodexClient, CodexClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
+pub use key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
 pub use select::{
     Availability, Preference, SelectError, SelectionReason, select_backend, select_summarizer,
+    select_summarizer_with_resolver,
 };
 
 /// Convenience alias so the public surface doesn't leak `String` for
@@ -98,7 +117,8 @@ pub trait Summarizer: Send + Sync {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError>;
 }
 
-/// Build a [`Summarizer`] for the requested backend.
+/// Build a [`Summarizer`] for the requested backend, reading API keys
+/// from the process environment via [`EnvKeyResolver`].
 ///
 /// `Anthropic` returns the real reqwest-backed client when
 /// `ANTHROPIC_API_KEY` is present in the environment; without the
@@ -109,9 +129,30 @@ pub trait Summarizer: Send + Sync {
 /// Callers that need a configured client (custom base URL, model,
 /// timeout) should construct [`AnthropicClient`] directly and pass
 /// it as a boxed [`Summarizer`].
+///
+/// Desktop callers that want the macOS Keychain to act as a fallback
+/// when the env var is unset should use
+/// [`build_summarizer_with_resolver`] with an
+/// `EnvThenKeychainResolver` (defined in
+/// `apps/desktop/src-tauri/src/keychain_resolver.rs`).
 pub fn build_summarizer(backend: Backend) -> Box<dyn Summarizer> {
+    build_summarizer_with_resolver(backend, &EnvKeyResolver)
+}
+
+/// Build a [`Summarizer`] for the requested backend, resolving API
+/// keys via the supplied [`KeyResolver`].
+///
+/// PR-μ (phase 74) hook: the desktop crate threads its
+/// `EnvThenKeychainResolver` through here so a user who pasted their
+/// key into Settings → Summarizer (PR-θ) can summarize without ever
+/// exporting the env var. The CLI binary keeps using `EnvKeyResolver`
+/// via [`build_summarizer`].
+pub fn build_summarizer_with_resolver(
+    backend: Backend,
+    resolver: &dyn KeyResolver,
+) -> Box<dyn Summarizer> {
     match backend {
-        Backend::Anthropic => match AnthropicClientConfig::from_env() {
+        Backend::Anthropic => match AnthropicClientConfig::from_resolver(resolver) {
             Ok(cfg) => match AnthropicClient::new(cfg) {
                 Ok(c) => Box::new(c),
                 // Fall through to the stub on construction failure

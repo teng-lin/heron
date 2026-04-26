@@ -14,7 +14,8 @@
 
 use std::path::PathBuf;
 
-use crate::{Backend, LlmError, Summarizer, build_summarizer};
+use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
+use crate::{Backend, LlmError, Summarizer, build_summarizer_with_resolver};
 
 /// User-expressed preference. Maps to `docs/plan.md` §5 weeks 7–8's
 /// "user can pick the cheapest viable option per session".
@@ -45,11 +46,47 @@ pub struct Availability {
 }
 
 impl Availability {
+    /// Detect availability using the env-only resolver. Equivalent to
+    /// `detect_with_resolver(&EnvKeyResolver)` and kept for callers
+    /// that only need the historical CLI behaviour (the heron-cli
+    /// status preflight, the test suite).
     pub fn detect() -> Self {
+        Self::detect_with_resolver(&EnvKeyResolver)
+    }
+
+    /// Detect availability using a caller-supplied
+    /// [`KeyResolver`]. PR-μ / phase 74: the desktop crate's
+    /// `EnvThenKeychainResolver` flips `has_anthropic_key` on when the
+    /// user pasted their key into Settings → Summarizer (PR-θ) but
+    /// hasn't exported the env var. The CLI path keeps using
+    /// [`Self::detect`] so its behaviour is unchanged.
+    ///
+    /// **Lossy on `Backend` errors by design.** This API returns a
+    /// flat `Self`, so a `KeyResolveError::Backend` from the resolver
+    /// is logged + treated as "key unavailable" rather than crashing
+    /// the probe. Callers that need to distinguish a real keychain
+    /// failure from a missing key MUST use
+    /// [`select_summarizer_with_resolver`], which propagates Backend
+    /// errors as [`LlmError::Backend`]. This split keeps the
+    /// diagnostics-tab "is Anthropic configured?" probe cheap while
+    /// the orchestrator's selection path still surfaces actionable
+    /// errors.
+    pub fn detect_with_resolver(resolver: &dyn KeyResolver) -> Self {
+        let has_anthropic_key = match resolver.resolve(KeyName::AnthropicApiKey) {
+            Ok(_) => true,
+            // NotFound is the steady-state "key not configured" case.
+            Err(KeyResolveError::NotFound(_)) => false,
+            // Backend errors shouldn't crash the selector — log + treat
+            // as "not available" so selection falls through to a CLI.
+            // The actual error surfaces at summarize-time via
+            // `from_resolver` if Anthropic ends up being chosen.
+            Err(KeyResolveError::Backend(msg)) => {
+                tracing::warn!("key resolver backend error during availability probe: {msg}");
+                false
+            }
+        };
         Self {
-            has_anthropic_key: std::env::var_os("ANTHROPIC_API_KEY")
-                .filter(|v| !v.is_empty())
-                .is_some(),
+            has_anthropic_key,
             has_claude_cli: which_on_path("claude").is_some(),
             has_codex_cli: which_on_path("codex").is_some(),
         }
@@ -161,17 +198,80 @@ pub fn select_backend(
 }
 
 /// One-stop helper: detect availability, select a backend, build the
-/// Summarizer, return both. Useful for the orchestrator's "give me
-/// something to call" path.
+/// Summarizer, return all three. Equivalent to calling
+/// [`select_summarizer_with_resolver`] with an [`EnvKeyResolver`] —
+/// kept for callers (heron-cli, the test suite) that only need the
+/// historical env-var behaviour.
 pub fn select_summarizer(
     pref: Preference,
 ) -> Result<(Box<dyn Summarizer>, Backend, SelectionReason), LlmError> {
-    let avail = Availability::detect();
+    select_summarizer_with_resolver(pref, &EnvKeyResolver)
+}
+
+/// Resolver-aware variant: detect availability, pick a backend, build
+/// the Summarizer, all driven through `resolver`.
+///
+/// PR-μ / phase 74 hook for the desktop crate. With an
+/// `EnvThenKeychainResolver` plugged in, a user who only ever pasted
+/// their key into Settings → Summarizer (PR-θ) gets
+/// `Backend::Anthropic` selected automatically, with the same fallback
+/// chain to the CLI backends as the env-only path. The CLI binary
+/// keeps using [`select_summarizer`] so its behaviour is unchanged.
+///
+/// **Resolver Backend errors are propagated, not masked.** A real
+/// keychain failure (corrupted UTF-8, Security framework returning
+/// non-`errSecItemNotFound`) surfaces as [`LlmError::Backend`] so the
+/// Review-UI toast can distinguish "macOS keychain returned an error"
+/// from "no key configured" / "fall back to CLI". This is the
+/// contract `apps/desktop/src-tauri/src/keychain_resolver.rs`
+/// documents under "Precedence #2". `Availability::detect_with_resolver`
+/// (used directly by callers that want a cheap probe — the
+/// diagnostics tab) keeps the lossy "treat Backend as unavailable"
+/// behaviour because there's no `Result` channel to surface the
+/// error through.
+pub fn select_summarizer_with_resolver(
+    pref: Preference,
+    resolver: &dyn KeyResolver,
+) -> Result<(Box<dyn Summarizer>, Backend, SelectionReason), LlmError> {
+    // Skip the resolver probe entirely under `FreeOnly` — that
+    // preference says "use a CLI backend, never the API". A broken
+    // keychain shouldn't block the user from selecting `claude` /
+    // `codex` when they've explicitly opted out of Anthropic.
+    let has_anthropic_key = match pref {
+        Preference::FreeOnly => false,
+        Preference::Auto | Preference::PremiumOnly => {
+            // Probe explicitly so a `Backend` error surfaces as
+            // `LlmError::Backend(...)` instead of being swallowed by
+            // `detect_with_resolver` and masquerading as either
+            // `NoBackendAvailable` (Auto fall-through) or
+            // `PremiumOnlyMissingApiKey` (PremiumOnly). This is the
+            // path the desktop crate's `EnvThenKeychainResolver`
+            // relies on so a corrupted keychain entry produces an
+            // actionable renderer toast distinct from "paste a key
+            // in Settings".
+            match resolver.resolve(KeyName::AnthropicApiKey) {
+                Ok(_) => true,
+                Err(KeyResolveError::NotFound(_)) => false,
+                Err(KeyResolveError::Backend(msg)) => {
+                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
+                }
+            }
+        }
+    };
+    let avail = Availability {
+        has_anthropic_key,
+        has_claude_cli: which_on_path("claude").is_some(),
+        has_codex_cli: which_on_path("codex").is_some(),
+    };
     let (backend, reason) = select_backend(pref, &avail).map_err(|e| match e {
         SelectError::NoBackendAvailable => LlmError::Backend(e.to_string()),
         SelectError::PremiumOnlyMissingApiKey => LlmError::MissingApiKey,
     })?;
-    Ok((build_summarizer(backend), backend, reason))
+    Ok((
+        build_summarizer_with_resolver(backend, resolver),
+        backend,
+        reason,
+    ))
 }
 
 /// Tiny PATH-walker shared with `heron-cli`'s status preflight. Has
@@ -321,5 +421,167 @@ mod tests {
     #[test]
     fn which_on_path_returns_none_for_phantom_binary() {
         assert!(which_on_path("definitely-not-a-real-binary-name-xyz123").is_none());
+    }
+
+    /// Stub resolver: hand back a fixed Ok(_) so `detect_with_resolver`
+    /// flips `has_anthropic_key` on without touching the env. Anchors
+    /// the desktop crate's `EnvThenKeychainResolver` integration: a
+    /// user who only pasted their key into the keychain still gets
+    /// the API path picked.
+    struct StubResolverYes;
+    impl KeyResolver for StubResolverYes {
+        fn resolve(&self, _name: KeyName) -> Result<String, KeyResolveError> {
+            Ok("test-key".to_owned())
+        }
+    }
+
+    /// Stub resolver: NotFound for every probe. Used to assert
+    /// `detect_with_resolver` flips `has_anthropic_key` off without
+    /// reading the env var.
+    struct StubResolverNo;
+    impl KeyResolver for StubResolverNo {
+        fn resolve(&self, name: KeyName) -> Result<String, KeyResolveError> {
+            Err(KeyResolveError::NotFound(name))
+        }
+    }
+
+    #[test]
+    fn detect_with_resolver_yes_flips_has_anthropic_key_on() {
+        let avail = Availability::detect_with_resolver(&StubResolverYes);
+        assert!(
+            avail.has_anthropic_key,
+            "stub resolver returned Ok; has_anthropic_key must be true"
+        );
+    }
+
+    #[test]
+    fn detect_with_resolver_no_flips_has_anthropic_key_off() {
+        let avail = Availability::detect_with_resolver(&StubResolverNo);
+        assert!(
+            !avail.has_anthropic_key,
+            "stub resolver returned NotFound; has_anthropic_key must be false"
+        );
+    }
+
+    /// Round-trip through the resolver-aware selector: a stub resolver
+    /// returning Ok must drive `Preference::Auto` to pick Anthropic
+    /// regardless of what the env var contains. End-to-end shape of
+    /// the desktop-side keychain integration.
+    #[test]
+    fn select_summarizer_with_resolver_picks_anthropic_when_resolver_yields_key() {
+        let (_summarizer, backend, _reason) =
+            select_summarizer_with_resolver(Preference::Auto, &StubResolverYes).expect("select");
+        assert_eq!(backend, Backend::Anthropic);
+    }
+
+    /// Stub resolver that always returns a `Backend` error. Used to
+    /// pin the contract that real keychain failures get propagated by
+    /// [`select_summarizer_with_resolver`] rather than being silently
+    /// downgraded to "no key configured".
+    struct StubResolverErr;
+    impl KeyResolver for StubResolverErr {
+        fn resolve(&self, _name: KeyName) -> Result<String, KeyResolveError> {
+            Err(KeyResolveError::Backend(
+                "simulated keychain failure".into(),
+            ))
+        }
+    }
+
+    /// `detect_with_resolver` is a flat `Self`-returning probe; it
+    /// has no `Result` channel to surface a `Backend` error through.
+    /// We accept the lossy "treat as unavailable" behaviour for THAT
+    /// API alone — diagnostics-tab callers only need a bool. The
+    /// `select_summarizer_with_resolver` path below pins the
+    /// orchestrator-side contract that Backend errors DO propagate.
+    #[test]
+    fn detect_with_resolver_lossily_treats_backend_error_as_unavailable() {
+        let avail = Availability::detect_with_resolver(&StubResolverErr);
+        assert!(
+            !avail.has_anthropic_key,
+            "detect_with_resolver is a flat probe; Backend errors must collapse to has_anthropic_key=false"
+        );
+    }
+
+    /// Per the `keychain_resolver.rs` contract: a real keychain
+    /// failure (corrupted UTF-8, Security-framework non-not-found
+    /// error) MUST surface as [`LlmError::Backend`] from
+    /// `select_summarizer_with_resolver` so the renderer can render
+    /// a distinct "macOS keychain returned an error" toast — not
+    /// fall through to a CLI backend or report `MissingApiKey`.
+    /// PR-μ review (codex) caught the regression where Backend
+    /// errors were being swallowed; this test guards the fix.
+    #[test]
+    fn select_summarizer_with_resolver_propagates_backend_error_as_llm_backend() {
+        // `Box<dyn Summarizer>` doesn't implement `Debug` so we can't
+        // use `expect_err`; pattern-match on the result instead.
+        match select_summarizer_with_resolver(Preference::Auto, &StubResolverErr) {
+            Ok(_) => panic!(
+                "Backend error must propagate; silent fall-through to a CLI \
+                 backend would mask a corrupted keychain entry from the user",
+            ),
+            Err(LlmError::Backend(msg)) => {
+                assert!(
+                    msg.contains("simulated keychain failure"),
+                    "expected resolver error to be wrapped, got: {msg}"
+                );
+                assert!(
+                    msg.contains("api key resolver"),
+                    "expected resolver-prefixed error, got: {msg}"
+                );
+            }
+            Err(other) => panic!(
+                "Backend errors must surface as LlmError::Backend, not {other:?}; \
+                 silent fall-through to CLI or MissingApiKey would mask a corrupted \
+                 keychain entry from the user"
+            ),
+        }
+    }
+
+    /// FreeOnly + resolver Backend error: the keychain probe must be
+    /// SKIPPED. The user opted out of Anthropic; a broken keychain
+    /// entry has nothing to do with whether `claude` / `codex` is on
+    /// PATH, so it must not block selection of a CLI backend. The
+    /// outcome depends on which CLIs are on PATH at test time
+    /// (different in CI vs a dev box) — what we pin is "the resolver
+    /// error did NOT propagate" by asserting the result is anything
+    /// other than `LlmError::Backend(api key resolver: ...)`.
+    #[test]
+    fn select_summarizer_with_resolver_skips_resolver_probe_under_free_only() {
+        match select_summarizer_with_resolver(Preference::FreeOnly, &StubResolverErr) {
+            // CLI on PATH: success. Resolver was never asked. ✓
+            Ok((_, backend, _)) => assert_ne!(
+                backend,
+                Backend::Anthropic,
+                "FreeOnly must never pick Anthropic"
+            ),
+            // No CLI on PATH: NoBackendAvailable, NOT a resolver-prefixed error.
+            Err(LlmError::Backend(msg)) => {
+                assert!(
+                    !msg.contains("api key resolver"),
+                    "FreeOnly must skip the resolver probe entirely; got {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("unexpected error variant under FreeOnly with broken resolver: {other:?}")
+            }
+        }
+    }
+
+    /// PremiumOnly + resolver Backend error: must surface as Backend,
+    /// not as `MissingApiKey`. Without the propagation, a corrupted
+    /// keychain entry under PremiumOnly would tell the user "export
+    /// the key" — a confusing toast when the key IS configured but
+    /// the keychain itself is broken.
+    #[test]
+    fn select_summarizer_with_resolver_propagates_backend_error_under_premium_only() {
+        match select_summarizer_with_resolver(Preference::PremiumOnly, &StubResolverErr) {
+            Ok(_) => panic!("Backend error must propagate even under PremiumOnly"),
+            Err(LlmError::Backend(_)) => {}
+            Err(other) => panic!(
+                "PremiumOnly + Backend error must surface as Backend, not {other:?}; \
+                 a 'export the key' toast is misleading when the key IS configured \
+                 but the keychain itself is broken"
+            ),
+        }
     }
 }

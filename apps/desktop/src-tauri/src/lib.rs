@@ -17,6 +17,7 @@ pub mod asset_protocol;
 pub mod diagnostics;
 pub mod disk;
 pub mod keychain;
+pub mod keychain_resolver;
 pub mod notes;
 pub mod onboarding;
 pub mod preflight;
@@ -47,6 +48,7 @@ pub use preflight::{DiskCheckOutcome, check_disk, heron_check_disk_for_recording
 // unit-testing, and the `#[tauri::command]` shims below thread the
 // arguments through.
 pub use keychain::{KEYCHAIN_SERVICE, KeychainAccount, KeychainError};
+pub use keychain_resolver::EnvThenKeychainResolver;
 pub use settings::{Settings, SettingsError, mark_onboarded, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]

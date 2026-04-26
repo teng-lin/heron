@@ -22,6 +22,17 @@
 //!   `keychain_set`; the `_get` accessor is intentionally Rust-only,
 //! - deletion is idempotent (a missing entry is treated as success).
 //!
+//! ## Consumer side (PR-μ / phase 74)
+//!
+//! The summarizer paths in `crates/heron-llm` consume these entries
+//! through the `KeyResolver` trait defined at
+//! `crates/heron-llm/src/key_resolver.rs`. The desktop-only
+//! `EnvThenKeychainResolver` (`crate::keychain_resolver`) layers a
+//! call to [`keychain_get`] under the env-var read so a user who only
+//! pasted their key into Settings → Summarizer can still summarize
+//! without exporting `ANTHROPIC_API_KEY`. CLI users keep the
+//! historical env-only behaviour via `heron_llm::EnvKeyResolver`.
+//!
 //! Account labels (single source of truth):
 //!
 //!   `KeychainAccount::AnthropicApiKey` → `"anthropic_api_key"`

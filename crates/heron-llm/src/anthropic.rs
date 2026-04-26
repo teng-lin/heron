@@ -31,6 +31,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::content::parse_content_json;
+use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
 use crate::transcript::{build_user_content, read_transcript_capped};
 use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
 
@@ -86,11 +87,37 @@ impl AnthropicClientConfig {
     /// rest. Returns [`LlmError::MissingApiKey`] if the env var is
     /// unset or empty so a misconfigured launch doesn't silently
     /// emit unauthenticated requests that 401 instead.
+    ///
+    /// Implemented in terms of [`Self::from_resolver`] with an
+    /// [`EnvKeyResolver`] so the resolver-aware constructor stays the
+    /// single source of truth for key-precedence behaviour. PR-μ /
+    /// phase 74 — desktop callers that want the keychain fallback
+    /// should reach for `from_resolver` directly with an
+    /// `EnvThenKeychainResolver` (defined in the desktop crate at
+    /// `apps/desktop/src-tauri/src/keychain_resolver.rs`).
     pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or(LlmError::MissingApiKey)?;
+        Self::from_resolver(&EnvKeyResolver)
+    }
+
+    /// Build a config by asking `resolver` for the Anthropic API key.
+    ///
+    /// PR-μ / phase 74: this is the resolver-aware path the
+    /// `select_summarizer_with_resolver` factory feeds. Maps a
+    /// `KeyResolveError::NotFound` to [`LlmError::MissingApiKey`] so
+    /// callers see the same error variant regardless of whether the
+    /// resolver consulted env-only or also checked the keychain.
+    /// Other resolver failures (a macOS keychain backend error) come
+    /// back as `LlmError::Backend` so they can be surfaced as a clean
+    /// renderer-side toast distinct from "no key configured".
+    pub fn from_resolver(resolver: &dyn KeyResolver) -> Result<Self, LlmError> {
+        let api_key = resolver
+            .resolve(KeyName::AnthropicApiKey)
+            .map_err(|e| match e {
+                KeyResolveError::NotFound(_) => LlmError::MissingApiKey,
+                KeyResolveError::Backend(msg) => {
+                    LlmError::Backend(format!("api key resolver: {msg}"))
+                }
+            })?;
         Ok(Self {
             api_key,
             base_url: DEFAULT_BASE_URL.to_owned(),
@@ -338,16 +365,15 @@ pub struct Usage {
 mod tests {
     use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     use heron_types::{ActionItem, ItemId, MeetingType};
 
     use super::*;
-
-    /// Serialize tests that mutate `ANTHROPIC_API_KEY` so they
-    /// don't race under cargo's parallel test runner. Process-global
-    /// env state has no other coordination point.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Crate-wide single ENV_LOCK so this module's tests don't race
+    // `key_resolver::tests` over `ANTHROPIC_API_KEY`. See
+    // [`crate::test_env`] for the rationale (two module-private
+    // mutexes would race the same env var).
+    use crate::test_env::ENV_LOCK;
 
     fn write_tmp_jsonl(lines: &[&str]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -595,6 +621,65 @@ mod tests {
             if let Some(v) = saved {
                 std::env::set_var("ANTHROPIC_API_KEY", v);
             }
+        }
+    }
+
+    #[test]
+    fn from_resolver_uses_resolver_value() {
+        // A bespoke resolver that returns a fixed key — proves
+        // `from_resolver` is wired to the trait, not to the env var
+        // directly. This is the contract the desktop crate's
+        // `EnvThenKeychainResolver` relies on.
+        struct Stub;
+        impl KeyResolver for Stub {
+            fn resolve(&self, _name: KeyName) -> Result<String, KeyResolveError> {
+                Ok("from-stub-resolver".to_owned())
+            }
+        }
+        let cfg = AnthropicClientConfig::from_resolver(&Stub).expect("ok");
+        assert_eq!(cfg.api_key, "from-stub-resolver");
+    }
+
+    #[test]
+    fn from_resolver_maps_not_found_to_missing_api_key() {
+        // `NotFound` from the resolver is the "neither env nor keychain
+        // had a value" case. The Anthropic constructor must surface
+        // it as `MissingApiKey` so the existing renderer toast
+        // ("set ANTHROPIC_API_KEY ...") fires unchanged.
+        struct Stub;
+        impl KeyResolver for Stub {
+            fn resolve(&self, name: KeyName) -> Result<String, KeyResolveError> {
+                Err(KeyResolveError::NotFound(name))
+            }
+        }
+        let err = AnthropicClientConfig::from_resolver(&Stub).expect_err("missing");
+        assert!(matches!(err, LlmError::MissingApiKey));
+    }
+
+    #[test]
+    fn from_resolver_maps_backend_to_llm_backend_error() {
+        // Distinct path from `MissingApiKey` — a keychain backend
+        // failure shouldn't masquerade as "user forgot to set the
+        // key". The renderer can render a different toast.
+        struct Stub;
+        impl KeyResolver for Stub {
+            fn resolve(&self, _name: KeyName) -> Result<String, KeyResolveError> {
+                Err(KeyResolveError::Backend("simulated keychain error".into()))
+            }
+        }
+        let err = AnthropicClientConfig::from_resolver(&Stub).expect_err("backend");
+        match err {
+            LlmError::Backend(msg) => {
+                assert!(
+                    msg.contains("simulated keychain error"),
+                    "expected backend error to be wrapped, got: {msg}"
+                );
+                assert!(
+                    msg.contains("api key resolver"),
+                    "expected resolver-prefixed error, got: {msg}"
+                );
+            }
+            other => panic!("expected Backend, got {other:?}"),
         }
     }
 
