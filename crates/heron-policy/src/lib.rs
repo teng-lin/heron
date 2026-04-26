@@ -18,9 +18,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+pub mod controller;
 pub mod filter;
 pub mod queue;
 pub mod validate;
+pub use controller::{DEFAULT_EVENT_CAPACITY, DefaultSpeechController};
 pub use filter::{PolicyDecision, evaluate};
 pub use heron_types::prefixed_id::IdParseError;
 pub use queue::{CancelOutcome, EnqueueOutcome, QueuedUtterance, SpeechQueue};
