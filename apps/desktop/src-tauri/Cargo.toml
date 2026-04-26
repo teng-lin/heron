@@ -56,6 +56,19 @@ heron-vault = { workspace = true }
 # `select_summarizer(Preference::Auto)`.
 heron-cli = { workspace = true }
 heron-llm = { workspace = true }
+# Phase 82: in-process bus + replay cache so future local publishers
+# (heron-cli v2 commands once they delegate through here, recording
+# state-machine probes, etc.) can broadcast envelopes without going
+# through herond's HTTP loopback. `LocalSessionOrchestrator` brings
+# the substrate; `TauriEventSink` re-emits onto Tauri IPC for the
+# WebView. Today the only consumer is the sink — there are no in-
+# process publishers yet, so the wiring is dormant. Cross-process
+# domain events (the published OpenAPI surface) still flow over
+# herond's HTTP/SSE; this is the in-process side.
+heron-event = { workspace = true }
+heron-event-tauri = { workspace = true }
+heron-orchestrator = { workspace = true }
+heron-session = { workspace = true }
 # Probes that hit TCC (mic, calendar) need `spawn_blocking`, and the
 # tap probe is async — pull `tokio` in for the shared runtime. The
 # `rt` + `time` features are the minimum the probes need (timeout +
@@ -108,6 +121,11 @@ tokio = { workspace = true }
 # `filetime` is the standard knob for setting `mtime` portably; pulling
 # it in only as a dev-dep keeps it out of the release binary.
 filetime = "0.2"
+# Phase 82 `event_bus` tests use `tauri::test::mock_app()` to build a
+# `MockRuntime`-backed `AppHandle` for in-process listener assertions.
+# The `test` feature is opt-in upstream because it pulls Tauri's mock
+# runtime; gate it to dev-deps so the production binary stays slim.
+tauri = { version = "2", features = ["test"] }
 
 # macOS Keychain integration (PR-θ / phase 70). The crate is broadly
 # used (rustls, reqwest, cargo) and dual-licensed MIT/Apache-2.0 (already
