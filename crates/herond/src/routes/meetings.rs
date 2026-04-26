@@ -85,6 +85,8 @@ async fn get_meeting(State(state): State<AppState>, Path(meeting_id): Path<Meeti
 pub struct StartCaptureBody {
     pub platform: Platform,
     pub hint: Option<String>,
+    #[serde(default)]
+    pub calendar_event_id: Option<String>,
 }
 
 async fn start_capture(
@@ -94,6 +96,7 @@ async fn start_capture(
     let args = StartCaptureArgs {
         platform: body.platform,
         hint: body.hint,
+        calendar_event_id: body.calendar_event_id,
     };
     match state.orchestrator.start_capture(args).await {
         Ok(meeting) => {

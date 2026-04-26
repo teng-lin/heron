@@ -436,23 +436,26 @@ async fn list_upcoming_calendar_translates_denied_to_permission_missing() {
 }
 
 #[tokio::test]
-async fn attach_context_still_returns_not_yet_implemented() {
-    // FSM-merge wired `start_capture` / `end_meeting` (see
-    // capture_lifecycle_drives_fsm_and_publishes_bus_events below).
-    // `attach_context`'s storage layer ships with the same PR that
-    // wires the consumer of pre-meeting context at capture-start
-    // time — until then it stays `NotYetImplemented`.
+async fn attach_context_persists_against_vault_orchestrator() {
+    // The vault-backed orchestrator stages context the same way the
+    // vault-less one does: in-memory, keyed by `calendar_event_id`,
+    // independent of the vault root. Pin that here so a future vault
+    // refactor doesn't accidentally route this through disk.
     let fix = Fixture::new();
     let orch = fix.orch();
 
-    let err = orch
-        .attach_context(heron_session::PreMeetingContextRequest {
-            calendar_event_id: "synth_x".into(),
-            context: Default::default(),
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(err, SessionError::NotYetImplemented));
+    orch.attach_context(heron_session::PreMeetingContextRequest {
+        calendar_event_id: "synth_x".into(),
+        context: heron_session::PreMeetingContext {
+            agenda: Some("kickoff".into()),
+            ..Default::default()
+        },
+    })
+    .await
+    .expect("attach_context");
+
+    let staged = orch.pending_context("synth_x").expect("staged context");
+    assert_eq!(staged.agenda.as_deref(), Some("kickoff"));
 }
 
 #[tokio::test]

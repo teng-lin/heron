@@ -66,7 +66,7 @@
 //!   daemon restart loses in-flight captures and the path-derived vault
 //!   IDs become the read-side source of truth.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -84,8 +84,9 @@ use heron_session::{
     AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
     HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
     MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Participant, Platform,
-    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator, StartCaptureArgs,
-    Summary, SummaryLifecycle, Transcript, TranscriptLifecycle, TranscriptSegment,
+    PreMeetingContext, PreMeetingContextRequest, SessionError, SessionEventBus,
+    SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
+    TranscriptLifecycle, TranscriptSegment,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
 use heron_vault::{
@@ -114,6 +115,29 @@ pub const MEETING_ID_NAMESPACE: Uuid = Uuid::from_bytes([
 /// malformed transcript that lost its newlines and presents as one
 /// gigantic line.
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
+
+/// Cap on the calendar event identifier `attach_context` accepts.
+/// EventKit ids are short opaque strings and the synthetic ids
+/// `list_upcoming_calendar` mints are bounded by `(start, end, title)`
+/// — 4 KiB is well past the largest realistic input.
+const MAX_CALENDAR_EVENT_ID_BYTES: usize = 4 * 1024;
+
+/// Cap on the JSON-serialized `PreMeetingContext` payload
+/// `attach_context` accepts. Spec-shape contexts (agenda, attendees,
+/// related notes, briefing) are kilobytes; 256 KiB tolerates a long
+/// briefing without letting one caller wedge daemon memory by
+/// uploading a megabyte-scale payload per calendar event id.
+const MAX_PRE_MEETING_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// Cap on the number of `PreMeetingContext` entries the in-memory
+/// staging map holds. Per-entry caps don't bound map size — a
+/// caller spraying unique `calendar_event_id`s without ever calling
+/// `start_capture` would otherwise grow the map without bound. At
+/// the cap a fresh `attach_context` evicts the oldest entry first
+/// (insertion-order FIFO via the `PendingContextsInner::order`
+/// queue). 1024 covers ~weeks of upcoming-calendar events and is
+/// orders of magnitude larger than any realistic working set.
+const MAX_PENDING_CONTEXTS: usize = 1024;
 
 /// Default broadcast bus capacity. 1024 covers a long meeting's
 /// worth of `transcript.partial` deltas without dropping for any
@@ -177,6 +201,20 @@ pub struct LocalSessionOrchestrator {
     /// `start_capture` remains readable after the background pipeline
     /// writes the note.
     finalized_meetings: Arc<Mutex<HashMap<MeetingId, FinalizedMeeting>>>,
+    /// Pre-meeting contexts staged via `attach_context`, keyed by
+    /// `calendar_event_id`. `start_capture` consumes the entry whose
+    /// id matches `StartCaptureArgs::calendar_event_id`, attaching it
+    /// to the resulting `ActiveMeeting`. Same sync-`Mutex` discipline
+    /// as `active_meetings`: insert / remove / lookup are CPU-bound
+    /// and the lock is never held across `.await`. In-memory only —
+    /// a daemon restart drops staged context, matching the bus /
+    /// cache resume contract.
+    ///
+    /// **Lock-ordering contract**: `start_capture` holds
+    /// `active_meetings` while acquiring `pending_contexts`; no other
+    /// path takes both. Any future code that needs both MUST follow
+    /// the same order or this becomes a deadlock.
+    pending_contexts: PendingContexts,
     /// Held in a `Mutex<Option<…>>` so [`Self::shutdown`] (taking
     /// `&self`) can still consume the sender. Real callers don't
     /// touch the lock; the test seam takes it once.
@@ -196,11 +234,15 @@ pub struct LocalSessionOrchestrator {
 /// drives in the live audio path; here it provides the legality check
 /// for every transition `start_capture` / `end_meeting` triggers, and
 /// the `meeting` snapshot is the latest copy that has been published
-/// on the bus.
+/// on the bus. `applied_context` carries the `PreMeetingContext`
+/// (agenda / persona / briefing) that was staged via
+/// `attach_context` and consumed at `start_capture`-time; the bot /
+/// realtime / policy wiring will read it when those layers compose.
 struct ActiveMeeting {
     fsm: RecordingFsm,
     meeting: Meeting,
     runtime: CaptureRuntime,
+    applied_context: Option<PreMeetingContext>,
 }
 
 /// Runtime backing for an active capture.
@@ -220,6 +262,73 @@ enum CaptureRuntime {
 struct FinalizedMeeting {
     meeting: Meeting,
     note_path: Option<PathBuf>,
+}
+
+/// Bounded staging map for `attach_context`. Pairs a `HashMap` with
+/// a FIFO `VecDeque` so the cap-eviction order is "oldest insertion
+/// drops first" rather than HashMap's iteration-order
+/// non-determinism. The `Mutex` wrapper holds both fields together
+/// so no caller can ever observe one being mutated without the
+/// other.
+struct PendingContexts {
+    inner: Mutex<PendingContextsInner>,
+}
+
+struct PendingContextsInner {
+    map: HashMap<String, PreMeetingContext>,
+    /// Insertion order of keys currently in `map`. On overwrite of
+    /// an existing key the queue is left unchanged (the key keeps
+    /// its original FIFO position) — that matches the spec's
+    /// "latest call wins" without resetting the eviction clock for
+    /// callers that re-attach the same id.
+    order: VecDeque<String>,
+}
+
+impl PendingContexts {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PendingContextsInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Insert or overwrite. Returns whether an existing entry for
+    /// `key` was overwritten. Caps the map at `MAX_PENDING_CONTEXTS`
+    /// by evicting the oldest unrelated entry FIFO when a new key
+    /// would push past the cap.
+    fn insert(&self, key: String, value: PreMeetingContext) -> bool {
+        let mut g = lock_or_recover(&self.inner);
+        let overwrote = g.map.insert(key.clone(), value).is_some();
+        if !overwrote {
+            g.order.push_back(key);
+            while g.order.len() > MAX_PENDING_CONTEXTS {
+                if let Some(oldest) = g.order.pop_front() {
+                    g.map.remove(&oldest);
+                }
+            }
+        }
+        overwrote
+    }
+
+    /// Remove and return the entry for `key`, if any. Used by
+    /// `start_capture` to consume a staged context once the FSM has
+    /// committed to materializing the session.
+    fn remove(&self, key: &str) -> Option<PreMeetingContext> {
+        let mut g = lock_or_recover(&self.inner);
+        let value = g.map.remove(key)?;
+        if let Some(pos) = g.order.iter().position(|k| k == key) {
+            g.order.remove(pos);
+        }
+        Some(value)
+    }
+
+    /// Snapshot the entry for `key` without consuming it. Diagnostic
+    /// only — production callers consume via `remove`.
+    fn get_cloned(&self, key: &str) -> Option<PreMeetingContext> {
+        lock_or_recover(&self.inner).map.get(key).cloned()
+    }
 }
 
 /// Builder for [`LocalSessionOrchestrator`] — exposed so the daemon
@@ -377,6 +486,7 @@ impl Builder {
             llm_preference: self.llm_preference,
             active_meetings: Mutex::new(HashMap::new()),
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
+            pending_contexts: PendingContexts::new(),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
             finalizers: Mutex::new(Vec::new()),
@@ -427,6 +537,27 @@ impl LocalSessionOrchestrator {
         find_note_path_by_id(vault_root, id)
     }
 
+    /// Snapshot of the `PreMeetingContext` currently staged for
+    /// `calendar_event_id`, or `None` if `attach_context` was never
+    /// called for that id (or `start_capture` already consumed it).
+    /// Lookup normalizes the id (trim) the same way `attach_context`
+    /// does so callers don't have to remember which form was stored.
+    /// Diagnostic only — the production consumer is the future
+    /// realtime / bot composition path that reads
+    /// `ActiveMeeting::applied_context`.
+    pub fn pending_context(&self, calendar_event_id: &str) -> Option<PreMeetingContext> {
+        self.pending_contexts.get_cloned(calendar_event_id.trim())
+    }
+
+    /// Snapshot of the `PreMeetingContext` that `start_capture`
+    /// consumed for the active meeting `id`, if any. Returns `None`
+    /// when the meeting is unknown or no context was attached.
+    pub fn applied_context(&self, id: &MeetingId) -> Option<PreMeetingContext> {
+        lock_or_recover(&self.active_meetings)
+            .get(id)
+            .and_then(|m| m.applied_context.clone())
+    }
+
     /// Signal the recorder task to exit and await its termination.
     /// Idempotent — repeated calls return `Ok(())` immediately
     /// after the first (the join handle is consumed). Use this in
@@ -469,10 +600,13 @@ impl Drop for LocalSessionOrchestrator {
     }
 }
 
-/// Acquire the mutex, recovering the inner data on poisoning. We
-/// only ever hold the lock briefly to take the `Option`'s value;
-/// poisoning here would mean another thread panicked between `take`
-/// calls, which is benign since we're just consuming an option.
+/// Acquire the mutex, recovering the inner data on poisoning.
+/// Every call site here holds the lock briefly for a synchronous
+/// CPU-bound operation (consuming an `Option`, mutating a small
+/// `HashMap` / `VecDeque`); poisoning would mean a panic happened
+/// while one of those was in progress, which is benign because the
+/// data structure is left in a consistent state and we're not
+/// preserving cross-call invariants across the panic.
 fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -703,6 +837,28 @@ fn transition_to_session_error(err: heron_types::TransitionError) -> SessionErro
     }
 }
 
+/// Trim and length-validate a `calendar_event_id`. Used by both
+/// `attach_context` (where it gates persistence) and `start_capture`
+/// (where it gates correlation against the staged map and what gets
+/// stamped on `Meeting.calendar_event_id`). Centralising here keeps
+/// the trim/cap rules symmetric — without this, a caller padding
+/// either side of the id with whitespace would silently miss the
+/// context they themselves attached.
+fn normalize_calendar_event_id(raw: &str) -> Result<String, SessionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SessionError::Validation {
+            detail: "calendar_event_id must not be empty".to_owned(),
+        });
+    }
+    if trimmed.len() > MAX_CALENDAR_EVENT_ID_BYTES {
+        return Err(SessionError::Validation {
+            detail: format!("calendar_event_id exceeds {MAX_CALENDAR_EVENT_ID_BYTES} bytes"),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
 /// `Down` plus a "not yet wired" message — the honest answer for a
 /// substrate-only orchestrator. Deliberately not `PermissionMissing`
 /// (which would suggest a TCC permission gap and route consumers
@@ -803,6 +959,10 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         // `MeetingStarted` once Core Audio actually starts producing
         // PCM; the trait + bus surface stays the same — only the
         // timing of `MeetingStarted` shifts.
+        let normalized_event_id = match args.calendar_event_id.as_deref() {
+            Some(raw) => Some(normalize_calendar_event_id(raw)?),
+            None => None,
+        };
         let mut active = lock_or_recover(&self.active_meetings);
         // Singleton-per-platform per the trait docs: a second
         // capture for the same platform while one is still non-
@@ -828,7 +988,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             // title is the most honest projection until a real source
             // (AX window title, calendar correlation) lands.
             title: args.hint,
-            calendar_event_id: None,
+            calendar_event_id: normalized_event_id.clone(),
             started_at,
             ended_at: None,
             duration_secs: None,
@@ -888,18 +1048,32 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             CaptureRuntime::Synthetic
         };
 
+        // Consume the pending context AFTER the FSM walk has
+        // committed — a `transition_to_session_error` early-return
+        // above would otherwise silently delete the staged context,
+        // which the next `start_capture` retry would expect to find.
+        // Per the lock-ordering contract on `pending_contexts`, this
+        // takes the second mutex while still holding `active_meetings`.
+        let applied_context = normalized_event_id
+            .as_deref()
+            .and_then(|cid| self.pending_contexts.remove(cid));
+
         let returned = meeting.clone();
+        let context_attached = applied_context.is_some();
         active.insert(
             id,
             ActiveMeeting {
                 fsm,
                 meeting,
                 runtime,
+                applied_context,
             },
         );
         tracing::info!(
             meeting_id = %id,
             platform = ?args.platform,
+            calendar_event_id = ?normalized_event_id,
+            context_attached,
             "capture started",
         );
         Ok(returned)
@@ -924,6 +1098,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             mut fsm,
             mut meeting,
             runtime,
+            applied_context: _,
         } = entry;
 
         // recording → transcribing. The `on_hotkey` from `Recording`
@@ -1130,11 +1305,30 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         Ok(events)
     }
 
-    async fn attach_context(&self, _req: PreMeetingContextRequest) -> Result<(), SessionError> {
-        // Storage layer for pre-meeting context lands with the FSM-
-        // merge PR (the orchestrator that consumes the context at
-        // capture-start time also owns the storage seam).
-        Err(SessionError::NotYetImplemented)
+    async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
+        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
+        // Serialize-then-size-check so the cap matches what a future
+        // on-disk persistence layer (or HTTP echo) would observe, and
+        // so a non-serializable payload bails before mutating state.
+        let serialized =
+            serde_json::to_vec(&req.context).map_err(|e| SessionError::Validation {
+                detail: format!("context serialization failed: {e}"),
+            })?;
+        if serialized.len() > MAX_PRE_MEETING_CONTEXT_BYTES {
+            return Err(SessionError::Validation {
+                detail: format!("context payload exceeds {MAX_PRE_MEETING_CONTEXT_BYTES} bytes"),
+            });
+        }
+        let overwrote = self
+            .pending_contexts
+            .insert(calendar_event_id.clone(), req.context);
+        tracing::info!(
+            calendar_event_id = %calendar_event_id,
+            overwrote,
+            bytes = serialized.len(),
+            "pre-meeting context attached",
+        );
+        Ok(())
     }
 
     async fn health(&self) -> Health {
@@ -1654,15 +1848,14 @@ mod tests {
         // Pin the "stub for now" contract per-method when no
         // `vault_root` is configured. Read endpoints fall back to
         // `NotYetImplemented` because there's no on-disk source to
-        // scan; `attach_context` stays `NotYetImplemented` until its
-        // storage layer ships alongside the consumer at capture-start.
-        // Capture-lifecycle methods (`start_capture` / `end_meeting`)
-        // are NOT in this set — FSM-merge wired them to drive the
-        // `RecordingFsm` and publish bus events directly, no vault
-        // dependency.
-        // `list_upcoming_calendar` is explicitly NOT in this set —
-        // it works as soon as a CalendarReader is configured, which
-        // is independent of the vault.
+        // scan. Capture-lifecycle methods (`start_capture` /
+        // `end_meeting`) are NOT in this set — FSM-merge wired them
+        // to drive the `RecordingFsm` and publish bus events directly,
+        // no vault dependency. `list_upcoming_calendar` is also NOT
+        // in this set — it works as soon as a CalendarReader is
+        // configured. `attach_context` is also NOT in this set:
+        // pre-meeting context lives in an in-memory map keyed by
+        // calendar event id, independent of the vault.
         let orch = LocalSessionOrchestrator::new();
         let id = MeetingId::now_v7();
 
@@ -1684,14 +1877,6 @@ mod tests {
         ));
         assert!(matches!(
             orch.audio_path(&id).await,
-            Err(SessionError::NotYetImplemented)
-        ));
-        assert!(matches!(
-            orch.attach_context(PreMeetingContextRequest {
-                calendar_event_id: "evt_x".into(),
-                context: Default::default(),
-            })
-            .await,
             Err(SessionError::NotYetImplemented)
         ));
     }
@@ -1909,6 +2094,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: Some("Standup".into()),
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -1944,6 +2130,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -1977,6 +2164,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("first start");
@@ -1985,6 +2173,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect_err("second Zoom start must conflict");
@@ -2002,6 +2191,7 @@ mod tests {
         orch.start_capture(StartCaptureArgs {
             platform: Platform::GoogleMeet,
             hint: None,
+            calendar_event_id: None,
         })
         .await
         .expect("second start on a different platform");
@@ -2018,6 +2208,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("first start");
@@ -2027,6 +2218,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("second start after end");
@@ -2061,6 +2253,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -2093,6 +2286,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: Some("Standup".into()),
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -2130,6 +2324,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -2155,6 +2350,7 @@ mod tests {
             .start_capture(StartCaptureArgs {
                 platform: Platform::Zoom,
                 hint: None,
+                calendar_event_id: None,
             })
             .await
             .expect("start_capture");
@@ -2180,5 +2376,309 @@ mod tests {
             .await
             .expect_err("no Webex captures, no vault — should be NotYetImplemented");
         assert!(matches!(err, SessionError::NotYetImplemented));
+    }
+
+    // ── pre-meeting context (gap #4) ──────────────────────────────────
+
+    fn ctx_with_agenda(agenda: &str) -> heron_session::PreMeetingContext {
+        heron_session::PreMeetingContext {
+            agenda: Some(agenda.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_context_persists_and_is_retrievable() {
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("standup"),
+        })
+        .await
+        .expect("attach");
+        let got = orch
+            .pending_context("evt_alpha")
+            .expect("staged context retrievable");
+        assert_eq!(got.agenda.as_deref(), Some("standup"));
+        // Unrelated id stays unstaged.
+        assert!(orch.pending_context("evt_other").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_context_overwrites_for_same_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("first"),
+        })
+        .await
+        .expect("first attach");
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("second"),
+        })
+        .await
+        .expect("second attach");
+        let got = orch.pending_context("evt_alpha").expect("staged");
+        assert_eq!(got.agenda.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn attach_context_rejects_empty_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        for cid in ["", "   "] {
+            let err = orch
+                .attach_context(PreMeetingContextRequest {
+                    calendar_event_id: cid.into(),
+                    context: Default::default(),
+                })
+                .await
+                .expect_err("empty id must be rejected");
+            assert!(
+                matches!(err, SessionError::Validation { .. }),
+                "expected Validation, got {err:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_context_rejects_oversized_payload() {
+        let orch = LocalSessionOrchestrator::new();
+        let big_briefing = "x".repeat(MAX_PRE_MEETING_CONTEXT_BYTES + 1);
+        let err = orch
+            .attach_context(PreMeetingContextRequest {
+                calendar_event_id: "evt_big".into(),
+                context: heron_session::PreMeetingContext {
+                    user_briefing: Some(big_briefing),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect_err("oversized payload must be rejected");
+        assert!(
+            matches!(err, SessionError::Validation { .. }),
+            "expected Validation, got {err:?}",
+        );
+        assert!(orch.pending_context("evt_big").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_context_rejects_oversized_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        let huge_id = "a".repeat(MAX_CALENDAR_EVENT_ID_BYTES + 1);
+        let err = orch
+            .attach_context(PreMeetingContextRequest {
+                calendar_event_id: huge_id,
+                context: Default::default(),
+            })
+            .await
+            .expect_err("oversized id must be rejected");
+        assert!(
+            matches!(err, SessionError::Validation { .. }),
+            "expected Validation, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn start_capture_consumes_pending_context_for_matching_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("kickoff"),
+        })
+        .await
+        .expect("attach");
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: Some("evt_alpha".into()),
+            })
+            .await
+            .expect("start_capture");
+        assert_eq!(meeting.calendar_event_id.as_deref(), Some("evt_alpha"));
+        let applied = orch
+            .applied_context(&meeting.id)
+            .expect("context applied to active meeting");
+        assert_eq!(applied.agenda.as_deref(), Some("kickoff"));
+        // Consuming the pending entry empties the staging map.
+        assert!(orch.pending_context("evt_alpha").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_capture_without_calendar_event_id_does_not_consume_context() {
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("kickoff"),
+        })
+        .await
+        .expect("attach");
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        assert!(orch.applied_context(&meeting.id).is_none());
+        assert!(orch.pending_context("evt_alpha").is_some());
+    }
+
+    #[tokio::test]
+    async fn start_capture_with_unmatched_calendar_event_id_attaches_no_context() {
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("kickoff"),
+        })
+        .await
+        .expect("attach");
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: Some("evt_other".into()),
+            })
+            .await
+            .expect("start_capture");
+        assert_eq!(meeting.calendar_event_id.as_deref(), Some("evt_other"));
+        assert!(orch.applied_context(&meeting.id).is_none());
+        // The pending entry for the original id is untouched.
+        assert!(orch.pending_context("evt_alpha").is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_and_start_capture_normalize_whitespace_symmetrically() {
+        // A caller that whitespace-pads either side of the id on
+        // either route still hits the staged entry. Without symmetric
+        // trimming, attach would store under "evt_alpha" while
+        // start_capture would look up " evt_alpha " and miss.
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "  evt_alpha\n".into(),
+            context: ctx_with_agenda("trimmed"),
+        })
+        .await
+        .expect("attach");
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: Some("\tevt_alpha ".into()),
+            })
+            .await
+            .expect("start_capture");
+        assert_eq!(meeting.calendar_event_id.as_deref(), Some("evt_alpha"));
+        let applied = orch
+            .applied_context(&meeting.id)
+            .expect("context consumed despite whitespace");
+        assert_eq!(applied.agenda.as_deref(), Some("trimmed"));
+    }
+
+    #[tokio::test]
+    async fn start_capture_validates_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        for cid in ["", "   "] {
+            let err = orch
+                .start_capture(StartCaptureArgs {
+                    platform: Platform::Zoom,
+                    hint: None,
+                    calendar_event_id: Some(cid.into()),
+                })
+                .await
+                .expect_err("empty id must be rejected on start_capture too");
+            assert!(
+                matches!(err, SessionError::Validation { .. }),
+                "expected Validation, got {err:?}",
+            );
+        }
+        let huge = "a".repeat(MAX_CALENDAR_EVENT_ID_BYTES + 1);
+        let err = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: Some(huge),
+            })
+            .await
+            .expect_err("oversized id must be rejected on start_capture too");
+        assert!(
+            matches!(err, SessionError::Validation { .. }),
+            "expected Validation, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_contexts_evict_oldest_at_cap() {
+        // The map is bounded at MAX_PENDING_CONTEXTS to defend against
+        // a caller spraying unique ids without ever calling
+        // start_capture. At the cap, a fresh attach evicts the oldest
+        // entry FIFO; an existing key keeps its slot when overwritten.
+        let orch = LocalSessionOrchestrator::new();
+        for i in 0..MAX_PENDING_CONTEXTS {
+            orch.attach_context(PreMeetingContextRequest {
+                calendar_event_id: format!("evt_{i}"),
+                context: ctx_with_agenda(&format!("a{i}")),
+            })
+            .await
+            .expect("attach within cap");
+        }
+        // At cap — every prior id is still resident.
+        assert!(orch.pending_context("evt_0").is_some());
+        assert!(
+            orch.pending_context(&format!("evt_{}", MAX_PENDING_CONTEXTS - 1))
+                .is_some(),
+        );
+
+        // One past the cap: the oldest entry is evicted, the newest
+        // is resident.
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_overflow".into(),
+            context: ctx_with_agenda("overflow"),
+        })
+        .await
+        .expect("attach past cap");
+        assert!(orch.pending_context("evt_0").is_none());
+        assert!(orch.pending_context("evt_overflow").is_some());
+        assert!(orch.pending_context("evt_1").is_some());
+    }
+
+    #[tokio::test]
+    async fn overwriting_pending_context_does_not_reset_eviction_clock() {
+        // When the same id is re-attached, FIFO eviction order should
+        // treat it as if the original insert is what counts —
+        // overwriting late shouldn't push older entries off the cliff.
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_0".into(),
+            context: ctx_with_agenda("first"),
+        })
+        .await
+        .expect("attach");
+        for i in 1..MAX_PENDING_CONTEXTS {
+            orch.attach_context(PreMeetingContextRequest {
+                calendar_event_id: format!("evt_{i}"),
+                context: ctx_with_agenda(&format!("a{i}")),
+            })
+            .await
+            .expect("attach");
+        }
+        // Overwrite evt_0 — its FIFO position is unchanged.
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_0".into(),
+            context: ctx_with_agenda("second"),
+        })
+        .await
+        .expect("overwrite");
+        // Push past cap — evt_0 (oldest) should still be evicted.
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_overflow".into(),
+            context: ctx_with_agenda("overflow"),
+        })
+        .await
+        .expect("attach past cap");
+        assert!(orch.pending_context("evt_0").is_none());
+        assert!(orch.pending_context("evt_1").is_some());
     }
 }
