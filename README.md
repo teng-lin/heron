@@ -10,8 +10,12 @@ A private, on-device meeting AI for macOS. Two modes:
   The notes the agent leaves behind become long-term memory it draws
   on for future meetings.
 
-Audio never leaves your machine except to the LLM provider you've
-chosen.
+In note-taker mode, audio never leaves your machine — only the
+transcript text is sent to your chosen LLM provider for
+summarization. In agent mode, audio necessarily travels to your
+meeting-bot driver (Recall.ai today) and the realtime LLM session,
+in both cases via API keys you supply. See [Where your data
+goes](#where-your-data-goes) for the per-mode breakdown.
 
 ## What heron does
 
@@ -137,8 +141,9 @@ When you launch heron for the first time:
 1. **Run the onboarding wizard.** A few quick checks make sure your
    machine is ready:
    - **Microphone** — heron needs your voice.
-   - **System audio** — Core Audio process tap on Zoom (or whichever
-     meeting app you select).
+   - **System audio** — Core Audio process tap on the Zoom native
+     macOS client. Other meeting apps (Meet, Teams, Webex) are on
+     the roadmap but not wired in note-taker mode today.
    - **Accessibility** — lets heron read window titles and the Zoom
      participant list. Without it, transcripts label everyone
      `Speaker 1 / 2 / 3`.
