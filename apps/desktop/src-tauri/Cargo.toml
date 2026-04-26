@@ -145,6 +145,13 @@ filetime = "0.2"
 # The `test` feature is opt-in upstream because it pulls Tauri's mock
 # runtime; gate it to dev-deps so the production binary stays slim.
 tauri = { version = "2", features = ["test"] }
+# Multi-subscriber fan-out test in `event_bus` exercises a Tauri IPC
+# sink AND an `SseEventSink` sharing the same orchestrator bus to pin
+# Invariant 13 (transports are projections of one canonical bus) under
+# realistic v2-frontend conditions. Production code never instantiates
+# `SseEventSink` from the desktop crate — that's herond's job — so the
+# adapter stays a dev-dep.
+heron-event-http = { workspace = true }
 
 # macOS Keychain integration (PR-θ / phase 70). The crate is broadly
 # used (rustls, reqwest, cargo) and dual-licensed MIT/Apache-2.0 (already

@@ -418,6 +418,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_publish_fans_out_to_tauri_and_sse_subscribers() {
+        // Invariant 13 (`docs/api-design-spec.md` §10) says every
+        // transport is a projection of the canonical
+        // `heron_event::EventBus`; no transport invents its own
+        // event types or its own publish path. Pin that property
+        // end-to-end with the two transports we ship today —
+        // [`TauriEventSink`] (desktop IPC) and
+        // [`heron_event_http::SseEventSink`] (HTTP/SSE) — sharing one
+        // [`LocalSessionOrchestrator`]'s bus. A single publish must
+        // reach both sinks.
+        //
+        // Closes `docs/codebase-gaps.md` gap #11's underlying concern
+        // (multi-subscriber fan-out works once v2 frontends multiply)
+        // — the integration coverage was missing even though both
+        // sinks shipped in phases 80 / 82.
+        use heron_event_http::{SseEventSink, TopicFilter};
+        use tokio::sync::broadcast::error::RecvError;
+        use tokio::sync::mpsc;
+
+        let app = tauri::test::mock_app();
+        // One orchestrator, one bus, two independent sinks.
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+
+        // Tauri IPC sink: install a listener so we observe the
+        // sanitized event name reaching the WebView path.
+        let tauri_sink = TauriEventSink::new("test-fanout:tauri", app.handle().clone());
+        let tauri_captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let tauri_clone = Arc::clone(&tauri_captured);
+        app.handle().listen("meeting:detected", move |evt| {
+            tauri_clone
+                .lock()
+                .expect("lock")
+                .push(evt.payload().to_owned());
+        });
+
+        // SSE sink: a small mpsc receiver stands in for the HTTP
+        // body the daemon would otherwise stream.
+        let (sse_tx, mut sse_rx) = mpsc::channel(8);
+        let sse_sink = SseEventSink::new("test-fanout:sse", sse_tx, TopicFilter::All);
+
+        // Subscribe each sink to the SAME bus. Drives the forwarder
+        // pattern `event_bus::install` uses, but here we own both
+        // tasks so the test can join on each independently.
+        let mut tauri_rx = orch.event_bus().subscribe();
+        let tauri_handle = tauri::async_runtime::spawn(async move {
+            // One iteration is enough for this test; production loops
+            // forever (see `install`).
+            match tauri_rx.recv().await {
+                Ok(env) => EventSink::forward(&tauri_sink, &env)
+                    .await
+                    .expect("tauri forward"),
+                Err(RecvError::Closed) => {}
+                Err(e) => panic!("tauri rx unexpected error: {e:?}"),
+            }
+        });
+
+        let mut sse_rx_bus = orch.event_bus().subscribe();
+        let sse_handle = tokio::spawn(async move {
+            match sse_rx_bus.recv().await {
+                Ok(env) => EventSink::forward(&sse_sink, &env)
+                    .await
+                    .expect("sse forward"),
+                Err(RecvError::Closed) => {}
+                Err(e) => panic!("sse rx unexpected error: {e:?}"),
+            }
+        });
+
+        // Single publish — each sink (and the orchestrator's own
+        // replay-cache recorder) sees the same envelope through its
+        // own broadcast handle.
+        let env = sample_envelope();
+        let event_id = env.event_id;
+        let delivered = orch.event_bus().publish(env);
+        // Three subscribers: two test forwarders + the orchestrator's
+        // built-in replay-cache recorder. Pin the count so a future
+        // refactor that silently drops a subscriber is caught here.
+        assert_eq!(delivered, 3, "expected fan-out to all three subscribers");
+
+        // Wait for both forwarders to drain their single publish.
+        tauri_handle.await.expect("tauri forwarder joined");
+        sse_handle.await.expect("sse forwarder joined");
+
+        // Tauri side: the listener fired with the full envelope JSON.
+        // Snapshot the captured payload under the lock and drop the
+        // guard before any further `await` — `clippy::await_holding_lock`
+        // would otherwise flag the mixed sync-mutex / async path.
+        wait_for_capture(&tauri_captured, "tauri sink never delivered the envelope").await;
+        let tauri_payload = {
+            let entries = tauri_captured.lock().expect("lock tauri");
+            assert_eq!(entries.len(), 1);
+            entries[0].clone()
+        };
+        assert!(
+            tauri_payload.contains("\"event_type\":\"meeting.detected\""),
+            "tauri payload missing event_type: {tauri_payload}",
+        );
+
+        // SSE side: one frame on the channel, with the OpenAPI-pinned
+        // `id:` / `event:` / `data:` lines. `try_recv` is enough —
+        // the forwarder has already returned.
+        let frame = sse_rx
+            .try_recv()
+            .expect("sse sink never delivered the envelope");
+        let s = frame.as_str();
+        assert!(
+            s.contains(&format!("id: {event_id}")),
+            "sse frame missing id: {s}",
+        );
+        assert!(
+            s.contains("event: meeting.detected"),
+            "sse frame missing event_type: {s}",
+        );
+
+        // Replay cache (the orchestrator's own subscriber) also got
+        // it — pin that too so this test catches regressions where a
+        // future refactor accidentally loses the cache subscription.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while orch.cache_len() < 1 {
+            if Instant::now() > deadline {
+                panic!("replay cache never recorded the envelope");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn forwarder_survives_lagged_bus_and_keeps_delivering() {
         // Drive the bus past its capacity to provoke `RecvError::Lagged`
         // in the forwarder. The forwarder must log-and-continue, not

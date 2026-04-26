@@ -2211,6 +2211,7 @@ dependencies = [
  "heron-audio",
  "heron-cli",
  "heron-event",
+ "heron-event-http",
  "heron-event-tauri",
  "heron-llm",
  "heron-orchestrator",
