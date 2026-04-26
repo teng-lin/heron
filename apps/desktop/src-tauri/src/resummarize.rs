@@ -39,10 +39,11 @@ use tokio::fs;
 
 use heron_cli::session::{Orchestrator, SessionConfig, SessionError};
 use heron_cli::summarize::re_summarize_in_vault;
-use heron_llm::{Preference, Summarizer, select_summarizer};
+use heron_llm::{Preference, Summarizer, select_summarizer_with_resolver};
 use heron_types::Frontmatter;
 use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note};
 
+use crate::keychain_resolver::EnvThenKeychainResolver;
 use crate::notes::{resolve_note_path, resolve_vault_path, validate_session_id};
 
 /// Resolve the `<vault>/<session_id>.md.bak` path the renderer is
@@ -106,13 +107,19 @@ async fn summarize_body(vault: &Path, session_id: &str) -> Result<String, String
     let note_path = resolve_note_path(vault, session_id, true).await?;
     let canonical_vault = resolve_vault_path(vault).await?;
 
-    // Build a real summarizer per `Preference::Auto`. The selector
-    // chooses anthropic if `ANTHROPIC_API_KEY` is set, falling back
-    // to `claude` / `codex` CLIs if they're on PATH. Errors surface
-    // verbatim so the Review UI can render an actionable toast
-    // ("set ANTHROPIC_API_KEY", "install claude-code", etc).
+    // Build a real summarizer per `Preference::Auto`. PR-μ / phase 74:
+    // the desktop crate threads its `EnvThenKeychainResolver` through
+    // so a user who only pasted their key into Settings → Summarizer
+    // (PR-θ) gets the Anthropic backend selected — with the env var
+    // still winning when both are set so CI / docker workflows are
+    // unaffected. Falls back to `claude` / `codex` CLIs if they're on
+    // PATH. Errors surface verbatim so the Review UI can render an
+    // actionable toast ("set ANTHROPIC_API_KEY or paste a key in
+    // Settings → Summarizer", "install claude-code", etc).
+    let resolver = EnvThenKeychainResolver::new();
     let (summarizer, _backend, _reason) =
-        select_summarizer(Preference::Auto).map_err(|e| format!("LLM backend: {e}"))?;
+        select_summarizer_with_resolver(Preference::Auto, &resolver)
+            .map_err(|e| format!("LLM backend: {e}"))?;
 
     let (ours_fm, ours_body) =
         vault_read_note(&note_path).map_err(|e| format!("read {}: {}", note_path.display(), e))?;
@@ -234,8 +241,19 @@ pub async fn resummarize(vault: &Path, session_id: &str) -> Result<String, Strin
     let note_path = resolve_note_path(vault, session_id, true).await?;
     let canonical_vault = resolve_vault_path(vault).await?;
 
+    // Build a real summarizer per `Preference::Auto`. PR-μ / phase 74:
+    // the desktop crate threads its `EnvThenKeychainResolver` through
+    // so a user who only pasted their key into Settings → Summarizer
+    // (PR-θ) gets the Anthropic backend selected — with the env var
+    // still winning when both are set so CI / docker workflows are
+    // unaffected. Falls back to `claude` / `codex` CLIs if they're on
+    // PATH. Errors surface verbatim so the Review UI can render an
+    // actionable toast ("set ANTHROPIC_API_KEY or paste a key in
+    // Settings → Summarizer", "install claude-code", etc).
+    let resolver = EnvThenKeychainResolver::new();
     let (summarizer, _backend, _reason) =
-        select_summarizer(Preference::Auto).map_err(|e| format!("LLM backend: {e}"))?;
+        select_summarizer_with_resolver(Preference::Auto, &resolver)
+            .map_err(|e| format!("LLM backend: {e}"))?;
 
     // `re_summarize_in_vault` does the work:
     // 1. Reads the note's frontmatter to find the transcript path.
