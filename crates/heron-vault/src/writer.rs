@@ -146,7 +146,13 @@ fn bak_path(note_path: &Path) -> PathBuf {
 
 /// Render `<frontmatter>\n<body>` as a single string, with `---` YAML
 /// fences around the frontmatter.
-fn render_note(frontmatter: &Frontmatter, body: &str) -> Result<String, VaultError> {
+///
+/// Public so the desktop crate's PR-ξ (phase 76) `resummarize_preview`
+/// command can produce byte-identical output to what
+/// [`VaultWriter::re_summarize`] writes — without the preview path
+/// re-implementing the fence + YAML serializer (which would silently
+/// drift the moment this renderer changes shape).
+pub fn render_note(frontmatter: &Frontmatter, body: &str) -> Result<String, VaultError> {
     let mut out = String::new();
     out.push_str(FRONTMATTER_FENCE);
     out.push_str(&serde_yaml::to_string(frontmatter)?);

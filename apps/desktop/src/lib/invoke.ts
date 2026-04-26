@@ -281,6 +281,18 @@ export interface HeronCommands {
     returns: string;
   };
   /**
+   * Phase 76 (PR-ξ): preview the post-merge note for the diff modal.
+   * Runs the same summarize + §10.3 merge pipeline as
+   * `heron_resummarize` but never writes `<id>.md` and never rotates
+   * `<id>.md.bak`. The Review UI compares the returned string against
+   * the current `<id>.md` and the user clicks Apply (which fires
+   * `heron_resummarize`) or Cancel.
+   */
+  heron_resummarize_preview: {
+    args: { vaultPath: string; sessionId: string };
+    returns: string;
+  };
+  /**
    * Phase 67 (PR-ε): report whether a `<id>.md.bak` is present. `null`
    * when there's no backup — the Review UI hides the Restore pill.
    */
