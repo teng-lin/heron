@@ -62,6 +62,20 @@ interface SettingsState {
    * failure (the error message is also written to `error`).
    */
   save: () => Promise<boolean>;
+  /**
+   * Phase 71 (PR-ι): optimistically flip `onboarded = true` in the
+   * in-memory snapshot after the wizard's `heron_mark_onboarded`
+   * Tauri call resolves. The Rust side has already written the new
+   * value to disk; this keeps `App.tsx`'s first-run detector from
+   * needing a second `load()` round-trip to see the new state.
+   *
+   * Tolerant of `settings === null`: a `markOnboarded()` call before
+   * `load()` resolved is a no-op rather than seeding a partial
+   * `Settings` object that would mis-render the rest of the form.
+   * The wizard always calls `load()` first via `App.tsx`, so the
+   * null-guard is defence in depth.
+   */
+  markOnboarded: () => void;
 }
 
 /**
@@ -165,5 +179,19 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       }
     })();
     return inFlightSave;
+  },
+  markOnboarded: () => {
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    if (current.onboarded) {
+      return;
+    }
+    // Mirror the Rust `mark_onboarded` semantics: only the
+    // `onboarded` field flips. We deliberately do NOT set `dirty =
+    // true` — the disk write happened on the Rust side, so the
+    // in-memory snapshot is already consistent with disk.
+    set({ settings: { ...current, onboarded: true } });
   },
 }));

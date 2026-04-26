@@ -1,10 +1,13 @@
 /**
  * Top-level route switch.
  *
- * - `/` — placeholder redirect to `/onboarding`. Real first-run
- *   detection (read `Settings`, branch on `vault_root` being empty)
- *   lands in PR-δ.
- * - `/onboarding` — five-step walkthrough stub (PR-α).
+ * - `/` — first-run gate. Loads `Settings` once on mount; if
+ *   `settings.onboarded === false` redirects to `/onboarding`,
+ *   otherwise jumps to `/review/<latest>` (when the vault has any
+ *   notes) or `/home`. While settings load, renders a small Loading
+ *   placeholder so a remount under React StrictMode doesn't flash
+ *   the wizard for already-onboarded users (PR-ι / phase 71).
+ * - `/onboarding` — five-step Test-button walkthrough (PR-ι).
  * - `/home` — dashboard with the `heron_status` smoke test +
  *   "Start recording" entry point (PR-β).
  * - `/recording` — full-window in-progress recording view (PR-β).
@@ -13,7 +16,7 @@
  * - `/settings` — settings form stub.
  * - `*` — anything else falls back to `/`. Without this, navigating
  *   to a typo or stale link renders a blank screen rather than
- *   landing back at the onboarding redirect.
+ *   landing back at the first-run gate.
  *
  * The `<ConsentGate />` modal is mounted at the shell level (rather
  * than inside `<Home />`) because the consent flow needs to survive
@@ -30,13 +33,14 @@
  * first.
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import ConsentGate from "./components/ConsentGate";
 import { useTrayNav } from "./hooks/useTrayNav";
 import { invoke } from "./lib/invoke";
+import { resolvePostOnboardingDestination } from "./lib/postOnboardingDestination";
 import Home from "./pages/Home";
 import Onboarding from "./pages/Onboarding";
 import Recording from "./pages/Recording";
@@ -44,6 +48,7 @@ import Review from "./pages/Review";
 import Salvage from "./pages/Salvage";
 import Settings from "./pages/Settings";
 import { useSalvagePromptStore } from "./store/salvage";
+import { useSettingsStore } from "./store/settings";
 
 export default function App() {
   useTrayNav();
@@ -52,7 +57,7 @@ export default function App() {
   return (
     <>
       <Routes>
-        <Route path="/" element={<Navigate to="/onboarding" replace />} />
+        <Route path="/" element={<FirstRunGate />} />
         <Route path="/home" element={<Home />} />
         <Route path="/onboarding" element={<Onboarding />} />
         <Route path="/recording" element={<Recording />} />
@@ -64,6 +69,88 @@ export default function App() {
       <ConsentGate />
     </>
   );
+}
+
+/**
+ * Loads `Settings` (if not already cached), then redirects:
+ *
+ * - `settings === null` (still loading) → `<Loading />` placeholder.
+ *   Without this branch, the route would render the wizard for a
+ *   single frame on every cold start, causing already-onboarded
+ *   users to see a flicker.
+ * - `settings.onboarded === false` → `/onboarding` (the wizard).
+ * - Otherwise, peek at `heron_last_note_session_id`. If the vault
+ *   has any notes, jump straight to the latest. If not, land on
+ *   `/home` (the recording-controls placeholder).
+ *
+ * The last-note probe is best-effort: a Tauri / IPC failure falls
+ * through to `/home`. Failing closed (the wizard) on a transient
+ * read error would re-onboard already-onboarded users, which is
+ * worse than landing on the placeholder.
+ */
+function FirstRunGate() {
+  // Subscribe to `settings` so the gate re-renders when the wizard's
+  // `markOnboarded` flips the in-memory snapshot. The current
+  // implementation routes once (via `setDestination`) and unmounts
+  // before the flip can matter, but keeping the subscription keeps
+  // the gate honest if a future feature reuses it for a re-onboard
+  // flow. The variable is read inside the effect's `ensureLoaded`
+  // result rather than directly so we don't accidentally close over
+  // a stale snapshot.
+  const ensureLoaded = useSettingsStore((state) => state.ensureLoaded);
+  const [destination, setDestination] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      // `ensureLoaded` returns the cached snapshot when present, so
+      // remounts (StrictMode) skip the IPC round-trip. The snapshot
+      // here is the resolved value, NOT the post-effect store
+      // contents — `useState` over the store would race a parallel
+      // remount; capturing the resolved value sidesteps that.
+      const loaded = await ensureLoaded();
+      if (cancelled) {
+        return;
+      }
+      if (loaded === null) {
+        // Settings load failed. Failing closed (the wizard) is the
+        // safe fallback — the worst case is the user runs through
+        // the wizard once after a transient settings.json read
+        // error, which is annoying but not destructive.
+        setDestination("/onboarding");
+        return;
+      }
+      if (!loaded.onboarded) {
+        setDestination("/onboarding");
+        return;
+      }
+      // Onboarded — defer to the shared post-onboarding destination
+      // helper so this lookup stays in lockstep with the wizard's
+      // `Finish setup` landing logic.
+      const dest = await resolvePostOnboardingDestination();
+      if (cancelled) {
+        return;
+      }
+      setDestination(dest);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ensureLoaded]);
+
+  // While the gate's async dance resolves, render a tiny spinner.
+  // The settings store may already have a snapshot (StrictMode
+  // remount, or a sibling consumer that called `load` first); we
+  // still wait for our `ensureLoaded` promise so the destination is
+  // computed exactly once.
+  if (destination === null) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        Loading…
+      </div>
+    );
+  }
+  return <Navigate to={destination} replace />;
 }
 
 /**

@@ -45,7 +45,7 @@ pub use onboarding::{
 // unit-testing, and the `#[tauri::command]` shims below thread the
 // arguments through.
 pub use keychain::{KEYCHAIN_SERVICE, KeychainAccount, KeychainError};
-pub use settings::{Settings, SettingsError, read_settings, write_settings};
+pub use settings::{Settings, SettingsError, mark_onboarded, read_settings, write_settings};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HeronStatus {
@@ -299,6 +299,28 @@ fn heron_disk_usage(vault_path: String) -> Result<DiskUsage, String> {
 #[tauri::command]
 fn heron_purge_audio_older_than(vault_path: String, days: u32) -> Result<u32, String> {
     purge_audio_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
+}
+
+/// Tauri command: persist the "wizard finished" flag (§13.3 / PR-ι).
+///
+/// Called by the desktop frontend's `Finish setup` button on the last
+/// onboarding step. Reads the on-disk settings, sets `onboarded =
+/// true`, writes back atomically. Idempotent — re-running on an
+/// already-onboarded file is a no-op.
+///
+/// We resolve the path via [`default_settings_path`] (the same path
+/// `heron_default_settings_path` returns to the renderer) rather than
+/// accepting a renderer-supplied path, because:
+///
+/// 1. The "I am onboarded" flag is per-install. There is no
+///    legitimate reason for the renderer to flip this flag in a
+///    non-default location.
+/// 2. Pinning the path here keeps the command from widening the
+///    "write-anywhere" primitive surface a renderer-supplied path
+///    would expose.
+#[tauri::command]
+fn heron_mark_onboarded() -> Result<(), String> {
+    mark_onboarded(&default_settings_path()).map_err(|e| e.to_string())
 }
 
 /// Tauri command: §13.3 step 1 microphone Test button.
@@ -576,6 +598,7 @@ pub fn run() {
             heron_test_accessibility,
             heron_test_calendar,
             heron_test_model_download,
+            heron_mark_onboarded,
             heron_open_window,
             heron_keychain_set,
             heron_keychain_has,
