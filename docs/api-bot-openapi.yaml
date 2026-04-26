@@ -1,0 +1,1973 @@
+openapi: 3.1.0
+
+# Bot-side HTTP API served by `heron-botd` (the localhost daemon that
+# owns `heron-bot` + `heron-realtime` + `heron-policy` + `heron-turn`).
+#
+# This file is a *transport projection* of the canonical Rust trait
+# surface defined under crates/heron-{bot,realtime,policy,turn,persona}
+# and the invariants in `api-design-spec.md`. The spec is authoritative
+# for semantics; this file pins the wire format. If they disagree, the
+# spec wins and this file is the bug.
+#
+# Scope: v2 server-side bot — heron joining meetings *instead of* the
+# user. The desktop ("as the user") projection lives in
+# `api-desktop-openapi.yaml`; the two daemons are deliberately
+# different processes with different ports, different singleton
+# constraints, and different threat models. Some schemas
+# (PreMeetingContext, AttendeeContext, Error) are intentionally
+# duplicated rather than $ref'd across files: the OpenAPI documents
+# are independent transport projections, and a shared schema would
+# couple them at the wire layer.
+#
+# Naming note: this spec uses `bot_`, `prs_`, `utt_`, `sess_`, `evt_`,
+# `wh_` prefixed IDs per `api-design-spec.md` §2. `bot.*` and
+# `agent.*` event names match the taxonomy in
+# `architecture-agent-participant.md`.
+#
+# Versioning: dated header `Heron-API-Version: 2026-04-25`. Same
+# discipline as the desktop API.
+
+info:
+  title: heron bot API
+  version: 2026-04-25
+  summary: Localhost HTTP control surface for the heron meeting-bot daemon.
+  description: |
+    `heron-botd` is the v2 bot daemon. It joins meetings as a
+    participant (Zoom / Meet / Teams), runs the realtime pipeline
+    (STT → policy → LLM → TTS → virtual mic), and exposes control
+    over personas, bot lifecycle, utterances, mute, transcripts,
+    audit logs, and webhooks.
+
+    This API is one of several transport projections of the canonical
+    trait surface (in-process Rust subscribers, MCP, Tauri IPC, and
+    outbound webhooks are the others — `api-design-spec.md` §10,
+    Invariant 13).
+
+    External consumers (the heron CLI, MCP wrappers, mobile remote
+    controls, Raycast extensions, Home Assistant, and the eventual
+    Tauri shell when it moves out-of-process) talk to this API.
+
+    Privacy posture: localhost-only by default
+    (`http://127.0.0.1:7385` — one above the desktop daemon's 7384).
+    `heron-botd --allow-remote` is required to bind a non-loopback
+    interface and prints a startup banner.
+
+    SECURITY WARNING — bot daemon is more dangerous to expose than
+    desktop. The bot daemon, unlike the desktop daemon, can *cause an
+    AI to speak in a meeting on the user's behalf*. A bearer token
+    leaked from this surface is not just a privacy breach — it is the
+    ability to impersonate the user in real meetings with real
+    counterparties. The "phone-controls-laptop" use case
+    (`--allow-remote` + Tailscale, etc.) is explicitly supported but
+    must be deliberately enabled. The startup banner for this daemon
+    is louder than the desktop's, and the bot daemon refuses to bind
+    a non-loopback interface unless `--allow-remote` is passed AND
+    `~/.heron/cli-token` was rotated within the last 30 days.
+
+    Safety invariant (`architecture-agent-participant.md` "the one
+    invariant to defend"): a human must be able to mute or eject the
+    agent in under one second from any consumer surface. The
+    `POST /bots/{id}/mute` endpoint exists specifically to honor that
+    budget over HTTP — see its description for the latency contract.
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+  contact:
+    email: peopleconf@gmail.com
+
+servers:
+  - url: http://127.0.0.1:7385/v1
+    description: |
+      Default localhost bind. Port 7385 is one above `herond`'s 7384
+      so both daemons can run side-by-side without collision.
+  - url: http://{host}:{port}/v1
+    description: |
+      Non-loopback bind. Requires `heron-botd --allow-remote`.
+      Hardening is the operator's responsibility; the daemon prints
+      a banner warning when this mode is active.
+
+      Bot mode is more likely to be remote-controlled than the
+      desktop mode (e.g. "mute the bot from my phone while I'm in a
+      different meeting"). The remote-control ergonomics are an
+      explicit goal — but operators choosing this mode SHOULD pair
+      it with a private overlay network (Tailscale, WireGuard) and
+      MUST NOT expose the daemon to the public internet. The bearer
+      token is the entire authorization surface.
+    variables:
+      host:
+        default: 127.0.0.1
+      port:
+        default: "7385"
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: personas
+    description: |
+      Long-lived agent identities (voice clone refs, system prompts,
+      expertise areas). Persisted to the vault (`personas/<id>.md`).
+  - name: bots
+    description: |
+      Bot lifecycle (create, observe, leave, terminate). Singleton in
+      v2.0 per Invariant 7.
+  - name: utterances
+    description: |
+      Speech-control: the load-bearing API per spec §9. The reason
+      heron's bot API exists.
+  - name: mute
+    description: |
+      Panic-stop and reversible mute. The "<1s safety invariant" lives
+      here.
+  - name: transcripts
+    description: Per-bot transcript reads (post-meeting and live).
+  - name: audit
+    description: |
+      AGPL-mandated audit log of every utterance the agent spoke,
+      every disclosure announcement, every state change.
+  - name: events
+    description: Realtime event stream (SSE) over the bot's lifetime.
+  - name: webhooks
+    description: Outbound webhook subscriptions (signed POST envelopes).
+  - name: ops
+    description: Health, version, capability discovery.
+
+paths:
+
+  /health:
+    get:
+      tags: [ops]
+      summary: Liveness + capability check.
+      description: |
+        Reports whether each load-bearing subsystem of the bot daemon
+        is healthy: bot driver (Recall / Attendee / native), realtime
+        LLM provider, TTS / voice-clone backend, vault writer, policy
+        engine. A consumer should call this before assuming
+        `POST /bots` will succeed.
+      security: []
+      responses:
+        "200":
+          description: At least one component is responsive.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /personas:
+    get:
+      tags: [personas]
+      summary: List personas, newest first.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: |
+            Opaque cursor returned by a previous response in
+            `next_cursor`. Cursor-based, not offset-based.
+      responses:
+        "200":
+          description: A page of personas.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Persona" }
+                  next_cursor:
+                    type: [string, "null"]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+    post:
+      tags: [personas]
+      summary: Create a new persona.
+      description: |
+        Creates a long-lived persona record. Voice clone enrollment
+        is a separate step (`POST /personas/{id}/voice-enrollments`)
+        and the persona is not bot-ready until enrollment completes
+        and `heron-doctor`'s voice-health check passes.
+
+        Idempotent on retry — see `Idempotency-Key` header. Reusing a
+        key with a different body returns 409.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PersonaCreateRequest" }
+      responses:
+        "201":
+          description: Persona created.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Path to the created persona resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Persona" }
+        "409":
+          description: Idempotency key reused with a different request body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Validation error (missing voice backend, bad system_prompt).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /personas/{persona_id}:
+    parameters:
+      - $ref: "#/components/parameters/PersonaIdPath"
+    get:
+      tags: [personas]
+      summary: Fetch a single persona.
+      responses:
+        "200":
+          description: Persona found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Persona" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [personas]
+      summary: Partial update of a persona.
+      description: |
+        Only fields supplied in the body are modified. Voice backend
+        rotation is supported here — the next bot using this persona
+        will pick up the new voice without further reconfiguration.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PersonaPatchRequest" }
+      responses:
+        "200":
+          description: Persona updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Persona" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [personas]
+      summary: Delete a persona.
+      description: |
+        Deletes the persona record from the vault. Idempotent — a
+        second DELETE on a missing persona returns 204. Bots that
+        already started with this persona keep running; the persona
+        record is the *template*, not a live binding.
+      responses:
+        "204": { description: Persona deleted (or was already gone). }
+        "409":
+          description: |
+            Persona is currently bound to an active bot. Body's
+            `details.bot_id` reports the offender; cancel that bot
+            (`POST /bots/{id}/leave` or `DELETE /bots/{id}`) before
+            deleting the persona.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /personas/{persona_id}/voice-enrollments:
+    parameters:
+      - $ref: "#/components/parameters/PersonaIdPath"
+    post:
+      tags: [personas]
+      summary: Upload voice samples for clone enrollment.
+      description: |
+        Multipart upload of one or more audio samples. The daemon
+        forwards the samples to the persona's `voice.backend`
+        (ElevenLabs / Cartesia / Piper) and updates
+        `voice.backend_voice_id` on success. Sample length and
+        format requirements vary by backend — see `/health` for the
+        backend's reported `min_sample_secs` /
+        `accepted_formats`.
+
+        # DRIVER-DEPENDENT: enrollment flow shape varies — ElevenLabs
+        # is a single-shot multipart POST, Cartesia is asynchronous
+        # with a polling token, Piper trains locally and may take
+        # minutes. The 202 + Location pattern below covers all three.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [samples]
+              properties:
+                samples:
+                  type: array
+                  items: { type: string, format: binary }
+                  description: |
+                    One or more audio files (WAV / FLAC / m4a). At
+                    least one sample is required; backends typically
+                    want 30–180s of total speech.
+                consent_attestation:
+                  type: string
+                  description: |
+                    Free-text attestation that the speaker in the
+                    samples is the user themselves and has consented
+                    to voice cloning. Stored in the vault audit log
+                    (`docs/api-design-spec.md` §4 / consent surface).
+      responses:
+        "202":
+          description: Enrollment accepted; backend is processing.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Path to the persona resource (poll for `voice.status`).
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Persona" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "424":
+          description: Voice-clone backend rejected the samples (quality, length).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /bots:
+    get:
+      tags: [bots]
+      summary: List active and recent bots.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+        - in: query
+          name: status
+          schema: { $ref: "#/components/schemas/BotStatus" }
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of bots.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Bot" }
+                  next_cursor:
+                    type: [string, "null"]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [bots]
+      summary: Send a bot to a meeting.
+      description: |
+        Asynchronously creates a bot. Returns 202 immediately with the
+        `bot_id`; the actual lifecycle (`init → loading_persona →
+        tts_warming → joining → disclosing → in_meeting`) plays out
+        over the next few seconds and is observable via
+        `GET /bots/{id}` or the `/events` SSE stream.
+
+        REQUIRED: `Idempotency-Key` header (Invariant 11). A network
+        retry of the same intent must not double-join the meeting.
+        The daemon stores the key for 24h; a retry with the same key
+        and matching body returns the *same* `bot_id` and 202.
+
+        REQUIRED: `disclosure` field (Invariant 6). A bot without a
+        DisclosureProfile is rejected at create time, not at join
+        time. There is no such thing as a heron bot that joins
+        silently; the configurable surface is the disclosure *text*,
+        not its presence. Two-party-consent jurisdictions
+        (California, Florida, Illinois, EU under GDPR) require this.
+
+        REQUIRED: `persona_id` (Invariant 8). A bot without a persona
+        is a bug.
+
+        Singleton (Invariant 7): v2.0 supports at most one
+        non-terminal bot at a time. A second `POST /bots` while a bot
+        is active returns 409 with `details.existing_bot_id`.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BotCreateRequest" }
+      responses:
+        "202":
+          description: Bot accepted; lifecycle in progress.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Path to the created bot resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Bot" }
+        "409":
+          description: |
+            Either (a) a bot is already active (singleton conflict —
+            body's `details.existing_bot_id` reports it), or (b) the
+            `Idempotency-Key` was reused with a different request body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            Validation error: missing/empty `disclosure.text_template`,
+            unknown `persona_id`, malformed `meeting_url`, or `context`
+            exceeds size limits before summarization.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "424":
+          description: |
+            Upstream realtime LLM provider failed during persona
+            warmup (e.g. OpenAI Realtime returned 5xx). Body's
+            `details.provider` names which one; user can retry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            A required permission or driver dependency is missing
+            (voice backend down, vault locked, audio device unavailable).
+            User-actionable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: |
+            Bot driver capacity exhausted. Distinct from 429 (which is
+            heron's own rate limiting). 507 means the upstream vendor
+            (e.g. Recall.ai) is at capacity; `Retry-After` is a
+            user-actionable wait time. Borrowed from Recall's
+            convention (`api-design-research.md`).
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /bots/{bot_id}:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    get:
+      tags: [bots]
+      summary: Fetch a single bot's full state.
+      description: |
+        Returns the bot's current FSM state, persona binding,
+        disclosure status, transcript metadata, and any terminal
+        outcome. Poll-friendly; `/events` SSE is the recommended
+        live channel.
+      responses:
+        "200":
+          description: Bot found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Bot" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [bots]
+      summary: Hard-terminate a bot.
+      description: |
+        DELETE is *only* valid for bots that have not yet joined the
+        meeting (states `init`, `loading_persona`, `tts_warming`,
+        `joining`). Once the bot is past the waiting room, you must
+        use `POST /bots/{id}/leave` (graceful) — a hard DELETE on a
+        joined bot is a privacy violation: the bot would vanish
+        without disclosing departure.
+
+        This split mirrors Recall.ai's `DELETE` vs `POST /leave_call`
+        and is encoded in spec §7.
+
+        Idempotent on already-deleted: a second DELETE returns 204.
+      responses:
+        "204": { description: Bot terminated (or was already gone). }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Bot has already joined; hard DELETE is not permitted in
+            this state. Body's `details.current_state` reports where
+            the FSM is. Use `POST /bots/{id}/leave` instead.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /bots/{bot_id}/leave:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    post:
+      tags: [bots]
+      summary: Graceful leave (the bot says goodbye and exits).
+      description: |
+        Transitions the bot through `* → leaving → completed`. The
+        bot speaks a closing line (configurable via persona) and
+        disconnects cleanly, leaving an audit trail.
+
+        This is the API the user's "stop the meeting" UI surfaces
+        bind to in the steady state. `DELETE /bots/{id}` is the
+        escape hatch for "hasn't-joined-yet" cases only (spec §7).
+
+        Idempotent: calling `leave` on a bot already in a terminal
+        state returns 202 with the existing terminal status.
+      responses:
+        "202":
+          description: Leave initiated; the bot will speak its closing line and disconnect.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Bot" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /bots/{bot_id}/utterances:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    post:
+      tags: [utterances]
+      summary: Speak — the load-bearing API.
+      description: |
+        Enqueue speech for the bot. Returns 202 with `utterance_id`
+        immediately; the bot will start speaking as soon as
+        `heron-turn` decides it is appropriate to take the floor.
+
+        # CRITICAL — `priority: replace` is a SINGLE atomic primitive,
+        # NOT cancel-then-speak.
+        #
+        # This is the design point heron's API exists to fix
+        # (Invariant 11, spec §9). Every existing realtime vendor
+        # implements `replace_current` as a two-call sequence
+        # (cancel(current) → speak(text)) which has a race producing
+        # audible silence between cancel-completion and the new
+        # utterance starting. Heron's server-side handler treats
+        # `replace` as one operation: it splices the new utterance
+        # into the audio stream so the cancel and the new audio are
+        # contiguous, with no audible gap.
+        #
+        # If a future driver/realtime backend cannot honor atomic
+        # replace, the daemon returns 424 (CapabilityNotSupported)
+        # rather than silently degrading — policy decides whether
+        # to fall back to two-call sequence.
+
+        Priority semantics:
+          - `append` — enqueue at the end (default)
+          - `replace` — cancel current + clear queue + speak (atomic)
+          - `interrupt` — cancel current only, queue stays (for corrections)
+
+        REQUIRED: `Idempotency-Key` header (Invariant 11). A network
+        retry must not produce two utterances. The daemon stores the
+        key for 24h; a retry with the same key returns the *same*
+        `utterance_id` and 202.
+
+        Returns 409 if the bot is not in `in_meeting` state
+        (Invariant 5 — no state outside `in_meeting` accepts
+        speech-control). Body's `details.current_state` reports the
+        actual FSM state.
+      parameters:
+        - $ref: "#/components/parameters/HeronApiVersion"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UtteranceCreateRequest" }
+      responses:
+        "202":
+          description: Utterance accepted; lifecycle observable via /events.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Path to the utterance resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Utterance" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Either (a) bot is not in `in_meeting` state — body's
+            `details.current_state` names where it actually is — or
+            (b) `Idempotency-Key` reuse with a different body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "423":
+          description: |
+            Bot is muted (`POST /bots/{id}/mute` was called). The
+            utterance is *rejected*, not queued — heron does not stash
+            speech that the user has explicitly silenced. Unmute via
+            `DELETE /bots/{id}/mute` and resubmit. Body's
+            `details.muted_until` carries the unmute deadline.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "424":
+          description: |
+            Upstream realtime LLM provider failed (e.g. OpenAI
+            Realtime WS dropped, Cartesia TTS 5xx). Body's
+            `details.provider` names the offender. The bot itself
+            stays in `in_meeting` if it can — only this utterance
+            failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: |
+            Heron's own per-bot speech rate limit. Distinct from 507
+            (vendor capacity) and 424 (vendor failure). User-actionable
+            backoff via `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [utterances]
+      summary: Bulk-cancel utterances.
+      description: |
+        Bulk variant of utterance cancel. `scope=queued` clears the
+        queue but lets the current utterance finish; `scope=current_and_queued`
+        is panic-stop on speech (cancel current + clear queue), the
+        speech-side analog to mute.
+
+        Idempotent: returns 204 even if there's nothing to cancel.
+
+        For a single-utterance cancel, use
+        `DELETE /bots/{id}/utterances/{utterance_id}`.
+      parameters:
+        - in: query
+          name: scope
+          required: true
+          schema:
+            type: string
+            enum: [queued, current_and_queued]
+      responses:
+        "204": { description: Cancellation applied (or queue was empty). }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /bots/{bot_id}/utterances/{utterance_id}:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+      - in: path
+        name: utterance_id
+        required: true
+        schema: { $ref: "#/components/schemas/UtteranceId" }
+    delete:
+      tags: [utterances]
+      summary: Cancel a specific utterance by ID.
+      description: |
+        Cancel a single utterance. Idempotent: cancel on a completed,
+        cancelled, or unknown utterance still returns 204
+        (`SpeechController::cancel` contract from spec §9).
+
+        Per-utterance cancel is the granular surface; bulk cancel via
+        `DELETE /bots/{id}/utterances?scope=...` is the panic surface.
+      responses:
+        "204": { description: Cancellation applied (or utterance was already done). }
+        "404":
+          description: |
+            Bot does not exist. (Unknown utterance IDs scoped to a
+            known bot still return 204 per the idempotent contract.)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /bots/{bot_id}/mute:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    post:
+      tags: [mute]
+      summary: Mute the bot — the <1s safety invariant lives here.
+      description: |
+        Mutes the bot's outbound mic immediately. Cancels the current
+        utterance, clears the queue, and stops emitting audio frames.
+
+        # LATENCY BUDGET: end-to-end time from this request hitting
+        # the daemon's HTTP listener to the bot ceasing to emit audio
+        # frames into the meeting MUST be under one second
+        # (`architecture-agent-participant.md` "the one invariant to
+        # defend").
+        #
+        # Concretely: the handler short-circuits the realtime
+        # pipeline by raising a panic-stop flag observed by every
+        # frame-producer, rather than waiting for in-flight TTS
+        # frames to drain. If you measure higher than 1s in
+        # production, the daemon is mis-tuned and that is a release
+        # blocker.
+        #
+        # # DRIVER-DEPENDENT: the *user-perceived* latency depends on
+        # the driver's audio buffer (typically 200–500ms). Heron's
+        # share of the budget is "from HTTP listener to mute flag
+        # raised" — well under 100ms; the rest is vendor-side.
+
+        While muted, `POST /bots/{id}/utterances` returns 423 (Locked)
+        rather than queueing — heron does not stash speech the user
+        explicitly silenced.
+
+        `duration_secs` is optional. If absent, mute is indefinite
+        (until `DELETE /bots/{id}/mute`). If present, the bot
+        auto-unmutes after the duration; the auto-unmute schedule is
+        cancelled if the user calls `DELETE /bots/{id}/mute` first.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MuteRequest" }
+      responses:
+        "204": { description: Bot is muted. The bot does not announce being muted; muting is silent. }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [mute]
+      summary: Unmute the bot.
+      description: |
+        Re-enables outbound audio. Idempotent: unmute on an unmuted
+        bot returns 204. The bot does *not* speak a re-greeting on
+        unmute — the user is the one explicitly choosing to re-engage,
+        not the bot.
+      responses:
+        "204": { description: Bot is unmuted (or was already unmuted). }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /bots/{bot_id}/transcript:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+      - in: query
+        name: format
+        schema: { type: string, enum: [json, md, vtt], default: json }
+    get:
+      tags: [transcripts]
+      summary: Read the bot's transcript.
+      description: |
+        Returns whatever the orchestrator has finalized so far. While
+        the bot is in `in_meeting`, partial segments are NOT in this
+        response — subscribe to `/events` for `transcript.partial`.
+
+        Same JSON shape as the desktop API's transcript so consumers
+        can share rendering code. The bot transcript additionally
+        attributes utterances spoken by the agent itself (the
+        `is_agent` field on `Participant`).
+      responses:
+        "200":
+          description: Transcript ready (full or partial-final).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transcript" }
+            text/markdown:
+              schema: { type: string }
+            text/vtt:
+              schema: { type: string }
+        "202":
+          description: |
+            Transcript still being generated. `Retry-After` gives a
+            soft hint. Subscribing to `/events` and waiting for
+            `transcript.final` is recommended.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /bots/{bot_id}/audit-log:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    get:
+      tags: [audit]
+      summary: Read the AGPL-mandated audit log for this bot.
+      description: |
+        Every utterance the agent spoke, every disclosure
+        announcement, every state change, every mute/unmute,
+        timestamped and signed.
+
+        # WHY THIS EXISTS: heron is AGPL-3.0-or-later. The license
+        # plus the "agent attending on the user's behalf" model
+        # together imply that the user (and any counterparty who
+        # legally requests it) must be able to audit what the agent
+        # said and when. The audit log is the artifact that satisfies
+        # this — a tamper-evident record local to the user's machine,
+        # never uploaded.
+        #
+        # The audit log is also the practical way to debug "did the
+        # bot really say that?" — partial transcripts can be
+        # ambiguous, but the audit log records the exact text the
+        # daemon told TTS to synthesize.
+
+        Returned entries are ordered by `at` ascending. Cursor
+        pagination via `next_cursor`.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of audit log entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditLogEntry" }
+                  next_cursor:
+                    type: [string, "null"]
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /bots/{bot_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/BotIdPath"
+    get:
+      tags: [events]
+      summary: Subscribe to per-bot realtime events (Server-Sent Events).
+      description: |
+        Long-lived `text/event-stream` connection scoped to a single
+        bot. Each event has an `id:` (the `evt_*` ID), an `event:`
+        (the type), and a `data:` JSON payload. `Last-Event-ID` is
+        honored on reconnect — the daemon will replay events since
+        the named ID up to a bounded window (default 1 hour).
+
+        The event taxonomy matches `architecture-agent-participant.md`
+        ("CONSUMERS" + the events bus diagram):
+
+          - `bot.*`              FSM state changes (init, loading_persona,
+                                 tts_warming, joining, disclosing,
+                                 in_meeting, leaving, reconnecting,
+                                 completed, failed, ejected, host_ended)
+          - `bot.disclosed`      one-shot when the disclosure utterance
+                                 was acknowledged (or timed out without
+                                 objection)
+          - `turn.started`       VAD or AX detected a turn opening
+          - `turn.yielded`       the bot finished a turn and yielded
+          - `addressed_by_name`  someone said the user's name (heron-turn)
+          - `agent.spoke`        the bot finished an utterance
+          - `agent.muted`        mute applied (manual or auto)
+          - `agent.unmuted`      unmute applied
+          - `transcript.partial` partial transcript segment
+          - `transcript.final`   finalized segment
+          - `utterance.started`  TTS began emitting frames
+          - `utterance.completed` utterance finished naturally
+          - `utterance.cancelled` utterance was cancelled (with reason)
+          - `escalation.requested` policy says "punt to the human"
+          - `intent.detected`    LLM classified an inbound utterance
+          - `silence.detected`   N seconds of silence
+      parameters:
+        - in: query
+          name: topics
+          schema: { type: string }
+          description: |
+            Comma-separated list of event-type globs. Default: all.
+            Examples: `bot.*,utterance.cancelled`,
+            `transcript.final`.
+        - in: query
+          name: since_event_id
+          schema: { type: string }
+          description: |
+            Replay events strictly after this `evt_*` ID. Equivalent
+            to setting `Last-Event-ID` on a fresh connection.
+        - in: header
+          name: Last-Event-ID
+          schema: { type: string }
+      responses:
+        "200":
+          description: Stream open.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/EventEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /webhooks:
+    get:
+      tags: [webhooks]
+      summary: List registered webhooks.
+      responses:
+        "200":
+          description: A list of webhook subscriptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Webhook" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [webhooks]
+      summary: Register a new outbound webhook.
+      description: |
+        Registers a URL to receive signed POST envelopes when matching
+        events fire. Returns the webhook record AND a `signing_secret`
+        — the secret is returned EXACTLY ONCE; the daemon stores only
+        a hash. Lose the secret, rotate the webhook (DELETE + create).
+
+        See the `WebhookEnvelope` schema for the outbound POST shape.
+        HMAC-SHA256 over canonicalized JSON, header
+        `X-Heron-Signature: sha256=<hex>`, content type
+        `application/webhook+json`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookCreateRequest" }
+      responses:
+        "201":
+          description: Webhook registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookCreateResponse" }
+        "422":
+          description: Validation error (bad URL, unknown event types).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /webhooks/{webhook_id}:
+    parameters:
+      - $ref: "#/components/parameters/WebhookIdPath"
+    get:
+      tags: [webhooks]
+      summary: Fetch a webhook subscription.
+      responses:
+        "200":
+          description: Webhook found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [webhooks]
+      summary: Update a webhook subscription.
+      description: |
+        Partial update. To rotate the signing secret, DELETE and
+        re-create — patching does not return a new secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookPatchRequest" }
+      responses:
+        "200":
+          description: Webhook updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [webhooks]
+      summary: Delete a webhook subscription.
+      responses:
+        "204": { description: Webhook deleted (or was already gone). }
+
+  /webhooks/{webhook_id}/deliveries:
+    parameters:
+      - $ref: "#/components/parameters/WebhookIdPath"
+    get:
+      tags: [webhooks]
+      summary: List delivery attempts for this webhook (replay log).
+      description: |
+        Diagnostic surface — every outbound POST attempt, with the
+        response code, timing, and whether the consumer 2xx'd. Useful
+        for debugging "my Zapier didn't fire" cases.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of delivery attempts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookDelivery" }
+                  next_cursor:
+                    type: [string, "null"]
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /webhooks/{webhook_id}/deliveries/{delivery_id}/replay:
+    parameters:
+      - $ref: "#/components/parameters/WebhookIdPath"
+      - in: path
+        name: delivery_id
+        required: true
+        schema: { type: string }
+    post:
+      tags: [webhooks]
+      summary: Replay a specific delivery.
+      description: |
+        Re-POSTs the original envelope to the webhook URL. The
+        `event_id` and `idempotency_key` are preserved so a
+        well-implemented consumer dedups; the `created_at` is
+        unchanged (it's the original event time, not the replay
+        time). Useful for testing consumer dedup logic and recovering
+        from consumer outages.
+      responses:
+        "202":
+          description: Replay scheduled; check `/deliveries` for the new attempt.
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Bearer token written by `heron-botd` to `~/.heron/cli-token`
+        (mode 0600) on first run. Same file as the desktop daemon —
+        a single token authorizes both surfaces. Single-token model;
+        rotate by deleting the file and restarting both daemons.
+
+        Reminder: this token is the ability to make an AI speak as
+        the user in real meetings. Treat it like a SSH private key,
+        not like an analytics token.
+
+  parameters:
+    HeronApiVersion:
+      in: header
+      name: Heron-API-Version
+      schema: { type: string, example: "2026-04-25" }
+      description: |
+        Dated API version. Optional. Defaults to the latest version
+        the daemon supports if absent. Pinning is recommended for
+        long-lived consumers.
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      schema: { type: string, minLength: 1, maxLength: 128 }
+      description: |
+        Caller-supplied idempotency key (UUID or any opaque string).
+        REQUIRED on `POST /bots`, `POST /bots/{id}/utterances`, and
+        `POST /personas`. The daemon stores the (key, request-hash,
+        response) tuple for 24h. A retry with the same key and
+        matching body returns the original response. A retry with the
+        same key but a *different* body returns 409.
+    BotIdPath:
+      in: path
+      name: bot_id
+      required: true
+      schema: { $ref: "#/components/schemas/BotId" }
+    PersonaIdPath:
+      in: path
+      name: persona_id
+      required: true
+      schema: { $ref: "#/components/schemas/PersonaId" }
+    WebhookIdPath:
+      in: path
+      name: webhook_id
+      required: true
+      schema: { $ref: "#/components/schemas/WebhookId" }
+
+  responses:
+    Unauthorized:
+      description: Bearer token missing or invalid.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+
+    BotId:
+      type: string
+      pattern: '^bot_[0-9A-HJKMNP-TV-Z]+$'
+      description: |
+        Stripe-style prefixed UUIDv7 (base32, Crockford alphabet),
+        per spec §2. Time-ordered.
+
+    PersonaId:
+      type: string
+      pattern: '^prs_[0-9A-HJKMNP-TV-Z]+$'
+
+    UtteranceId:
+      type: string
+      pattern: '^utt_[0-9A-HJKMNP-TV-Z]+$'
+
+    SessionId:
+      type: string
+      pattern: '^sess_[0-9A-HJKMNP-TV-Z]+$'
+      description: |
+        Realtime LLM session handle (spec §2). Surfaced for
+        debugging; not a primary identifier in this API.
+
+    EventId:
+      type: string
+      pattern: '^evt_[0-9A-HJKMNP-TV-Z]+$'
+
+    WebhookId:
+      type: string
+      pattern: '^wh_[0-9A-HJKMNP-TV-Z]+$'
+
+    Platform:
+      type: string
+      enum: [zoom, google_meet, microsoft_teams, webex]
+      description: |
+        Native meeting platform. Coverage depends on the chosen bot
+        driver — see /health for the platform list the running
+        daemon supports.
+
+    BotStatus:
+      type: string
+      enum:
+        - init
+        - loading_persona
+        - tts_warming
+        - joining
+        - disclosing
+        - in_meeting
+        - leaving
+        - reconnecting
+        - completed
+        - failed
+        - ejected
+        - host_ended
+      description: |
+        Full FSM from spec §3. `in_meeting` is the only state that
+        accepts speech-control calls (Invariant 5). `completed`,
+        `failed`, `ejected`, `host_ended` are terminal — every
+        terminal transition emits exactly one `bot.completed` event
+        (Invariant 9).
+
+    EjectReason:
+      type: string
+      enum:
+        - host_removed
+        - recording_permission_denied
+        - admission_refused
+        - policy_violation
+        - unknown
+      description: |
+        # DRIVER-DEPENDENT: precision of these values varies by driver.
+        # Recall.ai surfaces `code` + `sub_code` and we map best-effort;
+        # Attendee surfaces a free-text reason; Vexa typically collapses
+        # to "ejected, reason unknown." Consumers should treat
+        # `unknown` as the common case and not rely on fine-grained
+        # values being populated.
+
+    VoiceBackend:
+      type: string
+      enum: [elevenlabs, cartesia, piper]
+      description: |
+        Voice-clone backend. Local (Piper) is the privacy-preserving
+        default once available; ElevenLabs and Cartesia are the
+        cloud options with current best-in-class quality. The
+        choice influences enrollment flow (see
+        `POST /personas/{id}/voice-enrollments`).
+
+    VoiceClone:
+      type: object
+      required: [backend, backend_voice_id]
+      properties:
+        backend: { $ref: "#/components/schemas/VoiceBackend" }
+        backend_voice_id:
+          type: string
+          description: Backend-specific identifier returned by enrollment.
+        fallback_voice_id:
+          type: [string, "null"]
+          description: |
+            Used if the primary backend is unavailable. Typically a
+            generic voice from the same backend or a Piper fallback.
+        status:
+          type: string
+          enum: [pending_enrollment, ready, failed]
+          description: |
+            `pending_enrollment` while the backend is processing
+            uploaded samples. A persona with non-`ready` voice
+            cannot back a bot — `POST /bots` returns 422.
+
+    Persona:
+      type: object
+      required: [id, name, voice, system_prompt, created_at, updated_at]
+      properties:
+        id: { $ref: "#/components/schemas/PersonaId" }
+        name: { type: string }
+        voice: { $ref: "#/components/schemas/VoiceClone" }
+        system_prompt:
+          type: string
+          description: |
+            Free text. Rendered with `PreMeetingContext` at session
+            init (`loading_persona → tts_warming`, spec §8).
+            Handlebars-style templating supported:
+            `{{user_name}}`, `{{meeting_title}}`,
+            `{{attendees_known}}`.
+        expertise_areas:
+          type: array
+          items: { type: string }
+          description: |
+            Free-text labels used by `heron-policy` to gate "I know
+            about X" responses. Expressive, not enforced.
+        decisions_ref:
+          type: [string, "null"]
+          description: |
+            Vault-relative path to a markdown file capturing prior
+            decisions the persona is bound by. Loaded into context
+            at session init.
+        vault_note_path:
+          type: [string, "null"]
+          description: |
+            Vault-relative path of the persona's own note
+            (`personas/<id>.md`). Exposed for debugging only.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PersonaCreateRequest:
+      type: object
+      required: [name, voice, system_prompt]
+      properties:
+        name: { type: string }
+        voice: { $ref: "#/components/schemas/VoiceClone" }
+        system_prompt: { type: string }
+        expertise_areas:
+          type: array
+          items: { type: string }
+        decisions_ref:
+          type: [string, "null"]
+
+    PersonaPatchRequest:
+      type: object
+      properties:
+        name: { type: [string, "null"] }
+        voice:
+          oneOf:
+            - { $ref: "#/components/schemas/VoiceClone" }
+            - { type: "null" }
+        system_prompt: { type: [string, "null"] }
+        expertise_areas:
+          type: [array, "null"]
+          items: { type: string }
+        decisions_ref: { type: [string, "null"] }
+
+    DisclosureProfile:
+      type: object
+      required: [text_template]
+      description: |
+        Configuration for the bot's first audible action — the legal
+        disclosure (spec §4 / Invariant 6). The `text_template` field
+        is REQUIRED and MAY NOT be empty; a bot without a populated
+        disclosure profile is rejected at create time. The configurable
+        surface is the disclosure *text*, not its presence.
+      properties:
+        text_template:
+          type: string
+          description: |
+            Handlebars template; `{{user_name}}` and
+            `{{meeting_title}}` are always available. Example:
+            "Hi, I'm {{user_name}}'s AI assistant. I'm
+            participating on their behalf and a recording is being
+            created. If anyone objects, please say so now."
+        voice_override:
+          type: [string, "null"]
+          description: |
+            Backend voice ID to use for the disclosure utterance
+            specifically (e.g. a clearly-synthetic voice for the
+            disclosure, then the user's clone for everything else).
+            Defaults to the persona's voice.
+        objection_patterns:
+          type: array
+          items: { type: string }
+          description: |
+            Regexes that, if matched in the ~5s after disclosure,
+            trigger graceful exit. Defaults bundled per
+            `jurisdiction`. Examples: `(?i)object`, `(?i)stop`,
+            `(?i)please don'?t`, `(?i)not okay`.
+        objection_timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 5
+          description: |
+            How long to listen for objections before transitioning
+            `disclosing → in_meeting`.
+        re_announce_on_join:
+          type: boolean
+          default: true
+          description: |
+            Whether to re-announce the disclosure when a new
+            participant joins mid-meeting (spec §4 design
+            consequence #4).
+        jurisdiction:
+          type: string
+          description: |
+            ISO 3166-1 alpha-2 country code, optionally suffixed with
+            a subdivision (e.g. `US-CA`, `US-IL`, `US-FL`, `EU`,
+            `GB`). Used to seed default `text_template` and
+            `objection_patterns`. Defaults to `US-CA` (the
+            most-restrictive common case).
+          example: US-CA
+
+    PreMeetingContext:
+      type: object
+      description: |
+        Mirrors `PreMeetingContext` in spec §8. Defined inline rather
+        than $ref'd from the desktop spec so the two transport
+        projections remain independent.
+
+        Context size is capped at 16K tokens before being passed to
+        `heron-realtime` (Invariant 10). Larger payloads are accepted
+        here but summarized at session-init time via a non-realtime
+        LLM call.
+      properties:
+        agenda: { type: [string, "null"] }
+        attendees_known:
+          type: array
+          items: { $ref: "#/components/schemas/AttendeeContext" }
+        related_notes:
+          type: array
+          items: { type: string }
+          description: Vault-relative paths.
+        prior_decisions:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              source_meeting_id: { type: string }
+        user_briefing:
+          type: [string, "null"]
+          description: |
+            Free-form note the user can attach per-meeting
+            (`heron speak-for --note "..."`).
+
+    AttendeeContext:
+      type: object
+      required: [name]
+      description: |
+        Mirrors the desktop spec's AttendeeContext shape. Defined
+        inline here for projection independence.
+      properties:
+        name: { type: string }
+        email: { type: [string, "null"], format: email }
+        last_seen_in:
+          type: [string, "null"]
+          description: |
+            Prior `mtg_*` ID where this attendee was seen. Resolver
+            input only.
+        relationship: { type: [string, "null"] }
+        notes: { type: [string, "null"] }
+
+    BotCreateRequest:
+      type: object
+      required: [meeting_url, persona_id, disclosure]
+      description: |
+        REQUIRED fields enforce three invariants at create time:
+        `disclosure` (Invariant 6), `persona_id` (Invariant 8), and
+        `meeting_url` (the resolver input from spec §2 Invariant 4).
+      properties:
+        meeting_url:
+          type: string
+          format: uri
+          description: |
+            Native meeting URL. Resolver-input shape — heron parses
+            this to determine `platform` and the driver's required
+            join parameters; the URL is not a primary key.
+        persona_id: { $ref: "#/components/schemas/PersonaId" }
+        context:
+          oneOf:
+            - { $ref: "#/components/schemas/PreMeetingContext" }
+            - { type: "null" }
+          description: |
+            Optional pre-meeting context. Strongly recommended — a
+            bot without context behaves like a chatty stranger.
+        disclosure: { $ref: "#/components/schemas/DisclosureProfile" }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Free-form metadata echoed in webhook envelopes
+            (`api-design-spec.md` §10). Useful for correlation IDs.
+
+    Bot:
+      type: object
+      required: [id, status, persona_id, meeting_url, created_at]
+      properties:
+        id: { $ref: "#/components/schemas/BotId" }
+        status: { $ref: "#/components/schemas/BotStatus" }
+        persona_id: { $ref: "#/components/schemas/PersonaId" }
+        meeting_url:
+          type: string
+          format: uri
+        platform: { $ref: "#/components/schemas/Platform" }
+        session_id:
+          oneOf:
+            - { $ref: "#/components/schemas/SessionId" }
+            - { type: "null" }
+          description: |
+            Active realtime session handle. Null until
+            `tts_warming`; surfaced for debugging.
+        meeting_title: { type: [string, "null"] }
+        # DRIVER-DEPENDENT: `participants` is best-effort. Recall.ai
+        # populates display names and emails; Attendee provides names
+        # only; native Zoom SDK gives the richest set including AX
+        # speaker attribution in real time. Treat empty arrays as
+        # "driver doesn't know," not "no participants."
+        participants:
+          type: array
+          items: { $ref: "#/components/schemas/Participant" }
+        disclosure_status:
+          type: string
+          enum: [pending, announced, acknowledged, objected, skipped]
+          description: |
+            `pending` until `disclosing`; `announced` when the
+            utterance fired; `acknowledged` after the timeout passed
+            with no objection; `objected` when an objection pattern
+            matched (and the bot is leaving); `skipped` is reserved
+            for a future config that allows deferring on rejoin.
+        joined_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+        ended_at: { type: [string, "null"], format: date-time }
+        outcome:
+          oneOf:
+            - { $ref: "#/components/schemas/BotOutcome" }
+            - { type: "null" }
+          description: |
+            Populated only in terminal states. `null` while the bot
+            is live.
+        transcript_status:
+          type: string
+          enum: [pending, partial, complete, failed]
+        muted_until:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            Non-null while muted. If indefinite mute is in effect,
+            this is set to a sentinel far-future timestamp; clients
+            should not treat the exact value as meaningful, only
+            non-null vs null.
+        # DRIVER-DEPENDENT: waiting-room behavior. Some drivers
+        # surface `waiting_room` as a distinct sub-state of `joining`;
+        # others emit a single state change once admitted. The FSM
+        # here collapses both into `joining`; consumers needing
+        # finer-grained signal should subscribe to driver-specific
+        # events on `/events`.
+        # DRIVER-DEPENDENT: recording-icon support. Some platforms
+        # (Zoom, Meet) display a "recording" icon next to the bot's
+        # name automatically; others (Teams) do not, and heron's
+        # disclosure utterance is the only signal. The
+        # `recording_icon_visible` field below is best-effort and may
+        # be null when the driver cannot report it.
+        recording_icon_visible: { type: [string, "boolean", "null"] }
+
+    BotOutcome:
+      type: object
+      required: [terminal_state]
+      properties:
+        terminal_state:
+          type: string
+          enum: [completed, failed, ejected, host_ended]
+        eject_reason:
+          oneOf:
+            - { $ref: "#/components/schemas/EjectReason" }
+            - { type: "null" }
+        error:
+          type: [string, "null"]
+          description: Free-text error message for `failed`.
+
+    Participant:
+      type: object
+      required: [display_name, is_user, is_agent]
+      properties:
+        display_name: { type: string }
+        email: { type: [string, "null"], format: email }
+        is_user:
+          type: boolean
+          description: |
+            True if this is the human user (the agent is *not* the
+            user; see `is_agent`). False or unknown for everyone else.
+        is_agent:
+          type: boolean
+          description: |
+            True for the heron bot itself, when it appears in the
+            participant list. The bot is a peer participant per
+            architecture.
+        identifier_kind:
+          type: string
+          enum: [driver_provided, ax_tree, webrtc_track, fallback]
+          description: |
+            How the display name was sourced.
+            # DRIVER-DEPENDENT: only native Zoom SDK + the
+            # AXObserver bridge produce `ax_tree` attributions;
+            # Recall and Attendee currently produce
+            # `driver_provided` only.
+
+    Priority:
+      type: string
+      enum: [append, replace, interrupt]
+      description: |
+        Speech queue priority (spec §9):
+          - `append` — enqueue at the end (default)
+          - `replace` — cancel current + clear queue + speak (single
+            atomic primitive — Invariant 11). NOT cancel-then-speak.
+          - `interrupt` — cancel current only; queue stays. For
+            corrections.
+
+    UtteranceStatus:
+      type: string
+      enum: [queued, speaking, completed, cancelled, failed]
+
+    CancelReason:
+      type: string
+      enum:
+        - user_requested
+        - replaced
+        - barged_in
+        - policy_denied
+        - failed
+        - bot_left
+
+    UtteranceCreateRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1 }
+        priority:
+          allOf:
+            - { $ref: "#/components/schemas/Priority" }
+          default: append
+        voice_override:
+          type: [string, "null"]
+          description: |
+            Backend voice ID to use for this utterance only. Defaults
+            to the bot's persona voice. Use sparingly — switching
+            voices mid-meeting is jarring and may re-trigger
+            disclosure.
+
+    Utterance:
+      type: object
+      required: [id, bot_id, text, priority, status, created_at]
+      properties:
+        id: { $ref: "#/components/schemas/UtteranceId" }
+        bot_id: { $ref: "#/components/schemas/BotId" }
+        text: { type: string }
+        priority: { $ref: "#/components/schemas/Priority" }
+        status: { $ref: "#/components/schemas/UtteranceStatus" }
+        voice_override: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+        duration_secs: { type: [number, "null"] }
+        cancel_reason:
+          oneOf:
+            - { $ref: "#/components/schemas/CancelReason" }
+            - { type: "null" }
+        replaced_by:
+          oneOf:
+            - { $ref: "#/components/schemas/UtteranceId" }
+            - { type: "null" }
+          description: |
+            Set when `cancel_reason = replaced` — points at the
+            utterance that took this one's place (Invariant 11
+            atomic-replace bookkeeping).
+
+    MuteRequest:
+      type: object
+      properties:
+        duration_secs:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 86400
+          description: |
+            Optional auto-unmute timer in seconds. Absent / null = mute
+            indefinitely until `DELETE /bots/{id}/mute`.
+
+    TranscriptSegment:
+      type: object
+      required: [speaker, text, start_secs, end_secs, is_final]
+      properties:
+        speaker: { $ref: "#/components/schemas/Participant" }
+        text: { type: string }
+        start_secs: { type: number }
+        end_secs: { type: number }
+        confidence:
+          type: string
+          enum: [high, low]
+        is_final:
+          type: boolean
+          description: |
+            False segments are subject to revision. Only final
+            segments persist to the vault.
+        # DRIVER-DEPENDENT: partial-transcript cadence. Recall and
+        # native Zoom emit partials every ~300ms; Attendee emits
+        # finals only (no partials). Consumers should not assume a
+        # partial cadence — subscribe and react.
+
+    Transcript:
+      type: object
+      required: [bot_id, segments]
+      properties:
+        bot_id: { $ref: "#/components/schemas/BotId" }
+        language:
+          type: string
+          example: en
+        segments:
+          type: array
+          items: { $ref: "#/components/schemas/TranscriptSegment" }
+
+    AuditLogEntry:
+      type: object
+      required: [id, bot_id, kind, at]
+      description: |
+        A single audit-log line. `kind` discriminates the payload.
+        AGPL audit trail — see `GET /bots/{id}/audit-log` description
+        for why this exists.
+      properties:
+        id: { $ref: "#/components/schemas/EventId" }
+        bot_id: { $ref: "#/components/schemas/BotId" }
+        at: { type: string, format: date-time }
+        actor:
+          type: string
+          enum: [agent, user, driver, system]
+          description: |
+            Who initiated the action. `user` covers explicit user
+            actions (mute, leave, terminate); `agent` covers
+            autonomous bot actions (utterances, disclosure); `driver`
+            covers vendor-side events (eject, host-ended, network
+            loss); `system` covers heron's own internals (state
+            transitions).
+        kind:
+          type: string
+          enum:
+            - state_change
+            - disclosure_announced
+            - disclosure_acknowledged
+            - utterance_spoken
+            - utterance_cancelled
+            - mute_applied
+            - mute_released
+            - escalation_requested
+            - policy_denied
+            - leave_initiated
+            - eject_received
+        text:
+          type: [string, "null"]
+          description: |
+            Verbatim text the agent said (for `utterance_spoken` and
+            `disclosure_announced`). The exact text passed to TTS,
+            not the partial transcript of what was heard.
+        from_state:
+          oneOf:
+            - { $ref: "#/components/schemas/BotStatus" }
+            - { type: "null" }
+        to_state:
+          oneOf:
+            - { $ref: "#/components/schemas/BotStatus" }
+            - { type: "null" }
+        utterance_id:
+          oneOf:
+            - { $ref: "#/components/schemas/UtteranceId" }
+            - { type: "null" }
+        details:
+          type: object
+          additionalProperties: true
+
+    EventEnvelope:
+      type: object
+      description: |
+        Wire shape of a single SSE frame's `data:` payload. The
+        framing (`id:` / `event:` / `data:`) is the standard
+        `text/event-stream` format and is not part of this schema.
+
+        For the WEBHOOK projection of the same event taxonomy, see
+        `WebhookEnvelope` (the canonical event emerges first; the SSE
+        and webhook shapes are sibling projections per Invariant 13).
+      required: [event_id, event_type, api_version, created_at]
+      properties:
+        event_id: { $ref: "#/components/schemas/EventId" }
+        event_type:
+          type: string
+          enum:
+            - bot.init
+            - bot.loading_persona
+            - bot.tts_warming
+            - bot.joining
+            - bot.disclosing
+            - bot.in_meeting
+            - bot.leaving
+            - bot.reconnecting
+            - bot.completed
+            - bot.failed
+            - bot.ejected
+            - bot.host_ended
+            - bot.disclosed
+            - turn.started
+            - turn.yielded
+            - addressed_by_name
+            - agent.spoke
+            - agent.muted
+            - agent.unmuted
+            - transcript.partial
+            - transcript.final
+            - utterance.started
+            - utterance.completed
+            - utterance.cancelled
+            - escalation.requested
+            - intent.detected
+            - silence.detected
+        api_version: { type: string, example: "2026-04-25" }
+        created_at: { type: string, format: date-time }
+        bot_id:
+          oneOf:
+            - { $ref: "#/components/schemas/BotId" }
+            - { type: "null" }
+        utterance_id:
+          oneOf:
+            - { $ref: "#/components/schemas/UtteranceId" }
+            - { type: "null" }
+        data:
+          type: object
+          description: |
+            Event-type-specific payload, discriminated by
+            `event_type`. For `bot.*` it's a `Bot`; for
+            `transcript.partial` / `transcript.final` it's a
+            `TranscriptSegment`; for `utterance.*` it's an
+            `Utterance`; for `addressed_by_name` it's
+            `{by_speaker: Participant, matched_token: string}`; for
+            `intent.detected` it's `{intent: string, confidence:
+            number}`; for `escalation.requested` it's `{rule: string,
+            text: string}`.
+
+    WebhookEnvelope:
+      type: object
+      description: |
+        OUTBOUND POST shape for registered webhooks. heron-botd POSTs
+        this JSON body to the webhook URL with these headers:
+
+          - `Content-Type: application/webhook+json`
+          - `X-Heron-Signature: sha256=<hex>` — HMAC-SHA256 over the
+            CANONICALIZED JSON body (sorted keys, no whitespace),
+            using the `signing_secret` returned at webhook creation.
+            Canonicalization defends against whitespace re-encoding
+            attacks (Attendee-style; spec §10 / §11).
+          - `X-Heron-Timestamp: <unix_secs>` — wall-clock send time.
+            Consumers SHOULD reject envelopes older than 5 minutes
+            to prevent replay.
+
+        Same event taxonomy as the SSE `EventEnvelope` (Invariant 13:
+        the trait is canonical, transports are projections).
+      required:
+        - event_id
+        - idempotency_key
+        - event_type
+        - api_version
+        - created_at
+      properties:
+        event_id: { $ref: "#/components/schemas/EventId" }
+        idempotency_key:
+          type: string
+          description: |
+            Equal to `event_id` for first-attempt deliveries; equal to
+            the original `event_id` for replays. Consumers dedupe on
+            this key. Adopted from Attendee's webhook envelope (spec §10).
+        event_type:
+          type: string
+          description: |
+            Same enum as `EventEnvelope.event_type`. Repeated as a
+            free string here to avoid coupling the webhook schema to
+            the SSE schema's exact set during evolution.
+        api_version: { type: string, example: "2026-04-25" }
+        created_at:
+          type: string
+          format: date-time
+          description: |
+            Original event time — preserved across replays. Use
+            `X-Heron-Timestamp` for "when this POST was sent."
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Echoed from `BotCreateRequest.metadata`. Useful for
+            consumer-side correlation (e.g. matching a webhook to a
+            row the consumer's own DB).
+        data:
+          type: object
+          description: |
+            Event-type-specific payload; same shape as
+            `EventEnvelope.data`.
+
+    Webhook:
+      type: object
+      required: [id, url, event_types, enabled, created_at]
+      properties:
+        id: { $ref: "#/components/schemas/WebhookId" }
+        url: { type: string, format: uri }
+        event_types:
+          type: array
+          items: { type: string }
+          description: |
+            Event-type globs to deliver. Empty = all events. Globs
+            match `EventEnvelope.event_type` (e.g. `bot.*`,
+            `transcript.final`).
+        enabled:
+          type: boolean
+          description: When false, deliveries are suspended (useful for debugging).
+        secret_hint:
+          type: [string, "null"]
+          description: |
+            First 4 chars of the signing secret, for human
+            identification. The full secret is returned ONCE at
+            creation and never again.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+
+    WebhookCreateRequest:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri }
+        event_types:
+          type: array
+          items: { type: string }
+        enabled:
+          type: boolean
+          default: true
+
+    WebhookCreateResponse:
+      type: object
+      required: [webhook, signing_secret]
+      description: |
+        Returned ONLY at creation. The `signing_secret` is shown
+        exactly once; the daemon stores only its hash. Capture it
+        immediately — there is no recovery path.
+      properties:
+        webhook: { $ref: "#/components/schemas/Webhook" }
+        signing_secret:
+          type: string
+          description: |
+            Opaque high-entropy string used as the HMAC-SHA256 key
+            over canonicalized JSON for outbound webhook envelopes.
+
+    WebhookPatchRequest:
+      type: object
+      properties:
+        url: { type: [string, "null"], format: uri }
+        event_types:
+          type: [array, "null"]
+          items: { type: string }
+        enabled: { type: [boolean, "null"] }
+
+    WebhookDelivery:
+      type: object
+      required: [id, webhook_id, event_id, attempted_at, succeeded]
+      properties:
+        id: { type: string, description: Delivery attempt ID. }
+        webhook_id: { $ref: "#/components/schemas/WebhookId" }
+        event_id: { $ref: "#/components/schemas/EventId" }
+        attempted_at: { type: string, format: date-time }
+        succeeded: { type: boolean }
+        response_status: { type: [integer, "null"] }
+        response_body_excerpt:
+          type: [string, "null"]
+          description: First ~512 bytes of the consumer's response body, for debugging.
+        error: { type: [string, "null"] }
+        attempt_number: { type: integer, minimum: 1 }
+
+    Health:
+      type: object
+      required: [status, components]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        version:
+          type: string
+          description: heron-botd build version.
+        platforms_supported:
+          type: array
+          items: { $ref: "#/components/schemas/Platform" }
+          description: |
+            # DRIVER-DEPENDENT: which meeting platforms the running
+            # daemon can join. Recall and Attendee report Zoom + Meet
+            # + Teams; native Zoom SDK reports Zoom only.
+        components:
+          type: object
+          properties:
+            bot_driver: { $ref: "#/components/schemas/HealthComponent" }
+            realtime_llm: { $ref: "#/components/schemas/HealthComponent" }
+            voice_backend: { $ref: "#/components/schemas/HealthComponent" }
+            policy_engine: { $ref: "#/components/schemas/HealthComponent" }
+            vault: { $ref: "#/components/schemas/HealthComponent" }
+
+    HealthComponent:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [ok, degraded, down, permission_missing]
+        message: { type: [string, "null"] }
+        last_check: { type: [string, "null"], format: date-time }
+
+    Error:
+      type: object
+      description: |
+        MeetingBaaS-shape error envelope, adopted in spec §11 as
+        heron's internal taxonomy projected over HTTP. Identical
+        shape to the desktop API.
+      required: [success, error, message, code, statusCode]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+          description: PascalCase machine-readable error name.
+          example: BotAlreadyActive
+        message:
+          type: string
+          description: Human-readable explanation. May change between versions.
+        code:
+          type: string
+          pattern: '^HERON_E_[A-Z0-9_]+$'
+          example: HERON_E_BOT_ALREADY_ACTIVE
+        statusCode:
+          type: integer
+          example: 409
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            Field-specific context. Common keys:
+              - `current_state` — for FSM-violation 409s
+              - `existing_bot_id` — for singleton-conflict 409s
+              - `provider` — for upstream-failure 424s
+              - `muted_until` — for 423 mute-locked utterance attempts
+              - `bot_id` — for persona-in-use DELETE conflicts
+              - `retry_after_secs` — for 507 / 429 (mirrors header)
