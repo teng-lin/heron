@@ -107,6 +107,8 @@ yet — check back as the cross-platform work lands.
 heron is currently distributed as source — pre-built binaries will
 come once the cross-platform matrix is closer to filled in.
 
+Clone and run the pinned-toolchain bootstrap once:
+
 ```sh
 git clone https://github.com/teng-lin/heron.git
 cd heron
@@ -114,23 +116,123 @@ cd heron
 # Install pinned Rust toolchain + checks system deps. Idempotent —
 # safe to re-run after upgrades.
 ./scripts/setup-dev.sh
-
-# Build the desktop app bundle.
-cd apps/desktop
-bun install
-bun run tauri build
 ```
 
-The signed `.app` bundle lands in
-`apps/desktop/src-tauri/target/release/bundle/macos/heron.app`. Drag
-it into `/Applications` and launch it.
+Then pick what you want to build.
 
-For an iterative dev loop instead of a release build:
+#### Desktop app (full UI)
 
 ```sh
 cd apps/desktop
-bun run tauri dev
+bun install
+bun run tauri build           # release .app
+# or:
+bun run tauri dev             # iterative dev loop
 ```
+
+The `.app` bundle lands in `target/release/bundle/macos/heron.app`
+(workspace target — Cargo shares the target directory across all
+workspace crates). Drag it into `/Applications` and launch it.
+
+Tauri's bundler does not copy the `sherpa-rs` ONNX dylibs into the
+bundle, so a one-time post-build patch is needed before the `.app`
+will launch:
+
+```sh
+APP=target/release/bundle/macos/heron.app
+mkdir -p "$APP/Contents/Frameworks"
+cp -p target/release/libonnxruntime.1.17.1.dylib \
+      target/release/libsherpa-onnx-c-api.dylib \
+      target/release/libsherpa-onnx-cxx-api.dylib \
+      "$APP/Contents/Frameworks/"
+(cd "$APP/Contents/Frameworks" \
+  && ln -sf libonnxruntime.1.17.1.dylib libonnxruntime.dylib)
+install_name_tool -add_rpath @executable_path/../Frameworks \
+  "$APP/Contents/MacOS/heron-desktop"
+```
+
+If you're running directly out of cargo via
+`cargo run -p heron-desktop --release` (or via `bun run tauri dev`),
+patch the standalone binary instead — the dylibs already sit next to
+it in `target/release/` (or `target/debug/`):
+
+```sh
+install_name_tool -add_rpath @executable_path/ target/release/heron-desktop
+install_name_tool -add_rpath @executable_path/ target/debug/heron-desktop
+```
+
+Both patches are one-time per build; re-run after each rebuild
+until a Tauri post-build hook handles it automatically.
+
+#### CLI binaries (`heron` and `herond`)
+
+The workspace ships two binary crates: **`heron-cli`** (which
+produces a binary named `heron` — not `heron-cli`) and **`herond`**
+(the localhost daemon).
+
+```sh
+# From the workspace root.
+cargo build -p heron-cli -p herond --release
+```
+
+That writes:
+
+```text
+target/release/heron        # main CLI: record / summarize / status / salvage / …
+target/release/herond       # localhost daemon on 127.0.0.1:7384
+```
+
+Patch the rpath so the binaries can find the bundled ONNX runtime:
+
+```sh
+install_name_tool -add_rpath @executable_path/ target/release/heron
+install_name_tool -add_rpath @executable_path/ target/release/herond
+```
+
+`sherpa-rs` drops `libonnxruntime.1.17.1.dylib` next to the
+binary in `target/release/`, but the binaries it produces only
+have `LC_RPATH=/usr/lib/swift` baked in. Without the
+`@executable_path/` rpath added, dyld fails to load the dylib at
+launch (`Library not loaded: @rpath/libonnxruntime.1.17.1.dylib`).
+The patch is a one-time fix per build — re-run after each
+`cargo build --release`. Future versions may bake this in via a
+post-build hook.
+
+Smoke check:
+
+```sh
+./target/release/heron --version
+./target/release/heron status
+./target/release/herond --version
+```
+
+If you'd rather run via cargo without picking the path manually:
+
+```sh
+cargo run --release --bin heron -- status
+cargo run --release --bin herond
+```
+
+##### Put them on `$PATH`
+
+```sh
+# Option A — symlink into ~/.local/bin (assuming it's on PATH)
+ln -sf "$(pwd)/target/release/heron"  ~/.local/bin/heron
+ln -sf "$(pwd)/target/release/herond" ~/.local/bin/herond
+
+# Option B — install via cargo (always release, copies into ~/.cargo/bin)
+cargo install --path crates/heron-cli
+cargo install --path crates/herond
+```
+
+#### Other useful binaries in the workspace
+
+```sh
+cargo build -p heron-doctor --release   # offline log-anomaly analyzer
+cargo build -p heron-vault --bin validate-vault --release   # vault integrity check
+```
+
+Both end up in `target/release/` next to `heron` and `herond`.
 
 ## Quick start
 
