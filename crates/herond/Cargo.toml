@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 heron-event = { workspace = true }
 heron-event-http = { workspace = true }
+heron-orchestrator = { workspace = true }
 heron-session = { workspace = true }
 heron-types = { workspace = true }
 

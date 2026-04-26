@@ -2297,6 +2297,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "heron-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "heron-event",
+ "heron-event-http",
+ "heron-session",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "heron-policy"
 version = "0.1.0"
 dependencies = [
@@ -2413,6 +2426,7 @@ dependencies = [
  "futures-util",
  "heron-event",
  "heron-event-http",
+ "heron-orchestrator",
  "heron-session",
  "heron-types",
  "http",
