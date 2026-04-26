@@ -8,13 +8,14 @@
  *   make that work is to keep the per-step outcome + skip flag
  *   outside the route component so each step picks up where it left
  *   off. Lifting state into a parent component would also work, but
- *   the page already has enough complexity (5 step bodies + buttons)
+ *   the page already has enough complexity (six step bodies + buttons)
  *   that pulling step state out keeps the page focused on layout.
  *
  * - The "Next" button enabledness depends on whether the step has
- *   been tested OR explicitly skipped. Encoding that predicate in a
- *   selector (`canAdvance(step)`) keeps the page free of branching
- *   per-step logic.
+ *   been tested OR explicitly skipped (with the daemon step demanding
+ *   a real pass — see `canAdvance` below). Encoding that predicate in
+ *   a selector (`canAdvance(stepId, step)`) keeps the page free of
+ *   branching per-step logic.
  *
  * The store is **wizard-local**: it holds in-memory state only, does
  * not persist across app restarts, and is reset on `Finish setup`.
@@ -28,18 +29,25 @@ import { create } from "zustand";
 import type { TestOutcome } from "../lib/invoke";
 
 /**
- * The five steps in the §13.3 wizard.
+ * The six steps in the §13.3 wizard.
  *
  * Numbered from 1 to match the §13.3 spec (and the user-visible
  * progress dots) instead of 0-indexed. The page consumes this enum
  * via `STEPS` for ordering, never spelled out as a literal.
+ *
+ * `daemon` (gap #5) is the final gate: every preceding step exercises
+ * a TCC permission or a bundled-asset probe that the user can grant
+ * out-of-band, but the in-process `herond` is what actually drives
+ * capture/transcription, so it goes last so the wizard's "Finish
+ * setup" button is only reachable when the daemon is verifiably up.
  */
 export type StepId =
   | "microphone"
   | "audio_tap"
   | "accessibility"
   | "calendar"
-  | "model_download";
+  | "model_download"
+  | "daemon";
 
 export const STEPS: readonly StepId[] = [
   "microphone",
@@ -47,6 +55,7 @@ export const STEPS: readonly StepId[] = [
   "accessibility",
   "calendar",
   "model_download",
+  "daemon",
 ] as const;
 
 interface StepState {
@@ -98,6 +107,7 @@ function freshSteps(): Record<StepId, StepState> {
     accessibility: freshStepState(),
     calendar: freshStepState(),
     model_download: freshStepState(),
+    daemon: freshStepState(),
   };
 }
 
@@ -145,14 +155,20 @@ export const useOnboardingStore = create<OnboardingState>((set) => ({
  * Selector: `true` iff the wizard's Next/Finish button should be
  * enabled for the current step.
  *
- * Rule per §13.3 / PR-ι spec: enabled when the step's probe has been
- * run at least once OR the step has been explicitly skipped. The
- * outcome's status is **not** consulted — a `fail` / `needs_permission`
- * outcome still satisfies "tested" so the user can advance and try to
- * fix the issue from inside System Settings without losing wizard
- * progress. The user can always click Skip if they want to bypass
- * altogether.
+ * For the original five §13.3 / PR-ι steps the rule is permissive:
+ * enabled when the probe has run at least once OR the step has been
+ * explicitly skipped — a `fail` / `needs_permission` outcome still
+ * satisfies "tested" so the user can advance and fix the underlying
+ * permission from System Settings without losing wizard progress.
+ *
+ * The `daemon` step (gap #5) is the exception: the wizard cannot
+ * meaningfully complete unless the in-process `herond` is reachable,
+ * so this selector requires a `pass` outcome and ignores the skip
+ * flag. The page mirrors that policy by hiding Skip on this step.
  */
-export function canAdvance(step: StepState): boolean {
+export function canAdvance(stepId: StepId, step: StepState): boolean {
+  if (stepId === "daemon") {
+    return step.outcome?.status === "pass";
+  }
   return step.outcome !== null || step.skipped;
 }

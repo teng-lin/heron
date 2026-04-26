@@ -505,6 +505,13 @@ pub struct StartCaptureArgs {
     /// Free-form hint forwarded to the orchestrator (e.g. window
     /// title, meeting URL). Not a primary identifier.
     pub hint: Option<String>,
+    /// EventKit identifier to correlate this capture with a
+    /// previously [`SessionOrchestrator::attach_context`]-supplied
+    /// `PreMeetingContext`. Resolver-input shape per Invariant 4 —
+    /// never a heron primary key. When `Some` and a context is
+    /// pending for this id, the orchestrator consumes it as part of
+    /// session materialization.
+    pub calendar_event_id: Option<String>,
 }
 
 /// Range hint for [`SessionOrchestrator::audio_path`]'s callers that

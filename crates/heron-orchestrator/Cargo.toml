@@ -8,14 +8,22 @@ publish.workspace = true
 build = "build.rs"
 
 [dependencies]
+heron-bot = { workspace = true }
+heron-bridge = { workspace = true }
 heron-event = { workspace = true }
 heron-event-http = { workspace = true }
+heron-policy = { workspace = true }
+heron-realtime = { workspace = true }
+heron-cli = { workspace = true }
+heron-llm = { workspace = true }
 heron-session = { workspace = true }
 heron-types = { workspace = true }
 heron-vault = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+dirs = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
