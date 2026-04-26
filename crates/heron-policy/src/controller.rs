@@ -60,6 +60,7 @@ use heron_realtime::{RealtimeBackend, RealtimeCapabilities, RealtimeEvent, Respo
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::escalation::{EscalationHook, LoggingEscalationHook};
 use crate::filter::{PolicyDecision, evaluate};
 use crate::queue::{QueuedUtterance, SpeechQueue};
 use crate::{
@@ -147,6 +148,12 @@ pub struct DefaultSpeechController<B: RealtimeBackend + 'static> {
     /// See module-level concurrency notes.
     speak_lock: Arc<tokio::sync::Mutex<()>>,
     listener: Mutex<Option<JoinHandle<()>>>,
+    /// Side-channel for [`PolicyDecision::Escalate`] outcomes. Defaults
+    /// to [`LoggingEscalationHook`]; production callers swap in a
+    /// transport-aware impl via
+    /// [`Self::with_escalation_hook`]. Held as `Arc<dyn ..>` so the
+    /// hot-path call site can clone cheaply without locking.
+    escalation: Arc<dyn EscalationHook>,
 }
 
 impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
@@ -169,6 +176,45 @@ impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
         session: SessionId,
         profile: PolicyProfile,
         event_capacity: usize,
+    ) -> Self {
+        Self::build(
+            backend,
+            session,
+            profile,
+            event_capacity,
+            Arc::new(LoggingEscalationHook),
+        )
+    }
+
+    /// Construct with a custom [`EscalationHook`]. Production
+    /// deployments use this to surface
+    /// [`PolicyDecision::Escalate`] outcomes through their preferred
+    /// transport (HTTP webhook, push notification, vault note).
+    /// Tests use it to assert that the controller wires escalation
+    /// from the filter through to the user-visible side-channel.
+    ///
+    /// The default constructor ([`Self::new`]) installs
+    /// [`LoggingEscalationHook`], which writes a `tracing::warn!` per
+    /// escalation. That's the right floor for v1 — escalations land
+    /// in the daemon log even before any richer transport is wired.
+    pub fn with_escalation_hook(
+        backend: Arc<B>,
+        session: SessionId,
+        profile: PolicyProfile,
+        hook: Arc<dyn EscalationHook>,
+    ) -> Self {
+        Self::build(backend, session, profile, DEFAULT_EVENT_CAPACITY, hook)
+    }
+
+    /// Internal builder shared by every public constructor — keeps the
+    /// `Inner`/listener wiring in one place so a future construction
+    /// option (e.g. preloaded queue state) can't drift.
+    fn build(
+        backend: Arc<B>,
+        session: SessionId,
+        profile: PolicyProfile,
+        event_capacity: usize,
+        escalation: Arc<dyn EscalationHook>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(event_capacity);
         let speak_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -205,6 +251,7 @@ impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
             inner,
             speak_lock,
             listener: Mutex::new(Some(listener)),
+            escalation,
         }
     }
 
@@ -279,6 +326,29 @@ impl<B: RealtimeBackend + 'static> DefaultSpeechController<B> {
             });
         }
     }
+
+    /// Fire the spec §9 audit event for a policy-blocked utterance.
+    /// `filter::PolicyDecision::{Denied, Escalate}` both promise this
+    /// shape via their docstring: one `Cancelled { reason:
+    /// PolicyDenied { rule } }` per blocked emission. The utterance
+    /// never made it to the queue, so we mint a synthetic
+    /// [`UtteranceId`] purely as the correlation handle on the event;
+    /// the caller still gets the rule via `Err(SpeechError::PolicyDenied)`.
+    ///
+    /// **Note for downstream subscribers:** these ids appear as
+    /// "orphans" — no `Started` / `Progress` / `Completed` event
+    /// shares them, because the speak path errored before the queue
+    /// step. A consumer building a per-utterance lifecycle FSM should
+    /// treat `Cancelled { reason: PolicyDenied }` as a valid first
+    /// observation of an id, not assume `Started` always precedes it.
+    fn emit_policy_denied(&self, rule: &str) {
+        let _ = self.inner.events.send(SpeechEvent::Cancelled {
+            id: UtteranceId::now_v7(),
+            reason: CancelReason::PolicyDenied {
+                rule: rule.to_owned(),
+            },
+        });
+    }
 }
 
 #[async_trait]
@@ -299,7 +369,28 @@ impl<B: RealtimeBackend + 'static> SpeechController for DefaultSpeechController<
         let profile_snapshot = lock(&self.inner.profile).clone();
         match evaluate(text, &profile_snapshot) {
             PolicyDecision::Allowed => {}
-            PolicyDecision::Denied { rule } | PolicyDecision::Escalate { rule, .. } => {
+            PolicyDecision::Denied { rule } => {
+                self.emit_policy_denied(&rule);
+                return Err(SpeechError::PolicyDenied { rule });
+            }
+            PolicyDecision::Escalate { rule, via } => {
+                // Same audit-log shape as `Denied`; the hook is then
+                // dispatched on a detached `tokio::spawn` so a slow,
+                // hung, or panicking hook can never block the
+                // `speak_lock`. Holding the lock across the hook
+                // would serialize every subsequent `speak`/`cancel`
+                // on the controller behind the hook's transport,
+                // turning a missing webhook acknowledgement into a
+                // controller-wide availability failure. The hook
+                // contract is fire-and-forget: the decision is final
+                // by the time we emit the `Cancelled` event, and the
+                // hook only drives the user-visible side-channel.
+                self.emit_policy_denied(&rule);
+                let escalation = Arc::clone(&self.escalation);
+                let rule_for_hook = rule.clone();
+                tokio::spawn(async move {
+                    escalation.escalate(rule_for_hook, via).await;
+                });
                 return Err(SpeechError::PolicyDenied { rule });
             }
         }
@@ -1517,5 +1608,325 @@ mod tests {
             }
             other => panic!("expected Progress, got {other:?}"),
         }
+    }
+
+    // ── Policy enforcement audit-log + escalation tests ──────────────
+    //
+    // The filter-only tests in `filter.rs` exercise `evaluate()`
+    // directly. These pin the *call path*: when a real
+    // [`DefaultSpeechController`] runs `speak()`, the filter fires,
+    // emits the spec-required `Cancelled { reason: PolicyDenied }`
+    // audit event, and (for `Escalate`) drives the configured
+    // [`EscalationHook`]. Closing gap #8 from `docs/codebase-gaps.md`:
+    // "policy filter is defined but never invoked" through the
+    // controller's user-facing surface — the previous controller path
+    // returned the right Err but skipped the audit event entirely.
+
+    use crate::escalation::RecordingEscalationHook;
+
+    /// Helper: drain pending events looking for the first
+    /// `Cancelled { reason: PolicyDenied { rule } }` and return its
+    /// rule string. Bails after `dur` so a regression that drops the
+    /// event surfaces as a `None` rather than hanging the test.
+    async fn first_policy_denied_rule(
+        rx: &mut broadcast::Receiver<SpeechEvent>,
+        dur: Duration,
+    ) -> Option<String> {
+        let evs = drain_events(rx, 4, dur).await;
+        for e in evs {
+            if let SpeechEvent::Cancelled {
+                reason: CancelReason::PolicyDenied { rule },
+                ..
+            } = e
+            {
+                return Some(rule);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn mute_emits_policy_denied_cancelled_event() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.mute = true;
+        let controller = DefaultSpeechController::new(Arc::clone(&backend) as _, session, profile);
+        let mut events = controller.subscribe_events();
+
+        let _ = controller
+            .speak("hi", Priority::Append, None)
+            .await
+            .expect_err("muted");
+
+        let rule = first_policy_denied_rule(&mut events, Duration::from_millis(50)).await;
+        assert_eq!(
+            rule.as_deref(),
+            Some("muted"),
+            "controller must emit PolicyDenied audit event on mute",
+        );
+        // Backend untouched on a policy-blocked speak.
+        assert!(backend.record_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_topic_without_escalation_emits_policy_denied_event_no_hook() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.deny_topics = vec!["compensation".into()];
+        // EscalationMode::None ⇒ filter returns Denied, not Escalate;
+        // the hook must NOT fire.
+        let hook = RecordingEscalationHook::new();
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::clone(&hook) as _,
+        );
+        let mut events = controller.subscribe_events();
+
+        let _ = controller
+            .speak("their compensation package", Priority::Append, None)
+            .await
+            .expect_err("denied");
+
+        let rule = first_policy_denied_rule(&mut events, Duration::from_millis(50))
+            .await
+            .expect("Cancelled event missing");
+        assert!(
+            rule.starts_with("deny_topic:") && rule.contains("compensation"),
+            "rule = {rule}",
+        );
+        assert!(
+            hook.calls().is_empty(),
+            "escalation hook must not fire when EscalationMode::None: {:?}",
+            hook.calls(),
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_topic_with_notify_drives_escalation_hook() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.deny_topics = vec!["legal".into()];
+        profile.escalation = EscalationMode::Notify {
+            destination: "ops@example.com".into(),
+        };
+        let hook = RecordingEscalationHook::new();
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::clone(&hook) as _,
+        );
+        let mut events = controller.subscribe_events();
+
+        let err = controller
+            .speak("send the legal contract", Priority::Append, None)
+            .await
+            .expect_err("escalated");
+        // Caller still sees PolicyDenied — escalation is a side
+        // channel, not a different return shape.
+        assert!(matches!(err, SpeechError::PolicyDenied { .. }));
+
+        // Audit event present.
+        let rule = first_policy_denied_rule(&mut events, Duration::from_millis(50))
+            .await
+            .expect("Cancelled event missing");
+        assert!(rule.contains("legal"), "rule = {rule}");
+
+        // Hook fired exactly once with the matching rule + via.
+        let calls = hook.calls();
+        assert_eq!(calls.len(), 1, "hook called {} times", calls.len());
+        let (hook_rule, hook_via) = &calls[0];
+        assert!(hook_rule.contains("legal"), "hook rule = {hook_rule}");
+        assert!(
+            matches!(
+                hook_via,
+                EscalationMode::Notify { destination } if destination == "ops@example.com",
+            ),
+            "hook via = {hook_via:?}",
+        );
+
+        // Backend never saw a response_create — escalation blocks
+        // emission, same as plain Denied.
+        assert!(backend.record_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_topic_with_leave_meeting_drives_escalation_hook() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.deny_topics = vec!["pricing".into()];
+        profile.escalation = EscalationMode::LeaveMeeting;
+        let hook = RecordingEscalationHook::new();
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::clone(&hook) as _,
+        );
+        let mut events = controller.subscribe_events();
+
+        let _ = controller
+            .speak("let's discuss pricing", Priority::Append, None)
+            .await
+            .expect_err("escalated");
+
+        // Audit event present.
+        assert!(
+            first_policy_denied_rule(&mut events, Duration::from_millis(50))
+                .await
+                .is_some(),
+            "Cancelled event missing for LeaveMeeting escalation",
+        );
+
+        // Hook saw the LeaveMeeting variant.
+        let calls = hook.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].1, EscalationMode::LeaveMeeting));
+    }
+
+    #[tokio::test]
+    async fn allow_list_miss_emits_policy_denied_event_no_hook() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.allow_topics = vec!["pricing".into()];
+        let hook = RecordingEscalationHook::new();
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::clone(&hook) as _,
+        );
+        let mut events = controller.subscribe_events();
+
+        let _ = controller
+            .speak("the weather is great", Priority::Append, None)
+            .await
+            .expect_err("not_in_allow_list");
+
+        let rule = first_policy_denied_rule(&mut events, Duration::from_millis(50))
+            .await
+            .expect("Cancelled event missing");
+        assert_eq!(rule, "not_in_allow_list");
+
+        // The allow-list miss is a plain Denied, not an escalation —
+        // the hook must stay silent.
+        assert!(hook.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn allow_list_hit_lets_speak_proceed_no_hook_no_extra_cancelled() {
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.allow_topics = vec!["pricing".into()];
+        let hook = RecordingEscalationHook::new();
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::clone(&hook) as _,
+        );
+        let mut events = controller.subscribe_events();
+
+        let _ = controller
+            .speak("share the Q3 pricing", Priority::Append, None)
+            .await
+            .expect("allowed");
+
+        // Backend received exactly one response_create — the speak
+        // path proceeded normally.
+        let creates = backend
+            .record_calls()
+            .into_iter()
+            .filter(|c| matches!(c, BackendCall::ResponseCreate { .. }))
+            .count();
+        assert_eq!(creates, 1);
+
+        // Started fires; no PolicyDenied audit entry.
+        let evs = drain_events(&mut events, 2, Duration::from_millis(50)).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, SpeechEvent::Started { .. })),
+            "missing Started: {evs:?}",
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                SpeechEvent::Cancelled {
+                    reason: CancelReason::PolicyDenied { .. },
+                    ..
+                }
+            )),
+            "Allowed path must not emit PolicyDenied: {evs:?}",
+        );
+
+        // Hook silent on the happy path.
+        assert!(hook.calls().is_empty());
+    }
+
+    /// Hook impl that blocks forever. Used to pin that the
+    /// controller's `speak_lock` is *not* held across the hook's
+    /// await — regression guard for the multi-model review finding.
+    struct BlockingEscalationHook;
+
+    #[async_trait]
+    impl EscalationHook for BlockingEscalationHook {
+        async fn escalate(&self, _rule: String, _via: EscalationMode) {
+            // Park forever. If the controller awaits this on the
+            // speak path, every subsequent `speak` / `cancel` will
+            // hang and this test will time out.
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_escalation_hook_does_not_block_speak_lock() {
+        // Pins the fix for the multi-model review's Major finding:
+        // the controller must NOT hold `speak_lock` across the
+        // escalation hook's await. A hook that hangs (or takes
+        // seconds to fire a webhook) would otherwise serialize every
+        // later `speak`/`cancel` behind it, turning a missing
+        // webhook ack into a controller-wide availability failure.
+        let backend = TestRealtimeBackend::new(caps_atomic());
+        let session = backend.session();
+        let mut profile = open_profile();
+        profile.deny_topics = vec!["legal".into()];
+        profile.escalation = EscalationMode::Notify {
+            destination: "ops@example.com".into(),
+        };
+        let controller = DefaultSpeechController::with_escalation_hook(
+            Arc::clone(&backend) as _,
+            session,
+            profile,
+            Arc::new(BlockingEscalationHook),
+        );
+
+        // Trigger an escalation. The hook will park forever, but
+        // `speak()` must still return promptly with PolicyDenied
+        // because the hook is dispatched detached.
+        let escalated = timeout(
+            Duration::from_secs(2),
+            controller.speak("send the legal contract", Priority::Append, None),
+        )
+        .await
+        .expect("speak() must not block on hook")
+        .expect_err("policy denied");
+        assert!(matches!(escalated, SpeechError::PolicyDenied { .. }));
+
+        // And follow-up controller calls also proceed without
+        // waiting on the parked hook.
+        let cancel = timeout(
+            Duration::from_secs(2),
+            controller.cancel(UtteranceId::now_v7()),
+        )
+        .await
+        .expect("cancel() must not block on hook");
+        assert!(cancel.is_ok());
     }
 }
