@@ -134,7 +134,7 @@ const MAX_PRE_MEETING_CONTEXT_BYTES: usize = 256 * 1024;
 /// caller spraying unique `calendar_event_id`s without ever calling
 /// `start_capture` would otherwise grow the map without bound. At
 /// the cap a fresh `attach_context` evicts the oldest entry first
-/// (insertion-order FIFO via the parallel `pending_contexts_order`
+/// (insertion-order FIFO via the `PendingContextsInner::order`
 /// queue). 1024 covers ~weeks of upcoming-calendar events and is
 /// orders of magnitude larger than any realistic working set.
 const MAX_PENDING_CONTEXTS: usize = 1024;
