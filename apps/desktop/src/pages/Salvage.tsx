@@ -57,6 +57,11 @@ function formatBytes(bytes: number): string {
     : `${value.toFixed(1)} ${units[exponent]}`;
 }
 
+/** Pluralise the noun "session" against an integer count. */
+function sessionsNoun(count: number): string {
+  return count === 1 ? "session" : "sessions";
+}
+
 /**
  * Compact summary of a failure list for a Sonner toast description.
  * The toast is single-line by default and a 30-row purge with full
@@ -314,11 +319,13 @@ export default function Salvage() {
       removeSessions(purged);
 
       if (failures.length === 0) {
-        toast.success(`Purged ${purged.size} of ${total} sessions`);
+        toast.success(
+          `Purged ${purged.size} of ${total} ${sessionsNoun(total)}`,
+        );
       } else if (purged.size === 0) {
         // Every row failed — show a generic error rather than a
         // per-row dump (which could push other toasts off-screen).
-        toast.error(`Purge failed for all ${total} sessions`, {
+        toast.error(`Purge failed for all ${total} ${sessionsNoun(total)}`, {
           description: summariseFailedIds(failures.map((f) => f.sessionId)),
         });
       } else {
@@ -438,9 +445,14 @@ export default function Salvage() {
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   {rowBusy && (
+                    // The disabled Recover/Purge buttons next to the
+                    // spinner already convey "operation in flight" to
+                    // screen readers; matching the rest of the file's
+                    // `aria-hidden="true"` spinners avoids a redundant
+                    // announcement next to a non-interactive element.
                     <Loader2
                       className="h-4 w-4 animate-spin text-muted-foreground"
-                      aria-label="Working"
+                      aria-hidden="true"
                     />
                   )}
                   <Button
@@ -604,7 +616,7 @@ function PurgeAllDialog({
   onCancel,
   onConfirm,
 }: PurgeAllDialogProps) {
-  const sessionsLabel = count === 1 ? "session" : "sessions";
+  const sessionsLabel = sessionsNoun(count);
   return (
     <Dialog.Root
       open={open}

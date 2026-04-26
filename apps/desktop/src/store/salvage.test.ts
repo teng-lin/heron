@@ -32,9 +32,11 @@ afterEach(() => {
 });
 
 /**
- * Mirrors the `<SalvageBanner />` visibility predicate. Pulled out of
- * the component to keep the test stand-alone — if a future refactor
- * moves the predicate into a helper, this snippet should follow.
+ * Mirrors the **store-driven slice** of the `<SalvageBanner />`
+ * visibility predicate. The component additionally suppresses the
+ * banner on `/salvage` itself (a `useLocation()` check), but that
+ * branch is independent of the store and is exercised by manual
+ * smoke-testing rather than via this headless test.
  */
 function bannerVisible(state: ReturnType<typeof useSalvagePromptStore.getState>) {
   return (

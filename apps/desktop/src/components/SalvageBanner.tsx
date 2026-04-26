@@ -12,7 +12,7 @@
  * Visibility rules
  * ----------------
  *
- * The banner renders iff **all three** are true:
+ * The banner renders iff **all four** are true:
  *
  *   1. The scan has run (`promptedThisSession === true`). Without this
  *      we'd render a stale "0 sessions" pre-scan flash on every cold
@@ -24,6 +24,9 @@
  *   3. The user has not clicked "Dismiss" this launch. The dismiss
  *      flag is per-launch only (see `store/salvage.ts`); a future
  *      launch with the same unfinalized sessions re-shows the banner.
+ *   4. The user is not currently on `/salvage`. Showing "N sessions
+ *      need recovery" with an "Open Salvage" button while the user is
+ *      already looking at that exact list is redundant.
  *
  * The dismiss button is intentionally a regular click (not a long-
  * press / not a confirm dialog): the user is opting out of the *banner*,
@@ -32,7 +35,7 @@
  */
 
 import { AlertTriangle } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { Button } from "./ui/button";
 import { useSalvagePromptStore } from "../store/salvage";
@@ -45,16 +48,29 @@ export default function SalvageBanner() {
   const dismissed = useSalvagePromptStore((s) => s.dismissed);
   const dismiss = useSalvagePromptStore((s) => s.dismiss);
   const navigate = useNavigate();
+  const location = useLocation();
 
-  if (!promptedThisSession || unfinalizedCount <= 0 || dismissed) {
+  // Suppress on `/salvage` itself — the banner's "Open Salvage" button
+  // would just navigate to the same page, and the user is already
+  // looking at the full list. The store-level state stays intact so a
+  // navigate-away-then-back keeps the banner visible until the user
+  // either dismisses or empties the list.
+  if (
+    !promptedThisSession ||
+    unfinalizedCount <= 0 ||
+    dismissed ||
+    location.pathname === "/salvage"
+  ) {
     return null;
   }
 
   // Pluralise without dragging in a dependency. The count is always a
   // positive integer at this point (negative / non-integer values would
   // have failed the visibility check above), so the simple `=== 1` test
-  // is sufficient.
+  // is sufficient. Verb plurals match the noun: "1 session needs" vs
+  // "2 sessions need".
   const sessionsLabel = unfinalizedCount === 1 ? "session" : "sessions";
+  const verb = unfinalizedCount === 1 ? "needs" : "need";
 
   return (
     <div
@@ -75,7 +91,7 @@ export default function SalvageBanner() {
           aria-hidden="true"
         />
         <span className="truncate">
-          {unfinalizedCount} {sessionsLabel} need recovery
+          {unfinalizedCount} {sessionsLabel} {verb} recovery
         </span>
       </div>
       <div className="flex shrink-0 gap-2">
