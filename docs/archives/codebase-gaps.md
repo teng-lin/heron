@@ -18,6 +18,7 @@ v2 pieces now exist:
 
 - `heron_orchestrator::LocalSessionOrchestrator`
 - `heron_bot::RecallDriver`
+- `heron_realtime::OpenAiRealtime`
 - `heron_policy::DefaultSpeechController`
 - `heron_realtime::MockRealtimeBackend`
 - `heron_bridge::NaiveBridge`
@@ -30,21 +31,22 @@ so the daemon can own a native capture session. It still does not compose
 realtime speech, bot playback, bridge policy, or pre-meeting context into one
 production v2 session.
 
-**Shipping blocker:** items 2-4 below must land before v2 can alpha-test.
+**Shipping blocker:** items 3 and 4 below must land before v2 can alpha-test.
 Items 5-7 block GA.
 
 ## Blockers — v2 cannot run a real session
 
-### 2. No production realtime backend
+### 2. Production realtime backend exists; orchestration is still pending
 
-`crates/heron-realtime/src/lib.rs:7` still documents the production backend
-choice (`OpenAiRealtime`, `GeminiLive`, `LiveKitAgent`, `Pipecat`) as deferred.
-`MockRealtimeBackend` exists and is useful for policy/controller tests, but no
-backend opens a real realtime LLM session.
+`crates/heron-realtime/src/openai.rs` implements `OpenAiRealtime`, a production
+`RealtimeBackend` that opens an OpenAI Realtime WebSocket session, sends
+`session.update`, creates/cancels responses, forwards tool results, and maps
+OpenAI server events into Heron's `RealtimeEvent` stream.
 
-Without a production `RealtimeBackend`, `DefaultSpeechController` cannot drive
-agent speech in a live meeting, even though policy enforcement and queueing are
-now implemented.
+This closes the standalone backend gap. The remaining blocker is composition:
+no production session owner yet instantiates `OpenAiRealtime`, binds audio
+through `heron-bridge`, routes the backend into `DefaultSpeechController`, and
+tears the session down with the bot lifecycle.
 
 ### 3. v2 bot + bridge + policy are not integrated by an orchestrator
 
@@ -191,6 +193,14 @@ absence of an implementation.
 invoked" gap is resolved at the controller layer; production session wiring is
 still pending.
 
+### `OpenAiRealtime` is the first production realtime backend
+
+`heron_realtime::OpenAiRealtime` opens a real OpenAI Realtime WebSocket session
+from `OPENAI_API_KEY`, translates session configuration into `session.update`,
+and maps response, transcript, speech, tool-call, and error events back into
+the crate's backend-neutral event model. Remaining work is orchestrator
+composition, not backend absence.
+
 ### `AudioBridge` has a naive implementation
 
 `heron_bridge::NaiveBridge` implements `AudioBridge` and is appropriate for
@@ -218,7 +228,8 @@ multi-subscriber behavior.
 
 | # | Gap | File:Line | Severity | Notes |
 | -- | --- | --- | --- | --- |
-| 2 | No production realtime backend | `crates/heron-realtime/src/lib.rs:7` | BLOCKER | OpenAI Realtime or chosen backend first |
+| 1 | Orchestrator lacks real capture/STT/LLM/vault pipeline | `crates/heron-orchestrator/src/lib.rs` | RESOLVED | Vault-backed daemon capture now delegates to the v1 pipeline |
+| 2 | Production realtime backend | `crates/heron-realtime/src/openai.rs` | RESOLVED | `OpenAiRealtime` now opens OpenAI Realtime WebSocket sessions |
 | 3 | Bot + bridge + policy not composed into a live session | `crates/heron-bot/src/recall/mod.rs:367`, `crates/heron-bridge/src/naive.rs:475`, `crates/heron-policy/src/controller.rs:355` | BLOCKER | Build production session owner |
 | 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
