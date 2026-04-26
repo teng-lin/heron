@@ -82,6 +82,16 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// for slow drains without unbounded memory.
 const SUBSCRIBER_CAPACITY: usize = 32;
 
+/// Grace window the polling task waits before firing the synthetic
+/// `Init → Joining` ladder, so a caller has time to subscribe after
+/// `bot_create` returns. Per the gemini-code-assist review on PR
+/// #121, the full poll interval was needlessly slow for the UX —
+/// 100ms is enough to cover the typical async-yield + subscribe()
+/// path. Capped via `min(poll_interval)` at the call site so test
+/// configs that drop the interval to a few ms (`TEST_POLL = 50ms`)
+/// still leave room.
+const SUBSCRIBER_GRACE: Duration = Duration::from_millis(100);
+
 /// Configuration for [`RecallDriver`]. Field-by-field public so the
 /// orchestrator can override individual knobs (region, poll interval)
 /// without having to fall back to env-only construction.
@@ -289,6 +299,66 @@ impl RecallDriver {
                 poll_interval,
                 bot_name,
             }),
+        }
+    }
+
+    /// Gracefully shut down the driver: ask Recall to leave every
+    /// active bot, then drain the polling tasks. After this returns,
+    /// no in-flight bot is orphaned on the vendor side.
+    ///
+    /// Per the gemini-code-assist review on PR #121: [`Drop`] can
+    /// only `abort()` the polling tasks (it cannot `await`), which
+    /// leaves the bots running on Recall's side and accruing cost.
+    /// `shutdown` is the explicit async path the orchestrator should
+    /// call on its graceful-exit flow.
+    ///
+    /// Idempotent — a second call is a no-op once the first drained
+    /// every entry. Vendor errors during the leave-call sweep are
+    /// logged via `tracing::warn!` and never propagated; the goal of
+    /// shutdown is "make best effort and exit cleanly," not surface
+    /// individual failures to the caller (the orchestrator's exit
+    /// path has nothing useful to do with them). Errors per-bot are
+    /// already published on each bot's broadcast channel by the
+    /// underlying `bot_leave` path, so subscribers still observe
+    /// outcomes if they're listening.
+    pub async fn shutdown(&self) {
+        // Snapshot active bot ids under the sync lock; release before
+        // awaiting (lock guard is `!Send` and `bot_leave` calls
+        // through to async HTTP).
+        let active_ids: Vec<BotId> = {
+            let bots = self.inner.lock_bots();
+            bots.iter()
+                .filter_map(|(id, entry)| entry.is_active().then_some(*id))
+                .collect()
+        };
+
+        for id in active_ids {
+            if let Err(e) = self.bot_leave(id).await {
+                tracing::warn!(
+                    ?id,
+                    error = %e,
+                    "shutdown: bot_leave failed; falling back to polling-task abort",
+                );
+            }
+        }
+
+        // Drain any polling tasks the leave sweep didn't already
+        // collect (e.g. bots that were already terminal but whose
+        // task had not yet observed cancellation). Take the handles
+        // under the lock, then await outside it so a slow task
+        // doesn't block driver methods on other threads.
+        let handles: Vec<JoinHandle<()>> = {
+            let mut bots = self.inner.lock_bots();
+            bots.values_mut()
+                .filter_map(|entry| entry.poll_task.take())
+                .collect()
+        };
+        for handle in handles {
+            // `abort` first so a still-polling task exits at its next
+            // poll point; then await the JoinError-or-Ok so we don't
+            // return before the runtime has reaped the task.
+            handle.abort();
+            let _ = handle.await;
         }
     }
 }
@@ -733,22 +803,26 @@ fn spawn_poll_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut seen: usize = 0;
-        // Sleep one poll interval before doing anything. Two reasons:
-        //   1. Subscribers (orchestrator + tests) need a window to
-        //      call `subscribe_state(bot_id)` before the synthetic
-        //      ladder fires, otherwise the broadcast channel will
-        //      drop the events on the floor.
-        //   2. Recall's `create_bot` ack lands ~700ms before the
-        //      first `joining_call` status appears; polling sooner
-        //      just wastes a request.
+        // Two-stage initial wait (gemini-code-assist on PR #121):
         //
-        // `select!` with the cancel oneshot so an immediate
-        // `bot_leave` / `bot_terminate` after `bot_create` exits
-        // before the synthetic ladder publishes — a Codex-flagged
-        // race where `Init → LoadingPersona → …` events would
-        // otherwise emit AFTER a `Completed` terminal.
+        //   1. A short [`SUBSCRIBER_GRACE`] window so callers have
+        //      time to invoke `subscribe_state(bot_id)` after
+        //      `bot_create` returns. Without it, the synthetic
+        //      ladder would fire on a broadcast channel with no
+        //      subscribers and the events would be dropped.
+        //   2. The remainder of `poll_interval` so the first GET
+        //      lands close to when Recall's `joining_call` status
+        //      typically appears (~700ms after dispatch per the
+        //      spike). The publish ladder fires between the two
+        //      stages so the UI sees `Joining` after ~100ms instead
+        //      of after the full poll interval.
+        //
+        // Cancellation via `select!` so an immediate `bot_leave` /
+        // `bot_terminate` after `bot_create` exits before any
+        // synthetic event lands.
+        let grace = SUBSCRIBER_GRACE.min(inner.poll_interval);
         tokio::select! {
-            _ = tokio::time::sleep(inner.poll_interval) => {}
+            _ = tokio::time::sleep(grace) => {}
             _ = &mut cancel_rx => {
                 tracing::debug!(?bot_id, vendor_id, "polling task cancelled before initial ladder");
                 return;
@@ -769,11 +843,24 @@ fn spawn_poll_task(
         }
 
         // Drive the synthetic pre-flight ladder so the FSM lands in
-        // `Joining` immediately after the create-time grace window.
-        // Recall's first status code is `joining_call`; matching the
-        // FSM up to it before the first poll keeps published
-        // transitions monotonic.
+        // `Joining` quickly after `bot_create` returns. Recall's
+        // first status code is `joining_call`; matching the FSM up
+        // to it before the first poll keeps published transitions
+        // monotonic.
         publish_initial_ladder(&inner, bot_id, &metadata);
+
+        // Now sleep the rest of `poll_interval` before the first
+        // network poll. Re-uses the cancel branch.
+        let remainder = inner.poll_interval.saturating_sub(grace);
+        if !remainder.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(remainder) => {}
+                _ = &mut cancel_rx => {
+                    tracing::debug!(?bot_id, vendor_id, "polling task cancelled before first poll");
+                    return;
+                }
+            }
+        }
 
         loop {
             // Fast-fail on cancellation. `try_recv` never blocks; if

@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +27,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Keeps a runaway 5MB Recall HTML stack-trace from blowing up the
 /// log line.
 const ERROR_BODY_SNIPPET_BYTES: usize = 1024;
+
+/// Cap for response bodies the driver actually parses. Recall's `BotDetail`
+/// is a few KB at most, even with a long `status_changes` history; 1MB
+/// gives generous headroom while preventing a malformed / runaway response
+/// from forcing an unbounded allocation. Per the gemini-code-assist
+/// review on PR #121.
+const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
 /// Configuration for a [`Client`]. The driver constructs one of these
 /// at startup; per-request state lives on [`Client`] itself.
@@ -135,14 +143,14 @@ impl Client {
         }
 
         let resp = req.send().await.map_err(http_send_error)?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| HttpError::Network(e.to_string()))?;
+        let (status, headers, body_text, truncated) = drain(resp).await?;
         if !status.is_success() {
             return Err(classify_http_error(status, &headers, body_text));
+        }
+        if truncated {
+            return Err(HttpError::Decode(format!(
+                "create_bot response exceeded {MAX_RESPONSE_BYTES}-byte cap"
+            )));
         }
         let detail: BotDetail = serde_json::from_str(&body_text).map_err(|e| {
             HttpError::Decode(format!(
@@ -164,14 +172,14 @@ impl Client {
             .send()
             .await
             .map_err(http_send_error)?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| HttpError::Network(e.to_string()))?;
+        let (status, headers, body_text, truncated) = drain(resp).await?;
         if !status.is_success() {
             return Err(classify_http_error(status, &headers, body_text));
+        }
+        if truncated {
+            return Err(HttpError::Decode(format!(
+                "get_bot response exceeded {MAX_RESPONSE_BYTES}-byte cap"
+            )));
         }
         let detail: BotDetail = serde_json::from_str(&body_text).map_err(|e| {
             HttpError::Decode(format!(
@@ -195,12 +203,7 @@ impl Client {
             .send()
             .await
             .map_err(http_send_error)?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| HttpError::Network(e.to_string()))?;
+        let (status, headers, body_text, _) = drain(resp).await?;
         if !status.is_success() {
             return Err(classify_http_error(status, &headers, body_text));
         }
@@ -219,17 +222,24 @@ impl Client {
             .send()
             .await
             .map_err(http_send_error)?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| HttpError::Network(e.to_string()))?;
+        let (status, headers, body_text, _) = drain(resp).await?;
         if !status.is_success() {
             return Err(classify_http_error(status, &headers, body_text));
         }
         Ok(())
     }
+}
+
+/// Snapshot status + headers, then read the body with the cap. The
+/// `(status, headers, body, truncated)` tuple is the lowest-common-
+/// denominator the four request methods share.
+async fn drain(
+    resp: reqwest::Response,
+) -> Result<(reqwest::StatusCode, HeaderMap, String, bool), HttpError> {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let (text, truncated) = read_capped(resp).await?;
+    Ok((status, headers, text, truncated))
 }
 
 /// Arguments to [`Client::create_bot`]. Borrowed so the driver can
@@ -314,6 +324,31 @@ pub(crate) enum HttpError {
 
 fn http_send_error(e: reqwest::Error) -> HttpError {
     HttpError::Network(e.to_string())
+}
+
+/// Drain `resp` into a `String`, refusing to buffer more than
+/// [`MAX_RESPONSE_BYTES`]. Returns `(text, truncated)` so the caller
+/// can tag a decode error as "body too large." Streaming chunk-by-
+/// chunk means the worst case is one chunk over the limit, never
+/// the full vendor payload.
+async fn read_capped(resp: reqwest::Response) -> Result<(String, bool), HttpError> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    let mut stream = resp.bytes_stream();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| HttpError::Network(e.to_string()))?;
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            // Take what fits; mark truncated. We don't error here so
+            // a too-big *error* body still surfaces a useful snippet.
+            let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((text, truncated))
 }
 
 fn classify_http_error(

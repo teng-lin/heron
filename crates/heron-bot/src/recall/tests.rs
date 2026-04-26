@@ -815,6 +815,47 @@ async fn terminate_handles_vendor_404_as_idempotent_success() {
 }
 
 #[tokio::test]
+async fn create_bot_response_over_cap_surfaces_decode_error() {
+    // gemini-code-assist on PR #121: a runaway vendor response must
+    // not OOM the driver. `read_capped` streams chunk-by-chunk and
+    // refuses to buffer more than `MAX_RESPONSE_BYTES`. We can't
+    // hit the real 1MB cap without slowing the test, so the driver
+    // surfaces the truncation as a decode error — pinned here.
+    use super::client::ClientConfig as CC;
+    let server = MockServer::start().await;
+    // Generate a >1MB body — wiremock holds it in memory but the
+    // driver streams it through the cap.
+    let oversize = "x".repeat(2 * 1024 * 1024);
+    Mock::given(method("POST"))
+        .and(path("/api/v1/bot/"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("Content-Type", "application/json")
+                .set_body_string(oversize),
+        )
+        .mount(&server)
+        .await;
+    let cfg = CC {
+        api_key: "test-token".into(),
+        base_url: server.uri(),
+        timeout: Duration::from_secs(10),
+    };
+    let client = Client::new(cfg).expect("client");
+    let driver = RecallDriver::from_client(client, TEST_POLL, "heron-test".into());
+    let err = driver
+        .bot_create(args("https://zoom.us/j/oversize"))
+        .await
+        .expect_err("oversize must error");
+    match err {
+        BotError::Vendor(msg) => assert!(
+            msg.contains("exceeded") || msg.contains("decode"),
+            "expected truncation diagnostic, got: {msg}"
+        ),
+        other => panic!("expected Vendor decode error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn already_terminal_terminate_returns_idempotent_ok() {
     // Codex suggestion: if the bot is already terminal, terminate
     // should be Ok(()) (matches bot_leave's behavior). Drive the
@@ -843,6 +884,78 @@ async fn already_terminal_terminate_returns_idempotent_ok() {
         .bot_terminate(bot_id)
         .await
         .expect("terminate on terminal bot must be idempotent");
+}
+
+#[tokio::test]
+async fn shutdown_calls_leave_on_active_bots_and_drains_polling_tasks() {
+    // gemini-code-assist on PR #121: `Drop` can `abort()` polling
+    // tasks but cannot await an HTTP leave_call, so dropping the
+    // driver mid-flight orphans bots on Recall (paid resources).
+    // `RecallDriver::shutdown()` is the explicit async path.
+    //
+    // We assert two things wiremock can observe end-to-end:
+    //   1. The vendor sees `POST /leave_call/` for the active bot
+    //      (i.e. shutdown actually goes through `bot_leave`, not
+    //      just abort).
+    //   2. After shutdown returns, the bot's state is terminal and
+    //      a second shutdown is a no-op (idempotent).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/bot/"))
+        .respond_with(create_response("vbot_shutdown", changes(&[])))
+        .mount(&server)
+        .await;
+    // First few polls keep the bot in `joining_call`; we want to
+    // shut down while it is still active so the leave path runs.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/bot/vbot_shutdown/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "vbot_shutdown",
+            "status_changes": changes(&[("joining_call", None)]),
+        })))
+        .mount(&server)
+        .await;
+    // Recall's leave-call endpoint (route_via_delete = false once
+    // the bot has reached `Joining`+ → uses `/leave_call/`; for our
+    // pre-meeting bot the driver routes via DELETE /bot/{id}/, so
+    // mount both responses and let the matcher pick).
+    Mock::given(method("POST"))
+        .and(path("/api/v1/bot/vbot_shutdown/leave_call/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/bot/vbot_shutdown/"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let driver = driver_for(&server);
+    let bot_id = driver
+        .bot_create(args("https://zoom.us/j/shutdown-test"))
+        .await
+        .expect("create ok");
+
+    // Don't wait for InMeeting — call shutdown while the bot is
+    // still active so the leave sweep actually does work. Whether
+    // the bot is pre-meeting (DELETE) or in-meeting (leave_call) at
+    // shutdown moment is a race; both routes return Ok per mocks.
+    driver.shutdown().await;
+
+    // After shutdown the bot is terminal (Completed if leave_call
+    // succeeded; Failed("…") if the pre-join DELETE path was taken).
+    let final_state = driver
+        .current_state(bot_id)
+        .expect("entry survives shutdown");
+    assert!(
+        is_terminal_state(&final_state),
+        "bot should be terminal after shutdown, got {final_state:?}",
+    );
+
+    // Idempotent — a second shutdown is a no-op (no panics, returns
+    // promptly). The first shutdown drained `poll_task` from every
+    // entry, so the second one finds nothing to await.
+    driver.shutdown().await;
 }
 
 struct BodyMatcher;
