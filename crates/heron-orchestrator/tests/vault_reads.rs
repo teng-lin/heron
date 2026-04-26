@@ -436,24 +436,14 @@ async fn list_upcoming_calendar_translates_denied_to_permission_missing() {
 }
 
 #[tokio::test]
-async fn capture_lifecycle_endpoints_still_return_not_yet_implemented() {
+async fn attach_context_still_returns_not_yet_implemented() {
+    // FSM-merge wired `start_capture` / `end_meeting` (see
+    // capture_lifecycle_drives_fsm_and_publishes_bus_events below).
+    // `attach_context`'s storage layer ships with the same PR that
+    // wires the consumer of pre-meeting context at capture-start
+    // time — until then it stays `NotYetImplemented`.
     let fix = Fixture::new();
     let orch = fix.orch();
-
-    let err = orch
-        .start_capture(heron_session::StartCaptureArgs {
-            platform: Platform::Zoom,
-            hint: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(err, SessionError::NotYetImplemented));
-
-    let err = orch
-        .end_meeting(&heron_session::MeetingId::now_v7())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, SessionError::NotYetImplemented));
 
     let err = orch
         .attach_context(heron_session::PreMeetingContextRequest {

@@ -35,20 +35,38 @@
 //! stub for `LocalSessionOrchestrator` in `herond`'s `AppState` is
 //! the cutover; routes don't change.
 //!
+//! What's wired today (FSM-merge, this PR):
+//!
+//! - **Capture lifecycle FSM.** [`SessionOrchestrator::start_capture`]
+//!   and [`SessionOrchestrator::end_meeting`] drive a
+//!   [`heron_types::RecordingFsm`] — the same FSM `heron-cli`'s
+//!   session orchestrator runs on the live audio path — and publish
+//!   `meeting.detected` / `meeting.armed` / `meeting.started` /
+//!   `meeting.ended` / `meeting.completed` envelopes onto the bus on
+//!   each transition. This is the first publisher on the substrate;
+//!   it's what makes `/events` actually carry traffic during a
+//!   manually-driven capture.
+//!
 //! What's NOT here:
 //!
-//! - **No real FSM.** `start_capture`, `end_meeting`, transcript /
-//!   summary / audio reads, calendar reads, context attach all
-//!   return [`heron_session::SessionError::NotYetImplemented`]
-//!   exactly like the test stub. They land one PR at a time as the
-//!   underlying subsystems (heron-cli's session FSM, heron-zoom's
-//!   AXObserver, heron-vault, heron-llm) get wrapped.
+//! - **No real audio / STT / LLM.** The FSM transitions fire
+//!   synchronously inside `start_capture` / `end_meeting` since
+//!   there's no audio backend yet to gate the `Recording` edge or
+//!   STT/LLM tasks to drive `transcribing → summarizing → idle` in
+//!   the background. When those subsystems wire in (one PR per
+//!   `heron-zoom`'s AXObserver, `heron-vault`, `heron-llm`), the
+//!   trait + bus surface stays the same — only the timing of those
+//!   intermediate transitions shifts.
 //! - **No persistent state.** The cache is in-memory and the bus is
 //!   a Tokio broadcast channel. A daemon restart loses both — the
 //!   spec's `Last-Event-ID` resume contract honors this by
 //!   returning `WindowExceeded` on cross-restart resumes (the
-//!   client reconnects fresh).
+//!   client reconnects fresh). Active-meeting bookkeeping lives in
+//!   the same in-memory map; a restart in the middle of a capture
+//!   loses the FSM and the next `end_meeting` for that id collapses
+//!   to `404`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -56,15 +74,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
-use heron_event::{EventBus, ReplayCache};
+use heron_event::{Envelope, EventBus, ReplayCache};
 use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
 use heron_session::{
     AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
     HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
-    MeetingId, MeetingStatus, Participant, Platform, PreMeetingContextRequest, SessionError,
-    SessionEventBus, SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
-    TranscriptLifecycle, TranscriptSegment,
+    MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Participant, Platform,
+    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator, StartCaptureArgs,
+    Summary, SummaryLifecycle, Transcript, TranscriptLifecycle, TranscriptSegment,
 };
+use heron_types::{RecordingFsm, SummaryOutcome};
 use heron_vault::{
     CalendarReader, EventKitCalendarReader, VaultError, epoch_seconds_to_utc, read_note,
 };
@@ -128,6 +147,14 @@ pub struct LocalSessionOrchestrator {
     /// Calendar bridge for `list_upcoming_calendar`. Defaults to the
     /// EventKit reader; tests inject a fake to bypass macOS TCC.
     calendar: Arc<dyn CalendarReader>,
+    /// In-flight captures keyed by `MeetingId`. Each entry pairs the
+    /// last-published `Meeting` snapshot with the [`RecordingFsm`]
+    /// driving its lifecycle. Held under a sync `Mutex` (no `.await`
+    /// while locked) because every operation on it is short and CPU-
+    /// bound: lookup, FSM transition, `bus.publish` (which is sync).
+    /// Entries are removed on terminal transitions so the map stays
+    /// the size of currently-active meetings.
+    active_meetings: Mutex<HashMap<MeetingId, ActiveMeeting>>,
     /// Held in a `Mutex<Option<…>>` so [`Self::shutdown`] (taking
     /// `&self`) can still consume the sender. Real callers don't
     /// touch the lock; the test seam takes it once.
@@ -135,6 +162,17 @@ pub struct LocalSessionOrchestrator {
     /// Same `Mutex<Option<…>>` rationale: lets `shutdown` move out
     /// of the join handle without `&mut self`.
     recorder: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Per-meeting state tracked while a capture is in flight. The
+/// [`RecordingFsm`] is the same one `heron-cli`'s session orchestrator
+/// drives in the live audio path; here it provides the legality check
+/// for every transition `start_capture` / `end_meeting` triggers, and
+/// the `meeting` snapshot is the latest copy that has been published
+/// on the bus.
+struct ActiveMeeting {
+    fsm: RecordingFsm,
+    meeting: Meeting,
 }
 
 /// Builder for [`LocalSessionOrchestrator`] — exposed so the daemon
@@ -254,6 +292,7 @@ impl Builder {
             cache,
             vault_root: self.vault_root,
             calendar,
+            active_meetings: Mutex::new(HashMap::new()),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
         }
@@ -391,6 +430,48 @@ fn spawn_recorder(
     })
 }
 
+/// Wrap an [`EventPayload`] in an [`Envelope`] scoped to `meeting_id`
+/// and publish it on the bus. Helper so every transition site picks
+/// up the same `with_meeting` framing without each one re-stringifying
+/// the id (the consistency contract on `Envelope::meeting_id` requires
+/// it match the meeting carried in the payload).
+fn publish_meeting_event(bus: &SessionEventBus, payload: EventPayload, meeting_id: MeetingId) {
+    bus.publish(Envelope::new(payload).with_meeting(meeting_id.to_string()));
+}
+
+/// Snapshot active captures matching a [`ListMeetingsQuery`]'s filters
+/// (since / status / platform), newest-first. Caller is responsible
+/// for limit / cursor handling — active captures never paginate.
+fn collect_active_for_query(
+    active: &Mutex<HashMap<MeetingId, ActiveMeeting>>,
+    q: &ListMeetingsQuery,
+) -> Vec<Meeting> {
+    let mut items: Vec<Meeting> = lock_or_recover(active)
+        .values()
+        .map(|m| m.meeting.clone())
+        .filter(|m| q.since.is_none_or(|since| m.started_at >= since))
+        .filter(|m| q.status.is_none_or(|s| m.status == s))
+        .filter(|m| q.platform.is_none_or(|p| m.platform == p))
+        .collect();
+    // Newest started_at first. Two captures with the same instant
+    // is implausible (UUIDv7 minting + the start_capture lock
+    // serialize them), so a strict-cmp on started_at is enough.
+    items.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    items
+}
+
+/// Map a [`heron_types::TransitionError`] to the closest
+/// [`SessionError`] for the HTTP projection. A transition error from
+/// the orchestrator's own FSM walks is "shouldn't happen" — it would
+/// mean the FSM disagrees with the orchestrator's own bookkeeping —
+/// so map to `Validation` and surface the FSM's diagnostic so a real
+/// occurrence can be investigated.
+fn transition_to_session_error(err: heron_types::TransitionError) -> SessionError {
+    SessionError::Validation {
+        detail: format!("FSM rejected internal transition: {err}"),
+    }
+}
+
 /// `Down` plus a "not yet wired" message — the honest answer for a
 /// substrate-only orchestrator. Deliberately not `PermissionMissing`
 /// (which would suggest a TCC permission gap and route consumers
@@ -416,13 +497,62 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     // surface.
 
     async fn list_meetings(&self, q: ListMeetingsQuery) -> Result<ListMeetingsPage, SessionError> {
-        let Some(root) = self.vault_root.as_deref() else {
-            return Err(SessionError::NotYetImplemented);
+        // Active captures are the live state; finalized vault notes
+        // are the disk snapshot. The same `Meeting` is never in both
+        // (no vault writer yet, and once one lands the entry is
+        // removed from `active_meetings` on `end_meeting` before the
+        // note is finalized). Surface active captures only on the
+        // first page (cursor=None) — the cursor format is a vault-
+        // relative path, so paginating through them would require a
+        // synthetic cursor scheme. Active captures are bounded by
+        // the singleton-per-platform invariant, so they always fit on
+        // page one anyway.
+        let active_items = if q.cursor.is_none() {
+            collect_active_for_query(&self.active_meetings, &q)
+        } else {
+            Vec::new()
         };
-        list_meetings_impl(root, q)
+
+        let Some(root) = self.vault_root.as_deref() else {
+            // Without a vault, the only meetings to surface are
+            // active ones. If there are none, preserve the substrate-
+            // only `NotYetImplemented` behavior so vault-less tests
+            // keep their existing surface.
+            return if active_items.is_empty() {
+                Err(SessionError::NotYetImplemented)
+            } else {
+                Ok(ListMeetingsPage {
+                    items: active_items,
+                    next_cursor: None,
+                })
+            };
+        };
+
+        let mut page = list_meetings_impl(root, q.clone())?;
+        // Newest first: active captures predate any cursor-paginated
+        // disk results, so prepend then re-apply the limit. The
+        // `next_cursor` from the disk scan still points into the disk
+        // set — that's fine because active items aren't paginated.
+        let limit = q.limit.unwrap_or(50).min(200) as usize;
+        let mut combined = active_items;
+        combined.extend(page.items);
+        if combined.len() > limit {
+            combined.truncate(limit);
+        }
+        page.items = combined;
+        Ok(page)
     }
 
     async fn get_meeting(&self, id: &MeetingId) -> Result<Meeting, SessionError> {
+        // Active capture wins — it's the live state, and it's the
+        // only thing that exists for a meeting between
+        // `start_capture` and the (future) vault note write. Without
+        // this short-circuit the `Location: /v1/meetings/{id}` header
+        // herond stamps on `POST /meetings` (per the OpenAPI
+        // 202-Accepted shape) would dangle into a 404.
+        if let Some(active) = lock_or_recover(&self.active_meetings).get(id) {
+            return Ok(active.meeting.clone());
+        }
         let Some(root) = self.vault_root.as_deref() else {
             return Err(SessionError::NotYetImplemented);
         };
@@ -430,12 +560,154 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         meeting_from_note(root, &path)
     }
 
-    async fn start_capture(&self, _args: StartCaptureArgs) -> Result<Meeting, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn start_capture(&self, args: StartCaptureArgs) -> Result<Meeting, SessionError> {
+        // FSM-merge: drive the same `RecordingFsm` `heron-cli`'s
+        // session orchestrator uses on the live audio path through
+        // `idle → armed → recording`, publishing one bus event per
+        // transition. A future PR replaces this synchronous walk with
+        // an audio-task-driven path that returns at `Armed` and emits
+        // `MeetingStarted` once Core Audio actually starts producing
+        // PCM; the trait + bus surface stays the same — only the
+        // timing of `MeetingStarted` shifts.
+        let mut active = lock_or_recover(&self.active_meetings);
+        // Singleton-per-platform per the trait docs: a second
+        // capture for the same platform while one is still non-
+        // terminal is a `409 Conflict`. Terminal entries are
+        // removed on `end_meeting`, so the scan stops at the active
+        // set.
+        if active
+            .values()
+            .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
+        {
+            return Err(SessionError::CaptureInProgress {
+                platform: args.platform,
+            });
+        }
+
+        let id = MeetingId::now_v7();
+        let started_at = Utc::now();
+        let mut meeting = Meeting {
+            id,
+            status: MeetingStatus::Detected,
+            platform: args.platform,
+            // The `hint` is wire-shape free text; surfacing it as the
+            // title is the most honest projection until a real source
+            // (AX window title, calendar correlation) lands.
+            title: args.hint,
+            calendar_event_id: None,
+            started_at,
+            ended_at: None,
+            duration_secs: None,
+            participants: Vec::new(),
+            transcript_status: TranscriptLifecycle::Pending,
+            summary_status: SummaryLifecycle::Pending,
+        };
+        let mut fsm = RecordingFsm::new();
+
+        publish_meeting_event(
+            &self.bus,
+            EventPayload::MeetingDetected(meeting.clone()),
+            id,
+        );
+
+        // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
+        // armed a capture" edge; `Invalid` here would mean the
+        // freshly-built FSM isn't actually `Idle`, which can't
+        // happen — map defensively rather than `unwrap` so a future
+        // FSM change surfaces as a typed error.
+        fsm.on_hotkey().map_err(transition_to_session_error)?;
+        meeting.status = MeetingStatus::Armed;
+        publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
+
+        // armed → recording.
+        fsm.on_yes().map_err(transition_to_session_error)?;
+        meeting.status = MeetingStatus::Recording;
+        publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
+
+        let returned = meeting.clone();
+        active.insert(id, ActiveMeeting { fsm, meeting });
+        tracing::info!(
+            meeting_id = %id,
+            platform = ?args.platform,
+            "capture started",
+        );
+        Ok(returned)
     }
 
-    async fn end_meeting(&self, _id: &MeetingId) -> Result<(), SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError> {
+        // Drive the FSM through `recording → transcribing →
+        // summarizing → idle`, publishing `meeting.ended` on the
+        // recording-stop edge and `meeting.completed` on the
+        // terminal edge. The intermediate transcribing/summarizing
+        // edges are internal to the pipeline — they don't have a
+        // public bus event today (transcript / summary deltas ride
+        // their own typed payloads, emitted by the future audio +
+        // STT + LLM impls).
+        let mut active = lock_or_recover(&self.active_meetings);
+        let entry = active.remove(id).ok_or_else(|| SessionError::NotFound {
+            what: format!("active meeting {id}"),
+        })?;
+        let ActiveMeeting {
+            mut fsm,
+            mut meeting,
+        } = entry;
+
+        // recording → transcribing. The `on_hotkey` from `Recording`
+        // is the FSM's stop edge per `docs/implementation.md` §14.2.
+        // The FSM rejects this from any other state via
+        // `TransitionError`, which `transition_to_session_error`
+        // surfaces as `Validation` — that's the safety net for the
+        // (currently impossible) drift where an entry's FSM is not
+        // at `Recording`.
+        fsm.on_hotkey().map_err(transition_to_session_error)?;
+        let ended_at = Utc::now();
+        // `num_seconds` is `i64`; saturate at 0 if the system clock
+        // ran backwards between `start_capture` and `end_meeting`
+        // (NTP slew on a long-running daemon). A negative duration
+        // would be both meaningless and a panic-on-cast risk.
+        let duration_secs = (ended_at - meeting.started_at).num_seconds().max(0) as u64;
+        meeting.status = MeetingStatus::Ended;
+        meeting.ended_at = Some(ended_at);
+        meeting.duration_secs = Some(duration_secs);
+        publish_meeting_event(&self.bus, EventPayload::MeetingEnded(meeting.clone()), *id);
+
+        // transcribing → summarizing → idle. With no real STT / LLM
+        // wired through this orchestrator yet, both edges fire
+        // synchronously and the meeting lands at `Done`. When the
+        // real pipeline lands, those transitions move into the
+        // background tasks that own them, and this method just
+        // signals the audio task to stop.
+        fsm.on_transcribe_done()
+            .map_err(transition_to_session_error)?;
+        fsm.on_summary(SummaryOutcome::Done)
+            .map_err(transition_to_session_error)?;
+        meeting.status = MeetingStatus::Done;
+        meeting.transcript_status = TranscriptLifecycle::Complete;
+        meeting.summary_status = SummaryLifecycle::Ready;
+        // `meeting` is consumed by the payload — last reference, no
+        // clone needed. Don't reinsert: the meeting is terminal. A
+        // subsequent `end_meeting` for the same id collapses to
+        // `NotFound`, which the HTTP projection maps to `404`. The
+        // OpenAPI's "idempotent against Done|Failed" wording is
+        // satisfied once a finalized vault note exists for the
+        // meeting; until the vault writer wires in, the active-set
+        // is the only source of truth and `404` is the honest
+        // answer.
+        publish_meeting_event(
+            &self.bus,
+            EventPayload::MeetingCompleted(MeetingCompletedData {
+                meeting,
+                outcome: MeetingOutcome::Success,
+                failure_reason: None,
+            }),
+            *id,
+        );
+        tracing::info!(
+            meeting_id = %id,
+            duration_secs,
+            "capture ended",
+        );
+        Ok(())
     }
 
     async fn read_transcript(&self, id: &MeetingId) -> Result<Transcript, SessionError> {
@@ -1083,9 +1355,12 @@ mod tests {
         // Pin the "stub for now" contract per-method when no
         // `vault_root` is configured. Read endpoints fall back to
         // `NotYetImplemented` because there's no on-disk source to
-        // scan; capture-lifecycle methods + attach_context stay
-        // `NotYetImplemented` regardless of vault config until
-        // FSM-merge wires the heron-cli session driver.
+        // scan; `attach_context` stays `NotYetImplemented` until its
+        // storage layer ships alongside the consumer at capture-start.
+        // Capture-lifecycle methods (`start_capture` / `end_meeting`)
+        // are NOT in this set — FSM-merge wired them to drive the
+        // `RecordingFsm` and publish bus events directly, no vault
+        // dependency.
         // `list_upcoming_calendar` is explicitly NOT in this set —
         // it works as soon as a CalendarReader is configured, which
         // is independent of the vault.
@@ -1098,18 +1373,6 @@ mod tests {
         ));
         assert!(matches!(
             orch.get_meeting(&id).await,
-            Err(SessionError::NotYetImplemented)
-        ));
-        assert!(matches!(
-            orch.start_capture(StartCaptureArgs {
-                platform: Platform::Zoom,
-                hint: None,
-            })
-            .await,
-            Err(SessionError::NotYetImplemented)
-        ));
-        assert!(matches!(
-            orch.end_meeting(&id).await,
             Err(SessionError::NotYetImplemented)
         ));
         assert!(matches!(
@@ -1287,5 +1550,306 @@ mod tests {
                 _ => tokio::time::sleep(Duration::from_millis(1)).await,
             }
         }
+    }
+
+    // ── FSM-merge: capture lifecycle ──────────────────────────────────
+
+    /// Drain every envelope currently buffered in `rx` into a vector.
+    /// Used by capture-lifecycle tests so they can assert the exact
+    /// sequence of `meeting.*` events `start_capture` / `end_meeting`
+    /// emits without racing the recorder task.
+    fn drain(
+        rx: &mut tokio::sync::broadcast::Receiver<Envelope<EventPayload>>,
+    ) -> Vec<Envelope<EventPayload>> {
+        let mut out = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            out.push(env);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn start_capture_walks_fsm_and_publishes_three_events() {
+        // Pin the bus contract for the manual-capture escape hatch:
+        // exactly three events fire (`detected → armed → started`),
+        // each carries the same `MeetingId` in its envelope frame
+        // (Envelope.meeting_id consistency invariant), and the
+        // returned `Meeting` lands at `Recording`.
+        let orch = LocalSessionOrchestrator::new();
+        let mut rx = orch.event_bus().subscribe();
+
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: Some("Standup".into()),
+            })
+            .await
+            .expect("start_capture");
+        assert!(matches!(meeting.status, MeetingStatus::Recording));
+        assert_eq!(meeting.title.as_deref(), Some("Standup"));
+
+        let events = drain(&mut rx);
+        let kinds: Vec<&str> = events.iter().map(|e| e.payload.event_type()).collect();
+        assert_eq!(
+            kinds,
+            ["meeting.detected", "meeting.armed", "meeting.started"],
+            "unexpected event sequence: {kinds:?}",
+        );
+        let id_str = meeting.id.to_string();
+        for env in &events {
+            assert_eq!(
+                env.meeting_id.as_deref(),
+                Some(id_str.as_str()),
+                "envelope.meeting_id must match payload meeting id",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn end_meeting_publishes_ended_then_completed() {
+        // The other half of the bus contract: end_meeting fires
+        // `meeting.ended` then a single `meeting.completed` with
+        // `outcome: success` (Invariant 9 — there is no
+        // `meeting.failed` variant).
+        let orch = LocalSessionOrchestrator::new();
+        let mut rx = orch.event_bus().subscribe();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("start_capture");
+        // Drain start_capture's events so the assertions below scope
+        // strictly to end_meeting's emissions.
+        let _ = drain(&mut rx);
+
+        orch.end_meeting(&meeting.id).await.expect("end_meeting");
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 2, "expected ended + completed");
+        assert!(matches!(events[0].payload, EventPayload::MeetingEnded(_)));
+        match &events[1].payload {
+            EventPayload::MeetingCompleted(data) => {
+                assert!(matches!(data.outcome, MeetingOutcome::Success));
+                assert!(matches!(data.meeting.status, MeetingStatus::Done));
+                assert!(data.meeting.ended_at.is_some());
+                assert!(data.meeting.duration_secs.is_some());
+            }
+            other => panic!("expected MeetingCompleted, got {}", other.event_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_capture_rejects_second_capture_for_same_platform() {
+        // Singleton-per-platform invariant: a second `start_capture`
+        // for an already-recording platform is `409 CaptureInProgress`.
+        // A different platform is allowed in parallel.
+        let orch = LocalSessionOrchestrator::new();
+        let _first = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("first start");
+
+        let err = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect_err("second Zoom start must conflict");
+        assert!(
+            matches!(
+                err,
+                SessionError::CaptureInProgress {
+                    platform: Platform::Zoom
+                }
+            ),
+            "expected CaptureInProgress, got {err:?}",
+        );
+
+        // A different platform doesn't conflict.
+        orch.start_capture(StartCaptureArgs {
+            platform: Platform::GoogleMeet,
+            hint: None,
+        })
+        .await
+        .expect("second start on a different platform");
+    }
+
+    #[tokio::test]
+    async fn start_capture_after_end_releases_the_platform_singleton() {
+        // Once a meeting is terminal (entry removed on end_meeting),
+        // a fresh capture on the same platform must succeed —
+        // otherwise the daemon would refuse all future captures
+        // after the first one ends.
+        let orch = LocalSessionOrchestrator::new();
+        let first = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("first start");
+        orch.end_meeting(&first.id).await.expect("end first");
+
+        let second = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("second start after end");
+        assert_ne!(first.id, second.id, "fresh meeting id expected");
+    }
+
+    #[tokio::test]
+    async fn end_meeting_unknown_id_is_not_found() {
+        // A meeting id the orchestrator never saw collapses to
+        // `NotFound` — the HTTP projection maps that to `404`. We
+        // deliberately don't store terminal meetings in the active
+        // map, so a second `end_meeting` for a just-completed
+        // meeting also lands here (documented in the impl).
+        let orch = LocalSessionOrchestrator::new();
+        let err = orch
+            .end_meeting(&MeetingId::now_v7())
+            .await
+            .expect_err("unknown id must error");
+        assert!(matches!(err, SessionError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn capture_lifecycle_events_land_in_replay_cache() {
+        // The fired-and-forgotten contract for `/events`: events
+        // published from `start_capture` / `end_meeting` flow through
+        // the bus → recorder → replay cache pipeline so a late SSE
+        // subscriber resuming with `Last-Event-ID` can still see the
+        // capture's history. Without this the FSM-merge wiring would
+        // be invisible to a reconnecting client.
+        let orch = LocalSessionOrchestrator::new();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("start_capture");
+        orch.end_meeting(&meeting.id).await.expect("end_meeting");
+
+        // Five envelopes total: detected, armed, started, ended, completed.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while orch.cache_len() < 5 {
+            if Instant::now() > deadline {
+                panic!(
+                    "recorder never reached 5 entries (cur={})",
+                    orch.cache_len(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(orch.cache_len(), 5);
+    }
+
+    #[tokio::test]
+    async fn get_meeting_returns_active_capture_before_vault_lookup() {
+        // Closes the wire-contract regression where
+        // `POST /meetings` returns `Location: /v1/meetings/{id}`
+        // but `GET /meetings/{id}` 404s because the read endpoint
+        // only scanned the disk vault. Active captures must be
+        // visible to `get_meeting` so the Location header doesn't
+        // dangle.
+        let orch = LocalSessionOrchestrator::new();
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: Some("Standup".into()),
+            })
+            .await
+            .expect("start_capture");
+
+        let fetched = orch.get_meeting(&started.id).await.expect("get_meeting");
+        assert_eq!(fetched.id, started.id);
+        assert!(matches!(fetched.status, MeetingStatus::Recording));
+        assert_eq!(fetched.title.as_deref(), Some("Standup"));
+
+        // After end_meeting, the entry is removed from active set.
+        // Without a vault root, the substrate falls back to
+        // `NotYetImplemented` — which is honest: the meeting was
+        // terminal-on-bus but the daemon has no persistent record.
+        orch.end_meeting(&started.id).await.expect("end_meeting");
+        assert!(matches!(
+            orch.get_meeting(&started.id).await,
+            Err(SessionError::NotYetImplemented)
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_meetings_surfaces_active_capture_without_vault() {
+        // A vault-less daemon can still capture; `list_meetings`
+        // must surface in-flight meetings so a client polling the
+        // REST surface (rather than subscribing to /events) can
+        // discover them. Without a vault and zero captures the
+        // method preserves the substrate-only `NotYetImplemented`
+        // contract — that's covered by the existing
+        // substrate_only_methods_return_not_yet_implemented_without_vault
+        // test, which doesn't start a capture.
+        let orch = LocalSessionOrchestrator::new();
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("start_capture");
+
+        let page = orch
+            .list_meetings(ListMeetingsQuery::default())
+            .await
+            .expect("list_meetings");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, started.id);
+        assert!(matches!(page.items[0].status, MeetingStatus::Recording));
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_meetings_filters_active_capture_by_platform_and_status() {
+        // The existing query filters (since / status / platform)
+        // apply to active captures the same as to disk results so a
+        // client polling `?status=recording` doesn't get a vault note
+        // mixed in, and vice versa.
+        let orch = LocalSessionOrchestrator::new();
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+            })
+            .await
+            .expect("start_capture");
+
+        // Filter: matching platform, recording status — should hit.
+        let page = orch
+            .list_meetings(ListMeetingsQuery {
+                platform: Some(Platform::Zoom),
+                status: Some(MeetingStatus::Recording),
+                ..Default::default()
+            })
+            .await
+            .expect("list_meetings");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, started.id);
+
+        // Filter: non-matching platform — should miss.
+        let err = orch
+            .list_meetings(ListMeetingsQuery {
+                platform: Some(Platform::Webex),
+                ..Default::default()
+            })
+            .await
+            .expect_err("no Webex captures, no vault — should be NotYetImplemented");
+        assert!(matches!(err, SessionError::NotYetImplemented));
     }
 }

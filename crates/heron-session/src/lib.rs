@@ -385,6 +385,33 @@ pub enum EventPayload {
     DaemonError(DaemonErrorData),
 }
 
+impl EventPayload {
+    /// The OpenAPI `event_type` literal for this variant — the same
+    /// string serde renders in `tag = "event_type"` framing. Single
+    /// canonical projection so transports (SSE in `herond`, future
+    /// MCP / webhook / Tauri sinks) and tests assert on the same
+    /// strings the wire actually carries. Adding a variant without
+    /// extending this match fails the exhaustive-match check, which
+    /// is the drift guard the manual `#[serde(rename = …)]`
+    /// annotations cannot enforce on their own.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::MeetingDetected(_) => "meeting.detected",
+            Self::MeetingArmed(_) => "meeting.armed",
+            Self::MeetingStarted(_) => "meeting.started",
+            Self::MeetingEnded(_) => "meeting.ended",
+            Self::MeetingCompleted(_) => "meeting.completed",
+            Self::MeetingParticipantJoined(_) => "meeting.participant_joined",
+            Self::TranscriptPartial(_) => "transcript.partial",
+            Self::TranscriptFinal(_) => "transcript.final",
+            Self::SummaryReady(_) => "summary.ready",
+            Self::ActionItemsReady(_) => "action_items.ready",
+            Self::DoctorWarning(_) => "doctor.warning",
+            Self::DaemonError(_) => "daemon.error",
+        }
+    }
+}
+
 /// Type alias for the event envelope flowing through the bus.
 /// Adapter crates (HTTP/SSE, Tauri IPC, MCP, webhook) project from
 /// `EventBus<EventPayload>`.
@@ -592,9 +619,13 @@ pub trait SessionOrchestrator: Send + Sync {
     async fn get_meeting(&self, id: &MeetingId) -> Result<Meeting, SessionError>;
 
     /// `POST /meetings` — manual-capture escape hatch. Returns
-    /// `Meeting` in the `Detected` or `Armed` state; subscribe to
-    /// `/events` for the `Recording → Ended → Done|Failed`
-    /// transitions.
+    /// `Meeting` in any non-terminal state — typically `Detected` or
+    /// `Armed` for a fully async-driven implementation that defers
+    /// the `Recording` edge to a background audio task, but a
+    /// substrate-only / synchronous-walk implementation may return at
+    /// `Recording`. Either way, callers subscribe to `/events` for
+    /// the `Recording → Ended → Done|Failed` transitions they don't
+    /// see in the synchronous response.
     ///
     /// Errors:
     /// - [`SessionError::CaptureInProgress`] for the
@@ -604,9 +635,15 @@ pub trait SessionOrchestrator: Send + Sync {
     async fn start_capture(&self, args: StartCaptureArgs) -> Result<Meeting, SessionError>;
 
     /// `POST /meetings/{meeting_id}/end` — manual end-of-meeting
-    /// escape hatch. Idempotent against `Done | Failed`; returns
-    /// [`SessionError::InvalidState`] for any other terminal state
-    /// the meeting is already in.
+    /// escape hatch. Once the meeting has been finalized (vault note
+    /// written, terminal state reachable via `get_meeting`),
+    /// idempotent against `Done | Failed`. Until that finalization
+    /// lands (the substrate-only impl, where the active capture is
+    /// the only source of truth), a second call after the first
+    /// completes collapses to [`SessionError::NotFound`] (HTTP
+    /// `404`); subscribe to `/events` for the terminal
+    /// `meeting.completed` envelope rather than relying on a
+    /// re-end.
     async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError>;
 
     // ── transcripts ───────────────────────────────────────────────────

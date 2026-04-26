@@ -62,7 +62,6 @@ use axum::routing::get;
 use futures_util::{Stream, StreamExt};
 use heron_event::{EventId, ReplayError};
 use heron_event_http::{REPLAY_WINDOW_HEADER, TopicFilter};
-use heron_session::EventPayload;
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -237,7 +236,7 @@ async fn get_events(
         let topics = Arc::clone(&topics);
         async move {
             let env = res.ok()?;
-            let event_type = event_type_of(&env.payload);
+            let event_type = env.payload.event_type();
             // Topic filter applies BEFORE serialization so a
             // wide-tail subscriber's narrow filter doesn't pay the
             // serialization cost on dropped events. Mirrors
@@ -280,25 +279,3 @@ async fn get_events(
 /// the upstream stream pipeline doesn't propagate into a type
 /// signature explosion.
 type Pinned<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
-
-/// Map an `EventPayload` variant to its OpenAPI `event_type` literal.
-/// Hand-coded match: keeps the SSE projection on the hot path
-/// allocation-free and pins the wire taxonomy in code so a future
-/// variant added without updating this fn fails the exhaustive-match
-/// check.
-fn event_type_of(p: &EventPayload) -> &'static str {
-    match p {
-        EventPayload::MeetingDetected(_) => "meeting.detected",
-        EventPayload::MeetingArmed(_) => "meeting.armed",
-        EventPayload::MeetingStarted(_) => "meeting.started",
-        EventPayload::MeetingEnded(_) => "meeting.ended",
-        EventPayload::MeetingCompleted(_) => "meeting.completed",
-        EventPayload::MeetingParticipantJoined(_) => "meeting.participant_joined",
-        EventPayload::TranscriptPartial(_) => "transcript.partial",
-        EventPayload::TranscriptFinal(_) => "transcript.final",
-        EventPayload::SummaryReady(_) => "summary.ready",
-        EventPayload::ActionItemsReady(_) => "action_items.ready",
-        EventPayload::DoctorWarning(_) => "doctor.warning",
-        EventPayload::DaemonError(_) => "daemon.error",
-    }
-}
