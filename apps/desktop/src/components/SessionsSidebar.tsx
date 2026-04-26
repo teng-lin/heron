@@ -79,7 +79,22 @@ export function SessionsSidebar({
     );
     const ms = nextMidnight.getTime() - now.getTime();
     const handle = setTimeout(() => setDayKey(localDayKey(new Date())), ms);
-    return () => clearTimeout(handle);
+    // Sleep/wake + background-throttling fallback: macOS suspends
+    // `setTimeout` while the laptop is closed, so a window opened at
+    // 23:55 and reopened the next morning would otherwise stay frozen
+    // on yesterday's bucketing until the next save/refetch. Re-syncing
+    // on visibility/focus catches that case without polling.
+    const recheck = () => {
+      const k = localDayKey(new Date());
+      setDayKey((prev) => (prev === k ? prev : k));
+    };
+    document.addEventListener("visibilitychange", recheck);
+    window.addEventListener("focus", recheck);
+    return () => {
+      clearTimeout(handle);
+      document.removeEventListener("visibilitychange", recheck);
+      window.removeEventListener("focus", recheck);
+    };
   }, [dayKey]);
   // Per-bucket expanded state. Today + Yesterday default open; older
   // buckets default closed so a long-running vault doesn't dominate
