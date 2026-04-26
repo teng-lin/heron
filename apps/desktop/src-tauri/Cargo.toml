@@ -63,6 +63,12 @@ heron-speech = { workspace = true }
 # alongside lets the Tauri command resolve a live `Summarizer` via
 # `select_summarizer(Preference::Auto)`.
 heron-cli = { workspace = true }
+# Gap #6: surface `Doctor::run_runtime_checks` (ONNX / Zoom / keychain
+# ACL / network reachability) to the onboarding wizard via the
+# `heron_run_runtime_checks` Tauri command. The doctor crate already
+# carries its own probe deps (`reqwest`, `sysinfo`, `dirs`); we only
+# pull in the public façade here.
+heron-doctor = { workspace = true }
 heron-llm = { workspace = true }
 # Phase 82: in-process bus + replay cache so future local publishers
 # (heron-cli v2 commands once they delegate through here, recording

@@ -8,7 +8,7 @@
  *   make that work is to keep the per-step outcome + skip flag
  *   outside the route component so each step picks up where it left
  *   off. Lifting state into a parent component would also work, but
- *   the page already has enough complexity (six step bodies + buttons)
+ *   the page already has enough complexity (multi-step bodies + buttons)
  *   that pulling step state out keeps the page focused on layout.
  *
  * - The "Next" button enabledness depends on whether the step has
@@ -29,17 +29,28 @@ import { create } from "zustand";
 import type { TestOutcome } from "../lib/invoke";
 
 /**
- * The six steps in the §13.3 wizard.
+ * The seven steps in the wizard.
  *
- * Numbered from 1 to match the §13.3 spec (and the user-visible
- * progress dots) instead of 0-indexed. The page consumes this enum
- * via `STEPS` for ordering, never spelled out as a literal.
+ * Originally five (§13.3 spec). Two extensions stack on the end:
  *
- * `daemon` (gap #5) is the final gate: every preceding step exercises
- * a TCC permission or a bundled-asset probe that the user can grant
- * out-of-band, but the in-process `herond` is what actually drives
- * capture/transcription, so it goes last so the wizard's "Finish
- * setup" button is only reachable when the daemon is verifiably up.
+ * - Gap #6 (`runtime_checks`) surfaces `heron-doctor`'s consolidated
+ *   preflight (ONNX runtime / Zoom process / keychain ACL / network
+ *   reachability) **after** the per-capability TCC probes — those
+ *   answer "do I have permission to capture?", and the doctor answers
+ *   "given those permissions, is the rest of the machine ready?". The
+ *   step is informational: severity translates to a per-check badge,
+ *   but `Next` enables on the same "tested or skipped" rule as the
+ *   first five so a `fail` doesn't trap the user mid-wizard.
+ *
+ * - Gap #5 (`daemon`) is the final gate. Every preceding step
+ *   exercises a TCC permission, a bundled-asset probe, or an
+ *   environment check the user can fix out-of-band, but the
+ *   in-process `herond` is what actually drives capture/transcription
+ *   — so it goes last so the "Finish setup" button is only reachable
+ *   when the daemon is verifiably up.
+ *
+ * The page consumes this enum via `STEPS` for ordering, never spelled
+ * out as a literal.
  */
 export type StepId =
   | "microphone"
@@ -47,6 +58,7 @@ export type StepId =
   | "accessibility"
   | "calendar"
   | "model_download"
+  | "runtime_checks"
   | "daemon";
 
 export const STEPS: readonly StepId[] = [
@@ -55,6 +67,7 @@ export const STEPS: readonly StepId[] = [
   "accessibility",
   "calendar",
   "model_download",
+  "runtime_checks",
   "daemon",
 ] as const;
 
@@ -107,6 +120,7 @@ function freshSteps(): Record<StepId, StepState> {
     accessibility: freshStepState(),
     calendar: freshStepState(),
     model_download: freshStepState(),
+    runtime_checks: freshStepState(),
     daemon: freshStepState(),
   };
 }

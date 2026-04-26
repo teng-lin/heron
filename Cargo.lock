@@ -2237,6 +2237,7 @@ dependencies = [
  "filetime",
  "heron-audio",
  "heron-cli",
+ "heron-doctor",
  "heron-event",
  "heron-event-http",
  "heron-event-tauri",

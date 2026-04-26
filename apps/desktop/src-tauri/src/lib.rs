@@ -25,6 +25,7 @@ pub mod notes;
 pub mod onboarding;
 pub mod preflight;
 pub mod resummarize;
+pub mod runtime_checks;
 pub mod salvage;
 pub mod settings;
 pub mod tray;
@@ -47,6 +48,9 @@ pub use onboarding::{
     test_microphone, test_microphone_async, test_model_download,
 };
 pub use preflight::{DiskCheckOutcome, check_disk, heron_check_disk_for_recording};
+pub use runtime_checks::{
+    RuntimeCheckEntry, Severity as RuntimeCheckSeverity, heron_run_runtime_checks,
+};
 
 // Tauri's command-handler macro requires the function names it
 // generates wrappers for to live at the same path the macro is in;
@@ -822,6 +826,12 @@ pub fn run() {
             // Phase 73 (PR-λ) — pre-flight checks.
             heron_check_disk_for_recording,
             tray::heron_emit_capture_degraded,
+            // Gap #6 — surface `heron-doctor`'s consolidated runtime
+            // checks (ONNX, Zoom, keychain ACL, network) to the
+            // onboarding wizard. The wizard's individual `heron_test_*`
+            // probes stay in place; this one returns the cross-cutting
+            // "is this machine ready to record?" verdict.
+            heron_run_runtime_checks,
         ])
         // We split the original `.run(generate_context!())`
         // shorthand into `.build(...)?.run(callback)` so we can

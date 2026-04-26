@@ -99,6 +99,7 @@ heron-zoom = { path = "crates/heron-zoom" }
 heron-llm = { path = "crates/heron-llm" }
 heron-vault = { path = "crates/heron-vault" }
 heron-cli = { path = "crates/heron-cli" }
+heron-doctor = { path = "crates/heron-doctor" }
 # v2 trait sketches per docs/archives/api-design-spec.md §13. Not yet wired
 # into heron-cli; they ship trait surfaces only until the spike.
 heron-bot = { path = "crates/heron-bot" }

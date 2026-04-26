@@ -195,6 +195,34 @@ export interface DaemonStatus {
 }
 
 /**
+ * Severity of a single `heron-doctor` runtime-check entry. Mirrors the
+ * Rust `runtime_checks::Severity` enum (snake_case via
+ * `#[serde(rename_all = "snake_case")]`).
+ */
+export type RuntimeCheckSeverity = "pass" | "warn" | "fail";
+
+/**
+ * Wire-format mirror of the Rust `RuntimeCheckEntry` returned by
+ * `heron_run_runtime_checks`. Gap #6: surfaces the consolidated doctor
+ * preflight (ONNX runtime, Zoom process, keychain ACL on macOS, network
+ * reachability) to the React onboarding wizard.
+ *
+ * `name` is one of the doctor's stable identifiers — `onnx_runtime`,
+ * `zoom_process`, `keychain_acl`, `network_reachability` — and the
+ * renderer switches on it to render per-check copy. The list of names
+ * is **not** exhaustive on the wire side because the doctor's check
+ * set may grow (a future RTC / EventKit probe lives behind the same
+ * façade); unknown `name` values fall back to a generic row instead of
+ * being filtered out.
+ */
+export interface RuntimeCheckEntry {
+  name: string;
+  severity: RuntimeCheckSeverity;
+  summary: string;
+  detail: string;
+}
+
+/**
  * Wire-format labels for the macOS-Keychain accounts heron knows
  * about (PR-θ / phase 70). Mirrors `KeychainAccount::as_str` in
  * `apps/desktop/src-tauri/src/keychain.rs`.
@@ -560,6 +588,24 @@ export interface HeronCommands {
       sessionId: string | null;
     };
     returns: void;
+  };
+  /**
+   * Gap #6: run `heron-doctor`'s consolidated runtime preflight (ONNX
+   * runtime health, Zoom process availability, keychain ACL on macOS,
+   * network reachability) and return one entry per check. Used by the
+   * onboarding wizard's "Runtime checks" step to surface the
+   * cross-cutting "is this machine ready to record?" verdict in one
+   * call rather than the renderer fanning out across the four
+   * underlying probes.
+   *
+   * Resolves with the entry list even when individual checks fail — a
+   * `fail` severity entry is the success path on the wire. Rejects
+   * only when the underlying `spawn_blocking` task panics, which is a
+   * pure infrastructure error.
+   */
+  heron_run_runtime_checks: {
+    args: Record<string, never>;
+    returns: RuntimeCheckEntry[];
   };
 }
 
