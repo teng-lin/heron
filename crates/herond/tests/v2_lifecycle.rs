@@ -126,6 +126,7 @@ async fn post_meetings_end_with_live_orchestrator_publishes_terminal_events() {
         .start_capture(heron_session::StartCaptureArgs {
             platform: heron_session::Platform::Zoom,
             hint: None,
+            calendar_event_id: None,
         })
         .await
         .expect("start_capture");
