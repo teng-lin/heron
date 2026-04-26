@@ -574,6 +574,50 @@ fn probe_model_presence(model_dir: Option<std::ffi::OsString>) -> TestOutcome {
     ))
 }
 
+/// **Gap #7 step 6 — Daemon liveness.** Probes the in-process /
+/// loopback `herond` at `/v1/health` via [`crate::daemon::probe`].
+///
+/// Returns:
+/// - [`TestOutcome::Pass`] when the probe reports `running == true`.
+///   We surface the daemon's reported version when present so the
+///   wizard can show a "herond v0.1.0 — ready" badge.
+/// - [`TestOutcome::Fail`] when the probe reports `running == false`.
+///   Includes the underlying error string (typically "connection
+///   refused" or "timed out") so the user can distinguish "the
+///   daemon never started" from "the daemon started but is wedged".
+///
+/// **JS-side wiring expectation:** the React onboarding flow in
+/// `apps/desktop/src/onboarding/` should add a 6th step that calls
+/// `invoke("heron_test_daemon")` and renders the returned
+/// [`TestOutcome`] with the same component the existing five steps
+/// use. The Rust shim is `crate::heron_test_daemon`. A substantive
+/// UX change to the wizard is out of scope for this PR — the
+/// command surface is here so the JS-side change is a one-file
+/// addition.
+///
+/// Cross-platform: unlike the TCC probes (mic / tap / accessibility
+/// / calendar / model), this one runs on every host because it's
+/// pure HTTP loopback. No `cfg(target_os = "macos")` gate.
+pub fn test_daemon() -> TestOutcome {
+    block_on_probe(test_daemon_async())
+}
+
+/// Async core of [`test_daemon`].
+pub async fn test_daemon_async() -> TestOutcome {
+    let status = crate::daemon::probe().await;
+    if status.running {
+        match status.version {
+            Some(v) => TestOutcome::pass(format!("herond v{v} responding at /v1/health")),
+            None => TestOutcome::pass("herond responding at /v1/health"),
+        }
+    } else {
+        let reason = status
+            .error
+            .unwrap_or_else(|| "no response from herond".to_owned());
+        TestOutcome::fail(format!("herond not reachable at 127.0.0.1:7384 ({reason})"))
+    }
+}
+
 /// Run an async probe body to completion from a sync context. The
 /// desktop binary runs on Tauri's own event loop (which doesn't bring
 /// a Tokio runtime), and `#[tauri::command]` shims are sync, so this

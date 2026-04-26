@@ -93,11 +93,21 @@ const SINK_LABEL: &str = "tauri-ipc:desktop";
 
 /// Install the in-process bus into the Tauri app.
 ///
-/// Constructs a [`LocalSessionOrchestrator`], stores it as a managed
-/// state via [`tauri::Manager::manage`] (so Tauri commands can grab
+/// Constructs a fresh [`LocalSessionOrchestrator`] (with default
+/// capacities, no vault root), stores it as a managed state via
+/// [`tauri::Manager::manage`] (so Tauri commands can grab
 /// `State<Arc<LocalSessionOrchestrator>>`), and spawns a forwarder
 /// task that pumps every envelope from the orchestrator's bus into
 /// a [`TauriEventSink`].
+///
+/// **Production callers** (the desktop's `lib::run` setup hook)
+/// should call [`install_with`] instead and supply the same
+/// orchestrator the in-process daemon (`daemon::install`) is using
+/// — that way an in-process publisher fans out across **both**
+/// transports (HTTP/SSE via the daemon, Tauri IPC via this sink)
+/// off one bus. This zero-arg `install` exists for back-compat with
+/// the original phase 82 wiring and for tests that don't care about
+/// the daemon.
 ///
 /// # Errors
 ///
@@ -124,7 +134,22 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), InstallError> {
         } else {
             tauri::async_runtime::block_on(async { Arc::new(LocalSessionOrchestrator::new()) })
         };
+    install_with(app, orchestrator)
+}
 
+/// Install the in-process bus, reusing a caller-supplied
+/// orchestrator. This is the entry point production code uses so the
+/// `daemon::install` axum service and the [`TauriEventSink`]
+/// forwarder share **one** bus.
+///
+/// # Errors
+///
+/// Same as [`install`]: [`InstallError::AlreadyInstalled`] if a
+/// `LocalSessionOrchestrator` is already in the state map.
+pub fn install_with<R: Runtime>(
+    app: &AppHandle<R>,
+    orchestrator: Arc<LocalSessionOrchestrator>,
+) -> Result<(), InstallError> {
     // Atomically take the state slot. `manage` returns `false` when
     // a value of this type is already managed — mirrors the TOCTOU-
     // free "set if absent" idiom without needing a separate guard

@@ -14,6 +14,7 @@
 //!   Settings pane can land in week 13/14 against stable Rust.
 
 pub mod asset_protocol;
+pub mod daemon;
 pub mod diagnostics;
 pub mod disk;
 pub mod event_bus;
@@ -28,18 +29,21 @@ pub mod settings;
 pub mod tray;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
+pub use daemon::{DaemonHandle, DaemonStatus};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
 pub use disk::{DiskError, DiskUsage, disk_usage, purge_audio_older_than};
 pub use onboarding::{
     TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
-    test_audio_tap_async, test_calendar, test_calendar_async, test_microphone,
-    test_microphone_async, test_model_download,
+    test_audio_tap_async, test_calendar, test_calendar_async, test_daemon, test_daemon_async,
+    test_microphone, test_microphone_async, test_model_download,
 };
 pub use preflight::{DiskCheckOutcome, check_disk, heron_check_disk_for_recording};
 
@@ -366,6 +370,30 @@ fn heron_test_calendar() -> TestOutcome {
     test_calendar()
 }
 
+/// Tauri command: §13.3 step 6 (Gap #7) — daemon liveness Test button.
+///
+/// Probes the in-process / loopback `herond` at `/v1/health`. Returns
+/// [`TestOutcome::Pass`] on a 200 with a parseable body,
+/// [`TestOutcome::Fail`] otherwise. The wizard's React side renders
+/// the same `TestOutcome` shape it already does for the other five
+/// steps — see the comment in `onboarding.rs::test_daemon` for the
+/// JS-side wiring expectation.
+#[tauri::command]
+async fn heron_test_daemon() -> TestOutcome {
+    test_daemon_async().await
+}
+
+/// Tauri command: surface the in-process daemon status for any UI
+/// surface that wants to render "daemon up?" without going through
+/// the onboarding [`TestOutcome`] shape (the menubar tray, a future
+/// status pill in the toolbar, etc.). Returns the structured
+/// [`DaemonStatus`] so the frontend can distinguish "running" /
+/// "version" / "error" without parsing a single string.
+#[tauri::command]
+async fn heron_daemon_status() -> DaemonStatus {
+    daemon::probe().await
+}
+
 /// Tauri command: §13.3 step 5 model-download Test button.
 ///
 /// The probe takes no arguments — it inspects
@@ -529,6 +557,37 @@ pub fn default_settings_path() -> PathBuf {
     base.join("com.heronnote.heron").join("settings.json")
 }
 
+/// Resolve the vault root the in-process [`LocalSessionOrchestrator`]
+/// scans for `<vault>/meetings/*.md`. Mirrors the precedence the
+/// standalone `herond` binary uses (`crates/herond/src/main.rs::resolve_vault_root`):
+///
+/// 1. `HERON_VAULT_ROOT` env var (trimmed; an empty / whitespace-only
+///    value is treated as unset, otherwise `PathBuf::from("")` would
+///    silently resolve to the CWD).
+/// 2. `~/heron-vault` default.
+///
+/// Returns `None` when the home directory itself is unresolvable
+/// (sandboxed test runners). The caller treats `None` as "no vault"
+/// — the orchestrator's read methods will then return
+/// `NotYetImplemented` for read endpoints, which matches the daemon's
+/// behaviour on a fresh install before any meetings exist.
+///
+/// Pulled out of the setup hook so the same precedence rule is one
+/// well-tested call rather than reimplemented inline. We deliberately
+/// don't `mkdir -p` the path here: the vault writer creates it at
+/// first capture, and an absent vault is reported as
+/// `permission_missing` on `/health` — the right signal to a
+/// freshly-installed daemon's first liveness probe.
+fn resolve_vault_root() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("HERON_VAULT_ROOT") {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    dirs::home_dir().map(|h| h.join("heron-vault"))
+}
+
 /// Default cache root.
 ///
 /// Resolves via [`dirs::cache_dir`]:
@@ -597,14 +656,51 @@ pub fn run() {
             // it: a missing tray on macOS is a regression worth
             // surfacing in CI logs, not silently degrading.
             tray::install(app.handle())?;
-            // Phase 82: in-process event bus + Tauri IPC fan-out. No
-            // publishers exist in the desktop yet (cross-process
-            // domain events flow over herond's HTTP/SSE), so the
-            // wiring is dormant — but the slot is here for the
-            // moment a local publisher lands. `InstallError` impls
-            // `std::error::Error` (via thiserror), so `?` boxes it
-            // directly into the setup hook's expected return type.
-            event_bus::install(app.handle())?;
+            // Gap #7 (this PR) + phase 82: build a single shared
+            // `LocalSessionOrchestrator` and hand the same `Arc` to
+            // both:
+            //   - `event_bus::install_with` — the Tauri-IPC fan-out
+            //     forwarder, so a future in-process publisher
+            //     reaches the WebView, AND
+            //   - `daemon::install` — the in-process axum service
+            //     that mirrors the standalone `herond` binary,
+            //     so HTTP/SSE consumers (CLI, future external API)
+            //     see the same bus + replay cache.
+            //
+            // Construction must run inside the Tauri-managed Tokio
+            // runtime because `LocalSessionOrchestrator::new`
+            // `tokio::spawn`s its recorder task. The setup hook runs
+            // on Tauri's main thread without that thread-local, so
+            // we wrap in `tauri::async_runtime::block_on`. The
+            // daemon's `bind()` is also async and runs in the same
+            // block_on so a bind error is observable here (logged +
+            // soft-failed inside `daemon::install`).
+            let vault_root = resolve_vault_root();
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::block_on(async move {
+                let orchestrator = match vault_root {
+                    Some(root) => {
+                        tracing::info!(
+                            vault_root = %root.display(),
+                            "in-process orchestrator: read-side wired against vault",
+                        );
+                        Arc::new(LocalSessionOrchestrator::with_vault(root))
+                    }
+                    None => {
+                        // Sandboxed test runner / no home dir.
+                        // Substrate-only — every read endpoint will
+                        // return NotYetImplemented, which is the
+                        // honest answer until a vault is configured.
+                        tracing::warn!(
+                            "no vault root resolvable; in-process orchestrator runs substrate-only",
+                        );
+                        Arc::new(LocalSessionOrchestrator::new())
+                    }
+                };
+                event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
+                daemon::install(&app_handle, orchestrator).await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
             // Phase 68 (PR-ζ): register the saved hotkey at app
             // startup so the chord is live the moment the app
             // launches — not only when the user opens Settings →
@@ -634,6 +730,10 @@ pub fn run() {
             heron_test_accessibility,
             heron_test_calendar,
             heron_test_model_download,
+            // Gap #7 (this PR): in-process daemon liveness +
+            // structured status surface.
+            heron_test_daemon,
+            heron_daemon_status,
             heron_mark_onboarded,
             heron_open_window,
             heron_keychain_set,
@@ -657,8 +757,39 @@ pub fn run() {
             heron_check_disk_for_recording,
             tray::heron_emit_capture_degraded,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running heron-desktop");
+        // We split the original `.run(generate_context!())`
+        // shorthand into `.build(...)?.run(callback)` so we can
+        // observe Tauri lifecycle events — specifically
+        // [`tauri::RunEvent::Exit`], which fires once after the
+        // event loop has drained but before the process exits.
+        // That window is where we ask the in-process `herond` axum
+        // service to gracefully stop (drains in-flight requests,
+        // closes the listener) instead of relying on
+        // process-teardown to abort the spawned task. Also see
+        // [`tauri::RunEvent::ExitRequested`], which fires *before*
+        // the loop drains — we don't bind that one because the
+        // user-driven close path (clicking Quit, Cmd+Q) already
+        // routes through `Exit` and we don't want to short-circuit
+        // the OS-level "are you sure?" dialog the API would let us
+        // override.
+        .build(tauri::generate_context!())
+        .expect("error while building heron-desktop")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                // Best-effort. The Exit callback is sync; reach into
+                // the managed `DaemonHandle` and fire its oneshot.
+                // Log if the handle is missing — that would mean
+                // `daemon::install` never ran, which is a
+                // programming bug we want to surface in the system
+                // log rather than swallow.
+                if let Some(handle) = app_handle.try_state::<DaemonHandle>() {
+                    handle.signal_shutdown();
+                    tracing::info!("Exit hook: shutdown signaled to in-process herond");
+                } else {
+                    tracing::warn!("Exit hook: no DaemonHandle in state; daemon shutdown skipped",);
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -710,6 +841,40 @@ mod tests {
     /// (which anchors the probe to `false` off-Apple), this transitively
     /// proves `heron_status::audio_available == false` on non-macOS —
     /// no separate off-Apple assertion needed here.
+    /// `resolve_vault_root` must mirror
+    /// `crates/herond/src/main.rs::resolve_vault_root`'s precedence:
+    /// non-empty env var wins, otherwise `~/heron-vault`. Empty /
+    /// whitespace-only env var must be treated as unset (the
+    /// `PathBuf::from("")` footgun otherwise resolves to CWD at
+    /// runtime).
+    ///
+    /// We avoid mutating the env var itself (process-global; would
+    /// race with the tray / event_bus tests in the same binary) and
+    /// instead exercise the precedence directly via the helper's
+    /// docstring contract: when `HERON_VAULT_ROOT` is unset, the
+    /// returned path ends in `heron-vault`.
+    #[test]
+    fn resolve_vault_root_falls_back_to_heron_vault() {
+        // Belt-and-suspenders: read the env var and skip if a parent
+        // process set it. This stops a developer with the var
+        // exported from getting a confusing red.
+        if std::env::var_os("HERON_VAULT_ROOT").is_some() {
+            eprintln!("skipped: HERON_VAULT_ROOT is set in this shell");
+            return;
+        }
+        // On a sandboxed runner without a resolvable home dir the
+        // fallback returns None; both are acceptable and pinned by
+        // the docstring (so `if let Some` is the right shape — we
+        // intentionally accept None as a no-op).
+        if let Some(p) = resolve_vault_root() {
+            assert!(
+                p.ends_with("heron-vault"),
+                "expected …/heron-vault, got {}",
+                p.display()
+            );
+        }
+    }
+
     #[test]
     fn heron_status_audio_available_matches_probe() {
         let status = heron_status();
