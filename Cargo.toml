@@ -66,6 +66,17 @@ sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 eventsource-stream = "0.2"
 
+# HTTP server (for `herond` localhost daemon — desktop OpenAPI). The
+# slimmest stack that gives us SSE + JSON + tower middleware idiomatic
+# on top of tokio. Versions chosen to match what tower-http 0.6 wants.
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1"
+http-body-util = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+
 # templating / markdown
 handlebars = "6"
 yaml-front-matter = "0.1"
@@ -93,6 +104,8 @@ heron-realtime = { path = "crates/heron-realtime" }
 # orchestrator hub consolidation lands.
 heron-event = { path = "crates/heron-event" }
 heron-session = { path = "crates/heron-session" }
+# Localhost HTTP daemon — vertical slice of the desktop OpenAPI.
+herond = { path = "crates/herond" }
 
 [profile.dev]
 opt-level = 1
