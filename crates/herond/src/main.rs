@@ -1,13 +1,21 @@
 //! `herond` daemon binary entry point.
 //!
-//! Loads (or mints) the bearer token, builds the stub-orchestrator
-//! [`AppState`], binds the OpenAPI-pinned `127.0.0.1:7384`, and
-//! serves until SIGINT.
+//! Loads (or mints) the bearer token, builds the
+//! [`LocalSessionOrchestrator`]-backed [`AppState`], binds the
+//! OpenAPI-pinned `127.0.0.1:7384`, and serves until SIGINT.
+//!
+//! The orchestrator brings a real bus + replay cache (from
+//! `heron-event-http`) — the SSE `Last-Event-ID` resume contract is
+//! live end-to-end as soon as any future publisher exists. The FSM
+//! methods (`start_capture`, `end_meeting`, transcript / summary /
+//! audio reads, calendar, context) still return
+//! `NotYetImplemented`; those land one PR at a time as the
+//! underlying subsystems wire in.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use herond::stub::StubOrchestrator;
+use heron_orchestrator::LocalSessionOrchestrator;
 use herond::{AppState, AuthConfig, DEFAULT_BIND, build_app};
 use tracing_subscriber::EnvFilter;
 
@@ -29,8 +37,11 @@ async fn main() -> Result<()> {
         "bearer token loaded; rotate by deleting the file and restarting"
     );
 
+    // `LocalSessionOrchestrator::new` spawns the bus → cache
+    // recorder task; it must run inside the `#[tokio::main]`
+    // runtime, which we're already in here.
     let state = AppState {
-        orchestrator: Arc::new(StubOrchestrator::new()),
+        orchestrator: Arc::new(LocalSessionOrchestrator::new()),
         auth: Arc::new(auth),
     };
     let app = build_app(state);

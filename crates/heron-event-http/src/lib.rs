@@ -150,6 +150,18 @@ impl<P: Clone + Send + 'static> InMemoryReplayCache<P> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Drop every entry. Intended for the discontinuity-recovery
+    /// path: when a bus subscriber driving this cache reports lag
+    /// (e.g. `tokio::sync::broadcast::error::RecvError::Lagged`),
+    /// a partial replay would silently hand a client events that
+    /// skip the gap with no `WindowExceeded`. Clearing the cache
+    /// downgrades every subsequent `replay_since` to
+    /// `WindowExceeded` until fresh entries arrive — same recovery
+    /// shape clients already handle (reconnect without resume).
+    pub fn clear(&self) {
+        lock_or_recover(&self.entries).clear();
+    }
 }
 
 #[async_trait]
@@ -782,6 +794,29 @@ mod tests {
         // populate the X-Heron-Replay-Window-Seconds header.
         let w = <InMemoryReplayCache<u32> as ReplayCache<u32>>::window(&cache);
         assert_eq!(w, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn replay_cache_clear_drops_all_entries() {
+        // Pin the discontinuity-recovery contract: after `clear()`,
+        // every prior id must be `WindowExceeded`. A bus subscriber
+        // that lagged calls `clear()` so subsequent resumes don't
+        // silently return events that skip the gap.
+        let cache: InMemoryReplayCache<u32> = InMemoryReplayCache::new(8);
+        let envs: Vec<Envelope<u32>> = (0..3).map(Envelope::new).collect();
+        for e in &envs {
+            cache.record(e.clone());
+        }
+        assert_eq!(cache.len(), 3);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        for e in &envs {
+            let result = cache.replay_since(e.event_id).await;
+            assert!(
+                matches!(result, Err(ReplayError::WindowExceeded { .. })),
+                "post-clear replay must be WindowExceeded for every prior id",
+            );
+        }
     }
 
     // ── SSE event sink ───────────────────────────────────────────────

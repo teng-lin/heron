@@ -105,6 +105,7 @@ heron-realtime = { path = "crates/heron-realtime" }
 heron-event = { path = "crates/heron-event" }
 heron-event-http = { path = "crates/heron-event-http" }
 heron-event-tauri = { path = "crates/heron-event-tauri" }
+heron-orchestrator = { path = "crates/heron-orchestrator" }
 heron-session = { path = "crates/heron-session" }
 # Localhost HTTP daemon — vertical slice of the desktop OpenAPI.
 herond = { path = "crates/herond" }
