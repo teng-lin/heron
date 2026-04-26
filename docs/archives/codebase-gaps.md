@@ -235,6 +235,26 @@ runs every async→sync hop through a `runWithTimeout` helper bounded by
 (30m), and surfaces `WK_TIMEOUT` (-4) on expiry. Resolved in PR #124
 (commit `30321bc`); the previous audit's item #9 was stale.
 
+### Onboarding model-download step now triggers a real fetch
+
+`apps/desktop/src/pages/Onboarding.tsx` step 5 used to render a "Preview"
+badge with a `// TODO(phase 72+): wire heron_download_model` placeholder; the
+button only checked whether a model was already on disk and the wizard could
+finish without delivering an STT artifact, so the first capture would fail
+opaquely. Now the wizard:
+
+- invokes a new `heron_download_model` Tauri command that wraps
+  `heron_speech::WhisperKitBackend::ensure_model`,
+- forwards 0..1 progress ticks onto a `model_download:progress` Tauri event,
+- and renders a real `<progress>` bar driven by those ticks until the fetch
+  resolves Pass / Fail.
+
+Off-Apple builds receive a structured `NotYetImplemented` failure with a
+platform hint; the underlying backend is a stub on those targets and the
+wizard surfaces that as a `Fail` outcome the user can skip past. Implemented
+in `apps/desktop/src-tauri/src/model_download.rs` with unit tests pinning the
+per-error copy.
+
 ## README claims vs. reality
 
 - **"v2 four-layer stack is currently trait surfaces only."** No longer
@@ -257,6 +277,7 @@ runs every async→sync hop through a `runWithTimeout` helper bounded by
 | 3 | Bot + bridge + policy live-session composition owner | `crates/heron-orchestrator/src/live_session.rs` | RESOLVED | `LiveSessionOwner` now owns startup and teardown; daemon capture wiring remains under #1/#2 |
 | 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
+| 5b | Onboarding model-download step was a stub | `apps/desktop/src-tauri/src/model_download.rs` | RESOLVED | `heron_download_model` Tauri command wired; wizard renders a real `<progress>` bar driven by the `model_download:progress` event (entry point: `runModelDownload` in `apps/desktop/src/pages/Onboarding.tsx`) |
 | 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
 | 7 | CLI v2 commands do not delegate to `herond` | `crates/heron-cli/src/main.rs:322` | MAJOR | Use bearer token + localhost API |
 | 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | RESOLVED | Fixed in PR #124 (commit `30321bc`): per-call deadlines + `WK_TIMEOUT` |

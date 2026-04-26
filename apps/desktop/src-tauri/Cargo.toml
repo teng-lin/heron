@@ -48,6 +48,14 @@ heron-types = { workspace = true }
 heron-audio = { workspace = true }
 heron-zoom = { workspace = true }
 heron-vault = { workspace = true }
+# Onboarding step 5 (`heron_download_model`) drives the real WhisperKit
+# fetch via `WhisperKitBackend::ensure_model`, forwarding 0..1 progress
+# ticks onto a Tauri event stream the renderer renders as a progress
+# bar. Off-Apple, `build_backend("whisperkit")` returns the stub which
+# resolves to `SttError::NotYetImplemented` — the command surfaces that
+# as a structured failure and the wizard's Test step copy explains the
+# platform gating.
+heron-speech = { workspace = true }
 # Phase 67 (PR-ε): the Re-summarize button in the Review UI calls
 # `heron_cli::summarize::re_summarize_in_vault`, which threads the
 # §10.5 ID-preservation contract + §10.3 merge through

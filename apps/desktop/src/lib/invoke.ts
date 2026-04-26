@@ -161,6 +161,17 @@ export interface DiskUsage {
 }
 
 /**
+ * Wire-format payload for the `model_download:progress` Tauri event
+ * emitted by `heron_download_model`. Mirrors the Rust
+ * `apps/desktop/src-tauri/src/model_download.rs::ProgressPayload`
+ * struct. `fraction` is a clamped `[0.0, 1.0]` ratio — render at
+ * 100x scale for a percentage bar.
+ */
+export interface ModelDownloadProgress {
+  fraction: number;
+}
+
+/**
  * Discriminated union mirroring `TestOutcome` (tag = "status").
  */
 export type TestOutcome =
@@ -342,6 +353,23 @@ export interface HeronCommands {
   heron_test_model_download: {
     args: Record<string, never>;
     returns: TestOutcome;
+  };
+  /**
+   * Gap #5b: trigger the real WhisperKit model download. Replaces the
+   * prior placeholder badge that only checked whether a model was
+   * already on disk. Resolves to a human-readable success message
+   * (e.g. "WhisperKit model ready") on success; rejects with a
+   * stringified error on every failure mode (`NotYetImplemented`,
+   * `ModelMissing`, `Unavailable`, `Failed`, `Io`).
+   *
+   * Progress ticks (0.0..1.0) are pushed over the
+   * `model_download:progress` Tauri event with a
+   * `{ fraction: number }` payload. The wizard renders the value
+   * as a real progress bar.
+   */
+  heron_download_model: {
+    args: Record<string, never>;
+    returns: string;
   };
   /**
    * Gap #5: probe the in-process / loopback `herond` at `/v1/health`.

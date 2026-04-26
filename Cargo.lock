@@ -2243,6 +2243,7 @@ dependencies = [
  "heron-llm",
  "heron-orchestrator",
  "heron-session",
+ "heron-speech",
  "heron-types",
  "heron-vault",
  "heron-zoom",
