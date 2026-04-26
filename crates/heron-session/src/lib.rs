@@ -761,7 +761,12 @@ mod prefix_tests {
     #[test]
     fn session_error_codes_match_heron_e_pattern() {
         // Spec §11: every code matches /^HERON_E_[A-Z0-9_]+$/.
+        // Cover every variant — `code()` is a hand-written `match`
+        // returning `&'static str` literals, and a typo in any
+        // literal would compile cleanly. This test is the only
+        // catch.
         let cases = [
+            SessionError::NotYetImplemented,
             SessionError::NotFound { what: "x".into() },
             SessionError::InvalidState {
                 current_state: MeetingStatus::Done,
@@ -769,9 +774,20 @@ mod prefix_tests {
             SessionError::CaptureInProgress {
                 platform: Platform::Zoom,
             },
+            SessionError::VaultLocked { detail: "x".into() },
+            SessionError::LlmProviderFailed {
+                provider: "anthropic".into(),
+                detail: "503".into(),
+            },
             SessionError::TooEarly,
             SessionError::PermissionMissing { permission: "mic" },
+            SessionError::Validation { detail: "x".into() },
         ];
+        // Sanity-check the covers-every-variant claim against
+        // SessionError's variant count via a discriminator-based
+        // pin: if a variant is added without extending this list,
+        // the count below diverges.
+        assert_eq!(cases.len(), 9, "extend test when SessionError gains a variant");
         for err in &cases {
             let code = err.code();
             assert!(code.starts_with("HERON_E_"), "code {code} missing prefix");

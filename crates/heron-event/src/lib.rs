@@ -148,7 +148,19 @@ impl<P: Clone + Send + 'static> EventBus<P> {
     /// for the desktop daemon — covers a long meeting's worth of
     /// `transcript.partial` deltas without dropping. Pick larger
     /// only if you measure subscriber lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity == 0`. `tokio::sync::broadcast::channel`
+    /// panics on a zero capacity with a generic message; the
+    /// assertion here surfaces a heron-specific one at the layer
+    /// the misuse actually originated from.
     pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "EventBus::new requires capacity > 0 (a zero-capacity \
+             broadcast channel can never deliver an event)",
+        );
         let (sender, _) = broadcast::channel(capacity);
         Self { sender }
     }
@@ -362,5 +374,14 @@ mod tests {
         assert!(json.starts_with(r#""evt_"#), "got: {json}");
         let back: EventId = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(id, back);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity > 0")]
+    fn zero_capacity_panics_with_clear_message() {
+        // Surface the misuse at this layer with a heron-specific
+        // message instead of letting tokio's generic
+        // `assertion failed: capacity > 0` bubble out.
+        let _: EventBus<u32> = EventBus::new(0);
     }
 }
