@@ -2178,6 +2178,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "heron-event"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "heron-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "heron-llm"
 version = "0.1.0"
 dependencies = [
@@ -2215,6 +2229,21 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "heron-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "heron-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "heron-event",
  "heron-types",
  "serde",
  "serde_json",

@@ -88,6 +88,11 @@ heron-bot = { path = "crates/heron-bot" }
 heron-bridge = { path = "crates/heron-bridge" }
 heron-policy = { path = "crates/heron-policy" }
 heron-realtime = { path = "crates/heron-realtime" }
+# v1 desktop trait sketches per docs/api-desktop-openapi.yaml. Not yet
+# wired into heron-cli; they ship trait surfaces only until the
+# orchestrator hub consolidation lands.
+heron-event = { path = "crates/heron-event" }
+heron-session = { path = "crates/heron-session" }
 
 [profile.dev]
 opt-level = 1
