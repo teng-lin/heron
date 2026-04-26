@@ -347,16 +347,19 @@ impl DaemonClient {
         {
             let mut q = url.query_pairs_mut();
             if let Some(p) = platform {
-                // Re-uses the same `snake_case` rename the daemon's
-                // serde derive applies; round-tripping through
-                // `serde_json` keeps the wire form in lockstep with
-                // the OpenAPI enum without a hand-maintained match
-                // that would drift on a future variant addition.
-                let s = serde_json::to_value(p)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "zoom".to_owned());
-                q.append_pair("platform", &s);
+                // Explicit match rather than a serde round-trip: a
+                // future `Platform` variant becomes a compile error
+                // here (which is what we want for a wire-format
+                // match — silently sending the wrong filter is the
+                // exact misroute typed enums are supposed to
+                // prevent).
+                let s = match p {
+                    Platform::Zoom => "zoom",
+                    Platform::GoogleMeet => "google_meet",
+                    Platform::MicrosoftTeams => "microsoft_teams",
+                    Platform::Webex => "webex",
+                };
+                q.append_pair("platform", s);
             }
             if let Some(n) = limit {
                 q.append_pair("limit", &n.to_string());
@@ -567,19 +570,18 @@ fn status_to_code(status: u16) -> &'static str {
 }
 
 fn snippet(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        // Take by char so we don't slice a UTF-8 grapheme.
-        let mut out = String::with_capacity(max);
-        for (i, ch) in s.chars().enumerate() {
-            if i >= max {
-                out.push('…');
-                break;
-            }
-            out.push(ch);
+    // Single pass: `char_indices().nth(max)` walks until the (max)-
+    // th char boundary, returning `None` if the string is shorter
+    // and the byte index of the truncation point otherwise. Slicing
+    // at a `char_indices` boundary never splits a UTF-8 grapheme.
+    match s.char_indices().nth(max) {
+        None => s.to_owned(),
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + '…'.len_utf8());
+            out.push_str(&s[..byte_idx]);
+            out.push('…');
+            out
         }
-        out
     }
 }
 

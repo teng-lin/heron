@@ -35,11 +35,10 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 hound = { workspace = true }
 reqwest = { workspace = true }
-# `bytes` is a transitive dep of `reqwest`, but we name the
-# `bytes::Bytes` type explicitly in the SSE stream signature, so
-# declare it here to keep the public API stable across reqwest minor
-# versions. Pinned through the same version reqwest 0.12 picks.
-bytes = "1"
+# Named explicitly because the daemon SSE stream signature mentions
+# `bytes::Bytes`. Version is sourced from the workspace so any
+# future reqwest 0.13 bump only touches one place.
+bytes = { workspace = true }
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }

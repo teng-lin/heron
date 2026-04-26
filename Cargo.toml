@@ -64,6 +64,10 @@ sha2 = "0.10"
 
 # HTTP / LLM
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+# `bytes` is a transitive dep of `reqwest`. Hoisted here so any crate
+# that names `bytes::Bytes` directly (currently `heron-cli`'s daemon
+# SSE stream) tracks the same major version reqwest 0.12 picks.
+bytes = "1"
 eventsource-stream = "0.2"
 
 # HTTP server (for `herond` localhost daemon — desktop OpenAPI). The

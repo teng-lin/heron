@@ -94,15 +94,14 @@ enum DaemonCommand {
 
 #[derive(Debug, clap::Args)]
 struct DaemonStatusArgs {
-    /// Override the daemon base URL. Defaults to the OpenAPI-pinned
-    /// `http://127.0.0.1:7384/v1`. Useful for hitting a non-default
-    /// daemon during development.
-    #[arg(long, env = "HERON_DAEMON_URL")]
-    url: Option<String>,
-    /// Override the bearer-token file. Defaults to
-    /// `~/.heron/cli-token` (the path `herond` writes at startup).
-    #[arg(long, env = "HERON_DAEMON_TOKEN_FILE")]
-    token_file: Option<PathBuf>,
+    /// Reuses the same override flags every other daemon subcommand
+    /// accepts (see [`DaemonCommonArgs`]) — keeps the help output
+    /// uniform across `daemon status` / `daemon meeting *` /
+    /// `daemon events` and avoids two places to edit when a new
+    /// shared flag (e.g. an `--insecure` for self-signed prod
+    /// daemons) gets added.
+    #[command(flatten)]
+    common: DaemonCommonArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -461,11 +460,7 @@ fn build_daemon_client(common: &DaemonCommonArgs) -> Result<DaemonClient> {
 }
 
 async fn daemon_status(args: DaemonStatusArgs) -> Result<()> {
-    let common = DaemonCommonArgs {
-        url: args.url,
-        token_file: args.token_file,
-    };
-    let client = build_daemon_client(&common)?;
+    let client = build_daemon_client(&args.common)?;
     let health = client.health().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let body = serde_json::to_string_pretty(&health)
         .map_err(|e| anyhow::anyhow!("encoding health: {e}"))?;
