@@ -23,38 +23,17 @@ v2 pieces now exist:
 - `heron_bridge::NaiveBridge`
 - `heron_doctor::Doctor::run_runtime_checks`
 
-The remaining blocker is not "make traits compile"; it is wiring a real
-capture/realtime session end-to-end. Today `LocalSessionOrchestrator` can walk
-the meeting FSM and publish lifecycle events, but it does not yet connect live
-audio, STT, LLM summarization, realtime speech, bot playback, or vault writes
-into one production session.
+The remaining blocker is not "make traits compile"; it is wiring the v2
+bot/realtime session end-to-end. `LocalSessionOrchestrator` now delegates
+vault-backed manual captures to the v1 audio -> STT -> LLM -> vault pipeline,
+so the daemon can own a native capture session. It still does not compose
+realtime speech, bot playback, bridge policy, or pre-meeting context into one
+production v2 session.
 
-**Shipping blocker:** items 1-4 below must land before v2 can alpha-test.
-Items 5-8 block GA.
+**Shipping blocker:** items 2-4 below must land before v2 can alpha-test.
+Items 5-7 block GA.
 
 ## Blockers — v2 cannot run a real session
-
-### 1. `LocalSessionOrchestrator` has lifecycle, not a capture pipeline
-
-`crates/heron-orchestrator/src/lib.rs:563` implements
-`SessionOrchestrator::start_capture` by synchronously walking the FSM through
-`Detected -> Armed -> Recording` and publishing lifecycle events. It does not
-start Core Audio, launch a bot, bind a bridge, open realtime, or spawn STT/LLM
-tasks.
-
-`crates/heron-orchestrator/src/lib.rs:637` implements `end_meeting` by walking
-the FSM through terminal states and publishing `meeting.ended` /
-`meeting.completed`. The implementation is honest in comments: with no real
-STT / LLM wired through this orchestrator, transcript and summary completion
-are synthetic.
-
-What is missing:
-
-- Core Audio mic/process-tap startup from the daemon path.
-- STT task ownership and transcript persistence.
-- LLM summary generation and vault note write/finalization.
-- Background task lifecycle, cancellation, and crash recovery.
-- Idempotent `end_meeting` against finalized meetings once vault writes exist.
 
 ### 2. No production realtime backend
 
@@ -142,17 +121,6 @@ authenticate to localhost `herond` and call `POST /v1/meetings`,
 `POST /v1/meetings/{id}/end`, or `/v1/events`. This leaves two session-control
 surfaces instead of one.
 
-### 8. Read-side daemon behavior depends on an existing vault snapshot
-
-`LocalSessionOrchestrator` can list/get/read transcript/read summary/read audio
-from an existing vault root, and `herond` projects those methods over HTTP.
-But because the daemon capture path does not write finalized notes yet, the
-read endpoints only become useful for sessions produced elsewhere.
-
-This is less severe than the old "mostly 501" gap, but it still matters for
-GA: the API surface looks complete, while the daemon cannot yet create the
-durable artifacts those read endpoints are meant to serve.
-
 ## Minor — polish and post-v1
 
 ### 9. WhisperKit Swift bridge has no timeout
@@ -192,6 +160,23 @@ capability, but the router itself is no longer a static unimplemented surface.
 `heron_orchestrator::LocalSessionOrchestrator` exists and is wired into both
 the standalone `herond` binary and the desktop in-process daemon path.
 `StubOrchestrator` remains useful for tests.
+
+### `LocalSessionOrchestrator` now owns a native capture pipeline
+
+For vault-backed daemon sessions, `start_capture` now spawns the existing
+`heron-cli` audio -> STT -> LLM -> vault pipeline with task ownership and an
+explicit stop signal. `end_meeting` signals the pipeline to stop, publishes
+`meeting.ended` immediately, and lets a background waiter publish
+`meeting.completed` after finalization. The daemon-issued `MeetingId` remains
+readable for the life of the process after the vault note is written.
+Vault-less test construction still uses the synthetic FSM path.
+
+### Daemon read-side no longer depends only on external vault artifacts
+
+Because vault-backed daemon capture now writes finalized notes through the
+existing v1 pipeline, the read endpoints can serve artifacts produced by the
+daemon itself. Cross-restart daemon-issued ID continuity remains in-memory only;
+after restart, the path-derived vault IDs are the source of truth.
 
 ### `MeetingBotDriver` has a concrete Recall implementation
 
@@ -233,13 +218,11 @@ multi-subscriber behavior.
 
 | # | Gap | File:Line | Severity | Notes |
 | -- | --- | --- | --- | --- |
-| 1 | Orchestrator lacks real capture/STT/LLM/vault pipeline | `crates/heron-orchestrator/src/lib.rs:563` | BLOCKER | Replace synthetic FSM-only lifecycle with real task ownership |
 | 2 | No production realtime backend | `crates/heron-realtime/src/lib.rs:7` | BLOCKER | OpenAI Realtime or chosen backend first |
 | 3 | Bot + bridge + policy not composed into a live session | `crates/heron-bot/src/recall/mod.rs:367`, `crates/heron-bridge/src/naive.rs:475`, `crates/heron-policy/src/controller.rs:355` | BLOCKER | Build production session owner |
 | 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
 | 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
 | 7 | CLI v2 commands do not delegate to `herond` | `crates/heron-cli/src/main.rs:322` | MAJOR | Use bearer token + localhost API |
-| 8 | Daemon read-side depends on external vault artifacts | `crates/heron-orchestrator/src/lib.rs:713` | MAJOR | Resolved by real daemon vault writes |
 | 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | MINOR | Add DispatchTime deadline |
 | 10 | Cross-crate v2 integration coverage | v2 crates | MINOR | Add end-to-end lifecycle suites with fakes |
