@@ -41,6 +41,12 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
+# Cross-crate v2 integration tests in `tests/v2_lifecycle.rs` and
+# `tests/v2_bridge_health.rs` exercise the bridge → daemon doctor.warning
+# contract. Bridge isn't a runtime dep (the daemon doesn't yet own a
+# bridge instance — that lands with the orchestrator-composition PR);
+# pulled in here at test scope so the contract is pinned today.
+heron-bridge = { workspace = true }
 
 [lints]
 workspace = true
