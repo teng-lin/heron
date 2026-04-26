@@ -22,9 +22,35 @@
 //! - The `X-Heron-Replay-Window-Seconds` response header advertises
 //!   the cache's retention so a long-lived consumer can size its
 //!   reconnect logic. Omitted when the orchestrator opts out of
-//!   replay.
+//!   replay. The header name is shared with [`heron_event_http`] via
+//!   the [`heron_event_http::REPLAY_WINDOW_HEADER`] constant — never
+//!   stringified inline so a future spec rename only touches one
+//!   place.
+//!
+//! ## Why we don't use `heron_event_http::SseEventSink` directly
+//!
+//! [`heron_event_http::SseEventSink`] is a per-connection
+//! [`heron_event::EventSink`] that writes [`heron_event_http::SseFrame`]
+//! strings into a `tokio::sync::mpsc` channel. That shape fits a
+//! transport whose body is built by the daemon itself (raw socket
+//! writer, webhook poster) — but the axum handler here lives inside
+//! a framework that wants `Stream<Item = axum::response::sse::Event>`
+//! plus a built-in [`axum::response::sse::KeepAlive`] scheduler. Going
+//! through `SseFrame` would require either parsing the formatted
+//! string back into an `Event` (silly) or bypassing axum's `Sse`
+//! response entirely (and re-implementing the heartbeat scheduler).
+//! Net: at the HTTP-handler layer we use axum's idiom; the
+//! `SseEventSink` building block is reserved for the non-HTTP
+//! transports (webhook, MCP, raw TCP) where there's no framework to
+//! work with. We *do* reuse [`heron_event_http`]'s pieces that are
+//! framework-agnostic — [`REPLAY_WINDOW_HEADER`] and
+//! [`heron_event_http::TopicFilter`].
+//!
+//! [`REPLAY_WINDOW_HEADER`]: heron_event_http::REPLAY_WINDOW_HEADER
 
 use std::convert::Infallible;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -35,9 +61,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{Stream, StreamExt};
 use heron_event::{EventId, ReplayError};
+use heron_event_http::{REPLAY_WINDOW_HEADER, TopicFilter};
 use heron_session::EventPayload;
 use serde::Deserialize;
-use std::str::FromStr;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
@@ -55,9 +81,10 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
     /// Comma-separated topic globs (e.g. `meeting.*,transcript.final`).
-    /// Reserved for v1.1 — currently ignored. Documented in the
-    /// OpenAPI so consumers can start sending it.
-    #[allow(dead_code)]
+    /// Compiled via [`heron_event_http::TopicFilter::parse`]; missing
+    /// / empty / `*` collapses to "all events" per the OpenAPI
+    /// default. Applied uniformly to replayed and live events so a
+    /// reconnect-with-resume sees the same filter as steady state.
     pub topics: Option<String>,
     /// Replay events strictly after this `evt_*` ID. `Last-Event-ID`
     /// header wins on conflict.
@@ -113,11 +140,23 @@ async fn get_events(
 
     let mut headers_out = HeaderMap::new();
 
+    // Compile the topic filter once outside the per-event hot path.
+    // `parse` collapses missing / empty / wildcard to `All`, so a
+    // request without `?topics=` short-circuits to "match every
+    // event_type" without running the glob engine.
+    //
+    // Wrapped in `Arc` because the per-event `filter_map` closure
+    // produces a fresh future per item; cloning the inner
+    // `TopicFilter::Globs(Vec<TopicGlob>)` would allocate a new Vec
+    // and clone every pattern `String` on every event. Arc clone is
+    // a single refcount bump, regardless of the glob count.
+    let topics = Arc::new(TopicFilter::parse(q.topics.as_deref().unwrap_or("")));
+
     let replayed = if let Some(since) = resume {
         match state.orchestrator.replay_cache() {
             Some(cache) => {
                 headers_out.insert(
-                    "x-heron-replay-window-seconds",
+                    REPLAY_WINDOW_HEADER,
                     HeaderValue::from(cache.window().as_secs()),
                 );
                 match cache.replay_since(since).await {
@@ -191,25 +230,39 @@ async fn get_events(
     // makes it tempting to filter only `live`; that would silently
     // leak filtered events through replay. Apply the filter on
     // `merged` to guarantee uniformity.
-    let event_stream = merged.filter_map(|res| async move {
-        let env = res.ok()?;
-        let event_type = event_type_of(&env.payload);
-        let id = env.event_id.to_string();
-        let data = match serde_json::to_string(&env) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    event_id = %env.event_id,
-                    event_type,
-                    "envelope serialization failed; dropping SSE frame",
-                );
+    let event_stream = merged.filter_map(move |res| {
+        // `Arc::clone` per iteration is a single refcount bump — the
+        // compiled filter is shared, not duplicated, even when the
+        // `Globs` variant carries a non-trivial `Vec<TopicGlob>`.
+        let topics = Arc::clone(&topics);
+        async move {
+            let env = res.ok()?;
+            let event_type = event_type_of(&env.payload);
+            // Topic filter applies BEFORE serialization so a
+            // wide-tail subscriber's narrow filter doesn't pay the
+            // serialization cost on dropped events. Mirrors
+            // [`heron_event_http::SseEventSink::forward`]'s
+            // filter-then-serialize order.
+            if !topics.matches(event_type) {
                 return None;
             }
-        };
-        Some(Ok::<_, Infallible>(
-            Event::default().id(id).event(event_type).data(data),
-        ))
+            let id = env.event_id.to_string();
+            let data = match serde_json::to_string(&env) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        event_id = %env.event_id,
+                        event_type,
+                        "envelope serialization failed; dropping SSE frame",
+                    );
+                    return None;
+                }
+            };
+            Some(Ok::<_, Infallible>(
+                Event::default().id(id).event(event_type).data(data),
+            ))
+        }
     });
 
     let pinned: Pinned<Result<Event, Infallible>> = Box::pin(event_stream);

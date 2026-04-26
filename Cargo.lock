@@ -2412,6 +2412,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "heron-event",
+ "heron-event-http",
  "heron-session",
  "heron-types",
  "http",

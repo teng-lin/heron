@@ -268,6 +268,146 @@ async fn events_replays_from_replay_cache_then_takes_live_tail() {
 }
 
 #[tokio::test]
+async fn events_topics_filter_passes_matching_event_type() {
+    // `?topics=meeting.*` should let `meeting.detected` through.
+    // Same shape as the unfiltered test, just with the filter
+    // attached — confirms the filter compile + application path
+    // is wired and the wildcard glob matches as the OpenAPI
+    // documents.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events?topics=meeting.*")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let envelope = sample_envelope();
+    bus.publish(envelope.clone());
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+    assert!(
+        body.contains("event: meeting.detected"),
+        "matching event filtered out: {body}"
+    );
+}
+
+#[tokio::test]
+async fn events_topics_filter_drops_non_matching_event_type() {
+    // `?topics=transcript.*` should drop a `meeting.detected`. The
+    // SSE stream closes once we drop the bus, so the body must be
+    // empty of any `event: meeting.detected` frame — heartbeats
+    // (15s interval) won't fire in this test's lifetime.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events?topics=transcript.*")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let envelope = sample_envelope();
+    bus.publish(envelope);
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+    assert!(
+        !body.contains("event: meeting.detected"),
+        "non-matching event leaked through filter: {body}"
+    );
+    assert!(
+        !body.contains("\"event_type\":\"meeting.detected\""),
+        "filtered event payload leaked through: {body}"
+    );
+}
+
+#[tokio::test]
+async fn events_topics_filter_applies_to_replayed_events_too() {
+    // Regression guard for the `events.rs` warning: filter must
+    // apply to BOTH replay and live. A future refactor moving the
+    // filter onto only `live_stream` would still pass the live-
+    // tail filter tests above; this one catches that.
+    //
+    // Setup: cache holds a `meeting.detected` envelope; request
+    // comes in with `?topics=transcript.*` which excludes it. The
+    // body must not contain the meeting frame.
+    let recorded = sample_envelope();
+    let cache = Arc::new(InMemoryCache::new(vec![recorded.clone()]));
+    let orch = Arc::new(WithCache::new(cache));
+    let app = build_app(test_state(orch.clone()));
+
+    let resume_from = EventId::now_v7();
+    let bus_handle = orch.event_bus();
+    let req = Request::get(format!(
+        "/v1/events?topics=transcript.*&since_event_id={resume_from}"
+    ))
+    .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+    .body(Body::empty())
+    .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus_handle).await;
+
+    drop(bus_handle);
+    drop(orch);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+    assert!(
+        !body.contains("event: meeting.detected"),
+        "replayed event leaked through topic filter: {body}"
+    );
+    assert!(
+        !body.contains(&format!("id: {}", recorded.event_id)),
+        "replayed envelope's id leaked through filter: {body}"
+    );
+}
+
+#[tokio::test]
+async fn events_topics_filter_supports_multiple_globs() {
+    // `?topics=meeting.*,doctor.warning` — two globs, comma-
+    // separated. Confirms list semantics (a `meeting.detected`
+    // envelope matches the first glob, even though it doesn't match
+    // the second).
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events?topics=meeting.*,doctor.warning")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let envelope = sample_envelope();
+    bus.publish(envelope);
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+    assert!(
+        body.contains("event: meeting.detected"),
+        "first-glob match dropped under multi-glob filter: {body}"
+    );
+}
+
+#[tokio::test]
 async fn events_returns_410_when_resume_window_exceeded() {
     let cache = Arc::new(WindowExceededCache);
     let orch = Arc::new(WithCache::new(cache));
