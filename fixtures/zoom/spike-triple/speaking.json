@@ -1,0 +1,1239 @@
+{
+  "nodes": [
+    {
+      "title": "zoom.us",
+      "depth": 0,
+      "role": "AXApplication"
+    },
+    {
+      "title": "Zoom Workplace",
+      "subrole": "AXStandardWindow",
+      "role": "AXWindow",
+      "depth": 1
+    },
+    {
+      "depth": 2,
+      "role": "",
+      "description": ""
+    },
+    {
+      "description": "Back in Chat(⌘ + left bracket)",
+      "role": "AXButton",
+      "help": "Back in Chat(⌘ + left bracket)",
+      "depth": 2
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "description": "Forward in Chat(⌘ + right bracket)",
+      "help": "Forward in Chat(⌘ + right bracket)"
+    },
+    {
+      "description": "History",
+      "role": "AXButton",
+      "depth": 2,
+      "help": "History"
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "description": "Search (⌘E)  ⌘E",
+      "help": "Press ⌘E to search"
+    },
+    {
+      "depth": 2,
+      "description": "Create new",
+      "help": "Create new",
+      "role": "AXButton"
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "help": "Open activity center",
+      "description": "Hide activity center"
+    },
+    {
+      "title": "",
+      "role": "AXButton",
+      "help": "In a Zoom Meeting",
+      "depth": 2,
+      "description": "Zoom, Teng Lin, In a Zoom Meeting, Basic account"
+    },
+    {
+      "description": "Hide AI Companion panel",
+      "role": "AXButton",
+      "help": "AI Companion always shows on the home screen.",
+      "depth": 2
+    },
+    {
+      "help": "Calendar always shows on the home screen.",
+      "depth": 2,
+      "role": "AXButton",
+      "description": "Calendar always shows on the home screen."
+    },
+    {
+      "depth": 2,
+      "description": "Navigation tabs",
+      "role": "AXGroup"
+    },
+    {
+      "description": "Home, selected, 1 of 6",
+      "role": "AXUnknown",
+      "depth": 3,
+      "help": "Home, selected, 1 of 6",
+      "value": "Home, selected"
+    },
+    {
+      "title": "",
+      "help": "Home, selected, 1 of 6",
+      "depth": 4,
+      "role": "AXButton"
+    },
+    {
+      "help": "Meetings, 2 of 6",
+      "depth": 3,
+      "role": "AXUnknown",
+      "value": "Meetings",
+      "description": "Meetings, 2 of 6"
+    },
+    {
+      "help": "Meetings, 2 of 6",
+      "role": "AXButton",
+      "depth": 4,
+      "title": ""
+    },
+    {
+      "description": "Chat, 3 of 6",
+      "role": "AXUnknown",
+      "depth": 3,
+      "value": "Chat",
+      "help": "Chat, 3 of 6"
+    },
+    {
+      "role": "AXButton",
+      "depth": 4,
+      "help": "Chat, 3 of 6",
+      "title": ""
+    },
+    {
+      "help": "Scheduler, 4 of 6",
+      "description": "Scheduler, 4 of 6",
+      "value": "Scheduler",
+      "depth": 3,
+      "role": "AXUnknown"
+    },
+    {
+      "title": "",
+      "depth": 4,
+      "help": "Scheduler, 4 of 6",
+      "role": "AXButton"
+    },
+    {
+      "description": "Hub, 5 of 6",
+      "role": "AXUnknown",
+      "help": "Hub, 5 of 6",
+      "value": "Hub",
+      "depth": 3
+    },
+    {
+      "help": "Hub, 5 of 6",
+      "title": "",
+      "depth": 4,
+      "role": "AXButton"
+    },
+    {
+      "description": "More, 6 of 6",
+      "role": "AXUnknown",
+      "help": "More, 6 of 6",
+      "value": "More",
+      "depth": 3
+    },
+    {
+      "role": "AXButton",
+      "help": "More, 6 of 6",
+      "title": "",
+      "depth": 4
+    },
+    {
+      "title": "Settings",
+      "depth": 2,
+      "role": "AXButton",
+      "help": "Settings"
+    },
+    {
+      "depth": 2,
+      "role": "AXSplitGroup"
+    },
+    {
+      "role": "AXStaticText",
+      "depth": 3,
+      "value": "6:16 PM"
+    },
+    {
+      "role": "AXStaticText",
+      "depth": 3,
+      "value": "Saturday, April 25"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "description": "Back to meeting",
+      "depth": 4,
+      "role": "AXButton",
+      "identifier": "44C2E00B-8419-42CF-B801-09CE1616F70F",
+      "title": ""
+    },
+    {
+      "role": "AXGroup",
+      "depth": 3
+    },
+    {
+      "description": "Join meeting",
+      "identifier": "7EFFADCF-73D2-4125-B433-2B5F1A03C4C2",
+      "role": "AXButton",
+      "depth": 4,
+      "title": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "depth": 4,
+      "title": "",
+      "role": "AXButton",
+      "identifier": "496FE469-2749-43A1-BDA6-DAD928A07B03",
+      "description": "Schedule meeting"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "role": "AXButton",
+      "description": "Share screen",
+      "depth": 4,
+      "title": "",
+      "identifier": "54433F9C-B6D7-4FCE-98D7-A13533490B3D"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "identifier": "0EFAEFAC-7A5D-4C43-9DA1-2D45BF1948D4",
+      "role": "AXButton",
+      "title": "",
+      "description": "My notes, new",
+      "depth": 4
+    },
+    {
+      "role": "AXGroup",
+      "depth": 3
+    },
+    {
+      "role": "AXGroup",
+      "depth": 4
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "title": "",
+      "depth": 5,
+      "role": "AXScrollArea",
+      "value": ""
+    },
+    {
+      "title": "",
+      "role": "AXWebArea",
+      "value": "",
+      "depth": 6,
+      "description": "Zoom Calendar",
+      "help": "",
+      "selected": false
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "help": "",
+      "description": "",
+      "role": "AXGroup",
+      "title": "",
+      "value": ""
+    },
+    {
+      "value": "You haven't connected your calendar yet. ",
+      "description": "",
+      "depth": 8,
+      "title": "",
+      "help": "",
+      "selected": false,
+      "role": "AXStaticText"
+    },
+    {
+      "description": "Connect now",
+      "role": "AXLink",
+      "title": "Connect now",
+      "value": "",
+      "selected": false,
+      "help": "",
+      "depth": 8
+    },
+    {
+      "depth": 9,
+      "help": "",
+      "value": "Connect now",
+      "description": "",
+      "role": "AXStaticText",
+      "selected": false,
+      "title": ""
+    },
+    {
+      "selected": false,
+      "help": "",
+      "title": "",
+      "value": " to manage all your meetings and events in one place.",
+      "depth": 8,
+      "description": "",
+      "role": "AXStaticText"
+    },
+    {
+      "help": "",
+      "depth": 7,
+      "title": "Dismiss banner message",
+      "description": "Dismiss banner message",
+      "selected": false,
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "role": "AXButton",
+      "help": "Create event",
+      "value": "",
+      "selected": false,
+      "description": "Create event",
+      "depth": 7,
+      "title": "Create event"
+    },
+    {
+      "description": "",
+      "role": "AXGroup",
+      "title": "",
+      "selected": false,
+      "help": "",
+      "value": "",
+      "depth": 7
+    },
+    {
+      "help": "",
+      "title": "Select calendar date: Today, Apr 25",
+      "value": "",
+      "description": "Select calendar date: Today, Apr 25",
+      "role": "AXPopUpButton",
+      "depth": 8,
+      "selected": false
+    },
+    {
+      "role": "AXButton",
+      "depth": 7,
+      "title": "Today",
+      "help": "Today",
+      "description": "Today",
+      "value": "",
+      "selected": false
+    },
+    {
+      "help": "Previous",
+      "selected": false,
+      "depth": 7,
+      "title": "Previous",
+      "description": "Previous",
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "role": "AXButton",
+      "depth": 7,
+      "title": "Next",
+      "value": "",
+      "description": "Next",
+      "help": "Next",
+      "selected": false
+    },
+    {
+      "role": "AXGroup",
+      "title": "",
+      "help": "",
+      "depth": 7,
+      "subrole": "AXApplicationGroup",
+      "value": "",
+      "description": "",
+      "selected": false
+    },
+    {
+      "value": "",
+      "help": "",
+      "description": "",
+      "depth": 8,
+      "role": "AXGroup",
+      "title": "",
+      "selected": false
+    },
+    {
+      "value": "",
+      "description": "More options",
+      "title": "More options",
+      "depth": 9,
+      "role": "AXButton",
+      "selected": false,
+      "help": ""
+    },
+    {
+      "value": "",
+      "selected": false,
+      "help": "",
+      "title": "",
+      "depth": 7,
+      "role": "AXGroup",
+      "description": ""
+    },
+    {
+      "description": "",
+      "value": "No meetings scheduled.",
+      "help": "",
+      "depth": 8,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText"
+    },
+    {
+      "value": "",
+      "help": "",
+      "title": "Schedule a meeting",
+      "depth": 7,
+      "role": "AXButton",
+      "description": "Schedule a meeting",
+      "selected": false
+    },
+    {
+      "selected": false,
+      "role": "AXButton",
+      "description": "Open recordings",
+      "help": "",
+      "depth": 7,
+      "value": "",
+      "title": "Open recordings"
+    },
+    {
+      "role": "AXSplitter",
+      "value": 638,
+      "depth": 3,
+      "selected": false
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "role": "AXGroup",
+      "depth": 4
+    },
+    {
+      "title": "",
+      "selected": false,
+      "role": "AXScrollArea",
+      "description": "",
+      "help": "",
+      "depth": 5,
+      "value": ""
+    },
+    {
+      "role": "AXWebArea",
+      "depth": 6,
+      "description": "Zoom AI Companion Plus",
+      "selected": false,
+      "title": "",
+      "value": "",
+      "help": ""
+    },
+    {
+      "subrole": "AXLandmarkBanner",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "selected": false,
+      "title": "",
+      "description": "",
+      "depth": 7
+    },
+    {
+      "value": 1,
+      "depth": 8,
+      "title": "AI CompanionBASIC",
+      "help": "",
+      "role": "AXHeading",
+      "selected": false,
+      "description": ""
+    },
+    {
+      "role": "AXStaticText",
+      "selected": false,
+      "depth": 9,
+      "value": "AI Companion",
+      "description": "",
+      "help": "",
+      "title": ""
+    },
+    {
+      "role": "AXStaticText",
+      "description": "",
+      "title": "",
+      "selected": false,
+      "help": "",
+      "depth": 9,
+      "value": "BASIC"
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "role": "AXGroup",
+      "value": "",
+      "depth": 8,
+      "title": ""
+    },
+    {
+      "description": "",
+      "help": "",
+      "selected": false,
+      "title": "",
+      "role": "AXGroup",
+      "value": "",
+      "depth": 9
+    },
+    {
+      "selected": false,
+      "help": "",
+      "role": "AXButton",
+      "description": "Open Notification Center",
+      "value": "",
+      "title": "Open Notification Center",
+      "depth": 10
+    },
+    {
+      "title": "Pop out window",
+      "description": "Pop out window",
+      "depth": 8,
+      "role": "AXButton",
+      "value": "",
+      "help": "",
+      "selected": false
+    },
+    {
+      "help": "",
+      "title": "",
+      "value": "",
+      "selected": false,
+      "subrole": "AXApplicationAlert",
+      "description": "",
+      "depth": 7,
+      "role": "AXGroup"
+    },
+    {
+      "help": "",
+      "depth": 8,
+      "selected": false,
+      "description": "See what’s included",
+      "title": "See what’s included",
+      "role": "AXButton",
+      "value": ""
+    },
+    {
+      "help": "",
+      "selected": false,
+      "title": "Close",
+      "value": "",
+      "description": "Close",
+      "depth": 8,
+      "role": "AXButton"
+    },
+    {
+      "selected": false,
+      "depth": 7,
+      "help": "",
+      "subrole": "AXEmptyGroup",
+      "description": "",
+      "role": "AXGroup",
+      "value": "",
+      "title": ""
+    },
+    {
+      "description": "",
+      "value": 2,
+      "title": "Suggested prompts",
+      "help": "",
+      "depth": 7,
+      "role": "AXHeading",
+      "selected": false
+    },
+    {
+      "help": "",
+      "value": "Suggested prompts",
+      "depth": 8,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText",
+      "description": ""
+    },
+    {
+      "description": "",
+      "value": "",
+      "title": "",
+      "depth": 7,
+      "subrole": "AXApplicationGroup",
+      "help": "",
+      "role": "AXGroup",
+      "selected": false
+    },
+    {
+      "title": "What are some tips for running a Zoom meeting",
+      "selected": false,
+      "depth": 8,
+      "role": "AXButton",
+      "value": "What are some tips for running a Zoom meeting",
+      "description": "What are some tips for running a Zoom meeting",
+      "help": ""
+    },
+    {
+      "value": "Coordinate meetings with external contacts",
+      "description": "Coordinate meetings with external contacts",
+      "title": "Coordinate meetings with external contacts",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "description": "Schedule a meeting with contact",
+      "title": "Schedule a meeting with contact",
+      "selected": false,
+      "value": "Schedule a meeting with contact",
+      "role": "AXButton",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "title": "Tell me what I can do with AI Companion",
+      "role": "AXButton",
+      "help": "",
+      "depth": 8,
+      "selected": false,
+      "value": "Tell me what I can do with AI Companion",
+      "description": "Tell me what I can do with AI Companion"
+    },
+    {
+      "title": "",
+      "value": "",
+      "selected": false,
+      "help": "",
+      "description": "",
+      "depth": 7,
+      "role": "AXGroup"
+    },
+    {
+      "selected": false,
+      "depth": 8,
+      "description": "Try on the web",
+      "help": "",
+      "value": "",
+      "role": "AXLink",
+      "title": "Try on the web"
+    },
+    {
+      "description": "",
+      "help": "",
+      "depth": 9,
+      "title": "",
+      "selected": false,
+      "role": "AXStaticText",
+      "value": "Try on the web"
+    },
+    {
+      "value": "",
+      "help": "",
+      "role": "AXGroup",
+      "selected": false,
+      "description": "",
+      "title": "",
+      "depth": 7
+    },
+    {
+      "title": "Attach file",
+      "depth": 8,
+      "selected": false,
+      "value": "",
+      "help": "",
+      "role": "AXPopUpButton",
+      "description": "Attach file"
+    },
+    {
+      "role": "AXTextArea",
+      "selected": false,
+      "value": "\n",
+      "depth": 7,
+      "title": "Message AI Companion Write a message or type / for more",
+      "description": "Message AI Companion Write a message or type / for more",
+      "help": ""
+    },
+    {
+      "title": "",
+      "role": "AXGroup",
+      "subrole": "AXEmptyGroup",
+      "depth": 8,
+      "value": "",
+      "description": "",
+      "help": "",
+      "selected": false
+    },
+    {
+      "help": "",
+      "description": "",
+      "role": "AXGroup",
+      "depth": 7,
+      "selected": false,
+      "value": "",
+      "title": ""
+    },
+    {
+      "value": "",
+      "description": "Send message",
+      "title": "Send message",
+      "help": "",
+      "role": "AXButton",
+      "depth": 8,
+      "selected": false
+    },
+    {
+      "role": "AXGroup",
+      "value": "",
+      "selected": false,
+      "description": "",
+      "help": "",
+      "depth": 7,
+      "title": ""
+    },
+    {
+      "subrole": "AXApplicationGroup",
+      "description": "AI can make mistakes. Review for accuracy.",
+      "title": "AI can make mistakes. Review for accuracy.",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "selected": false,
+      "depth": 8
+    },
+    {
+      "depth": 9,
+      "selected": false,
+      "role": "AXStaticText",
+      "title": "",
+      "description": "",
+      "help": "",
+      "value": "AI can make mistakes. Review for accuracy."
+    },
+    {
+      "selected": false,
+      "title": "",
+      "role": "AXGroup",
+      "help": "",
+      "value": "",
+      "depth": 7,
+      "description": "",
+      "subrole": "AXEmptyGroup"
+    },
+    {
+      "role": "AXGroup",
+      "subrole": "AXEmptyGroup",
+      "title": "",
+      "selected": false,
+      "value": "",
+      "description": "",
+      "depth": 7,
+      "help": ""
+    },
+    {
+      "title": "",
+      "subrole": "AXEmptyGroup",
+      "help": "",
+      "role": "AXGroup",
+      "depth": 7,
+      "description": "",
+      "selected": false,
+      "value": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "depth": 4,
+      "role": "AXGroup"
+    },
+    {
+      "value": "",
+      "title": "",
+      "help": "",
+      "description": "",
+      "depth": 5,
+      "role": "AXScrollArea",
+      "selected": false
+    },
+    {
+      "depth": 6,
+      "title": "",
+      "value": "",
+      "help": "",
+      "role": "AXWebArea",
+      "description": "Activity Center",
+      "selected": false
+    },
+    {
+      "title": "More options",
+      "help": "More",
+      "value": "",
+      "description": "More options",
+      "role": "AXPopUpButton",
+      "selected": false,
+      "depth": 7
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "subrole": "AXApplicationGroup",
+      "help": "",
+      "role": "AXGroup",
+      "title": "",
+      "description": "",
+      "value": ""
+    },
+    {
+      "description": "Filter",
+      "help": "Filter",
+      "value": "",
+      "selected": false,
+      "title": "Filter",
+      "depth": 8,
+      "role": "AXButton"
+    },
+    {
+      "role": "AXStaticText",
+      "title": "",
+      "value": "Activity",
+      "help": "",
+      "selected": false,
+      "description": "",
+      "depth": 7
+    },
+    {
+      "value": "",
+      "depth": 7,
+      "help": "",
+      "description": "Learn more about Close",
+      "title": "Learn more about Close",
+      "role": "AXButton",
+      "selected": false
+    },
+    {
+      "depth": 7,
+      "selected": false,
+      "help": "",
+      "description": "",
+      "title": "",
+      "role": "AXTabGroup",
+      "value": "<AXUIElement 0x98103d3e0> {pid=80247}"
+    },
+    {
+      "role": "AXRadioButton",
+      "value": true,
+      "description": "",
+      "selected": true,
+      "depth": 8,
+      "help": "",
+      "title": "Focus"
+    },
+    {
+      "value": false,
+      "title": "Others",
+      "depth": 8,
+      "help": "",
+      "selected": false,
+      "role": "AXRadioButton",
+      "description": ""
+    },
+    {
+      "depth": 7,
+      "role": "AXGroup",
+      "help": "",
+      "description": "Focus",
+      "subrole": "AXTabPanel",
+      "title": "Focus",
+      "value": "",
+      "selected": false
+    },
+    {
+      "title": "",
+      "value": "🎉 Activity Center 2.0 is here",
+      "role": "AXStaticText",
+      "selected": false,
+      "depth": 8,
+      "description": "",
+      "help": ""
+    },
+    {
+      "role": "AXGroup",
+      "selected": false,
+      "value": "",
+      "help": "",
+      "description": "",
+      "depth": 8,
+      "title": ""
+    },
+    {
+      "title": "",
+      "depth": 9,
+      "description": "",
+      "role": "AXStaticText",
+      "selected": false,
+      "value": "A smarter side panel for all your Zoom Workplace notifications with a new Focus tab for your most important notifications - easy to access, easy to act on!",
+      "help": ""
+    },
+    {
+      "selected": false,
+      "value": "",
+      "help": "",
+      "depth": 8,
+      "description": "Learn more, link",
+      "role": "AXButton",
+      "title": "Learn more, link"
+    },
+    {
+      "description": "Dismiss banner message",
+      "depth": 8,
+      "role": "AXButton",
+      "title": "Dismiss banner message",
+      "help": "",
+      "selected": false,
+      "value": ""
+    },
+    {
+      "help": "Mark All as Read",
+      "role": "AXGroup",
+      "description": "",
+      "depth": 8,
+      "title": "",
+      "value": "",
+      "selected": false
+    },
+    {
+      "selected": false,
+      "description": "",
+      "title": "",
+      "role": "AXImage",
+      "depth": 9,
+      "value": "",
+      "help": ""
+    },
+    {
+      "depth": 8,
+      "selected": false,
+      "value": "",
+      "subrole": "AXEmptyGroup",
+      "description": "",
+      "help": "",
+      "title": "",
+      "role": "AXGroup"
+    },
+    {
+      "value": "",
+      "title": "",
+      "selected": false,
+      "description": "",
+      "role": "AXGroup",
+      "depth": 8,
+      "help": ""
+    },
+    {
+      "depth": 9,
+      "help": "",
+      "role": "AXStaticText",
+      "title": "",
+      "value": "You've cleared your suggestions",
+      "description": "",
+      "selected": false
+    },
+    {
+      "description": "",
+      "value": "",
+      "help": "",
+      "selected": false,
+      "depth": 8,
+      "title": "",
+      "role": "AXGroup"
+    },
+    {
+      "description": "",
+      "depth": 9,
+      "title": "",
+      "value": "Check out the rest of your notifications in the Other tab.",
+      "help": "",
+      "role": "AXStaticText",
+      "selected": false
+    },
+    {
+      "help": "",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 8,
+      "description": "",
+      "value": "",
+      "title": "View other notifications"
+    },
+    {
+      "title": "",
+      "depth": 7,
+      "role": "AXImage",
+      "selected": false,
+      "description": "",
+      "help": "",
+      "value": ""
+    },
+    {
+      "help": "",
+      "depth": 8,
+      "role": "AXImage",
+      "selected": false,
+      "title": "",
+      "description": "",
+      "value": ""
+    },
+    {
+      "help": "",
+      "selected": false,
+      "role": "AXImage",
+      "title": "",
+      "description": "",
+      "depth": 7,
+      "value": ""
+    },
+    {
+      "role": "AXImage",
+      "depth": 8,
+      "value": "",
+      "selected": false,
+      "description": "",
+      "title": "",
+      "help": ""
+    },
+    {
+      "depth": 7,
+      "description": "",
+      "selected": false,
+      "role": "AXImage",
+      "title": "",
+      "value": "",
+      "help": ""
+    },
+    {
+      "depth": 7,
+      "help": "",
+      "selected": false,
+      "role": "AXImage",
+      "value": "",
+      "title": "",
+      "description": ""
+    },
+    {
+      "value": 0.58187435633367657,
+      "role": "AXSplitter",
+      "depth": 3
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "subrole": "AXCloseButton"
+    },
+    {
+      "depth": 2,
+      "role": "AXButton",
+      "subrole": "AXFullScreenButton",
+      "help": "this button also has an action to zoom the window"
+    },
+    {
+      "depth": 3,
+      "role": "AXGroup"
+    },
+    {
+      "subrole": "AXMinimizeButton",
+      "depth": 2,
+      "role": "AXButton"
+    },
+    {
+      "role": "AXWindow",
+      "depth": 1,
+      "subrole": "AXStandardWindow",
+      "title": "Zoom Meeting"
+    },
+    {
+      "role": "AXTabGroup",
+      "help": "",
+      "description": "Blackmyth, Computer audio unmuted",
+      "depth": 2
+    },
+    {
+      "description": "View Blackmyth's profile",
+      "role": "AXButton",
+      "depth": 3
+    },
+    {
+      "role": "AXTabGroup",
+      "description": "Teng Lin, Computer audio muted, Video off",
+      "depth": 2,
+      "help": ""
+    },
+    {
+      "depth": 3,
+      "role": "AXImage"
+    },
+    {
+      "role": "AXButton",
+      "description": "View Teng Lin's profile",
+      "depth": 3
+    },
+    {
+      "role": "AXSplitter",
+      "depth": 2,
+      "value": 0.12862547288776796
+    },
+    {
+      "depth": 2,
+      "role": "AXScrollArea"
+    },
+    {
+      "role": "AXOutline",
+      "description": "Participants list",
+      "help": "Press tab for more options and to return to the main meeting window",
+      "depth": 3
+    },
+    {
+      "subrole": "AXTableRow",
+      "role": "AXRow",
+      "depth": 4,
+      "selected": false
+    },
+    {
+      "role": "AXCell",
+      "identifier": "ZMHCTableItemType_PANELIST",
+      "depth": 5
+    },
+    {
+      "depth": 6,
+      "value": "Teng Lin (me)",
+      "role": "AXStaticText"
+    },
+    {
+      "description": "More options for Teng Lin, collapsed",
+      "role": "AXMenuButton",
+      "help": "More",
+      "depth": 6
+    },
+    {
+      "depth": 6,
+      "help": "Start video",
+      "description": "Start video",
+      "role": "AXButton"
+    },
+    {
+      "role": "AXButton",
+      "help": "Unmute",
+      "depth": 6,
+      "description": "Unmute"
+    },
+    {
+      "subrole": "AXTableRow",
+      "selected": false,
+      "depth": 4,
+      "role": "AXRow"
+    },
+    {
+      "role": "AXCell",
+      "depth": 5,
+      "identifier": "ZMHCTableItemType_PANELIST"
+    },
+    {
+      "description": "Invite",
+      "role": "AXButton",
+      "depth": 2
+    },
+    {
+      "role": "AXButton",
+      "depth": 2,
+      "description": "Unmute me"
+    },
+    {
+      "role": "AXUnknown",
+      "description": "Participants (2)",
+      "depth": 2
+    },
+    {
+      "help": "Close",
+      "depth": 3,
+      "title": "Close",
+      "role": "AXButton",
+      "description": "Button"
+    },
+    {
+      "role": "AXButton",
+      "description": "Button",
+      "title": "Pop out",
+      "help": "Pop out",
+      "depth": 3
+    },
+    {
+      "value": "Participants (2)",
+      "depth": 3,
+      "role": "AXStaticText"
+    },
+    {
+      "depth": 2,
+      "role": "AXSplitter",
+      "value": 0.71570121951219512
+    },
+    {
+      "role": "AXButton",
+      "subrole": "AXCloseButton",
+      "selected": false,
+      "depth": 2
+    },
+    {
+      "depth": 2,
+      "subrole": "AXMinimizeButton",
+      "role": "AXButton",
+      "selected": false
+    },
+    {
+      "subrole": "AXFullScreenButton",
+      "selected": false,
+      "role": "AXButton",
+      "depth": 2
+    }
+  ],
+  "bundle_id": "us.zoom.xos",
+  "node_count": 165,
+  "pid": 80214,
+  "node_cap": 4096,
+  "max_depth": 12,
+  "scrubbed": "true: AXMenuBar/AXMenuBarItem/AXMenu/AXMenuItem subtrees removed because they incidentally captured personal email + recent document filenames during the spike (per coderabbit #94 review). The mute-state attribution contract — AXTabGroup at depth 2 with `<Name>, Computer audio (muted|unmuted)[, Video (off|on)]` — lives entirely outside those subtrees, so the trim preserves the spike evidence with zero loss of relevance."
+}

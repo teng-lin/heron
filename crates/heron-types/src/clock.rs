@@ -97,6 +97,33 @@ impl SessionClock {
             Err(e) => -e.duration().as_secs_f64(),
         }
     }
+
+    /// Monotonic "right now" in session-secs.
+    ///
+    /// Stamps relative to the session's mach anchor (Apple) so the
+    /// returned value never regresses on NTP/DST adjustments to wall
+    /// time — the property [`heron_zoom::aligner`] depends on, since
+    /// a backward-stepped event timestamp creates a degenerate
+    /// `SpeakingInterval` where `t0 >= t1` and silently drops the
+    /// overlap-attributed turn.
+    ///
+    /// Off-Apple this falls through to [`Self::wall_to_session_secs`]
+    /// — there is no mach clock on Linux/Windows, but the heron
+    /// pipeline that consumes this value (the §9.3 aligner) is
+    /// macOS-only in v1, so the fallback is best-effort rather than
+    /// load-bearing.
+    #[inline]
+    pub fn now_session_secs(&self) -> f64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            let (now, _timebase) = platform::now_with_timebase();
+            self.host_to_session_secs(now)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            self.wall_to_session_secs(SystemTime::now())
+        }
+    }
 }
 
 impl Default for SessionClock {

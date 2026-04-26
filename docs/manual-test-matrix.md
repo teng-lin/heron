@@ -23,6 +23,7 @@ Schema: `# | Section | Test name | Owner | When | Pass criterion | Artifact loca
 | 12 | §15.5 | review UI playback | engineer | week 13 | edit one turn's text, save, re-open — text is preserved; playback synchronizes to the JSONL timestamps | `fixtures/manual-validation/review-ui/<date>.mov` |
 | 13 | §17 | personal dogfood | engineer | week 15 | author runs heron on every meeting for the week; bug list ≤ 5 P1; no data loss | `docs/dogfood-log.md` |
 | 14 | §18 | exec dogfood + ship gate | exec-friend + author | week 16 | exec uses heron unaided for 5 client calls; quality promise met (§1 plan.md); ship-criteria §18.2 all green | `docs/dogfood-log.md` |
+| 15 | §3.3 | AX speaker-indicator triple spike | engineer | pre-week-15 | characterize the `(role, subrole, identifier)` triple for the active-speaker tile, OR document that no stable triple exists and update `ZoomAxHelper.swift` accordingly. **Run 2026-04-25, outcome: no AX-readable speaker indicator in Zoom 7.0.0; bridge pivoted to mute-state attribution per `fixtures/zoom/spike-triple/README.md`.** | `fixtures/zoom/spike-triple/` |
 
 ## Status legend
 
@@ -98,43 +99,44 @@ All three tests should print `skipped: …` and pass.
 
 ## Zoom AX observer (heron-zoom)
 
-This is the live-call runbook for the §9 AXObserver bridge. It is
-the human procedure that pins the placeholder
-`(role, subrole, identifier)` triple in
-`swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift` to
-real values, then exercises the full Rust + Swift wiring
-end-to-end against a Zoom call.
+This is the live-call runbook for the §9 AX bridge. It exercises
+the full Rust + Swift wiring end-to-end against a Zoom call.
 
-### 1. Capture the speaker-indicator triple (one-time)
+### 1. Validate the AXDescription contract (one-time per Zoom version)
 
-Until this step is run, the placeholders in `ZoomAxHelper.swift`
-(`SPEAKER_INDICATOR_ROLE`, `SPEAKER_INDICATOR_SUBROLE`,
-`SPEAKER_INDICATOR_IDENTIFIER`) are guesses. They will not match
-anything in the real Zoom AX tree.
+The §3.3 spike (artifacts at `fixtures/zoom/spike-triple/`,
+outcome at that directory's `README.md`) established that Zoom does
+not surface an active-speaker indicator via Accessibility. The
+bridge `swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift`
+instead parses each participant tile's `AXDescription`:
 
-1. Start a Zoom call (or join Zoom's "Test meeting" at
-   <https://zoom.us/test>) in gallery view with at least 2
-   participants.
-2. Launch Xcode → Open Developer Tool → Accessibility Inspector.
-3. In the Inspector's target picker, select the Zoom process.
-4. Activate the "inspection pointer" and hover the speaker
-   indicator (the colored frame around the active speaker's
-   tile).
-5. Read off the **Role**, **Subrole**, and **Identifier** fields
-   from the Basic panel. Note them down alongside the Zoom version
-   (`zoom.us → About Zoom`).
-6. Repeat in active-speaker view and paginated gallery; if the
-   triple changes between modes, file a follow-up — the bridge
-   currently expects one stable triple.
-7. Edit `swift/zoomax-helper/Sources/ZoomAxHelper/ZoomAxHelper.swift`,
-   replacing the three `SPEAKER_INDICATOR_*` constants with the
-   captured values, and remove the `TODO(spike-fixture)` comments.
-8. Confirm the matching notification: in Accessibility Inspector
-   click "Subscribe to Notifications" → toggle the speaker on/off
-   → confirm `AXValueChanged` fires (or note the actual
-   notification name and update `SPEAKER_INDICATOR_NOTIFICATION`).
-9. Capture the artifacts under `fixtures/zoom/spike-triple/` per
-   row #1 in the table above so the values are auditable.
+```
+"<Name>, Computer audio (muted|unmuted)[, Video (off|on)]"
+```
+
+A new Zoom release could break this format. Before relying on the
+bridge against an unfamiliar Zoom version, re-run the spike capture
+to confirm the contract still holds:
+
+1. Join a Zoom call with ≥ 2 participants (laptop + phone, or a
+   real partner). zoom.us/test by itself is single-participant and
+   won't surface remote tiles.
+2. Run the dump (build heron first if needed via
+   `cargo build -p heron-cli`):
+   ```sh
+   DYLD_LIBRARY_PATH="$(pwd)/target/debug" \
+     ./target/debug/heron ax-dump --bundle us.zoom.xos --out /tmp/ax.json
+   jq -r '.nodes[] | select(.role == "AXTabGroup" and .depth == 2) | .description' /tmp/ax.json
+   ```
+3. Confirm the output looks like
+   `<Name>, Computer audio (muted|unmuted)…` — one line per
+   participant. If the format has changed, update
+   `tileDescriptionRegex` in `ZoomAxHelper.swift` and re-archive a
+   new fixture pair under `fixtures/zoom/spike-triple/`.
+
+If you don't already have artifacts on disk, the existing fixtures
+(`muted.json` / `speaking.json`) document what the spike found
+against Zoom 7.0.0.
 
 ### 2. Grant Accessibility to the test binary (one-time)
 
@@ -154,7 +156,7 @@ Accessibility.
 
 ### 3. Run the live test
 
-With Zoom in a meeting and someone (probably you) talking:
+With Zoom in a meeting (≥ 2 participants visible — see step 1):
 
 ```sh
 HERON_ZOOM_RUNNING=1 cargo test -p heron-zoom \
@@ -163,14 +165,24 @@ HERON_ZOOM_RUNNING=1 cargo test -p heron-zoom \
 
 Pass criterion: at least one `SpeakerEvent` arrives within 5
 seconds, the test prints it via `--nocapture`, and `stop()`
-returns cleanly. Failure modes:
+returns cleanly. (The polling thread emits an event on its very
+first walk, so being in a 2-participant meeting is enough — no
+need to toggle anything.)
+
+Failure modes:
 
 - `Err(ZoomNotRunning)`: Zoom isn't running under bundle id
   `us.zoom.xos`. Check `lsappinfo list | grep -i zoom`.
 - `Err(AccessibilityDenied)`: re-do step 2.
-- "no SpeakerEvent received in 5s": the AX triple is wrong (most
-  likely cause: step 1 hasn't been run since a Zoom update). Re-run
-  step 1 against the current Zoom version.
+- "no SpeakerEvent received in 5s": the most likely cause is a
+  single-participant meeting (no remote tiles to enumerate) or a
+  Zoom version change that broke the AXDescription contract. Re-run
+  step 1 to diagnose; if the contract has changed, update
+  `tileDescriptionRegex` in `ZoomAxHelper.swift`. The fallback when
+  the regex stops parsing is `Event::AttributionDegraded` from the
+  aligner after `ATTRIBUTION_GAP_THRESHOLD` (30s) of silence — the
+  recording still completes, but speaker attribution drops to
+  channel-only.
 
 ## WhisperKit STT backend
 
