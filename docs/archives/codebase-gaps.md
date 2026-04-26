@@ -28,7 +28,7 @@ audio→STT→LLM→vault pipeline — but never opens a v2 realtime/bot/policy 
 Two adjacent gaps (no key-provisioning path, no real model-download UX) prevent
 even a manual workaround.
 
-**Alpha blockers (must land):** items 1, 2, 3, 4 below.
+**Alpha blockers (must land):** items 1, 2, 3 below.
 **GA blockers (can defer past alpha):** items 5, 6, 7.
 **Polish:** items 8, 9.
 
@@ -68,20 +68,6 @@ Required: settings field + secure store + injection into the daemon child env
 final step does not actually deliver a model. Without a working download (or a
 clearly-documented bundled-model alpha posture), users finish onboarding
 without the local STT artifact and the first capture fails opaquely.
-
-### 4. Pre-meeting context wiring still needs orchestrator hand-off
-
-(_Was previously listed as "`attach_context` returns 501". That part is closed:
-`crates/heron-orchestrator/src/lib.rs:1308` now persists context into an
-in-memory map keyed by `calendar_event_id`, and `start_capture` consumes the
-staged entry at `lib.rs:1047–1062`._)
-
-What remains is the consumer side once item 1 lands: the staged context must
-flow into `LiveSessionOwner` (system prompt / tool wiring / persona) so the
-agent actually behaves differently when a calendar entry has been
-context-loaded. Today the `Vec<MeetingContext>` is read out and dropped on the
-floor in the v1 path. Tracking it as an alpha blocker because shipping #1
-without #4 means context never reaches the model.
 
 ## GA blockers — defer past alpha
 
@@ -154,7 +140,8 @@ the consolidated runtime-preflight answer.
 
 `crates/heron-orchestrator/src/lib.rs:1308` persists context into an in-memory
 map; `start_capture` consumes staged entries (`lib.rs:1047–1062`). The
-remaining work is consumer-side and is tracked as item 4 above.
+consumer-side hand-off into both v1 and v2 paths is documented under
+"Pre-meeting context now flows end-to-end" below.
 
 ### React onboarding wizard now has a daemon step
 
@@ -234,6 +221,33 @@ every async→sync hop through `runWithTimeout` bounded by `WK_INIT_TIMEOUT`
 bounded by `EK_REQUEST_TIMEOUT` (60s) and surfaces a recoverable
 `CalendarError::Timeout`, mirroring the WhisperKit pattern from PR #124.
 
+### Pre-meeting context now flows end-to-end (gap #4)
+
+The "context staged via `attach_context` is dropped on the floor" gap closed in
+three steps:
+
+- **PR #132** taught `LocalSessionOrchestrator::attach_context` to persist the
+  staged `PreMeetingContext` into an in-memory map keyed by
+  `calendar_event_id`, with a JSON-payload size cap.
+- **PR #140** wired `LiveSessionOwner` into `start_capture` and threaded the
+  staged context into both `BotCreateArgs.pre_meeting_context` and the realtime
+  `SessionConfig.system_prompt` via `heron_bot::render_context` (48 KiB rendered
+  cap from spec Invariant 10) — the v2 agent now sees the agenda / attendees /
+  briefing from turn one.
+- **This PR** does the same for the v1 vault-backed summarization path:
+  `SummarizerInput` carries an optional `pre_meeting_briefing`, the
+  `meeting.hbs` template emits a `## Pre-meeting context` preamble when it's
+  present, and `LocalSessionOrchestrator::start_capture` renders the staged
+  context with `heron_bot::render_context` (same cap, same shape) and forwards
+  the rendered briefing into `CliSessionConfig`. With the v2 fallback in
+  place, the agent and the post-meeting summarizer now consume the same
+  briefing copy whenever both run.
+
+`prior_decisions` is intentionally dropped during translation to
+`BotPreMeetingContext` — the bot driver's typed shape doesn't carry it. A
+future change to `heron_bot::render_context` can add it back without further
+changes here, since both v1 and v2 funnel through that single renderer.
+
 ### Onboarding model-download step now triggers a real fetch
 
 `apps/desktop/src/pages/Onboarding.tsx` step 5 used to render a "Preview"
@@ -273,14 +287,14 @@ per-error copy.
 | 1 | `LiveSessionOwner` never wired into `start_capture` | `crates/heron-orchestrator/src/lib.rs` (`start_capture`) | ALPHA | Compose `RecallDriver` + `OpenAiRealtime` + `NaiveBridge` + `DefaultSpeechController` on the daemon hot path |
 | 2 | `OPENAI_API_KEY` has no UI/keychain → daemon path | `crates/heron-realtime/src/openai.rs:40` | ALPHA | Settings field + secure store + injection into daemon env/config |
 | 3 | Onboarding model-download step is a stub | `apps/desktop/src/pages/Onboarding.tsx:443` | ALPHA | Wire `heron_download_model` (or document bundled-model posture) |
-| 4 | Pre-meeting context not consumed by `LiveSessionOwner` | `crates/heron-orchestrator/src/lib.rs:1047–1062` | ALPHA | Persist+apply landed; consumer hand-off pending with item 1 |
+| 4 | Pre-meeting context not consumed by capture path | `crates/heron-orchestrator/src/lib.rs` | RESOLVED | Persistence (PR #132) + v2 consumer in `LiveSessionOwner` (PR #140) + v1 LLM-summarizer preamble (this PR); both paths render through `heron_bot::render_context` |
 | 5 | `heron-cli` does not delegate v2 capture to `herond` | `crates/heron-cli/src/main.rs:324` | GA | Bearer auth + localhost API |
 | 6 | Production-grade audio bridge | `crates/heron-bridge/src/naive.rs` | GA | `WebRtcAecBridge` or equivalent |
 | 7 | Daemon state in-memory only | `crates/heron-orchestrator/src/lib.rs:64–66` | GA | Acceptable for alpha if release notes flag it |
 | 8 | Cross-crate v2 integration coverage | v2 crates | POLISH | Add lifecycle suites alongside item 1 |
 | 9 | No crash/error reporting | `apps/desktop/src-tauri/tauri.conf.json` + `crates/herond` | POLISH | Wire log tail / lightweight reporter before external alpha |
 | — | Doctor runtime checks in onboarding | (in flight) | — | Working-tree edits already underway |
-| — | `attach_context` returns 501 | `crates/heron-orchestrator/src/lib.rs:1308` | RESOLVED | Persists into in-memory map; consumer hand-off tracked as item 4 |
+| — | `attach_context` returns 501 | `crates/heron-orchestrator/src/lib.rs:1308` | RESOLVED | Persists into in-memory map; consumer hand-off closed under item 4 |
 | — | React onboarding wizard 5 steps | `apps/desktop/src/store/onboarding.ts:44` | RESOLVED | Six steps including `daemon` |
 | — | Production realtime backend | `crates/heron-realtime/src/openai.rs` | RESOLVED | `OpenAiRealtime` ships |
 | — | Bot/bridge/policy composition owner | `crates/heron-orchestrator/src/live_session.rs` | RESOLVED | Owner exists; daemon wiring tracked as item 1 |

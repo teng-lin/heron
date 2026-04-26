@@ -215,6 +215,9 @@ async fn run_summarize(
         vault_root: vault_root.to_path_buf(),
         stt_backend_name: "sherpa".into(),
         llm_preference: Preference::Auto,
+        // Re-summarize is a vault-side operation; pre-meeting context
+        // never participates here.
+        pre_meeting_briefing: None,
     };
     let orch = Orchestrator::new(cfg);
     orch.re_summarize_note(summarizer, note_path, meeting_type, transcript)

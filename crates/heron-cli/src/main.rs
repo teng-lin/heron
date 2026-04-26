@@ -631,6 +631,9 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         vault_root,
         stt_backend_name: "sherpa".into(),
         llm_preference: heron_llm::Preference::Auto,
+        // CLI captures never stage pre-meeting context — that path is
+        // a daemon-only concern (`attach_context` -> `start_capture`).
+        pre_meeting_briefing: None,
     };
 
     if args.no_op {

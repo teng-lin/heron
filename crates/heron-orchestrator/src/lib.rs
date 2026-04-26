@@ -812,27 +812,8 @@ fn build_live_session_start_args(
     meeting: &Meeting,
     applied_context: Option<&PreMeetingContext>,
 ) -> LiveSessionStartArgs {
-    // The bot driver carries its own typed `PreMeetingContext` shape
-    // (subset of the orchestrator-side one — no `prior_decisions`).
-    // Translate field-by-field rather than re-using a serde round
-    // trip so a missing field is a compile error, not a silent drop.
     let bot_context = applied_context
-        .map(|ctx| BotPreMeetingContext {
-            agenda: ctx.agenda.clone(),
-            attendees_known: ctx
-                .attendees_known
-                .iter()
-                .map(|a| BotAttendeeContext {
-                    name: a.name.clone(),
-                    email: a.email.clone(),
-                    last_seen_in: a.last_seen_in,
-                    relationship: a.relationship.clone(),
-                    notes: a.notes.clone(),
-                })
-                .collect(),
-            related_notes: ctx.related_notes.clone(),
-            user_briefing: ctx.user_briefing.clone(),
-        })
+        .map(translate_to_bot_context)
         .unwrap_or_default();
 
     // Render the system prompt as `<persona>\n\n<context>` when a
@@ -916,6 +897,61 @@ fn build_live_session_start_args(
             mute: false,
             escalation: EscalationMode::None,
         },
+    }
+}
+
+/// The bot driver carries its own typed `PreMeetingContext` shape
+/// (subset of the orchestrator-side one — no `prior_decisions`).
+/// Translate field-by-field rather than re-using a serde round trip
+/// so a missing field is a compile error, not a silent drop.
+fn translate_to_bot_context(ctx: &PreMeetingContext) -> BotPreMeetingContext {
+    BotPreMeetingContext {
+        agenda: ctx.agenda.clone(),
+        attendees_known: ctx
+            .attendees_known
+            .iter()
+            .map(|a| BotAttendeeContext {
+                name: a.name.clone(),
+                email: a.email.clone(),
+                last_seen_in: a.last_seen_in,
+                relationship: a.relationship.clone(),
+                notes: a.notes.clone(),
+            })
+            .collect(),
+        related_notes: ctx.related_notes.clone(),
+        user_briefing: ctx.user_briefing.clone(),
+    }
+}
+
+/// Render the staged pre-meeting context into a markdown preamble for
+/// the v1 LLM summarizer prompt. Mirrors what
+/// [`build_live_session_start_args`] does for the v2 system prompt
+/// (`heron_bot::render_context` with its 48 KiB cap from spec
+/// Invariant 10) so v1 and v2 agents see the same briefing copy when
+/// both paths run.
+///
+/// Returns `None` when no context is staged, when render fails (e.g.
+/// the rendered text would exceed the cap), or when the rendered
+/// output is empty whitespace. The summarizer prompt template
+/// suppresses its `## Pre-meeting context` block on `None`, so capture
+/// continues normally either way — context is a hint, not a
+/// precondition.
+fn pre_meeting_briefing_for_v1(
+    applied_context: Option<&PreMeetingContext>,
+    meeting_id: MeetingId,
+) -> Option<String> {
+    let bot_context = translate_to_bot_context(applied_context?);
+    match heron_bot::render_context(&bot_context) {
+        Ok(rendered) if !rendered.trim().is_empty() => Some(rendered),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                meeting_id = %meeting_id,
+                error = %err,
+                "v1 pre-meeting briefing exceeds spec budget; v1 summary will run without preamble",
+            );
+            None
+        }
     }
 }
 
@@ -1269,6 +1305,17 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         meeting.status = MeetingStatus::Recording;
         publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
 
+        // Consume the pending context AFTER the FSM walk commits but
+        // BEFORE building `CliSessionConfig`, so the rendered briefing
+        // can feed both v1 (`CliSessionConfig.pre_meeting_briefing`)
+        // and v2 (`build_live_session_start_args`). An earlier read
+        // would silently delete context that a `transition_to_session_error`
+        // early-return path is expected to leave staged for retry.
+        let applied_context = normalized_event_id
+            .as_deref()
+            .and_then(|cid| self.pending_contexts.remove(cid));
+        let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
+
         let runtime = if let Some(vault_root) = self.vault_root.clone() {
             let (stop_tx, stop_rx) = oneshot::channel();
             let config = CliSessionConfig {
@@ -1278,6 +1325,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 vault_root,
                 stt_backend_name: self.stt_backend_name.clone(),
                 llm_preference: self.llm_preference,
+                pre_meeting_briefing,
             };
             let handle = tokio::task::spawn_blocking(move || {
                 // CoreAudio/cpal handles in the capture path are not
@@ -1298,16 +1346,6 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         } else {
             CaptureRuntime::Synthetic
         };
-
-        // Consume the pending context AFTER the FSM walk has
-        // committed — a `transition_to_session_error` early-return
-        // above would otherwise silently delete the staged context,
-        // which the next `start_capture` retry would expect to find.
-        // Per the lock-ordering contract on `pending_contexts`, this
-        // takes the second mutex while still holding `active_meetings`.
-        let applied_context = normalized_event_id
-            .as_deref()
-            .and_then(|cid| self.pending_contexts.remove(cid));
 
         // Best-effort v2 composition. We release `active_meetings`
         // before awaiting the factory because:
@@ -3370,5 +3408,51 @@ mod tests {
             1,
             "orphan live session shutdown invoked exactly once",
         );
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_is_none_without_context() {
+        let id = MeetingId::now_v7();
+        assert!(pre_meeting_briefing_for_v1(None, id).is_none());
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_is_none_for_empty_context() {
+        // A staged-but-empty `PreMeetingContext` (every field default)
+        // should not produce a stranded `## Pre-meeting context`
+        // header in the v1 summarizer prompt — the heron-llm template
+        // already suppresses empty briefings, but we suppress earlier
+        // here too so callers can rely on `Some`/`None` instead of
+        // re-checking emptiness.
+        let id = MeetingId::now_v7();
+        let ctx = PreMeetingContext::default();
+        assert!(pre_meeting_briefing_for_v1(Some(&ctx), id).is_none());
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_renders_populated_context() {
+        let id = MeetingId::now_v7();
+        let ctx = PreMeetingContext {
+            agenda: Some("Q3 launch readiness review".into()),
+            attendees_known: vec![heron_session::AttendeeContext {
+                name: "Alice".into(),
+                email: Some("alice@example.com".into()),
+                last_seen_in: None,
+                relationship: Some("CFO".into()),
+                notes: None,
+            }],
+            related_notes: vec!["meetings/2026-04-12.md".into()],
+            // `prior_decisions` is dropped by the heron_bot translation
+            // (the bot shape doesn't carry it); we still exercise it
+            // here so the test pins the lossy translation rather than
+            // regressing silently if a future render adds support.
+            prior_decisions: Vec::new(),
+            user_briefing: Some("Alice will push for slipping the date.".into()),
+        };
+        let rendered =
+            pre_meeting_briefing_for_v1(Some(&ctx), id).expect("populated context renders");
+        assert!(rendered.contains("Q3 launch readiness review"));
+        assert!(rendered.contains("Alice"));
+        assert!(rendered.contains("Alice will push for slipping the date."));
     }
 }

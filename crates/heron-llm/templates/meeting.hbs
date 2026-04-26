@@ -24,6 +24,18 @@ them into a single voice.
 Surface the most important content for someone who didn't attend.
 {{/if}}
 
+{{#if pre_meeting_briefing}}
+## Pre-meeting context
+
+The user staged the following context before this meeting (agenda,
+attendees, prior decisions, briefing notes). Treat it as background
+knowledge — the transcript is still authoritative for what was
+actually said. Use this context to disambiguate references, attribute
+attendees, and surface follow-ups against prior commitments.
+
+{{pre_meeting_briefing}}
+
+{{/if}}
 {{#if existing_action_items}}
 The following action items were generated from a prior summary of
 this meeting. Each has a stable `id`. **For items that you would
