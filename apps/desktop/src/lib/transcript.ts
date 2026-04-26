@@ -16,15 +16,33 @@
  * `time` is the absolute clock string as written in the .md
  * (`HH:MM:SS`); we keep it as text for display and do not need a
  * `Date` because we only render — we do not dedup.
+ *
+ * `is_low_confidence` is the §3.4 UI rule expressed against the
+ * markdown body: when the rendered .md only carries the speaker name
+ * (not the full JSONL `speaker_source` / `confidence` triple), the
+ * canonical low-confidence marker is `speaker == "them"` — the
+ * channel-fallback name produced by the Zoom aligner when AX didn't
+ * fire or overlap-confidence was below the §3.4 floor. We default to
+ * `false` for all other speakers since we can't observe `speaker_source`
+ * here. PR-κ documents this trade-off; richer channel-fallback signal
+ * (e.g. emitting `speaker_source` into the body) is a future PR.
  */
 export interface TranscriptSegment {
   time: string;
   speaker: string;
   text: string;
+  is_low_confidence: boolean;
 }
 
 /**
  * Consecutive same-speaker run.
+ *
+ * `is_low_confidence` is true when at least
+ * `LOW_CONFIDENCE_GROUP_FRACTION` of the run's segments are
+ * low-confidence. We pick a 50% majority because a single stray
+ * channel-fallback inside an otherwise AX-confident run shouldn't
+ * italicize the whole bubble, but a run that's mostly `them` should
+ * read as low-confidence at a glance.
  */
 export interface SpeakerGroup {
   speaker: string;
@@ -34,10 +52,39 @@ export interface SpeakerGroup {
   segments: TranscriptSegment[];
   /** Pre-joined text for convenience; respects the maxChars split. */
   combinedText: string;
+  /**
+   * Whether the run as a whole should render in italics per §3.4.
+   * Computed by [`groupBySpeaker`] from the underlying segments.
+   */
+  isLowConfidence: boolean;
 }
 
 const TRANSCRIPT_LINE = /^>\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+([^:]+?):\s*(.*)$/;
 const DEFAULT_MAX_CHARS = 512;
+/**
+ * Fraction of low-confidence segments needed to flip a [`SpeakerGroup`]
+ * into the italicized rendering. ≥0.5 reads as "majority"; we use `≥`
+ * (not `>`) so a single-segment `them` group still italicizes.
+ */
+export const LOW_CONFIDENCE_GROUP_FRACTION = 0.5;
+/**
+ * Canonical channel-fallback speaker name from `crates/heron-zoom`'s
+ * aligner — turns where AX didn't fire (or fell below the §3.4
+ * confidence floor) are rewritten to `speaker = "them"`. Compared
+ * case-insensitively because the markdown body is human-edited and a
+ * stray capitalization shouldn't suppress the low-confidence cue.
+ */
+const CHANNEL_FALLBACK_SPEAKER = "them";
+
+/**
+ * Apply the §3.4 channel-fallback heuristic to a single speaker name.
+ *
+ * Exposed so tests and the sidebar can reuse the same rule without
+ * re-deriving it.
+ */
+export function isLowConfidenceSpeaker(name: string): boolean {
+  return name.trim().toLowerCase() === CHANNEL_FALLBACK_SPEAKER;
+}
 
 /**
  * Parse `> HH:MM:SS Speaker: text` lines from a markdown body.
@@ -56,7 +103,13 @@ export function parseTranscriptLines(markdown: string): TranscriptSegment[] {
     const [, time, speaker, text] = m;
     const trimmedText = text.trim();
     if (!trimmedText) continue;
-    out.push({ time, speaker: speaker.trim(), text: trimmedText });
+    const trimmedSpeaker = speaker.trim();
+    out.push({
+      time,
+      speaker: trimmedSpeaker,
+      text: trimmedText,
+      is_low_confidence: isLowConfidenceSpeaker(trimmedSpeaker),
+    });
   }
   return out;
 }
@@ -83,29 +136,51 @@ export function groupBySpeaker(
         ? `${current.combinedText} ${seg.text}`
         : seg.text;
       if (candidate.length > maxChars) {
-        groups.push(current);
-        current = {
-          speaker: seg.speaker,
-          startTime: seg.time,
-          segments: [seg],
-          combinedText: seg.text,
-        };
+        groups.push(finalizeGroup(current));
+        current = newGroup(seg);
       } else {
         current.segments.push(seg);
         current.combinedText = candidate;
       }
     } else {
-      if (current) groups.push(current);
-      current = {
-        speaker: seg.speaker,
-        startTime: seg.time,
-        segments: [seg],
-        combinedText: seg.text,
-      };
+      if (current) groups.push(finalizeGroup(current));
+      current = newGroup(seg);
     }
   }
-  if (current) groups.push(current);
+  if (current) groups.push(finalizeGroup(current));
   return groups;
+}
+
+function newGroup(seg: TranscriptSegment): SpeakerGroup {
+  return {
+    speaker: seg.speaker,
+    startTime: seg.time,
+    segments: [seg],
+    combinedText: seg.text,
+    // Recomputed in `finalizeGroup` once all segments are in.
+    isLowConfidence: false,
+  };
+}
+
+/**
+ * Recompute `isLowConfidence` from the segment population. We do this
+ * at finalize time (rather than incrementally) so the §3.4 majority
+ * rule reflects the whole run; an early stray `them` segment in an
+ * otherwise AX-confident run shouldn't italicize prematurely if the
+ * group later overflows the maxChars threshold and gets split.
+ */
+function finalizeGroup(group: SpeakerGroup): SpeakerGroup {
+  if (group.segments.length === 0) {
+    group.isLowConfidence = false;
+    return group;
+  }
+  const lowConfidenceCount = group.segments.reduce(
+    (acc, seg) => acc + (seg.is_low_confidence ? 1 : 0),
+    0,
+  );
+  group.isLowConfidence =
+    lowConfidenceCount / group.segments.length >= LOW_CONFIDENCE_GROUP_FRACTION;
+  return group;
 }
 
 /**
