@@ -1,9 +1,9 @@
 /**
- * Home / dashboard route.
+ * Home / dashboard route — the post-onboarding landing surface.
  *
- * Acts as a smoke test for the React tree: clicking "Status" calls
- * the `heron_status` Tauri command via the typed `invoke` wrapper and
- * stores the response in Zustand.
+ * App.tsx routes returning users here when there's no `heron_last_note_session_id`
+ * to deep-link into a Review window, so the copy + affordances need to read as a
+ * "ready to record" state, not a scaffold.
  *
  * Phase 64 (PR-β) adds the "Start recording" entry point: it routes
  * through the consent gate (`useConsentStore.requestConsent()`) and,
@@ -16,6 +16,11 @@
  * threshold, a warning modal explains the shortfall and offers
  * "Continue anyway" / "Cancel" / "Open vault folder". Only on
  * confirm/override does the consent gate run.
+ *
+ * The Status / Onboarding / Settings links double as a diagnostic surface
+ * during dogfood: Status pretty-prints `heron_status` for FSM-state
+ * verification; Onboarding lets a user re-run the wizard manually until
+ * a Settings-side "Re-run onboarding" entry ships.
  */
 
 import { useState } from "react";
@@ -115,9 +120,9 @@ export default function Home() {
 
   return (
     <main className="p-6 space-y-4">
-      <h1 className="text-2xl font-semibold">Home</h1>
+      <h1 className="text-2xl font-semibold">Welcome back</h1>
       <p className="text-muted-foreground">
-        Foundation scaffold. The recording UX lands in PR-γ.
+        Start a meeting recording from the tray, hit ⌘⇧R, or use the button below.
       </p>
       <div className="flex gap-2 flex-wrap">
         <Button onClick={() => void onStart()}>Start recording</Button>
