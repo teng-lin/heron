@@ -92,6 +92,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+pub mod live_session;
+
 /// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
 /// a `MeetingId` from a vault-relative note path. The byte pattern
 /// is arbitrary but FIXED — changing it would re-key every meeting
