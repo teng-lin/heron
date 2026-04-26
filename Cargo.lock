@@ -2323,8 +2323,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "dirs 5.0.1",
+ "heron-cli",
  "heron-event",
  "heron-event-http",
+ "heron-llm",
  "heron-session",
  "heron-types",
  "heron-vault",
