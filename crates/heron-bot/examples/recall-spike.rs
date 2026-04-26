@@ -319,10 +319,19 @@ mod recall_api {
         }
 
         /// Per Recall's [bot status events docs](https://docs.recall.ai/docs/bot-status-change-events),
-        /// `bot.done` and `bot.fatal` are the only terminal codes.
-        /// `bot.call_ended` is NOT terminal — `bot.done` follows.
+        /// `done` / `fatal` (or `bot.done` / `bot.fatal` on the
+        /// webhook surface) are the only terminal codes. `call_ended`
+        /// is NOT terminal — `done` follows.
+        ///
+        /// SPIKE FINDING: Recall's REST `GET /bot/{id}/` returns
+        /// codes WITHOUT the `bot.` prefix the webhook docs show.
+        /// We accept both forms so the same code works against either
+        /// surface.
         pub fn is_terminal(&self) -> bool {
-            matches!(self.current_code(), Some("bot.done") | Some("bot.fatal"))
+            matches!(
+                self.current_code(),
+                Some("done" | "fatal" | "bot.done" | "bot.fatal")
+            )
         }
     }
 
@@ -916,7 +925,12 @@ async fn cmd_watch_eject(client: &recall_api::Client, bot_id: &str, poll_secs: u
                 let detail = &ok.body;
                 let new_changes = detail.status_changes.iter().skip(seen);
                 for change in new_changes {
-                    let terminal = matches!(change.code.as_str(), "bot.done" | "bot.fatal");
+                    // Same dual-form match as wait_for_in_call —
+                    // REST returns "done"/"fatal", webhooks push "bot.*".
+                    let terminal = matches!(
+                        change.code.as_str(),
+                        "done" | "fatal" | "bot.done" | "bot.fatal"
+                    );
                     println!(
                         "{}: code={} sub_code={:?} message={:?} terminal={terminal}",
                         change.created_at.to_rfc3339(),
@@ -1113,9 +1127,9 @@ async fn wait_for_in_call(
         };
         let code = detail.current_code().unwrap_or("(none)");
         tracing::debug!(state = code, "polling");
-        // Recall's documented in-call codes are bot.in_call_*; anything
-        // matching the prefix means audio I/O is now valid.
-        if code.starts_with("bot.in_call") {
+        // SPIKE FINDING: Recall's REST API returns codes WITHOUT the
+        // `bot.` prefix that the webhook docs show. Accept both forms.
+        if code.starts_with("in_call") || code.starts_with("bot.in_call") {
             return Ok(started.elapsed().as_millis());
         }
         if detail.is_terminal() {
@@ -1296,6 +1310,53 @@ mod tests {
     fn region_empty_string_treated_as_unset() -> Result<()> {
         let url = recall_api::resolve_region_url(Some(""))?;
         assert_eq!(url, "https://us-east-1.recall.ai");
+        Ok(())
+    }
+
+    /// Live spike (PR #85) discovered that Recall's REST `GET /bot/{id}/`
+    /// returns status codes WITHOUT the `bot.` prefix that the webhook
+    /// docs use. These tests pin the discovery so future code-changes
+    /// can't silently regress it.
+    #[test]
+    fn bot_detail_terminal_unprefixed_rest_form() -> Result<()> {
+        let json = json!({
+            "id": "bot_123",
+            "status_changes": [
+                { "code": "joining_call", "created_at": "2026-04-25T01:00:00Z" },
+                { "code": "done",         "created_at": "2026-04-25T01:05:00Z" }
+            ]
+        });
+        let detail: recall_api::BotDetail = serde_json::from_value(json)?;
+        assert!(detail.is_terminal(), "REST `done` must be terminal");
+        Ok(())
+    }
+
+    #[test]
+    fn bot_detail_terminal_prefixed_webhook_form() -> Result<()> {
+        let json = json!({
+            "id": "bot_123",
+            "status_changes": [
+                { "code": "bot.fatal", "created_at": "2026-04-25T01:05:00Z" }
+            ]
+        });
+        let detail: recall_api::BotDetail = serde_json::from_value(json)?;
+        assert!(detail.is_terminal(), "Webhook `bot.fatal` must be terminal");
+        Ok(())
+    }
+
+    #[test]
+    fn bot_detail_call_ended_is_not_terminal() -> Result<()> {
+        // Per Recall docs, `call_ended` is followed by `done`. Don't
+        // exit watch loops on `call_ended` or we'll miss the real end.
+        let json = json!({
+            "id": "bot_123",
+            "status_changes": [
+                { "code": "call_ended", "sub_code": "bot_received_leave_call",
+                  "created_at": "2026-04-25T01:05:00Z" }
+            ]
+        });
+        let detail: recall_api::BotDetail = serde_json::from_value(json)?;
+        assert!(!detail.is_terminal(), "`call_ended` must NOT be terminal");
         Ok(())
     }
 
