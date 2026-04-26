@@ -167,6 +167,20 @@ async fn heron_resummarize(vault_path: String, session_id: String) -> Result<Str
     resummarize::resummarize(Path::new(&vault_path), &session_id).await
 }
 
+/// Tauri command: PR-ξ (phase 76) preview the post-merge note for the
+/// diff modal. Runs the same summarize + §10.3 merge pipeline as
+/// [`heron_resummarize`] but never writes `<id>.md` and never rotates
+/// `<id>.md.bak` — the renderer compares the returned string against
+/// `heron_read_note` and the user clicks Apply (which fires
+/// [`heron_resummarize`]) or Cancel.
+#[tauri::command]
+async fn heron_resummarize_preview(
+    vault_path: String,
+    session_id: String,
+) -> Result<String, String> {
+    resummarize::resummarize_preview(Path::new(&vault_path), &session_id).await
+}
+
 /// Tauri command: report whether a `<id>.md.bak` exists. `Ok(None)` when
 /// no backup is on disk — the steady-state case after a save without
 /// a re-summarize.
@@ -593,6 +607,7 @@ pub fn run() {
             heron_write_note_atomic,
             heron_list_sessions,
             heron_resummarize,
+            heron_resummarize_preview,
             heron_check_backup,
             heron_restore_backup,
             heron_test_microphone,

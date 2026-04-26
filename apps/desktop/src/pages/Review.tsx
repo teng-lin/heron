@@ -11,10 +11,18 @@
  * - Re-summarize button + confirmation dialog.
  * - `.md.bak` rollback pill — visible only when a backup is on disk.
  *
+ * Phase 76 (PR-ξ) brings the diff-view-before-accepting checkbox
+ * forward from §15 v1.1: the Re-summarize flow now confirms, fetches
+ * the post-merge preview via `heron_resummarize_preview` (read-only),
+ * shows a side-by-side diff modal, and only writes when the user
+ * clicks Apply — which fires `heron_resummarize` (rotate + write).
+ * Cancel discards the preview without touching disk.
+ *
  * Out of scope (deferred per plan.md §15):
- * - Diff modal between old/new summary.
  * - Edit history beyond a single `.md.bak`.
  * - Live audio playback while recording (only finalized files).
+ * - Inline (non-split) diff toggle, ignore-whitespace toggle.
+ * - Three-way diff against `.md.bak`.
  *
  * The vault path comes from `useSettingsStore`; the cache root is
  * resolved once via `heron_default_cache_root` and cached on the
@@ -34,6 +42,7 @@ import { TranscriptView } from "../components/TranscriptView";
 import { PlaybackBar, type PlaybackBarHandle } from "../components/PlaybackBar";
 import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { ResummarizeDialog } from "../components/ResummarizeDialog";
+import { ResummarizeDiffModal } from "../components/ResummarizeDiffModal";
 import { Button } from "../components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { invoke, type BackupInfo } from "../lib/invoke";
@@ -112,13 +121,58 @@ export default function Review() {
 
   // `.md.bak` backup state for the Restore pill.
   const [backup, setBackup] = useState<BackupInfo | null>(null);
-  // Re-summarize dialog open state + in-flight flag.
+  // PR-ξ (phase 76) Re-summarize flow has three open-states:
+  //   1. `resummarizeOpen`  — initial confirmation dialog.
+  //   2. `diffOpen`         — diff modal (spinner → preview → Apply).
+  //   3. neither            — idle.
+  // And two in-flight flags that disable buttons during invokes:
+  //   - `previewInFlight`   — `heron_resummarize_preview` running.
+  //   - `applyInFlight`     — `heron_resummarize` running.
+  // Splitting them lets the diff modal show the spinner during
+  // preview-fetch and disable buttons during apply, without each
+  // phase having to know about the other's invoke state.
   const [resummarizeOpen, setResummarizeOpen] = useState(false);
-  const [resummarizing, setResummarizing] = useState(false);
+  const [previewInFlight, setPreviewInFlight] = useState(false);
+  const [applyInFlight, setApplyInFlight] = useState(false);
+  // `diffPreview` is `null` while the preview invoke is running (the
+  // modal renders a spinner) and the rendered post-merge string once
+  // it resolves. `diffCurrent` is the body the editor was last
+  // mounted against — captured at preview time so the comparison is
+  // against the version the user actually sees, not whatever a
+  // concurrent save might have written between Confirm and the modal
+  // opening.
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [diffPreview, setDiffPreview] = useState<string | null>(null);
+  const [diffCurrent, setDiffCurrent] = useState<string | null>(null);
+  // AbortController for the in-flight preview invoke. Cancel during
+  // the loading window aborts the underlying invoke promise so a
+  // wasted summarizer call doesn't keep running after the user
+  // bailed — and a stale preview can't land on the modal after the
+  // user closed it (we drop the result if `signal.aborted`).
+  const previewAbortRef = useRef<AbortController | null>(null);
+  // Aggregate flag the toolbar Re-summarize button reads to disable
+  // itself across the whole flow (open the confirmation dialog,
+  // preview fetch, diff modal, apply commit). Computed rather than
+  // stored so it can never drift out of sync with the underlying flags.
+  const resummarizeBusy =
+    resummarizeOpen || diffOpen || previewInFlight || applyInFlight;
 
   useEffect(() => {
     void ensureLoaded();
   }, [ensureLoaded]);
+
+  // PR-ξ (phase 76): abort any in-flight preview invoke on unmount.
+  // Without this, navigating away from `/review/<id>` while the
+  // summarizer is still running leaves the controller in the ref and
+  // the eventual promise resolution updates state on a dead
+  // component. The abort signals "drop the result on the floor"
+  // (the underlying Tauri invoke can't truly cancel — see
+  // `onCancelDiff`'s comment for the rationale).
+  useEffect(() => {
+    return () => {
+      previewAbortRef.current?.abort();
+    };
+  }, []);
 
   // Resolve the cache root once on mount. The fallback to `""` on
   // failure means the playback bar and diagnostics panel both render
@@ -255,12 +309,30 @@ export default function Review() {
     return () => window.removeEventListener("keydown", handler);
   }, [save]);
 
+  // PR-ξ (phase 76) Confirm-button handler. Replaces the previous
+  // direct `heron_resummarize` call with a two-step flow:
+  //   1. Flush any unsaved edits to disk.
+  //   2. Read the current note + fetch the post-merge preview in
+  //      parallel.
+  //   3. Open the diff modal and let the user click Apply or Cancel.
+  // The actual write happens in `onApplyResummarize` below.
   const onConfirmResummarize = useCallback(async () => {
     if (!vaultRoot || !sessionId) {
       toast.error("No vault configured — cannot re-summarize.");
       return;
     }
-    setResummarizing(true);
+    // If a previous preview was somehow still in flight (e.g. user
+    // hit Cancel and re-opened fast), abort it so its result can't
+    // race the new one onto the modal.
+    previewAbortRef.current?.abort();
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
+
+    setPreviewInFlight(true);
+    // Reset modal state up-front so a re-open after a previous
+    // Cancel doesn't briefly flash the stale preview.
+    setDiffPreview(null);
+    setDiffCurrent(null);
     try {
       // Flush any unsaved editor edits to disk first. The Rust side
       // reads `<id>.md` from disk to seed the merge — without this
@@ -272,6 +344,56 @@ export default function Review() {
       if (live !== undefined) {
         await save(live);
       }
+      // Close the confirmation dialog and open the diff modal with
+      // the spinner state — the preview fetch then resolves into it.
+      setResummarizeOpen(false);
+      setDiffOpen(true);
+      // Fetch current body + preview in parallel. The current-body
+      // fetch is local + fast; the preview can take 5–30s. Doing
+      // them in parallel rather than sequentially shaves the local
+      // read time off the perceived latency.
+      const [currentBody, previewBody] = await Promise.all([
+        invoke("heron_read_note", { vaultPath: vaultRoot, sessionId }),
+        invoke("heron_resummarize_preview", {
+          vaultPath: vaultRoot,
+          sessionId,
+        }),
+      ]);
+      // Drop the result if the user already clicked Cancel — the
+      // modal is closed and updating state would flash stale data
+      // if the user re-opens later.
+      if (controller.signal.aborted) return;
+      setDiffCurrent(currentBody);
+      setDiffPreview(previewBody);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Re-summarize failed: ${message}`);
+      // Close the diff modal on error — there's nothing to show.
+      setDiffOpen(false);
+    } finally {
+      // Only clear the flag if THIS controller is still the active
+      // one. If the user cancelled and started a fresh preview, a
+      // new controller has already taken over — clearing here would
+      // falsely claim that fresh fetch is no longer in flight.
+      if (previewAbortRef.current === controller) {
+        setPreviewInFlight(false);
+      }
+    }
+  }, [vaultRoot, sessionId, save]);
+
+  // PR-ξ (phase 76) Apply-button handler. Fires `heron_resummarize`
+  // (which rotates `.md.bak` and writes the merged body), updates
+  // the editor, and closes the diff modal. The diff library renders
+  // a strict view of two strings — the user has already approved
+  // the bytes; this just commits them.
+  const onApplyResummarize = useCallback(async () => {
+    if (!vaultRoot || !sessionId) {
+      toast.error("No vault configured — cannot re-summarize.");
+      return;
+    }
+    setApplyInFlight(true);
+    try {
       const newBody = await invoke("heron_resummarize", {
         vaultPath: vaultRoot,
         sessionId,
@@ -287,14 +409,38 @@ export default function Review() {
       setSavedKey((k) => k + 1);
       await refreshBackup();
       toast.success("Re-summarized");
-      setResummarizeOpen(false);
+      setDiffOpen(false);
+      setDiffPreview(null);
+      setDiffCurrent(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error(`Re-summarize failed: ${message}`);
     } finally {
-      setResummarizing(false);
+      setApplyInFlight(false);
     }
-  }, [vaultRoot, sessionId, refreshBackup, save]);
+  }, [vaultRoot, sessionId, refreshBackup]);
+
+  // Cancel handler for the diff modal: drops the preview result and
+  // closes the modal. We can't truly cancel an in-flight Tauri
+  // `invoke` (the underlying summarizer call keeps running on the
+  // Rust side until it completes), but the AbortController acts as
+  // a "drop result on the floor" signal — the controller's
+  // `aborted` flag prevents the late-resolving promise from
+  // updating React state into a closed modal.
+  //
+  // We also clear `previewInFlight` immediately so the toolbar
+  // Re-summarize button re-enables. Letting the user start a fresh
+  // preview while the cancelled one is still grinding away is the
+  // intended UX — the cancelled call's eventual result is discarded
+  // by the aborted-check above.
+  const onCancelDiff = useCallback(() => {
+    previewAbortRef.current?.abort();
+    previewAbortRef.current = null;
+    setPreviewInFlight(false);
+    setDiffOpen(false);
+    setDiffPreview(null);
+    setDiffCurrent(null);
+  }, []);
 
   const onRestoreBackup = useCallback(async () => {
     if (!vaultRoot || !sessionId) return;
@@ -347,7 +493,7 @@ export default function Review() {
                   variant="outline"
                   size="sm"
                   onClick={() => setResummarizeOpen(true)}
-                  disabled={!vaultRoot || !sessionId || resummarizing}
+                  disabled={!vaultRoot || !sessionId || resummarizeBusy}
                   title="Re-summarize this note (current body backs up to .md.bak)"
                 >
                   <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
@@ -496,7 +642,24 @@ export default function Review() {
         open={resummarizeOpen}
         onOpenChange={setResummarizeOpen}
         onConfirm={onConfirmResummarize}
-        loading={resummarizing}
+        loading={previewInFlight}
+      />
+      {/* PR-ξ (phase 76) diff modal. The `open` -> `setDiffOpen(false)`
+          path goes through `onCancelDiff` so an Escape / overlay
+          click also aborts any in-flight preview invoke. */}
+      <ResummarizeDiffModal
+        open={diffOpen}
+        onOpenChange={(next) => {
+          if (next) {
+            setDiffOpen(true);
+          } else {
+            onCancelDiff();
+          }
+        }}
+        currentBody={diffCurrent}
+        preview={diffPreview}
+        applying={applyInFlight}
+        onApply={onApplyResummarize}
       />
     </div>
   );

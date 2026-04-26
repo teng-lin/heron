@@ -25,4 +25,6 @@ pub use id_match::{LayerTwoMatch, MIN_SIMILARITY, apply_matches, match_action_it
 pub use merge::{MergeInputs, MergeOutcome, merge, merge_action_items, merge_attendees};
 pub use purge::{PurgeOutcome, purge_after_verify};
 pub use validate::{Issue, validate_vault};
-pub use writer::{PriorItems, VaultError, VaultWriter, atomic_write, read_note, read_prior_items};
+pub use writer::{
+    PriorItems, VaultError, VaultWriter, atomic_write, read_note, read_prior_items, render_note,
+};

@@ -1,10 +1,15 @@
-//! Re-summarize + `.md.bak` rollback backend per §15 PR-ε (phase 67).
+//! Re-summarize + `.md.bak` rollback backend per §15 PR-ε (phase 67),
+//! plus the §15 v1.1 diff-modal preview surface added by PR-ξ (phase 76).
 //!
 //! Wraps [`heron_cli::summarize::re_summarize_in_vault`] for the Tauri
 //! Re-summarize button and adds two companion commands —
 //! [`check_backup`] and [`restore_backup`] — that surface the
 //! `<note>.md.bak` rotation [`heron_vault::VaultWriter::re_summarize`]
-//! creates so the Review UI can offer a one-click rollback.
+//! creates so the Review UI can offer a one-click rollback. The
+//! [`resummarize_preview`] entry point added in PR-ξ runs the full
+//! summarize + §10.3 merge + render pipeline **without** rotating or
+//! writing, so the renderer can show a side-by-side diff modal before
+//! the user commits.
 //!
 //! ## Why a module separate from `notes.rs`?
 //!
@@ -23,7 +28,7 @@
 //!
 //! ## Errors
 //!
-//! All four entry points return `Result<_, String>` so the React side
+//! All entry points return `Result<_, String>` so the React side
 //! can render the failure as a Sonner toast verbatim, matching the
 //! `notes::read_note` / `settings::*` convention.
 
@@ -32,8 +37,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tokio::fs;
 
+use heron_cli::session::{Orchestrator, SessionConfig, SessionError};
 use heron_cli::summarize::re_summarize_in_vault;
-use heron_llm::{Preference, select_summarizer};
+use heron_llm::{Preference, Summarizer, select_summarizer};
+use heron_types::Frontmatter;
+use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note};
 
 use crate::notes::{resolve_note_path, resolve_vault_path, validate_session_id};
 
@@ -74,6 +82,139 @@ pub struct BackupInfo {
     pub created_at: String,
 }
 
+/// Build a real summarizer + run [`Orchestrator::re_summarize_note`]
+/// against `<vault>/<session_id>.md`, returning the rendered post-merge
+/// note (frontmatter + body) the renderer should display.
+///
+/// **Read-only**: the helper reads the current note, the optional
+/// `.md.bak`, and the transcript, but never writes to disk and never
+/// rotates the backup. [`resummarize_preview`] is the only caller —
+/// the apply path stays on [`re_summarize_in_vault`] because that
+/// function bundles the rotate + atomic_write through
+/// `heron_vault`'s private `atomic_copy` helper, which we'd otherwise
+/// have to duplicate at the desktop layer. Going through
+/// [`heron_vault::render_note`] + [`heron_vault::merge`] keeps the
+/// preview byte-identical to what `re_summarize_in_vault` would
+/// write modulo non-determinism in the LLM's output (the LLM is
+/// re-invoked on Apply; see PR-ξ for that trade-off rationale).
+///
+/// The merge runs against `(base = .md.bak ?? ours, ours = current,
+/// theirs = LLM output)` per §10.3 so the rendered preview reflects the
+/// same four-bucket ownership model the writer enforces — user-edited
+/// fields survive, untouched fields refresh.
+async fn summarize_body(vault: &Path, session_id: &str) -> Result<String, String> {
+    let note_path = resolve_note_path(vault, session_id, true).await?;
+    let canonical_vault = resolve_vault_path(vault).await?;
+
+    // Build a real summarizer per `Preference::Auto`. The selector
+    // chooses anthropic if `ANTHROPIC_API_KEY` is set, falling back
+    // to `claude` / `codex` CLIs if they're on PATH. Errors surface
+    // verbatim so the Review UI can render an actionable toast
+    // ("set ANTHROPIC_API_KEY", "install claude-code", etc).
+    let (summarizer, _backend, _reason) =
+        select_summarizer(Preference::Auto).map_err(|e| format!("LLM backend: {e}"))?;
+
+    let (ours_fm, ours_body) =
+        vault_read_note(&note_path).map_err(|e| format!("read {}: {}", note_path.display(), e))?;
+
+    // `Path::join` returns the pushed path unchanged when it's
+    // absolute, so this single call covers both the vault-relative
+    // (default) and hand-edited-absolute (escape hatch) cases — same
+    // policy `heron_cli::summarize::re_summarize_in_vault` applies.
+    let transcript = canonical_vault.join(&ours_fm.transcript);
+    if !transcript.exists() {
+        return Err(format!(
+            "transcript {} not found (frontmatter.transcript = {}); \
+             the note's recorded transcript path no longer resolves on disk",
+            transcript.display(),
+            ours_fm.transcript.display()
+        ));
+    }
+
+    let output = run_summarize(
+        summarizer.as_ref(),
+        &canonical_vault,
+        &note_path,
+        ours_fm.meeting_type,
+        &transcript,
+    )
+    .await?;
+
+    // Build `theirs_frontmatter` for the §10.3 merge identical to
+    // `re_summarize_in_vault`'s overlay: keep heron-managed fields
+    // (date / start / duration / source_app / recording / transcript /
+    // diarize_source / disclosed / extra) intact from the current
+    // note, and overlay the fields the LLM is authoritative for.
+    let theirs_fm = Frontmatter {
+        company: output.company,
+        meeting_type: output.meeting_type,
+        tags: output.tags,
+        action_items: output.action_items,
+        attendees: output.attendees,
+        cost: output.cost,
+        ..ours_fm.clone()
+    };
+
+    // Read the optional `.md.bak` baseline for the 3-way merge. When
+    // none exists (first re-summarize) `base = ours` per the merge-
+    // model contract — every llm_inferred decision then collapses to
+    // "user untouched, theirs wins", matching what the vault writer
+    // does on the same input.
+    let bak_path = resolve_bak_path(vault, session_id).await?;
+    let (base_fm, base_body) = if bak_path.exists() {
+        vault_read_note(&bak_path).map_err(|e| format!("read {}: {}", bak_path.display(), e))?
+    } else {
+        (ours_fm.clone(), ours_body.clone())
+    };
+
+    let outcome = merge(MergeInputs {
+        base: &base_fm,
+        ours: &ours_fm,
+        theirs: &theirs_fm,
+        base_body: &base_body,
+        ours_body: &ours_body,
+        theirs_body: &output.body,
+    });
+
+    // Routing through `heron_vault::render_note` (the same renderer
+    // `VaultWriter::re_summarize` calls) guarantees the preview the
+    // user approves in the diff modal is byte-identical to what
+    // [`resummarize`] eventually writes — even if a future heron-vault
+    // change tweaks the YAML serializer or fence convention.
+    render_note(&outcome.frontmatter, &outcome.body).map_err(|e| format!("render preview: {e}"))
+}
+
+/// Invoke the orchestrator's `re_summarize_note` against a real
+/// summarizer, returning the LLM's `SummarizerOutput`.
+///
+/// Split out so the [`resummarize_preview_does_not_touch_disk`] test
+/// could in principle stub the call without faking the whole vault
+/// state. Today the production path drives this with a real
+/// `select_summarizer` instance — the helper is a thin shim around
+/// [`Orchestrator::re_summarize_note`] that fixes the `SessionConfig`
+/// fields the orchestrator doesn't read on a re-summarize (cache_dir,
+/// session_id) to inert defaults.
+async fn run_summarize(
+    summarizer: &dyn Summarizer,
+    vault_root: &Path,
+    note_path: &Path,
+    meeting_type: heron_types::MeetingType,
+    transcript: &Path,
+) -> Result<heron_llm::SummarizerOutput, String> {
+    let cfg = SessionConfig {
+        session_id: uuid::Uuid::nil(),
+        target_bundle_id: String::new(),
+        cache_dir: PathBuf::new(),
+        vault_root: vault_root.to_path_buf(),
+        stt_backend_name: "sherpa".into(),
+        llm_preference: Preference::Auto,
+    };
+    let orch = Orchestrator::new(cfg);
+    orch.re_summarize_note(summarizer, note_path, meeting_type, transcript)
+        .await
+        .map_err(|e: SessionError| format!("re-summarize: {e}"))
+}
+
 /// Re-summarize `<vault>/<session_id>.md` in place, returning the new
 /// body the Review editor should render.
 ///
@@ -93,11 +234,6 @@ pub async fn resummarize(vault: &Path, session_id: &str) -> Result<String, Strin
     let note_path = resolve_note_path(vault, session_id, true).await?;
     let canonical_vault = resolve_vault_path(vault).await?;
 
-    // Build a real summarizer per `Preference::Auto`. The selector
-    // chooses anthropic if `ANTHROPIC_API_KEY` is set, falling back
-    // to `claude` / `codex` CLIs if they're on PATH. Errors surface
-    // verbatim so the Review UI can render an actionable toast
-    // ("set ANTHROPIC_API_KEY", "install claude-code", etc).
     let (summarizer, _backend, _reason) =
         select_summarizer(Preference::Auto).map_err(|e| format!("LLM backend: {e}"))?;
 
@@ -114,6 +250,28 @@ pub async fn resummarize(vault: &Path, session_id: &str) -> Result<String, Strin
     fs::read_to_string(&note_path)
         .await
         .map_err(|e| format!("read {}: {}", note_path.display(), e))
+}
+
+/// Compute the post-merge note **without** rotating `.md.bak` or
+/// writing to disk — the data the diff modal's right pane shows.
+///
+/// PR-ξ (phase 76) lifts the diff-view-before-accepting checkbox from
+/// `plan.md` §15 v1.1 forward. The flow is:
+///
+/// 1. Renderer fires [`resummarize_preview`] from the confirmation
+///    dialog's onConfirm.
+/// 2. Spinner shows while the summarizer runs (5–30s on a real LLM).
+/// 3. Modal renders the current `<id>.md` body on the left and the
+///    string returned here on the right.
+/// 4. On Apply: renderer fires [`resummarize`] which rotates + writes.
+/// 5. On Cancel: renderer drops the preview; nothing changes on disk.
+///
+/// Disk safety: this command **must not** write `<id>.md`,
+/// **must not** create `<id>.md.bak`, and **must not** mutate any
+/// existing file under the vault. The `resummarize_preview_does_not_touch_disk`
+/// test anchors all three invariants.
+pub async fn resummarize_preview(vault: &Path, session_id: &str) -> Result<String, String> {
+    summarize_body(vault, session_id).await
 }
 
 /// Return the `.md.bak`'s modification time as an ISO-8601 string,
@@ -320,5 +478,107 @@ mod tests {
                 .expect_err(&format!("must reject {evil}"));
             assert!(!err.is_empty());
         }
+    }
+
+    /// PR-ξ (phase 76): `resummarize_preview` rejects the same
+    /// traversal payloads `resolve_note_path` rejects. Defense in
+    /// depth — the validator runs identically on the preview path
+    /// and the write path so a renderer bug can't only break one
+    /// side. We don't need a vault to be stood up for this test;
+    /// the validator is the first thing each call hits.
+    #[tokio::test]
+    async fn resummarize_preview_rejects_traversal() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path();
+        for evil in ["..", ".", "../etc/passwd", "foo/bar", ""] {
+            let err = resummarize_preview(vault, evil)
+                .await
+                .expect_err(&format!("must reject {evil}"));
+            assert!(!err.is_empty());
+        }
+    }
+
+    /// PR-ξ (phase 76): the preview command surfaces a clear error
+    /// when the note is empty / has no frontmatter, instead of
+    /// hanging or returning a confusing summarize-pipeline error.
+    /// This is the precondition the Review UI's empty-result branch
+    /// relies on — without the upfront read, an empty note would
+    /// surface only after the summarizer ran (5–30s wasted).
+    #[tokio::test]
+    async fn resummarize_preview_errors_on_missing_frontmatter() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path();
+        // Note exists but has no `---` fence — `vault_read_note`
+        // surfaces `MissingFrontmatter`, which we wrap into the
+        // "read <path>: ..." string the renderer toasts.
+        seed_note(vault, "note", "no frontmatter here").await;
+        let err = resummarize_preview(vault, "note")
+            .await
+            .expect_err("malformed note must error");
+        assert!(!err.is_empty());
+    }
+
+    /// PR-ξ (phase 76) core invariant: the preview path **never**
+    /// writes to disk. Even when the LLM call fails (the common case
+    /// in CI without `ANTHROPIC_API_KEY`), the original `<id>.md`
+    /// must be byte-identical to its pre-call contents and no
+    /// `<id>.md.bak` may have been created.
+    ///
+    /// We can't easily inject a real summarizer in a unit test
+    /// without a live backend, so this asserts the disk invariant
+    /// across the failure paths the CI runner actually hits — every
+    /// failure mode in the preview pipeline runs **before** any
+    /// filesystem mutation, which is the property the test pins.
+    #[tokio::test]
+    async fn resummarize_preview_does_not_touch_disk() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path();
+        // Seed a real note + transcript so the preview call gets as
+        // far as the summarizer. The body+frontmatter are valid YAML
+        // so `vault_read_note` succeeds; the summarizer will then
+        // either fail (no API key + no CLI on PATH) or run, and in
+        // either case the disk must not change.
+        let original_body = "---\n\
+date: 2025-01-01\n\
+start: \"09:00\"\n\
+duration_min: 30\n\
+source_app: us.zoom.xos\n\
+recording: rec.m4a\n\
+transcript: transcript.txt\n\
+diarize_source: ax_observer\n\
+disclosed: false\n\
+company: null\n\
+meeting_type: other\n\
+tags: []\n\
+action_items: []\n\
+attendees: []\n\
+cost: null\n\
+---\n# Body\n";
+        fs::write(vault.join("note.md"), original_body)
+            .await
+            .expect("seed note");
+        fs::write(vault.join("transcript.txt"), "stub transcript")
+            .await
+            .expect("seed transcript");
+
+        // The call may succeed (live backend) or fail (no API key,
+        // no CLI on PATH); either way, the disk invariants below
+        // must hold.
+        let _ = resummarize_preview(vault, "note").await;
+
+        // `<id>.md` must be byte-identical — no rotate, no merge-
+        // and-write side effect.
+        let on_disk = fs::read_to_string(vault.join("note.md"))
+            .await
+            .expect("read note");
+        assert_eq!(on_disk, original_body, "preview must not modify <id>.md",);
+
+        // `<id>.md.bak` must not have been created.
+        let bak = vault.join("note.md.bak");
+        assert!(
+            !bak.exists(),
+            "preview must not create <id>.md.bak (found {})",
+            bak.display(),
+        );
     }
 }
