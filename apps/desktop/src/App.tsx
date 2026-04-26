@@ -27,10 +27,11 @@
  * events into `react-router`'s `useNavigate`.
  *
  * `useSalvagePrompt()` runs once on mount: scans the cache for
- * unfinalized sessions and pops a Sonner banner with a "Open Salvage"
- * action button when there are any. The auto-redirect is intentionally
- * NOT done — the user might want to use the app for something else
- * first.
+ * unfinalized sessions and feeds the count into the salvage prompt
+ * store, which drives the persistent `<SalvageBanner />` at the top of
+ * the app shell (PR-ν / phase 75 — replaces the previous Sonner
+ * toast). The auto-redirect is intentionally NOT done — the user might
+ * want to use the app for something else first.
  */
 
 import { useEffect, useState } from "react";
@@ -39,6 +40,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import ConsentGate from "./components/ConsentGate";
+import SalvageBanner from "./components/SalvageBanner";
 import { useTrayNav } from "./hooks/useTrayNav";
 import { invoke, type DegradedPayload } from "./lib/invoke";
 import { resolvePostOnboardingDestination } from "./lib/postOnboardingDestination";
@@ -59,6 +61,14 @@ export default function App() {
 
   return (
     <>
+      {/*
+       * Phase 75 (PR-ν): the persistent salvage banner sits above the
+       * route switch so it's visible from any page until the user
+       * either opens `/salvage` or explicitly dismisses it. The
+       * component renders nothing when there's nothing to salvage —
+       * see `SalvageBanner.tsx` for the visibility rules.
+       */}
+      <SalvageBanner />
       <Routes>
         <Route path="/" element={<FirstRunGate />} />
         <Route path="/home" element={<Home />} />
@@ -157,11 +167,17 @@ function FirstRunGate() {
 }
 
 /**
- * On app mount, scan the cache for unfinalized sessions; if any are
- * found, pop a Sonner banner with an action button that navigates to
- * `/salvage`. The store-tracked `promptedThisSession` flag prevents
- * the banner from re-firing on every StrictMode remount + Vite
- * hot-reload.
+ * On app mount, scan the cache for unfinalized sessions and feed the
+ * count into the salvage prompt store. The persistent
+ * `<SalvageBanner />` (mounted at the top of the app shell) reads the
+ * count and renders itself iff > 0 and the user hasn't dismissed it
+ * this launch.
+ *
+ * Phase 75 (PR-ν) note. The previous draft popped a Sonner toast
+ * directly from this hook. Toasts auto-dismiss after ~10 s and are
+ * easy to miss when the user is mid-task; we replaced the surface
+ * with a sticky banner. The scan logic itself is unchanged — only the
+ * presentation moved into a component the store now drives.
  *
  * IPC failures are intentionally swallowed (logged only) — we'd
  * rather miss the prompt than block startup with a recovery toast
@@ -172,13 +188,11 @@ function FirstRunGate() {
  * before either resolves the `await invoke(...)` — so the outer
  * `useEffect` guard is necessary but not sufficient. The flag is
  * re-checked imperatively *after* the IPC resolves (via
- * `useSalvagePromptStore.getState()`) and the mark-then-toast write
+ * `useSalvagePromptStore.getState()`) and the mark-then-set write
  * is atomic against any prior winner. The result is exactly one
- * toast per app launch, even under StrictMode.
+ * scan per app launch, even under StrictMode.
  */
 function useSalvagePrompt() {
-  const navigate = useNavigate();
-
   useEffect(() => {
     if (useSalvagePromptStore.getState().promptedThisSession) {
       return;
@@ -191,44 +205,29 @@ function useSalvagePrompt() {
           return;
         }
         // Re-check the store: a sibling effect run (StrictMode) may
-        // have already marked the prompt. We claim the toast only if
+        // have already marked the prompt. We claim the write only if
         // we're the first to flip the flag; subsequent runs see the
-        // flag set and bail without firing a duplicate toast.
+        // flag set and bail without re-running the scan.
         if (useSalvagePromptStore.getState().promptedThisSession) {
           return;
         }
-        useSalvagePromptStore.getState().markPrompted();
-        if (sessions.length === 0) {
-          return;
-        }
-        const count = sessions.length;
-        toast(
-          `${count} session${count === 1 ? "" : "s"} need recovery`,
-          {
-            description:
-              "Open Salvage to recover or purge cached recordings.",
-            action: {
-              label: "Open Salvage",
-              onClick: () => navigate("/salvage"),
-            },
-            duration: 10_000,
-          },
-        );
+        useSalvagePromptStore.getState().markPrompted(sessions.length);
       } catch (err) {
         // The scan never throws on a missing cache root, so this
         // branch only fires for serious IPC / IO failures. Log and
-        // mark prompted so we don't keep retrying on every remount.
+        // mark prompted (with count = 0) so we don't keep retrying
+        // on every remount.
         // eslint-disable-next-line no-console
         console.warn("[heron] salvage scan failed:", err);
-        useSalvagePromptStore.getState().markPrompted();
+        useSalvagePromptStore.getState().markPrompted(0);
       }
     })();
     return () => {
       cancelled = true;
     };
-    // `navigate` is stable across renders; intentionally one-shot
-    // for the lifetime of the app. The store is read imperatively
-    // inside the effect so we don't need to subscribe.
+    // Intentionally one-shot for the lifetime of the app. The store
+    // is read imperatively inside the effect so we don't need to
+    // subscribe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 }

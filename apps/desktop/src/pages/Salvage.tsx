@@ -14,6 +14,14 @@
  *   - **Purge** — confirmation dialog ("permanent") → calls
  *     `heron_purge_session` → row is removed from the list on success.
  *
+ * Phase 75 (PR-ν) extends the page with a **Purge all** affordance —
+ * a top-right button gated behind a two-step confirmation modal that
+ * iterates the list calling `heron_purge_session` per session_id with
+ * `Promise.allSettled` (so a single failure doesn't abort the rest).
+ * The store-tracked unfinalized count is kept in sync so the
+ * `<SalvageBanner />` in the app shell disappears as soon as the list
+ * empties.
+ *
  * The dialogs use Radix Dialog (same pattern as `ConsentGate.tsx`)
  * and Sonner toasts mirror the Settings pane's success/error
  * conventions. There is no batch-recovery surface, no diff modal —
@@ -32,6 +40,7 @@ import {
   type Settings,
   type UnfinalizedSession,
 } from "../lib/invoke";
+import { useSalvagePromptStore } from "../store/salvage";
 
 /** Pretty-print a byte count using IEC 1024-based units. */
 function formatBytes(bytes: number): string {
@@ -46,6 +55,27 @@ function formatBytes(bytes: number): string {
   return exponent === 0
     ? `${value.toFixed(0)} ${units[exponent]}`
     : `${value.toFixed(1)} ${units[exponent]}`;
+}
+
+/** Pluralise the noun "session" against an integer count. */
+function sessionsNoun(count: number): string {
+  return count === 1 ? "session" : "sessions";
+}
+
+/**
+ * Compact summary of a failure list for a Sonner toast description.
+ * The toast is single-line by default and a 30-row purge with full
+ * error messages would push other toasts off-screen; we cap to the
+ * first three ids and append "+N more" when truncated. Full details
+ * land in `console.warn` for power-user diagnosis.
+ */
+function summariseFailedIds(ids: readonly string[]): string {
+  const MAX_INLINE = 3;
+  if (ids.length <= MAX_INLINE) {
+    return ids.join(", ");
+  }
+  const head = ids.slice(0, MAX_INLINE).join(", ");
+  return `${head} (+${ids.length - MAX_INLINE} more)`;
 }
 
 /** Format an ISO 8601 timestamp for the row header. */
@@ -69,9 +99,20 @@ interface ConfirmTarget {
 
 export default function Salvage() {
   const navigate = useNavigate();
+  const setUnfinalizedCount = useSalvagePromptStore(
+    (s) => s.setUnfinalizedCount,
+  );
   const [sessions, setSessions] = useState<UnfinalizedSession[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<ConfirmTarget | null>(null);
+  // Two-step "Purge all" confirmation gate (PR-ν / phase 75). `null`
+  // means the modal is closed; `true` means the user clicked "Purge
+  // all" and is now looking at the destructive-confirm pane.
+  const [purgeAllOpen, setPurgeAllOpen] = useState(false);
+  // Track a "batch in progress" flag so per-row buttons disable while
+  // the bulk purge is running — interleaved per-row + batch operations
+  // would race the `setSessions` writes below.
+  const [batchInFlight, setBatchInFlight] = useState(false);
   // Track *every* in-flight operation by session id so two concurrent
   // recover/purge calls on different rows don't clobber each other's
   // disabled state. A `Set` keeps the per-row check O(1).
@@ -93,6 +134,34 @@ export default function Salvage() {
     });
   }
 
+  /**
+   * Drop the named session ids from the visible list. The companion
+   * effect below mirrors the new length into the salvage-prompt store
+   * so the app-shell `<SalvageBanner />` stays in sync without any
+   * caller having to remember the second call.
+   *
+   * Pulled out so the per-row + batch handlers all share one
+   * mutation point and the effect's `sessions` dep covers every
+   * removal path (initial scan, single-row purge, single-row recover,
+   * batch purge).
+   */
+  function removeSessions(ids: ReadonlySet<string>) {
+    setSessions((prev) => (prev ?? []).filter((s) => !ids.has(s.session_id)));
+  }
+
+  // Mirror the visible-list length into the prompt store so a
+  // `<SalvageBanner />` mounted in the app shell sees the same count
+  // we render here. Skipping the write while `sessions === null` (the
+  // pre-scan state) avoids stomping on the count the App-mount scan
+  // wrote — the banner shouldn't blink to zero just because `/salvage`
+  // is mid-fetch.
+  useEffect(() => {
+    if (sessions === null) {
+      return;
+    }
+    setUnfinalizedCount(sessions.length);
+  }, [sessions, setUnfinalizedCount]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -101,6 +170,10 @@ export default function Salvage() {
         if (cancelled) return;
         setSessions(result);
         setLoadError(null);
+        // The companion effect on `sessions` mirrors the new length
+        // into the prompt store, so navigating here from the tray
+        // and finding zero sessions drops the banner without an
+        // explicit second write here.
       } catch (err) {
         if (cancelled) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -140,9 +213,7 @@ export default function Salvage() {
       // the `.md` path; we don't render it directly, but we DO want
       // the row removed from the list so a refresh-less navigate-and-
       // back doesn't show a now-finalized row.
-      setSessions((prev) =>
-        (prev ?? []).filter((s) => s.session_id !== session.session_id),
-      );
+      removeSessions(new Set([session.session_id]));
       toast.success("Session recovered");
       navigate(`/review/${encodeURIComponent(session.session_id)}`);
     } catch (err) {
@@ -160,15 +231,131 @@ export default function Salvage() {
     markBusy(session.session_id);
     try {
       await invoke("heron_purge_session", { sessionId: session.session_id });
-      setSessions((prev) =>
-        (prev ?? []).filter((s) => s.session_id !== session.session_id),
-      );
+      removeSessions(new Set([session.session_id]));
       toast.success("Session purged");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error(`Purge failed: ${message}`);
     } finally {
       clearBusy(session.session_id);
+    }
+  }
+
+  /**
+   * Bulk-purge every row currently in the list (PR-ν / phase 75).
+   *
+   * Uses `Promise.allSettled` rather than `Promise.all` so a single
+   * `heron_purge_session` rejection (e.g. EBUSY on a still-mmapped
+   * file) doesn't strand the rest. Each successful row is removed
+   * from the list once the whole batch has settled; failures are
+   * collected and surfaced in a single error toast at the end.
+   *
+   * The function snapshots `sessions` up-front: if the user races a
+   * per-row Purge button against the batch, the per-row click is
+   * already disabled by `batchInFlight`, but the snapshot guarantees
+   * we don't see a `null` mid-iteration if React batches a state
+   * update behind us.
+   *
+   * **Concurrency note.** All purges fire in parallel via
+   * `Promise.allSettled`. Tauri's IPC thread pool (~4 threads by
+   * default) bounds the actual concurrency on the Rust side, so
+   * dispatching N promises here is not the same as N concurrent
+   * filesystem operations. For realistic N (a handful of crashed
+   * sessions), parallel dispatch is the right shape; if a future
+   * pathological user accumulates hundreds of unfinalized sessions,
+   * we should chunk via a worker pool — but that's not the steady
+   * state the brief targets.
+   */
+  async function runPurgeAll() {
+    setPurgeAllOpen(false);
+    const snapshot = sessions ?? [];
+    if (snapshot.length === 0) {
+      return;
+    }
+    setBatchInFlight(true);
+    const total = snapshot.length;
+    // Mark every row busy so the per-row spinners render. We clear
+    // them all at the end in a single sweep rather than per-resolve;
+    // that keeps the UI consistent with the "batch is one operation"
+    // mental model and avoids a flicker when a fast row resolves
+    // before its sibling.
+    setBusyIds((prev) => {
+      const next = new Set(prev);
+      for (const s of snapshot) {
+        next.add(s.session_id);
+      }
+      return next;
+    });
+
+    try {
+      const outcomes = await Promise.allSettled(
+        snapshot.map((s) =>
+          invoke("heron_purge_session", { sessionId: s.session_id }).then(
+            () => s.session_id,
+          ),
+        ),
+      );
+
+      const purged = new Set<string>();
+      const failures: { sessionId: string; message: string }[] = [];
+      outcomes.forEach((outcome, index) => {
+        const sessionId = snapshot[index]?.session_id;
+        if (sessionId === undefined) {
+          // Defensive: `forEach` over `outcomes` mirrors `snapshot`
+          // 1:1, so this branch is unreachable in practice. Keeps the
+          // index access type-safe under `noUncheckedIndexedAccess`.
+          return;
+        }
+        if (outcome.status === "fulfilled") {
+          purged.add(sessionId);
+        } else {
+          const reason = outcome.reason;
+          const message =
+            reason instanceof Error ? reason.message : String(reason);
+          failures.push({ sessionId, message });
+        }
+      });
+
+      removeSessions(purged);
+
+      if (failures.length === 0) {
+        toast.success(
+          `Purged ${purged.size} of ${total} ${sessionsNoun(total)}`,
+        );
+      } else if (purged.size === 0) {
+        // Every row failed — show a generic error rather than a
+        // per-row dump (which could push other toasts off-screen).
+        toast.error(`Purge failed for all ${total} ${sessionsNoun(total)}`, {
+          description: summariseFailedIds(failures.map((f) => f.sessionId)),
+        });
+      } else {
+        toast.error(
+          `Purged ${purged.size} of ${total}; ${failures.length} failed`,
+          {
+            description: summariseFailedIds(failures.map((f) => f.sessionId)),
+          },
+        );
+      }
+      if (failures.length > 0) {
+        // Belt-and-braces: also log each failure to the console so a
+        // developer / power user can pull the full list out of devtools
+        // when the toast description is truncated.
+        // eslint-disable-next-line no-console
+        console.warn("[heron] purge failures:", failures);
+      }
+    } finally {
+      // Clear the busy flags for every row that was in the snapshot —
+      // some of those ids may already be gone from the list (if the
+      // call succeeded), but `clearBusy`-style filtering on a missing
+      // entry is a no-op.
+      setBusyIds((prev) => {
+        const next = new Set(prev);
+        for (const s of snapshot) {
+          next.delete(s.session_id);
+        }
+        return next;
+      });
+      setBatchInFlight(false);
     }
   }
 
@@ -183,13 +370,42 @@ export default function Salvage() {
     );
   }
 
+  const hasRows = sessions.length > 0;
+
   return (
     <main className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <h1 className="text-2xl font-semibold">Salvage</h1>
-        <Link to="/home" className="text-sm underline text-muted-foreground">
-          Back to home
-        </Link>
+        <div className="flex items-center gap-3">
+          <Button
+            variant="destructive"
+            size="sm"
+            // Disabled when:
+            //   - the list is empty (nothing to purge),
+            //   - a batch is already running (re-clicking would
+            //     race the in-flight `Promise.allSettled`), or
+            //   - any per-row operation is in flight (a stuck
+            //     spinner on a row would race the snapshot-based
+            //     batch path).
+            disabled={!hasRows || batchInFlight || busyIds.size > 0}
+            onClick={() => setPurgeAllOpen(true)}
+          >
+            {batchInFlight ? (
+              <>
+                <Loader2
+                  className="h-4 w-4 animate-spin"
+                  aria-hidden="true"
+                />
+                Purging…
+              </>
+            ) : (
+              "Purge all"
+            )}
+          </Button>
+          <Link to="/home" className="text-sm underline text-muted-foreground">
+            Back to home
+          </Link>
+        </div>
       </div>
 
       <p className="text-sm text-muted-foreground">
@@ -204,46 +420,60 @@ export default function Salvage() {
         </p>
       )}
 
-      {sessions.length === 0 ? (
+      {!hasRows ? (
         <p className="text-muted-foreground italic">Nothing to recover.</p>
       ) : (
         <ul className="space-y-3">
-          {sessions.map((session) => (
-            <li
-              key={session.session_id}
-              className="flex items-center justify-between gap-4 rounded-md border border-border p-3"
-            >
-              <div className="min-w-0 flex-1">
-                <p className="font-mono text-sm truncate">
-                  {session.session_id}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Started {formatStarted(session.started_at)} ·{" "}
-                  {formatBytes(session.audio_bytes)} audio
-                  {session.has_partial_transcript
-                    ? " · partial transcript"
-                    : ""}
-                </p>
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <Button
-                  onClick={() =>
-                    setConfirm({ kind: "recover", session })
-                  }
-                  disabled={busyIds.has(session.session_id)}
-                >
-                  Recover
-                </Button>
-                <Button
-                  variant="destructive"
-                  onClick={() => setConfirm({ kind: "purge", session })}
-                  disabled={busyIds.has(session.session_id)}
-                >
-                  Purge
-                </Button>
-              </div>
-            </li>
-          ))}
+          {sessions.map((session) => {
+            const rowBusy = busyIds.has(session.session_id);
+            return (
+              <li
+                key={session.session_id}
+                className="flex items-center justify-between gap-4 rounded-md border border-border p-3"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="font-mono text-sm truncate">
+                    {session.session_id}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Started {formatStarted(session.started_at)} ·{" "}
+                    {formatBytes(session.audio_bytes)} audio
+                    {session.has_partial_transcript
+                      ? " · partial transcript"
+                      : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {rowBusy && (
+                    // The disabled Recover/Purge buttons next to the
+                    // spinner already convey "operation in flight" to
+                    // screen readers; matching the rest of the file's
+                    // `aria-hidden="true"` spinners avoids a redundant
+                    // announcement next to a non-interactive element.
+                    <Loader2
+                      className="h-4 w-4 animate-spin text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <Button
+                    onClick={() =>
+                      setConfirm({ kind: "recover", session })
+                    }
+                    disabled={rowBusy || batchInFlight}
+                  >
+                    Recover
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    onClick={() => setConfirm({ kind: "purge", session })}
+                    disabled={rowBusy || batchInFlight}
+                  >
+                    Purge
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
 
@@ -258,6 +488,16 @@ export default function Salvage() {
           } else {
             await runPurge(target.session);
           }
+        }}
+      />
+
+      <PurgeAllDialog
+        open={purgeAllOpen}
+        count={sessions.length}
+        busy={batchInFlight}
+        onCancel={() => setPurgeAllOpen(false)}
+        onConfirm={() => {
+          void runPurgeAll();
         }}
       />
     </main>
@@ -342,6 +582,89 @@ function ConfirmDialog({
                 </>
               ) : (
                 confirmLabel
+              )}
+            </Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+interface PurgeAllDialogProps {
+  open: boolean;
+  count: number;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+/**
+ * Two-step confirmation modal for "Purge all" (PR-ν / phase 75).
+ *
+ * Bulk destructive operations get the same dialog primitive as the
+ * per-row Purge, but with copy that names the count + the irreversible
+ * nature explicitly. We deliberately do NOT add a "type the count to
+ * confirm" interlock — the count is shown in the headline and the
+ * destructive button colour, which is the same level of friction the
+ * per-row Purge applies for a single session.
+ */
+function PurgeAllDialog({
+  open,
+  count,
+  busy,
+  onCancel,
+  onConfirm,
+}: PurgeAllDialogProps) {
+  const sessionsLabel = sessionsNoun(count);
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (!next && !busy) {
+          onCancel();
+        }
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/40 backdrop-blur-sm" />
+        <Dialog.Content
+          className={
+            "fixed left-1/2 top-1/2 w-[min(480px,90vw)] -translate-x-1/2 " +
+            "-translate-y-1/2 rounded-lg bg-background p-6 shadow-xl " +
+            "border border-border space-y-4"
+          }
+          aria-describedby="salvage-purge-all-description"
+        >
+          <Dialog.Title className="text-lg font-semibold">
+            Purge all {count} unfinalized {sessionsLabel}?
+          </Dialog.Title>
+          <Dialog.Description
+            id="salvage-purge-all-description"
+            className="text-sm text-muted-foreground"
+          >
+            Audio + cached transcripts will be permanently deleted. This
+            cannot be undone.
+          </Dialog.Description>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="ghost" onClick={onCancel} disabled={busy}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy || count === 0}
+              onClick={onConfirm}
+            >
+              {busy ? (
+                <>
+                  <Loader2
+                    className="h-4 w-4 animate-spin"
+                    aria-hidden="true"
+                  />
+                  Purging…
+                </>
+              ) : (
+                `Purge all ${count}`
               )}
             </Button>
           </div>
