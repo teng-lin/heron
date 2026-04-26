@@ -16,6 +16,7 @@
 pub mod asset_protocol;
 pub mod diagnostics;
 pub mod disk;
+pub mod event_bus;
 pub mod keychain;
 pub mod keychain_resolver;
 pub mod notes;
@@ -596,6 +597,14 @@ pub fn run() {
             // it: a missing tray on macOS is a regression worth
             // surfacing in CI logs, not silently degrading.
             tray::install(app.handle())?;
+            // Phase 82: in-process event bus + Tauri IPC fan-out. No
+            // publishers exist in the desktop yet (cross-process
+            // domain events flow over herond's HTTP/SSE), so the
+            // wiring is dormant — but the slot is here for the
+            // moment a local publisher lands. `InstallError` impls
+            // `std::error::Error` (via thiserror), so `?` boxes it
+            // directly into the setup hook's expected return type.
+            event_bus::install(app.handle())?;
             // Phase 68 (PR-ζ): register the saved hotkey at app
             // startup so the chord is live the moment the app
             // launches — not only when the user opens Settings →

@@ -147,13 +147,20 @@ async fn origin_header_is_rejected_even_for_health() {
 }
 
 #[tokio::test]
-async fn unimpl_endpoints_all_return_501() {
-    let app = build_app(stub_state());
+async fn stub_orchestrator_endpoints_all_return_501() {
+    // The herond test suite uses `StubOrchestrator`, which returns
+    // `NotYetImplemented` for every operation. With the v1 routes
+    // now actually wired through to the orchestrator, that means
+    // every endpoint returns 501 here. The `MeetingId` in the path
+    // is a well-formed `mtg_<uuid>` so the typed `Path<MeetingId>`
+    // extractor passes — we want to test the orchestrator response,
+    // not the extractor's malformed-id rejection.
+    const VALID_MTG: &str = "mtg_01234567-89ab-7def-8000-000000000001";
     let cases = [
-        ("GET", "/v1/meetings/mtg_x"),
-        ("GET", "/v1/meetings/mtg_x/transcript"),
-        ("GET", "/v1/meetings/mtg_x/summary"),
-        ("GET", "/v1/meetings/mtg_x/audio"),
+        ("GET", &format!("/v1/meetings/{VALID_MTG}")[..]),
+        ("GET", &format!("/v1/meetings/{VALID_MTG}/transcript")[..]),
+        ("GET", &format!("/v1/meetings/{VALID_MTG}/summary")[..]),
+        ("GET", &format!("/v1/meetings/{VALID_MTG}/audio")[..]),
         ("GET", "/v1/calendar/upcoming"),
     ];
     for (method, path) in cases {
@@ -170,8 +177,26 @@ async fn unimpl_endpoints_all_return_501() {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "{method} {path}");
     }
-    // Silence unused-binding warning when the loop owns `app`.
-    let _ = app;
+}
+
+#[tokio::test]
+async fn malformed_meeting_id_in_path_returns_400() {
+    // Path<MeetingId> rejects non-`mtg_<uuid>` values with a 400.
+    // Pin the rejection so a future change to the path-extractor
+    // shape is caught — silently changing this to 404 (route
+    // doesn't match) would let path-traversal-shaped ids reach
+    // the handler.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::get("/v1/meetings/not-an-mtg-id")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
