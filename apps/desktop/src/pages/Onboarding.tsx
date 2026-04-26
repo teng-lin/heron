@@ -1,11 +1,13 @@
 /**
- * Onboarding wizard (§13.3 / PR-ι, phase 71; gap #5 added the daemon step;
- * gap #5b wired the real WhisperKit download).
+ * Onboarding wizard (§13.3 / PR-ι, phase 71; gap #5 added the daemon
+ * step; gap #5b wired the real WhisperKit download; gap #6 added the
+ * runtime-checks step).
  *
- * Six-step Test-button walkthrough that exercises the §13.3 probes
- * (mic, audio-tap, accessibility, calendar, WhisperKit model fetch)
- * plus a final daemon-liveness check before the user starts recording.
- * The wizard is one-shot per install — `Finish setup` calls
+ * Test-button walkthrough that exercises the §13.3 probes (mic,
+ * audio-tap, accessibility, calendar, WhisperKit model fetch), then
+ * the doctor's environment sweep (ONNX / Zoom / keychain ACL /
+ * network), then a final daemon-liveness check before the user starts
+ * recording. The wizard is one-shot per install — `Finish setup` calls
  * `heron_mark_onboarded`, which the `App.tsx` first-run detector reads
  * to skip the route on subsequent launches.
  *
@@ -32,6 +34,12 @@
  */
 
 import { useEffect, useState } from "react";
+import {
+  RuntimeChecksPanel,
+  aggregateSeverity,
+  summariseEntries,
+  type RuntimeChecksLoad,
+} from "../components/RuntimeChecksPanel";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
@@ -123,6 +131,10 @@ const STEP_COPY: Record<StepId, { title: string; body: string }> = {
     title: "Speech-to-text model",
     body: "heron downloads ~1 GB of WhisperKit models for on-device transcription. Connect to wifi if you're on a metered link — clicking Download fetches the model into the system cache and reports progress as it goes. On non-Apple builds, this step can be skipped.",
   },
+  runtime_checks: {
+    title: "Runtime checks",
+    body: "One last environment sweep: ONNX models on disk, Zoom availability, the macOS keychain ACL, and network reachability. Permissions are covered by the earlier steps; this is the consolidated \"is the rest of the machine ready?\" answer from heron-doctor.",
+  },
   daemon: {
     title: "Background service",
     body: "heron's local daemon (herond) routes audio, transcripts, and meeting events between the desktop app and the recording pipeline. This step verifies it is reachable on the loopback port the daemon listens on. You cannot skip this one — without the daemon, recording cannot start.",
@@ -146,6 +158,13 @@ export default function Onboarding() {
   // outcome — it resets every time the user clicks Download again and
   // doesn't survive Back/Next navigation.
   const [modelProgress, setModelProgress] = useState<number | null>(null);
+  // Runtime-check step (gap #6) renders a list of doctor entries
+  // rather than a single `TestOutcome`. We track that list in
+  // page-local state for the same reason `modelProgress` lives here:
+  // wire-shape state that's volatile across the wizard's one-shot
+  // lifetime doesn't belong in the Zustand store.
+  const [runtimeChecksLoad, setRuntimeChecksLoad] =
+    useState<RuntimeChecksLoad>({ kind: "idle" });
 
   // Lifecycle-bound listener for `model_download:progress` ticks.
   // Registering inside the component (rather than inside the
@@ -194,6 +213,10 @@ export default function Onboarding() {
   const isLast = current === STEPS.length - 1;
 
   const runTest = async () => {
+    if (stepId === "runtime_checks") {
+      await runRuntimeChecks();
+      return;
+    }
     setLoading(stepId, true);
     try {
       // Step 5 (model_download) has its own code path: instead of a
@@ -223,6 +246,48 @@ export default function Onboarding() {
       setOutcome(stepId, {
         status: "fail",
         details: `probe call failed: ${message}`,
+      });
+    }
+  };
+
+  /**
+   * Gap #6: invoke `heron_run_runtime_checks` and surface the
+   * consolidated entry list. We also synthesize a `TestOutcome` so
+   * the standard `canAdvance(step)` selector lights up the Next /
+   * Finish button without forking the store predicate for one step.
+   *
+   * The synthesized outcome's `status` reflects the *blocking*
+   * severity only: any `fail` entry → `fail`; otherwise `pass`. A
+   * lone `warn` (e.g. Zoom not currently running) keeps the
+   * headline badge green so it does not contradict the per-row
+   * panel below — the warning is still visible there and is named
+   * in the `details` line ("3 OK, 1 warning"). Without this rule
+   * the headline shows red "Failed" while the panel shows amber,
+   * which reads as a wizard bug.
+   */
+  const runRuntimeChecks = async () => {
+    if (runtimeChecksLoad.kind === "loading") {
+      // Defense-in-depth against a double-click slipping past the
+      // button's `disabled={step.loading}` gate (e.g. via keyboard).
+      return;
+    }
+    setLoading("runtime_checks", true);
+    setRuntimeChecksLoad({ kind: "loading" });
+    try {
+      const entries = await invoke("heron_run_runtime_checks");
+      setRuntimeChecksLoad({ kind: "ready", entries });
+      const worst = aggregateSeverity(entries);
+      const detailsLine = summariseEntries(entries);
+      setOutcome("runtime_checks", {
+        status: worst === "fail" ? "fail" : "pass",
+        details: detailsLine,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setRuntimeChecksLoad({ kind: "error", message });
+      setOutcome("runtime_checks", {
+        status: "fail",
+        details: `doctor call failed: ${message}`,
       });
     }
   };
@@ -282,7 +347,7 @@ export default function Onboarding() {
       <header className="space-y-2">
         <h1 className="text-2xl font-semibold">Set up heron</h1>
         <p className="text-sm text-muted-foreground">
-          Six quick checks before your first recording. Each step has a
+          A few quick checks before your first recording. Each step has a
           Test button — heron only records when you ask it to.
         </p>
       </header>
@@ -343,6 +408,10 @@ export default function Onboarding() {
           </div>
 
           <TestStatus outcome={step.outcome} />
+
+          {stepId === "runtime_checks" && (
+            <RuntimeChecksPanel load={runtimeChecksLoad} />
+          )}
         </div>
       </section>
 
@@ -413,7 +482,7 @@ export default function Onboarding() {
  * step, with the active step's circle slightly larger.
  *
  * Accessibility note: the wrapping element is a real `<ol>` so screen
- * readers announce "list of 5 items". The active step is marked with
+ * readers announce "list of N items". The active step is marked with
  * `aria-current="step"`. Visited steps that have an outcome /
  * skipped flag get a `CheckCircle2` rather than the plain dot.
  */
@@ -564,12 +633,19 @@ async function runModelDownload(): Promise<TestOutcome> {
  * `targetBundleId`) need to read fresh state at call time, not the
  * value captured at render time.
  *
- * The `model_download` step is intentionally absent — gap #3 wired
- * the real `heron_download_model` command, which is a long-running
- * download with progress events rather than a sub-second probe; the
- * `runModelDownload` helper above owns its call site.
+ * Two steps are intentionally absent:
+ *
+ * - `model_download` (gap #3) is wired to the real
+ *   `heron_download_model` command, which is a long-running download
+ *   with progress events rather than a sub-second probe; the
+ *   `runModelDownload` helper above owns its call site.
+ * - `runtime_checks` (gap #6) returns a list of `RuntimeCheckEntry`
+ *   rather than a single `TestOutcome` — the page handles that shape
+ *   directly via `runRuntimeChecks`.
  */
-async function invokeProbe(step: Exclude<StepId, "model_download">) {
+async function invokeProbe(
+  step: Exclude<StepId, "model_download" | "runtime_checks">,
+) {
   switch (step) {
     case "microphone":
       return invoke("heron_test_microphone");
@@ -585,3 +661,4 @@ async function invokeProbe(step: Exclude<StepId, "model_download">) {
       return invoke("heron_test_daemon");
   }
 }
+
