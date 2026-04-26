@@ -66,6 +66,12 @@ releases fill the matrix in.
   upstream.
 - **Webex (v1.1+):** native macOS client; the AXObserver approach
   should port directly pending an accessibility-tree survey.
+- **Tencent Meeting / Feishu (Lark) Meeting (v2.2+):** outside the
+  Recall / Attendee / MeetingBaaS coverage set, so each gets its own
+  native driver (TRTC SDK and Lark Open Platform respectively) gated
+  on a concrete CN distribution thesis. Tradeoff and architectural
+  fit in
+  [`docs/build-vs-buy-decision.md`](docs/build-vs-buy-decision.md#regional-platforms-tencent-meeting-feishu--lark-meeting).
 
 The Rust crate boundaries (`heron-audio`, `heron-zoom`, `heron-speech`)
 are designed for this kind of extension. v1 introduces the `SttBackend`

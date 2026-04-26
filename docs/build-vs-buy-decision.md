@@ -186,6 +186,73 @@ and Teams there's no equivalent native SDK, so WKWebView (or partner
 with Recall/Attendee per-platform) is the only option — but **only
 for those two platforms**, not all three.
 
+## Regional platforms (Tencent Meeting, Feishu / Lark Meeting)
+
+Paths A–D all assume the platform set is {Zoom, Google Meet, Microsoft
+Teams, Webex} — what Recall, Attendee, MeetingBaaS, and Vexa target.
+Two CN-region platforms have meaningful market share but sit
+**entirely outside that set**: no hosted vendor covers them, and no
+DOM-scraping OSS project supports them.
+
+### Tencent Meeting (腾讯会议)
+
+Tencent's enterprise meeting product. The native path is
+[TRTC SDK](https://trtc.io/) (Tencent Real-Time Communication) for the
+audio/video plane, plus the [Tencent Meeting OpenAPI](https://meeting.tencent.com/open/documents)
+for recording, transcript, and admin operations. The TRTC SDK has
+mature macOS support, so the heron-audio capture pipeline carries
+over largely unchanged. There is no Recall-equivalent hosted bot
+vendor for Tencent Meeting.
+
+### Feishu / Lark Meeting (飞书会议)
+
+ByteDance's enterprise platform. The
+[Lark Open Platform](https://open.larksuite.com/document/) exposes
+meeting APIs (`vc.meeting.*`) for recording / transcript pulls and
+event subscriptions. The "bot" pattern in the Lark ecosystem leans
+chat-bot rather than voice participant — live audio playback into an
+active meeting is bespoke rather than a documented SDK surface. No
+hosted bot vendor targets it.
+
+### Comparison
+
+| Dimension                | Tencent Meeting              | Feishu / Lark                       |
+| ------------------------ | ---------------------------- | ----------------------------------- |
+| Hosted vendor coverage   | None (no Recall-equivalent)  | None                                |
+| Native SDK               | TRTC SDK (mature, macOS)     | Lark Open Platform (less SDK-shaped)|
+| Voice-bot pattern        | TRTC participant + OpenAPI   | Bespoke; bot APIs are chat-shaped   |
+| AGPL fit                 | Same as Path C               | Same as Path C                      |
+| Reuses `heron-*`         | ~50% (capture pipeline)      | ~30% (playback path more custom)    |
+| Time-to-spike            | 2–3 weeks                    | 2–4 weeks                           |
+| Time-to-ship             | 8–12 weeks                   | 8–16 weeks                          |
+
+### Architectural answer
+
+Both are accommodated by the existing trait surface. Adding
+`Platform::TencentMeeting` / `Platform::FeishuMeeting` to the
+[`Platform`](../crates/heron-bot/src/lib.rs) enum and shipping
+`TencentDriver: MeetingBotDriver` / `FeishuDriver: MeetingBotDriver`
+is the same per-crate pattern as the planned `NativeZoomDriver`
+migration. Invariant 1 — vendor quirks live only in `heron-bot` —
+means CN-platform support adds drivers, not workspace-wide rework.
+
+### Strategic answer
+
+Both are **deferred until there's a concrete CN distribution plan.**
+An AGPL'd consumer Mac app distribution into PRC has its own legal,
+payment-rail, and installer issues that are independent of (and
+larger than) the driver question; the driver work is wasted if the
+broader distribution story isn't there. Revisit after v2.0 alpha
+when the product hypothesis is validated and the CN-market thesis is
+concrete.
+
+This is **not a reversibility trigger** for the Recall decision
+above. None of the existing triggers fire for "we want to add
+Tencent Meeting" — that's planned platform expansion, not a reason
+to abandon Recall for the Western platforms. The trigger to actually
+start CN-platform driver work is "concrete CN distribution plan AND
+validated v2.0 alpha in Western markets."
+
 ## The product-shape question (not bypassed by this decision)
 
 The above assumes the product is "AI agent attends meetings when the
@@ -255,6 +322,12 @@ Re-evaluation cadence: after the Recall spike completes (estimated
   router to `heron-cli`.
 - Sunset `RecallDriver` once the native paths are at parity.
 - Trait surface stays unchanged; this is per-crate work.
+
+**v2.2+** (regional platforms — gated on CN distribution thesis):
+- See "Regional platforms" section above. `TencentDriver` and
+  `FeishuDriver` are additional `MeetingBotDriver` impls, not changes
+  to the trait. Not started until v2.0 alpha validates the product
+  AND a concrete CN go-to-market plan exists.
 
 Estimated total: v2.0 in 1–2 months from spike start; v2.1 in 4–6
 months after v2.0 alpha lands.
