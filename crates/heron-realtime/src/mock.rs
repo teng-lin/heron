@@ -77,6 +77,19 @@ struct SessionState {
     /// Captured tool-call results keyed by `tool_call_id`, exposed via
     /// [`MockRealtimeBackend::expect_tool_result`].
     tool_results: HashMap<String, serde_json::Value>,
+    /// Captured `response_create` requests keyed by the minted
+    /// `ResponseId`, exposed via
+    /// [`MockRealtimeBackend::expect_response_request`] so tests can
+    /// assert the controller forwarded the right text and voice.
+    requested_responses: HashMap<ResponseId, RequestedResponse>,
+}
+
+/// Captured arguments from a [`RealtimeBackend::response_create`] call,
+/// retrievable via [`MockRealtimeBackend::expect_response_request`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedResponse {
+    pub text: String,
+    pub voice_override: Option<String>,
 }
 
 impl SessionState {
@@ -87,6 +100,7 @@ impl SessionState {
             in_flight: HashSet::new(),
             truncate_points: HashMap::new(),
             tool_results: HashMap::new(),
+            requested_responses: HashMap::new(),
         }
     }
 }
@@ -302,6 +316,25 @@ impl MockRealtimeBackend {
             .get(&response)
             .copied()
     }
+
+    /// Retrieve the captured arguments from a
+    /// [`RealtimeBackend::response_create`] call by `response`. Tests
+    /// asserting that the controller forwarded the right text or voice
+    /// override use this. `None` when the session is unknown or no
+    /// `response_create` was recorded for the given id.
+    pub fn expect_response_request(
+        &self,
+        session: SessionId,
+        response: ResponseId,
+    ) -> Option<RequestedResponse> {
+        let inner = lock(&self.inner);
+        inner
+            .sessions
+            .get(&session)?
+            .requested_responses
+            .get(&response)
+            .cloned()
+    }
 }
 
 impl Default for MockRealtimeBackend {
@@ -324,6 +357,40 @@ impl RealtimeBackend for MockRealtimeBackend {
         let mut inner = lock(&self.inner);
         inner.sessions.remove(&id).ok_or_else(unknown_session)?;
         Ok(())
+    }
+
+    async fn response_create(
+        &self,
+        session: SessionId,
+        text: &str,
+        voice_override: Option<String>,
+    ) -> Result<ResponseId, RealtimeError> {
+        let response = ResponseId::now_v7();
+        let mut inner = lock(&self.inner);
+        let state = inner
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(unknown_session)?;
+        state.in_flight.insert(response);
+        state.requested_responses.insert(
+            response,
+            RequestedResponse {
+                text: text.to_owned(),
+                voice_override,
+            },
+        );
+        // Real backends emit `ResponseCreated` synchronously when they
+        // accept the request; mirror that so consumers see the event
+        // without a separate scripting call. Audio + done events stay
+        // the test's responsibility via [`Self::script_response`] /
+        // [`Self::script_emit`] so a paused-mid-response scenario is
+        // expressible without racing the broadcast.
+        let _ = state.sender.send(RealtimeEvent::ResponseCreated {
+            session,
+            response,
+            at: Utc::now(),
+        });
+        Ok(response)
     }
 
     async fn response_cancel(
@@ -367,9 +434,15 @@ impl RealtimeBackend for MockRealtimeBackend {
         // "the current item"). Record the truncate against every
         // currently in-flight response so tests that scripted
         // exactly one in-flight response can assert against it
-        // without guessing which id was current.
-        for response in state.in_flight.iter().copied().collect::<Vec<_>>() {
-            state.truncate_points.insert(response, audio_end_ms);
+        // without guessing which id was current. Destructured to make
+        // the disjoint-field borrow explicit to the borrow checker.
+        let SessionState {
+            in_flight,
+            truncate_points,
+            ..
+        } = state;
+        for response in in_flight.iter().copied() {
+            truncate_points.insert(response, audio_end_ms);
         }
         Ok(())
     }
@@ -646,6 +719,67 @@ mod tests {
             Err(TryRecvError::Empty) => {}
             other => panic!("expected empty receiver, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_create_emits_created_and_records_request() {
+        let backend = MockRealtimeBackend::new();
+        let session = backend.session_open(config()).await.expect("open");
+        let mut rx = backend.subscribe_events(session);
+
+        let response = backend
+            .response_create(session, "hello there", Some("voice_alt".to_owned()))
+            .await
+            .expect("response_create");
+
+        let events = drain_until(&mut rx, |ev| {
+            matches!(ev, RealtimeEvent::ResponseCreated { .. })
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RealtimeEvent::ResponseCreated {
+                session: s,
+                response: r,
+                ..
+            } => {
+                assert_eq!(*s, session);
+                assert_eq!(*r, response);
+            }
+            other => panic!("expected ResponseCreated, got {other:?}"),
+        }
+
+        let req = backend
+            .expect_response_request(session, response)
+            .expect("captured");
+        assert_eq!(req.text, "hello there");
+        assert_eq!(req.voice_override.as_deref(), Some("voice_alt"));
+
+        // Response is now in flight; cancel observes it and emits Done.
+        backend
+            .response_cancel(session, response)
+            .await
+            .expect("cancel in-flight response");
+        let after_cancel = drain_until(&mut rx, |ev| {
+            matches!(ev, RealtimeEvent::ResponseDone { .. })
+        })
+        .await;
+        assert!(
+            after_cancel
+                .iter()
+                .any(|e| matches!(e, RealtimeEvent::ResponseDone { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn response_create_on_unknown_session_errors() {
+        let backend = MockRealtimeBackend::new();
+        let phantom = SessionId::now_v7();
+        let err = backend
+            .response_create(phantom, "x", None)
+            .await
+            .expect_err("unknown session");
+        assert!(matches!(err, RealtimeError::Backend(_)));
     }
 
     #[tokio::test]
