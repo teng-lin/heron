@@ -34,3 +34,8 @@ settings.local.toml
 /heron-vault/
 /recordings/
 /transcripts/
+
+# Recall.ai spike artifacts (see crates/heron-bot/examples/recall-spike.rs)
+spike-findings.jsonl
+disclosure.mp3
+*.aiff
