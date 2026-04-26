@@ -236,7 +236,12 @@ export function summariseEntries(entries: RuntimeCheckEntry[]): string {
     else if (e.severity === "warn") warn += 1;
     else fail += 1;
   }
-  const parts: string[] = [`${pass} OK`];
+  // Drop zero-count buckets so a `fail`-only result reads "1 failed"
+  // rather than "0 OK, 0 warning, 1 failed". The early return above
+  // covers the all-zero case, so a non-empty `entries` list has at
+  // least one bucket > 0 — `parts` is never empty here.
+  const parts: string[] = [];
+  if (pass > 0) parts.push(`${pass} OK`);
   if (warn > 0) parts.push(`${warn} warning${warn === 1 ? "" : "s"}`);
   if (fail > 0) parts.push(`${fail} failed`);
   return parts.join(", ");

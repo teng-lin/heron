@@ -88,6 +88,6 @@ describe("summariseEntries", () => {
   test("zero-count buckets are omitted", () => {
     // A `fail`-only outcome should not produce "0 OK, 0 warning, 1
     // failed" — drop the zero buckets so the badge text is tight.
-    expect(summariseEntries([entry("fail")])).toBe("0 OK, 1 failed");
+    expect(summariseEntries([entry("fail")])).toBe("1 failed");
   });
 });
