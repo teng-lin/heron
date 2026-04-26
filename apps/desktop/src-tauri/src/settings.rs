@@ -87,6 +87,19 @@ pub struct Settings {
     /// [`crate::disk::purge_audio_older_than`], which the Settings
     /// pane's "Purge now" button + an eventual launch-time hook call.
     pub audio_retention_days: Option<u32>,
+    /// Phase 71 (PR-ι): `true` once the user has finished the §13.3
+    /// five-step onboarding wizard. Persisted so subsequent app
+    /// launches skip the wizard and route straight to the home /
+    /// last-note state (see `App.tsx`).
+    ///
+    /// The struct-level `#[serde(default)]` already covers the
+    /// "missing field" migration path — pre-PR-71 settings.json files
+    /// deserialize with `onboarded = false`, which means the wizard
+    /// runs once after upgrade. The dedicated test
+    /// `read_pre_phase_71_settings_fills_onboarded_default` pins that
+    /// contract so a future regression that drops the container-level
+    /// `default` doesn't silently re-onboard every existing user.
+    pub onboarded: bool,
 }
 
 impl Default for Settings {
@@ -103,8 +116,54 @@ impl Default for Settings {
             session_logging: true,
             crash_telemetry: false,
             audio_retention_days: None,
+            onboarded: false,
         }
     }
+}
+
+/// Mark the user as onboarded by reading `path`, flipping
+/// [`Settings::onboarded`] to `true`, and writing it back atomically
+/// (§13.3 / PR-ι).
+///
+/// Reading first (instead of writing
+/// `Settings { onboarded: true, ..Default::default() }`) preserves
+/// any other fields the user may have already changed via the
+/// Settings pane between launching the app and finishing the wizard
+/// — uncommon, but the read-modify-write keeps that race side
+/// benign. Re-running on an already-onboarded settings file is a
+/// no-op (idempotent).
+///
+/// ## Concurrency
+///
+/// The read-modify-write is **not** synchronized against a
+/// concurrent [`write_settings`] from another Tauri command (e.g.
+/// the Settings pane's auto-save). Today this is benign: the wizard
+/// only runs on first launch, before any UI affordance to reach the
+/// Settings pane exists. A future "re-run onboarding" entry from
+/// Settings would open the lost-update window — the Settings pane's
+/// pending `dirty` edits could be clobbered by the wizard's flush
+/// here. The fix when that lands is a `Mutex<()>` shared across all
+/// settings.json writers (or a `patch_field` command that flips
+/// individual fields server-side without re-reading the whole file).
+///
+/// ## Parse-error recovery
+///
+/// If `path` exists but `serde_json::from_slice` rejects it (a
+/// truncated write from a power loss, manual hand-edit), bubble the
+/// error up so the frontend toasts. Falling back to
+/// `Settings::default()` here would silently overwrite a recoverable
+/// settings file with a wizard-finished blank slate — losing any
+/// user preferences the Settings pane had persisted. The wizard's
+/// `Finish setup` button surfaces the error so the user can choose
+/// to manually fix the file (via Finder) or accept the loss with a
+/// future "Reset settings" affordance.
+pub fn mark_onboarded(path: &Path) -> Result<(), SettingsError> {
+    let mut settings = read_settings(path)?;
+    if settings.onboarded {
+        return Ok(());
+    }
+    settings.onboarded = true;
+    write_settings(path, &settings)
 }
 
 /// Read settings from `path`. Returns `Settings::default()` if the
@@ -282,6 +341,96 @@ mod tests {
         write_settings(&path, &Settings::default()).expect("write");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Pre-PR-71 settings.json files have no `onboarded` field. The
+    /// container-level `#[serde(default)]` must let those deserialize
+    /// cleanly with `onboarded = false`, so the wizard runs once on
+    /// next launch instead of the deserialize failing and the user's
+    /// Settings pane breaking. Sister test to
+    /// `read_pre_phase_68_settings_fills_audio_retention_default`.
+    #[test]
+    fn read_pre_phase_71_settings_fills_onboarded_default() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // Field-set heron-desktop wrote between PR-ζ (phase 68 added
+        // `audio_retention_days`) and PR-ι (phase 71 added
+        // `onboarded`). Note the absence of `onboarded`.
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
+                "vault_root":"/tmp/vault","record_hotkey":"CmdOrCtrl+Shift+R",
+                "remind_interval_secs":30,"recover_on_launch":true,
+                "min_free_disk_mib":2048,"session_logging":true,"crash_telemetry":false,
+                "audio_retention_days":null}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        assert!(
+            !s.onboarded,
+            "missing onboarded field must default to false"
+        );
+        // The other fields the file carried must survive untouched —
+        // belt-and-suspenders against a regression that confuses
+        // container-level default with field-level reset.
+        assert_eq!(s.vault_root, "/tmp/vault");
+        assert!(s.auto_summarize);
+    }
+
+    #[test]
+    fn default_settings_have_onboarded_false() {
+        // First-run state must be "not onboarded yet" so the wizard
+        // routes (§13.3 / PR-ι) actually run for new installs.
+        assert!(!Settings::default().onboarded);
+    }
+
+    #[test]
+    fn mark_onboarded_flips_field_and_persists() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // No file on disk yet — `mark_onboarded` reads via
+        // `read_settings`, which yields `Settings::default()` for a
+        // missing file, then writes back with `onboarded = true`.
+        mark_onboarded(&path).expect("mark");
+        let parsed = read_settings(&path).expect("read");
+        assert!(parsed.onboarded);
+    }
+
+    #[test]
+    fn mark_onboarded_preserves_other_fields() {
+        // Writing `Settings { onboarded: true, ..Default::default() }`
+        // would clobber any user customizations made between app
+        // launch and finishing the wizard. `mark_onboarded` reads
+        // first, then flips, so unrelated fields survive.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        let custom = Settings {
+            vault_root: "/tmp/vault".to_owned(),
+            record_hotkey: "F12".to_owned(),
+            audio_retention_days: Some(14),
+            ..Default::default()
+        };
+        write_settings(&path, &custom).expect("seed");
+        mark_onboarded(&path).expect("mark");
+        let parsed = read_settings(&path).expect("read");
+        assert!(parsed.onboarded);
+        assert_eq!(parsed.vault_root, "/tmp/vault");
+        assert_eq!(parsed.record_hotkey, "F12");
+        assert_eq!(parsed.audio_retention_days, Some(14));
+    }
+
+    #[test]
+    fn mark_onboarded_is_idempotent() {
+        // Re-running on an already-onboarded settings file is a no-op
+        // write. The post-condition (`onboarded == true`) holds either
+        // way; this test pins that the second call doesn't panic /
+        // error / corrupt the file.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        mark_onboarded(&path).expect("mark 1");
+        mark_onboarded(&path).expect("mark 2 (idempotent)");
+        let parsed = read_settings(&path).expect("read");
+        assert!(parsed.onboarded);
     }
 
     #[test]

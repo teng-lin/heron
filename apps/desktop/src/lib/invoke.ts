@@ -94,6 +94,15 @@ export interface Settings {
    * `42` → "Purge audio older than 42 days".
    */
   audio_retention_days: number | null;
+  /**
+   * PR-ι (phase 71). `true` once the user has finished the §13.3
+   * five-step onboarding wizard. The Rust struct's container-level
+   * `#[serde(default)]` deserializes pre-PR-71 settings.json files
+   * with `onboarded = false` so the wizard runs once after upgrade —
+   * no migration ceremony needed on the JS side. `App.tsx`'s
+   * first-run detection branches on this field.
+   */
+  onboarded: boolean;
 }
 
 /**
@@ -261,6 +270,18 @@ export interface HeronCommands {
   heron_test_model_download: {
     args: Record<string, never>;
     returns: TestOutcome;
+  };
+  /**
+   * Phase 71 (PR-ι): persist the "wizard finished" flag on the
+   * §13.3 onboarding wizard's "Finish setup" button. Idempotent —
+   * the Rust side reads, flips, writes; re-running is a no-op.
+   * Takes no path argument because the path is canonical
+   * (`default_settings_path()`); see `heron_mark_onboarded`'s
+   * doc comment in `lib.rs` for the rationale.
+   */
+  heron_mark_onboarded: {
+    args: Record<string, never>;
+    returns: void;
   };
   /**
    * Phase 64 (PR-β): focus the main window and emit `nav:<target>` so
