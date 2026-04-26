@@ -68,6 +68,7 @@ pub const WK_OK_RAW: i32 = 0;
 pub const WK_NOT_IMPLEMENTED_RAW: i32 = -1;
 pub const WK_MODEL_MISSING_RAW: i32 = -2;
 pub const WK_INTERNAL_RAW: i32 = -3;
+pub const WK_TIMEOUT_RAW: i32 = -4;
 
 /// Status codes the Swift side returns. Mirror
 /// `swift/whisperkit-helper/Sources/WhisperKitHelper.swift` 1-for-1.
@@ -79,6 +80,13 @@ pub enum WkStatus {
     Ok,
     NotYetImplemented,
     ModelMissing,
+    /// Swift bridge gave up waiting on the async WhisperKit Task. The
+    /// per-call deadlines live in
+    /// `swift/whisperkit-helper/.../WhisperKitHelper.swift`
+    /// (`WK_INIT_TIMEOUT` / `WK_FETCH_TIMEOUT` / `WK_TRANSCRIBE_TIMEOUT`).
+    /// Distinct from `Internal` because the orchestrator may want to
+    /// retry on timeout but not on a hard error.
+    Timeout,
     /// Bridge returned a non-`Ok` code we recognized as the generic
     /// internal-error sentinel **or** a code we don't know about.
     /// The wrapped `i32` is the raw return value verbatim.
@@ -91,6 +99,7 @@ impl WkStatus {
             WK_OK_RAW => Self::Ok,
             WK_NOT_IMPLEMENTED_RAW => Self::NotYetImplemented,
             WK_MODEL_MISSING_RAW => Self::ModelMissing,
+            WK_TIMEOUT_RAW => Self::Timeout,
             // -3 plus any unknown code reaches Internal(code). The
             // raw value is preserved so a Swift-side renumber doesn't
             // get hidden behind a stable enum variant.
@@ -111,6 +120,8 @@ pub enum WkError {
     InvalidUtf8(#[from] std::str::Utf8Error),
     #[error("path contains a NUL byte; can't pass to FFI")]
     PathNul,
+    #[error("WhisperKit Swift bridge timed out waiting for the async Task")]
+    Timeout,
     #[error("WhisperKit internal error (code {code})")]
     Internal { code: i32 },
 }
@@ -125,6 +136,7 @@ impl From<WkStatus> for WkError {
             WkStatus::Ok => WkError::Internal { code: WK_OK_RAW },
             WkStatus::NotYetImplemented => WkError::NotYetImplemented,
             WkStatus::ModelMissing => WkError::ModelMissing,
+            WkStatus::Timeout => WkError::Timeout,
             WkStatus::Internal(code) => WkError::Internal { code },
         }
     }
@@ -166,9 +178,11 @@ pub fn whisperkit_init(_model_dir: &Path) -> Result<(), WkError> {
 /// can hand it straight to [`whisperkit_init`].
 ///
 /// `on_progress` is invoked with values in `[0.0, 1.0]` from the
-/// WhisperKit download Task. Closures may capture; the boxed trait
-/// object lives on the stack frame for the duration of the call (no
-/// `'static` requirement).
+/// WhisperKit download Task. Closures may capture, but must be
+/// `'static` — on a `WkError::Timeout` return the lingering Swift
+/// Task can fire progress callbacks after this function returns, so
+/// the closure cannot borrow from the caller's frame. The current
+/// call sites use Arc-based captures and satisfy this trivially.
 ///
 /// # Threading
 ///
@@ -179,26 +193,44 @@ pub fn whisperkit_init(_model_dir: &Path) -> Result<(), WkError> {
 pub fn whisperkit_fetch(
     variant: &str,
     dest_dir: &Path,
-    on_progress: impl FnMut(f32),
+    on_progress: impl FnMut(f32) + 'static,
 ) -> Result<PathBuf, WkError> {
     let c_variant = CString::new(variant.as_bytes()).map_err(|_| WkError::PathNul)?;
     let c_dest = path_to_cstring(dest_dir)?;
 
-    // The closure goes into a double-Box: outer `Box<dyn FnMut>` so
-    // the inner pointer is thin (one word), then `Box::into_raw` to
-    // hand the heap address to Swift as opaque userdata. We rebuild
-    // the Box from the raw pointer after the call returns so the
-    // closure (and any captures) are dropped.
+    // The closure goes into a double-Box and we hand a *raw* pointer
+    // into Swift. On the success path we rebuild the Box from the raw
+    // pointer and drop it; on the **timeout** path, however, the Swift
+    // Task is still alive (we can't cancel an in-flight WhisperKit
+    // download from the C entry point) and may invoke `progress_thunk`
+    // through the same pointer *after* `wk_fetch_model` has returned.
+    // If we dropped the box unconditionally that would be a UAF.
+    //
+    // We therefore split ownership: the box is held by raw pointer
+    // while Swift is using it, and we free it only on a clean
+    // (non-timeout) return. On timeout we deliberately leak — the
+    // closure captures stay alive for the lifetime of the lingering
+    // Task, and the orchestrator's retry creates a fresh closure with
+    // a fresh allocation. The leak is bounded by the per-retry policy
+    // and the closures themselves are small (thin Arc clones in the
+    // current call sites).
+    //
+    // The `'static` bound on `on_progress` is what makes this sound:
+    // the leaked closure can be safely invoked from the Swift Task at
+    // any later time, since none of its captures borrow from the
+    // caller's frame.
     let trait_obj: Box<dyn FnMut(f32)> = Box::new(on_progress);
-    let mut boxed: Box<Box<dyn FnMut(f32)>> = Box::new(trait_obj);
-    let userdata: *mut c_void = (&mut *boxed as *mut Box<dyn FnMut(f32)>).cast();
+    let boxed: Box<Box<dyn FnMut(f32)>> = Box::new(trait_obj);
+    let userdata_raw = Box::into_raw(boxed);
+    let userdata: *mut c_void = userdata_raw.cast();
 
     let mut out_buf: *mut c_char = std::ptr::null_mut();
     // SAFETY: all pointers are non-NULL (`c_variant`, `c_dest` outlive
-    // the call; `userdata` points at the boxed closure on the stack
-    // above). The thunk only runs while the Swift Task is alive,
-    // which is bracketed by the semaphore wait inside `wk_fetch_model`,
-    // so `userdata` is always valid for the duration of any callback.
+    // the call). `userdata` points at a heap-allocated boxed closure
+    // owned by `userdata_raw`. The Swift bridge invokes the thunk
+    // synchronously from inside its async download Task; on a clean
+    // return we reclaim the box below, on `WK_TIMEOUT` we leak it so
+    // the lingering Task's progress callbacks remain valid.
     let raw = unsafe {
         ffi::wk_fetch_model(
             c_variant.as_ptr(),
@@ -208,9 +240,23 @@ pub fn whisperkit_fetch(
             &mut out_buf,
         )
     };
-    drop(boxed);
 
     let status = WkStatus::from_raw(raw);
+
+    // Reclaim the boxed closure on every status *except* Timeout.
+    // The Timeout branch deliberately leaks (see the doc-comment
+    // above) so the still-running Swift Task can fire late progress
+    // callbacks without dereferencing freed memory.
+    if status != WkStatus::Timeout {
+        // SAFETY: `userdata_raw` was just produced by `Box::into_raw`
+        // a few lines above and has not been used to materialize any
+        // other Box. Swift no longer holds a reference once the call
+        // returns with a non-Timeout status (the Task has signaled
+        // and we're past the semaphore wait).
+        unsafe {
+            drop(Box::from_raw(userdata_raw));
+        }
+    }
 
     let resolved = if out_buf.is_null() {
         None
@@ -241,7 +287,7 @@ pub fn whisperkit_fetch(
 pub fn whisperkit_fetch(
     _variant: &str,
     _dest_dir: &Path,
-    _on_progress: impl FnMut(f32),
+    _on_progress: impl FnMut(f32) + 'static,
 ) -> Result<std::path::PathBuf, WkError> {
     Err(WkError::NotYetImplemented)
 }
@@ -332,6 +378,7 @@ mod tests {
         assert_eq!(WK_NOT_IMPLEMENTED_RAW, -1);
         assert_eq!(WK_MODEL_MISSING_RAW, -2);
         assert_eq!(WK_INTERNAL_RAW, -3);
+        assert_eq!(WK_TIMEOUT_RAW, -4);
     }
 
     #[test]
@@ -345,6 +392,7 @@ mod tests {
             WkStatus::from_raw(WK_MODEL_MISSING_RAW),
             WkStatus::ModelMissing
         );
+        assert_eq!(WkStatus::from_raw(WK_TIMEOUT_RAW), WkStatus::Timeout);
     }
 
     #[test]
@@ -368,6 +416,25 @@ mod tests {
             WkError::Internal { code } => assert_eq!(code, -99),
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn timeout_status_maps_to_timeout_error() {
+        // The Swift bridge returns WK_TIMEOUT (-4) when its async
+        // Task doesn't signal the semaphore before the deadline. The
+        // Rust wrapper must surface that as WkError::Timeout — a
+        // distinct variant so callers can decide between "retry"
+        // (Timeout) and "give up" (Internal). This test pins the
+        // mapping so a future renumber on either side fails CI rather
+        // than silently coercing to Internal.
+        let raw = WK_TIMEOUT_RAW;
+        let status = WkStatus::from_raw(raw);
+        assert_eq!(status, WkStatus::Timeout);
+        let err = WkError::from(status);
+        assert!(
+            matches!(err, WkError::Timeout),
+            "expected Timeout, got {err:?}"
+        );
     }
 
     #[cfg(target_vendor = "apple")]
