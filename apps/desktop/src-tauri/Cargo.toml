@@ -69,6 +69,25 @@ heron-event = { workspace = true }
 heron-event-tauri = { workspace = true }
 heron-orchestrator = { workspace = true }
 heron-session = { workspace = true }
+# Gap #7: the desktop shell launches `herond` in-process (rather than
+# as a packaged sidecar binary) so the daemon shares a Tokio runtime,
+# the in-process `LocalSessionOrchestrator`, and an unambiguous
+# shutdown signal with the Tauri side. `herond::build_app` builds the
+# axum router; `herond::auth::load_or_mint` brings in the same bearer
+# token surface main.rs uses, so a CLI talking to `127.0.0.1:7384` and
+# the desktop process see one identical token.
+herond = { workspace = true }
+# `axum::serve` + `tokio::net::TcpListener` are the runtime-side glue
+# the in-process daemon needs (`herond::build_app` returns a router but
+# does not bind). The `axum-macros` feature is not required.
+axum = { workspace = true }
+# `heron_daemon_status` and `test_daemon` probe the daemon's
+# `/v1/health` over loopback. `default-features = false` skips the
+# `default-tls` feature (which would pull `native-tls` → OpenSSL on
+# macOS); we re-enable `rustls-tls` even though the probe target is
+# always plain `http://` so a future migration to https loopback
+# (e.g. mTLS for a paired companion app) doesn't need a Cargo edit.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Probes that hit TCC (mic, calendar) need `spawn_blocking`, and the
 # tap probe is async — pull `tokio` in for the shared runtime. The
 # `rt` + `time` features are the minimum the probes need (timeout +

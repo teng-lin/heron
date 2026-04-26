@@ -93,11 +93,21 @@ const SINK_LABEL: &str = "tauri-ipc:desktop";
 
 /// Install the in-process bus into the Tauri app.
 ///
-/// Constructs a [`LocalSessionOrchestrator`], stores it as a managed
-/// state via [`tauri::Manager::manage`] (so Tauri commands can grab
+/// Constructs a fresh [`LocalSessionOrchestrator`] (with default
+/// capacities, no vault root), stores it as a managed state via
+/// [`tauri::Manager::manage`] (so Tauri commands can grab
 /// `State<Arc<LocalSessionOrchestrator>>`), and spawns a forwarder
 /// task that pumps every envelope from the orchestrator's bus into
 /// a [`TauriEventSink`].
+///
+/// **Production callers** (the desktop's `lib::run` setup hook)
+/// should call [`install_with`] instead and supply the same
+/// orchestrator the in-process daemon (`daemon::install`) is using
+/// — that way an in-process publisher fans out across **both**
+/// transports (HTTP/SSE via the daemon, Tauri IPC via this sink)
+/// off one bus. This zero-arg `install` exists for back-compat with
+/// the original phase 82 wiring and for tests that don't care about
+/// the daemon.
 ///
 /// # Errors
 ///
@@ -124,7 +134,22 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), InstallError> {
         } else {
             tauri::async_runtime::block_on(async { Arc::new(LocalSessionOrchestrator::new()) })
         };
+    install_with(app, orchestrator)
+}
 
+/// Install the in-process bus, reusing a caller-supplied
+/// orchestrator. This is the entry point production code uses so the
+/// `daemon::install` axum service and the [`TauriEventSink`]
+/// forwarder share **one** bus.
+///
+/// # Errors
+///
+/// Same as [`install`]: [`InstallError::AlreadyInstalled`] if a
+/// `LocalSessionOrchestrator` is already in the state map.
+pub fn install_with<R: Runtime>(
+    app: &AppHandle<R>,
+    orchestrator: Arc<LocalSessionOrchestrator>,
+) -> Result<(), InstallError> {
     // Atomically take the state slot. `manage` returns `false` when
     // a value of this type is already managed — mirrors the TOCTOU-
     // free "set if absent" idiom without needing a separate guard
@@ -280,6 +305,70 @@ mod tests {
         install(app.handle()).expect("first install");
         let result = install(app.handle());
         assert!(result.is_err(), "second install should fail");
+    }
+
+    /// `install_with` is the production entry point: `lib::run`'s
+    /// setup hook constructs one shared orchestrator and hands the
+    /// same `Arc` to both this forwarder and `daemon::install`. Pin
+    /// that path explicitly so a regression in `install_with` (e.g.
+    /// failing to subscribe before spawning the forwarder) doesn't
+    /// hide behind the zero-arg `install()`'s test coverage.
+    ///
+    /// Also pins the shared-orchestrator semantic: the `Arc` we
+    /// pass in is the same `Arc` that ends up in
+    /// `state::<Arc<LocalSessionOrchestrator>>`, so a publisher
+    /// holding the original `Arc` reaches the forwarder.
+    #[tokio::test]
+    async fn install_with_uses_supplied_orchestrator_and_forwards() {
+        let app = tauri::test::mock_app();
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+        install_with(app.handle(), Arc::clone(&orch)).expect("install_with");
+
+        // The Arc in state must be `ptr_eq` to the one we passed —
+        // a regression that constructs a *new* orchestrator inside
+        // `install_with` (the bug the refactor risks reintroducing)
+        // would surface as a different Arc here.
+        let stored = app
+            .handle()
+            .state::<Arc<LocalSessionOrchestrator>>()
+            .inner()
+            .clone();
+        assert!(
+            Arc::ptr_eq(&orch, &stored),
+            "install_with must store the supplied Arc, not a clone-of-clone of it",
+        );
+
+        // End-to-end: a publish on the supplied orchestrator's bus
+        // reaches a Tauri listener via the forwarder.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        app.handle().listen("meeting:detected", move |evt| {
+            captured_clone
+                .lock()
+                .expect("lock")
+                .push(evt.payload().to_owned());
+        });
+        orch.event_bus().publish(sample_envelope());
+        wait_for_capture(
+            &captured,
+            "install_with's forwarder didn't deliver the event",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn install_with_twice_returns_err() {
+        // Same idempotency guard as `install_twice_returns_err`, but
+        // exercising the new entry point directly. Both `install`
+        // and `install_with` route through the same `app.manage`
+        // check, but pinning the contract on each public surface
+        // stops a refactor that splits the manage call from
+        // returning Err on duplicate.
+        let app = tauri::test::mock_app();
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+        install_with(app.handle(), Arc::clone(&orch)).expect("first install_with");
+        let result = install_with(app.handle(), orch);
+        assert!(result.is_err(), "second install_with should fail");
     }
 
     #[tokio::test]
