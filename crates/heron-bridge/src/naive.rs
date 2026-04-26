@@ -602,14 +602,12 @@ fn spawn_meeting_in_task(
                 }
             }
         }
-        // Input closed (all senders dropped, not aborted via Drop).
-        // Flush remaining buffered frames so the tail isn't lost
-        // on graceful shutdown.
-        for out in jitter.drain() {
-            if !forward(&tx, out, &health) {
-                return;
-            }
-        }
+        // No tail flush: [`NaiveBridge::drop`] aborts this task at
+        // the next `rx.recv().await` yield, so any code past the
+        // loop is structurally unreachable. A graceful-shutdown
+        // path that drains buffered frames belongs on a future
+        // `async fn shutdown(self)` API where we can await the
+        // task; doing it here would only hide the abort race.
     })
 }
 
@@ -646,23 +644,17 @@ fn spawn_agent_out_task(
     })
 }
 
-/// Approximate the jitter buffer's current capture-time spread.
+/// Snapshot the jitter buffer's current capture-time spread into
+/// the bridge's lock-free health surface.
 ///
-/// **Approximation note:** This reports `len * 20 ms`, treating
-/// each buffered frame as one realtime-backend chunk. That under-
-/// reports actual spread when buffered frames have non-uniform
-/// capture-time gaps — e.g. two frames at t=0 and t=200_000 µs
-/// represent a 200 ms span but report 40 ms here. The current
-/// [`JitterBuffer`] API doesn't expose its keys, so an exact span
-/// would require widening that API; pinning this approximation
-/// keeps the metric honest about its limits without an out-of-
-/// scope cross-module change. The verdict integration test relies
-/// only on the AEC-loss path, which is unaffected.
-///
-/// Encoded into `AtomicU32` via `f32::to_bits` so the snapshot
-/// path stays lock-free. An empty buffer reports 0 ms (Healthy).
+/// Reads [`JitterBuffer::spread_micros`] — the exact `last_key -
+/// first_key` span of the buffer's `BTreeMap` — so frames of
+/// non-uniform size or capture-time gaps still produce the right
+/// "ms of backlog" number. Encoded into `AtomicU32` via
+/// `f32::to_bits` so the snapshot path stays lock-free. An empty
+/// or single-frame buffer reports 0 ms (Healthy).
 fn update_jitter_metric(jitter: &JitterBuffer, health: &HealthState) {
-    let span_ms = (jitter.len() as f32) * 20.0;
+    let span_ms = jitter.spread_micros() as f32 / 1_000.0;
     health.jitter_ms.store(span_ms.to_bits(), Ordering::Relaxed);
 }
 

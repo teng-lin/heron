@@ -174,6 +174,19 @@ impl JitterBuffer {
         self.watermark_micros
     }
 
+    /// Span between the oldest and newest buffered frames in capture
+    /// micros, or `0` when the buffer is empty or holds a single
+    /// frame. The `BTreeMap` is keyed by `captured_at_micros`, so
+    /// `last - first` is the exact backlog spread regardless of
+    /// per-frame size — what bridge health surfaces want to report
+    /// as "jitter."
+    pub fn spread_micros(&self) -> u64 {
+        match (self.frames.first_key_value(), self.frames.last_key_value()) {
+            (Some((first, _)), Some((last, _))) => last.saturating_sub(*first),
+            _ => 0,
+        }
+    }
+
     /// Insert a frame. Returns the outcome; the buffer advances its
     /// watermark to `max(watermark, captured_at_micros - late_drop_micros)`
     /// on a successful insert.
@@ -287,6 +300,23 @@ mod tests {
     fn empty_buffer_pop_returns_none() {
         let mut jb = JitterBuffer::new(JitterConfig::default());
         assert!(jb.pop_oldest().is_none());
+    }
+
+    #[test]
+    fn spread_micros_reflects_first_to_last_capture_gap() {
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        assert_eq!(jb.spread_micros(), 0, "empty");
+        jb.insert(frame(5_000));
+        assert_eq!(jb.spread_micros(), 0, "single frame");
+        jb.insert(frame(205_000));
+        // 205 ms - 5 ms = 200 ms = 200_000 µs.
+        assert_eq!(jb.spread_micros(), 200_000);
+        jb.insert(frame(105_000));
+        // Adding a middle frame must not change the spread.
+        assert_eq!(jb.spread_micros(), 200_000);
+        let _ = jb.pop_oldest(); // drop t=5_000
+        // New first is 105_000; spread = 205_000 - 105_000 = 100 ms.
+        assert_eq!(jb.spread_micros(), 100_000);
     }
 
     #[test]
