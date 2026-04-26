@@ -38,44 +38,70 @@ pub enum TokenError {
     NoHome,
     #[error("token file io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("token file is empty: {path}")]
-    Empty { path: String },
 }
 
-/// Default location of the token file: `~/.heron/cli-token`. The
-/// production binary uses this; tests bypass it entirely by
-/// constructing [`AuthConfig`] directly.
+/// Default location of the token file: `~/.heron/cli-token`. Uses
+/// the `dirs` crate so platform-specific home resolution (and the
+/// `HOME` env-var fallback on unix) is one well-tested call rather
+/// than reimplemented inline.
 pub fn default_token_path() -> Result<PathBuf, TokenError> {
-    let home = std::env::var_os("HOME").ok_or(TokenError::NoHome)?;
-    let mut path = PathBuf::from(home);
+    let mut path = dirs::home_dir().ok_or(TokenError::NoHome)?;
     path.push(".heron");
     path.push("cli-token");
     Ok(path)
 }
 
-/// Load the bearer token from `path`, minting a fresh one if absent.
-/// Mints a UUIDv7 (so the token is unguessable but log-greppable as
-/// a heron-shaped ID) and writes it with mode 0600. Newline-trimmed
-/// on read so a `printf` vs `echo` round-trip doesn't shift the
+/// Load the bearer token from `path`, minting a fresh one if absent
+/// **or empty**. Mints a UUIDv7 (so the token is unguessable but
+/// log-greppable as a heron-shaped ID) and writes it with mode 0600
+/// inside a directory created with mode 0700. Newline-trimmed on
+/// read so a `printf` vs `echo` round-trip doesn't shift the
 /// comparison.
+///
+/// An empty token file is treated as "no token" (and a fresh one is
+/// minted in its place) rather than a hard error: the user's
+/// rotation procedure is "delete the file and restart", and an
+/// interrupted edit that leaves the file empty should self-heal on
+/// the next start instead of bricking the daemon.
 pub fn load_or_mint(path: &std::path::Path) -> Result<AuthConfig, TokenError> {
     if path.exists() {
         let raw = std::fs::read_to_string(path)?;
         let bearer = raw.trim().to_owned();
-        if bearer.is_empty() {
-            return Err(TokenError::Empty {
-                path: path.display().to_string(),
-            });
+        if !bearer.is_empty() {
+            return Ok(AuthConfig { bearer });
         }
-        return Ok(AuthConfig { bearer });
+        // Empty file — fall through to mint, then truncate-and-write.
+        // `create_new(true)` would fail because the file exists, so
+        // remove first and let the mint path recreate it with mode
+        // 0600.
+        std::fs::remove_file(path)?;
     }
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_with_mode_0700(parent)?;
     }
     let bearer = uuid::Uuid::now_v7().to_string();
     write_with_mode_0600(path, &bearer)?;
     Ok(AuthConfig { bearer })
+}
+
+#[cfg(unix)]
+fn create_dir_all_with_mode_0700(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)?;
+    // `create_dir_all` honors the process umask; explicitly tighten
+    // to 0700 so a permissive umask doesn't leak the token directory
+    // to other local users. Idempotent — safe to call on an
+    // already-tight directory.
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_with_mode_0700(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
@@ -117,11 +143,13 @@ pub async fn reject_browser_origin(req: Request<Body>, next: Next) -> Response {
 }
 
 /// Bearer-token check. `/health` is allowlisted because the OpenAPI
-/// declares it `security: []`. Constant-time string comparison would
-/// be belt-and-suspenders here — the token is a 36-byte UUID so a
-/// timing oracle leaks at most the prefix length and the daemon is
-/// localhost-only — but we still use a length-then-bytes compare so
-/// the trivial mismatches short-circuit fast without leaking length.
+/// declares it `security: []`. The byte-comparison path
+/// ([`bearer_eq`]) is constant-time **for inputs of equal length**;
+/// length itself is leaked via a fast-path mismatch. That's
+/// acceptable because the token is a fixed-length UUID (36 bytes)
+/// and the daemon is localhost-only — a timing oracle on a
+/// localhost-bound socket has negligible signal — but the comment
+/// is honest about what the constant-time guarantee covers.
 pub async fn require_bearer_except_health(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -199,12 +227,32 @@ mod tests {
     }
 
     #[test]
-    fn load_or_mint_rejects_empty_token_file() {
+    fn load_or_mint_self_heals_empty_token_file() {
         let dir = tempdir();
         let path = dir.join("cli-token");
         std::fs::write(&path, "\n").expect("write empty");
-        let err = load_or_mint(&path).expect_err("should reject empty");
-        assert!(matches!(err, TokenError::Empty { .. }));
+        let cfg = load_or_mint(&path).expect("self-heal mints fresh");
+        assert!(!cfg.bearer.is_empty());
+        // The freshly-minted token is now persisted, so a re-load
+        // returns the same value rather than minting again.
+        let again = load_or_mint(&path).expect("re-read after self-heal");
+        assert_eq!(cfg.bearer, again.bearer);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_or_mint_sets_token_directory_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let nested = dir.join("nested-heron-dir");
+        let path = nested.join("cli-token");
+        load_or_mint(&path).expect("mint");
+        let mode = std::fs::metadata(&nested)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "directory mode = {mode:o}");
     }
 
     fn tempdir() -> std::path::PathBuf {

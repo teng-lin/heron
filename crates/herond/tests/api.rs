@@ -184,19 +184,16 @@ async fn events_emits_published_envelope_in_sse_framing() {
     let app = build_app(test_state(stub.clone()));
 
     // Spawn the request first so the subscriber is up before we
-    // publish — broadcast::Sender drops events with no live receivers.
+    // publish — broadcast::Sender drops events with no live
+    // receivers. We deterministically wait for the SSE handler to
+    // reach `bus.subscribe()` by polling `subscriber_count` rather
+    // than racing on a fixed sleep.
     let req = Request::get("/events")
         .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
         .body(Body::empty())
         .unwrap();
     let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
-    // Yield enough times for the subscriber to register. Without
-    // this the publish lands before the broadcast subscribe, and
-    // the test flakes.
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_subscriber(&bus).await;
 
     let envelope = sample_envelope();
     let delivered = bus.publish(envelope.clone());
@@ -242,17 +239,16 @@ async fn events_replays_from_replay_cache_then_takes_live_tail() {
     // and replay everything we have" for simplicity. That's fine
     // for asserting the replay path is wired.
     let resume_from = EventId::now_v7();
+    let bus_handle = orch.event_bus();
     let req = Request::get(format!("/events?since_event_id={resume_from}"))
         .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
         .body(Body::empty())
         .unwrap();
     let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_subscriber(&bus_handle).await;
 
     // Drop the orchestrator handle so the bus closes and SSE ends.
+    drop(bus_handle);
     drop(orch);
 
     let response = response_fut.await.unwrap();
@@ -327,6 +323,22 @@ fn sample_envelope() -> Envelope<EventPayload> {
     };
     Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
         .with_meeting(meeting.id.to_string())
+}
+
+/// Poll the broadcast bus until the SSE handler has registered its
+/// subscriber. Replaces a fixed-duration sleep so the test is
+/// deterministic — we wait exactly as long as needed and no longer.
+/// Falls back to a generous total budget so a hung handler fails
+/// the test instead of hanging the test runner.
+async fn wait_for_subscriber(bus: &SessionEventBus) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while bus.subscriber_count() == 0 {
+        if std::time::Instant::now() >= deadline {
+            panic!("SSE handler never registered a subscriber within 5s");
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 async fn body_json(res: axum::response::Response) -> serde_json::Value {

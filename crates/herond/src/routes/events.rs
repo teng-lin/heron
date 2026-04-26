@@ -178,19 +178,15 @@ async fn get_events(
         res.map(|env| {
             // event_type rides flattened on the envelope; surface it
             // up so the SSE framing carries a typed `event:` field
-            // that matches the OpenAPI taxonomy.
-            let event_type = serde_json::to_value(&env.payload).ok().and_then(|v| {
-                v.as_object()
-                    .and_then(|m| m.get("event_type").cloned())
-                    .and_then(|v| v.as_str().map(str::to_owned))
-            });
+            // that matches the OpenAPI taxonomy. Match the enum
+            // directly rather than round-tripping the payload
+            // through `serde_json::Value` just to read the tag —
+            // that saves a heap allocation per event on the SSE
+            // hot path.
+            let event_type = event_type_of(&env.payload);
             let id = env.event_id.to_string();
             let data = serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_owned());
-            let mut sse = Event::default().id(id).data(data);
-            if let Some(et) = event_type {
-                sse = sse.event(et);
-            }
-            sse
+            Event::default().id(id).event(event_type).data(data)
         })
     });
 
@@ -214,5 +210,24 @@ fn window_secs(d: Duration) -> Option<u64> {
     Some(d.as_secs())
 }
 
-#[allow(dead_code)]
-fn _payload_imported(_: EventPayload) {}
+/// Map an `EventPayload` variant to its OpenAPI `event_type` literal.
+/// Hand-coded match: keeps the SSE projection on the hot path
+/// allocation-free and pins the wire taxonomy in code so a future
+/// variant added without updating this fn fails the exhaustive-match
+/// check.
+fn event_type_of(p: &EventPayload) -> &'static str {
+    match p {
+        EventPayload::MeetingDetected(_) => "meeting.detected",
+        EventPayload::MeetingArmed(_) => "meeting.armed",
+        EventPayload::MeetingStarted(_) => "meeting.started",
+        EventPayload::MeetingEnded(_) => "meeting.ended",
+        EventPayload::MeetingCompleted(_) => "meeting.completed",
+        EventPayload::MeetingParticipantJoined(_) => "meeting.participant_joined",
+        EventPayload::TranscriptPartial(_) => "transcript.partial",
+        EventPayload::TranscriptFinal(_) => "transcript.final",
+        EventPayload::SummaryReady(_) => "summary.ready",
+        EventPayload::ActionItemsReady(_) => "action_items.ready",
+        EventPayload::DoctorWarning(_) => "doctor.warning",
+        EventPayload::DaemonError(_) => "daemon.error",
+    }
+}
