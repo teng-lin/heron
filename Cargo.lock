@@ -2154,6 +2154,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "futures-util",
  "heron-types",
  "reqwest 0.12.28",
  "serde",
@@ -2163,6 +2164,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
