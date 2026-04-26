@@ -1,0 +1,1068 @@
+openapi: 3.1.0
+
+# Desktop-side HTTP API served by `herond` (the localhost daemon).
+#
+# This file is a *transport projection* of the canonical Rust trait
+# surface defined under crates/heron-* and the invariants in
+# `api-design-spec.md`. The spec is authoritative for semantics; this
+# file pins the wire format. If they disagree, the spec wins and this
+# file is the bug.
+#
+# Scope: v1 desktop (note-taker, "as the user"). The v2 bot-API
+# projection is a separate file once the driver spike resolves.
+#
+# Naming note: this spec uses `mtg_` prefixed IDs and `meeting.*`
+# event names per `api-design-spec.md` §2, superseding the `session.*`
+# vocabulary in `architecture.md` (which is older). A follow-up renames
+# the events in `architecture.md` for consistency.
+
+info:
+  title: heron desktop API
+  version: 2026-04-25
+  summary: Localhost HTTP control surface for the heron desktop daemon.
+  description: |
+    `herond` exposes meeting capture, transcripts, summaries, calendar
+    reads, and a realtime event stream over HTTP on localhost. It is
+    one of several transport projections of the same canonical trait
+    surface; in-process Rust subscribers, Tauri IPC, MCP, and outbound
+    webhooks are the others (`api-design-spec.md` §10, Invariant 13).
+
+    External consumers (Raycast extensions, scripts, MCP wrappers, the
+    Tauri shell when it later moves out-of-process) talk to this API.
+    The Tauri shell currently uses Tauri IPC directly; HTTP is for
+    *external* consumers.
+
+    **Network posture: localhost-only.** v1 binds `127.0.0.1:7384`
+    exclusively. A networked mode (with explicit pairing, short-lived
+    tokens or mTLS) is deferred to v1.1; a single long-lived bearer
+    in `~/.heron/cli-token` is not a defensible auth model over a
+    network and v1 declines to ship one.
+
+    **CORS: denied by default.** Browser-origin `fetch()` is rejected
+    at the daemon. Browser-style consumers must use a non-`fetch`
+    transport (Tauri's `invoke`, native HTTP from a desktop app, or a
+    same-origin proxy). This avoids accidentally exposing the daemon
+    to a malicious page on the same machine.
+
+    **Versioning:** every request may include
+    `Heron-API-Version: 2026-04-25`. The header is honored on every
+    operation; absent it, the daemon picks the latest dated version
+    it supports. Long-lived consumers should pin.
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+  contact:
+    email: peopleconf@gmail.com
+
+servers:
+  - url: http://127.0.0.1:7384/v1
+    description: |
+      Localhost bind. v1 is localhost-only. A networked mode is
+      deferred to v1.1 — see `info.description`.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: meetings
+    description: Captured meetings (one resource per meeting).
+  - name: transcripts
+    description: Per-meeting transcript reads.
+  - name: summaries
+    description: LLM-generated meeting summaries.
+  - name: events
+    description: Realtime event stream (SSE).
+  - name: calendar
+    description: EventKit calendar reads.
+  - name: context
+    description: Pre-meeting context injection (consumed at meeting start).
+  - name: ops
+    description: Health, version, capability discovery.
+
+paths:
+
+  /health:
+    get:
+      tags: [ops]
+      summary: Liveness + capability check.
+      description: |
+        Reports whether each load-bearing subsystem is healthy:
+        Core Audio process tap, WhisperKit, the Obsidian vault, and
+        EventKit. Mirrors what `heron-doctor` reports offline. A
+        consumer should call this before assuming captures will work.
+      security: []
+      responses:
+        "200":
+          description: At least one component is responsive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /meetings:
+    get:
+      tags: [meetings]
+      summary: List meetings, newest first.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+          description: Filter to meetings created at or after this timestamp.
+        - in: query
+          name: status
+          schema: { $ref: "#/components/schemas/MeetingStatus" }
+        - in: query
+          name: platform
+          schema: { $ref: "#/components/schemas/Platform" }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: |
+            Opaque cursor returned by a previous response in
+            `next_cursor`. Cursor-based, not offset-based, so deletes
+            don't shift the page.
+      responses:
+        "200":
+          description: A page of meetings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Meeting" }
+                  next_cursor:
+                    type: [string, "null"]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+    post:
+      tags: [meetings]
+      summary: Manually start a meeting capture (escape hatch).
+      description: |
+        The happy path is ambient detection — `heron-session` (planned
+        hub, today split between `heron-cli::session` and `heron-zoom`)
+        emits `meeting.detected` and the daemon arms capture without a
+        client ever calling this. This endpoint exists so an agent can
+        force a capture when detection fails. If a client calls this in
+        the steady state, detection is broken; treat it as a bug
+        report, not a feature.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform]
+              properties:
+                platform: { $ref: "#/components/schemas/Platform" }
+                hint:
+                  type: string
+                  description: |
+                    Free-form hint forwarded to the orchestrator
+                    (e.g. window title, meeting URL). Not a primary
+                    identifier.
+      responses:
+        "202":
+          description: Capture starting; poll the returned meeting.
+          headers:
+            Location:
+              schema: { type: string }
+              description: Path to the created meeting resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Meeting" }
+        "409":
+          description: A capture is already in progress for this platform.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            A required capture permission (Core Audio, mic,
+            accessibility) is missing. The error body's `details`
+            names which permission. User-actionable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /meetings/{meeting_id}:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+    get:
+      tags: [meetings]
+      summary: Fetch a single meeting.
+      responses:
+        "200":
+          description: Meeting found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Meeting" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /meetings/{meeting_id}/end:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+    post:
+      tags: [meetings]
+      summary: Manually end an in-progress meeting (escape hatch).
+      description: |
+        As with `POST /meetings`, this is an escape hatch. Detection
+        normally drives the `recording → ended → done` transition; if
+        you find yourself reaching for this, detection failed.
+      responses:
+        "204": { description: Meeting transitioned to `ended`. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Meeting is not in a state that accepts `end` (e.g. already
+            terminal). Body's `details.current_state` reports where it
+            actually is.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /meetings/{meeting_id}/transcript:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+      - in: query
+        name: format
+        schema: { type: string, enum: [json, md, vtt], default: json }
+        description: |
+          Browser fallback when the client cannot set an `Accept`
+          header. If both are present, `Accept` wins.
+    get:
+      tags: [transcripts]
+      summary: Read the meeting transcript.
+      description: |
+        Returns the orchestrator's finalized segments. While the
+        meeting is `recording`, the response carries finalized
+        segments only and `Transcript.status` is `partial`; live
+        partials remain SSE-only on `/events`. Once the meeting
+        reaches `ended | done`, status flips to `complete`.
+
+        Content negotiation: `Accept: application/json | text/markdown
+        | text/vtt`. The `?format=` query is the browser fallback;
+        `Accept` wins on conflict.
+      responses:
+        "200":
+          description: |
+            Transcript readable. The body's `status` reports whether
+            segments are still being added (`partial`) or the
+            transcript is sealed (`complete`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transcript" }
+            text/markdown:
+              schema: { type: string }
+            text/vtt:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "423":
+          description: |
+            Vault temporarily locked (e.g. iCloud Drive evicted the
+            file or another writer holds the path). User-actionable;
+            retry once the vault settles.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /meetings/{meeting_id}/summary:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+    get:
+      tags: [summaries]
+      summary: Read the meeting summary if ready.
+      description: |
+        Summaries are generated asynchronously after the meeting
+        reaches a terminal state. Subscribe to `summary.ready` on
+        `/events` rather than polling.
+      responses:
+        "200":
+          description: Summary ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Summary" }
+        "202":
+          description: |
+            Summary not yet generated. Prefer subscribing to
+            `summary.ready` on `/events`; `Retry-After` is a soft
+            hint only.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "423":
+          description: |
+            Vault temporarily locked (e.g. iCloud eviction). Retry
+            once the vault path is readable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "424":
+          description: |
+            Upstream LLM provider failed. The error body names the
+            provider in `details.provider` and uses
+            `code: HERON_E_LLM_PROVIDER_FAILED`. A `daemon.error`
+            event with the same code fires on `/events`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /meetings/{meeting_id}/audio:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+      - in: header
+        name: Range
+        schema: { type: string, example: "bytes=0-65535" }
+        description: Standard HTTP byte-range request.
+      - in: header
+        name: If-None-Match
+        schema: { type: string }
+        description: Conditional GET against `ETag`.
+    get:
+      tags: [meetings]
+      summary: Download the m4a audio sidecar.
+      description: |
+        Streams the m4a file inline. Supports byte-range requests for
+        seek. The sidecar lives in the user's vault directory; the
+        daemon proxies bytes rather than redirecting to a `file://`
+        URL because vault paths may be inside cloud-sync directories
+        the consumer cannot read directly.
+
+        **Availability:** audio is only served when the meeting status
+        is `ended | done`. A still-recording meeting returns
+        `425 Too Early` because the m4a is being written and a
+        partial download is indistinguishable from a complete file.
+        Wait for `meeting.completed` on `/events` before fetching.
+      responses:
+        "200":
+          description: Full audio stream.
+          headers:
+            Accept-Ranges:
+              schema: { type: string, enum: [bytes] }
+            ETag:
+              schema: { type: string }
+            Content-Length:
+              schema: { type: integer }
+          content:
+            audio/mp4:
+              schema: { type: string, format: binary }
+        "206":
+          description: Partial content (range request).
+          headers:
+            Content-Range:
+              schema: { type: string, example: "bytes 0-65535/1048576" }
+            ETag:
+              schema: { type: string }
+          content:
+            audio/mp4:
+              schema: { type: string, format: binary }
+        "304":
+          description: Not modified (matched `If-None-Match`).
+        "404": { $ref: "#/components/responses/NotFound" }
+        "416":
+          description: Requested range not satisfiable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "423":
+          description: |
+            Vault temporarily locked (e.g. iCloud eviction). Retry
+            once the vault settles.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "425":
+          description: |
+            Meeting is still recording. The m4a is in flight; a
+            partial download would be indistinguishable from a
+            complete file. Wait for `meeting.completed` on `/events`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /events:
+    get:
+      tags: [events]
+      summary: Subscribe to realtime events (Server-Sent Events).
+      description: |
+        Long-lived `text/event-stream` connection. Each event has an
+        `id:` (the `evt_*` ID), an `event:` (the type), and a `data:`
+        JSON payload conforming to `EventEnvelope`. The framing
+        carries the same `event_id` / `event_type` that appear inside
+        `data:` — intentional, so non-SSE projections (webhook, MCP)
+        can carry the envelope as JSON without losing typing.
+
+        **Keepalive:** the daemon emits `:heartbeat\n\n` SSE comment
+        frames every 15s. They are not JSON events and are ignored by
+        spec-compliant clients; they exist to defeat idle-connection
+        drops during macOS sleep, NAT timeouts, or proxy idle eviction.
+
+        **Resume:** `Last-Event-ID` (the SSE-standard header, sent
+        automatically by user agents on reconnect) and the
+        `?since_event_id` query are honored; the daemon replays
+        events strictly after the named ID. The replay window is
+        bounded — `X-Heron-Replay-Window-Seconds` on the response
+        declares it (default 3600). If the named ID is older than the
+        window, the daemon returns `410 Gone`; consumers should
+        reconnect without resume and accept that the gap is
+        unrecoverable.
+
+        The event taxonomy matches `architecture.md` §"Ideal agent
+        integration" with the renaming `session.*` → `meeting.*`
+        described at the top of this file. Per Invariant 9, every
+        terminal-state transition emits exactly one `meeting.completed`
+        event with `data.outcome` carrying the success/failure label —
+        consumers must not expect a separate `meeting.failed`.
+      parameters:
+        - in: query
+          name: topics
+          schema:
+            type: string
+          description: |
+            Comma-separated list of event-type globs. Default: all.
+            Examples: `meeting.*,transcript.final`,
+            `transcript.partial`.
+        - in: query
+          name: since_event_id
+          schema: { type: string }
+          description: |
+            Replay events strictly after this `evt_*` ID. Equivalent
+            to setting `Last-Event-ID` on a fresh connection. If both
+            are present, `Last-Event-ID` wins.
+      responses:
+        "200":
+          description: Stream open.
+          headers:
+            X-Heron-Replay-Window-Seconds:
+              schema: { type: integer, example: 3600 }
+              description: |
+                Maximum age (in seconds) of an event ID that
+                `Last-Event-ID` / `since_event_id` can resume from.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/EventEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "410":
+          description: |
+            `Last-Event-ID` / `since_event_id` is older than the
+            replay window. Reconnect without resume to start fresh;
+            the gap is unrecoverable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /calendar/upcoming:
+    get:
+      tags: [calendar]
+      summary: List upcoming calendar events.
+      description: |
+        Read-only slice over the EventKit bridge already wired into
+        `heron-vault`. Returned events are correlated with prior
+        meetings where attendees overlap, so a consumer can fetch the
+        full pre-meeting briefing in one call.
+      parameters:
+        - in: query
+          name: from
+          schema: { type: string, format: date-time }
+        - in: query
+          name: to
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: A list of calendar events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/CalendarEvent" }
+        "503":
+          description: Calendar permission missing. User-actionable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /context:
+    put:
+      tags: [context]
+      summary: Attach pre-meeting context to a calendar event.
+      description: |
+        Stores user-supplied context keyed to a calendar event. When
+        capture starts and the calendar event matches, the context is
+        consumed by the orchestrator and (in v2) injected into the
+        agent's system prompt during `loading_persona → tts_warming`
+        per spec §8. Idempotent: the latest PUT for a given
+        `calendar_event_id` wins.
+
+        `calendar_event_id` is an EventKit identifier — a resolver
+        input (Invariant 4), so it lives in the request body, never
+        in a URL path.
+
+        Context size is capped at 16K tokens before downstream
+        consumption (Invariant 10). Larger payloads are accepted here
+        but summarized at consumption time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PreMeetingContextRequest" }
+      responses:
+        "204": { description: Context stored. }
+        "404":
+          description: Calendar event not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Validation error (e.g. attendee email malformed).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Bearer token written by `herond` to `~/.heron/cli-token` (mode
+        0600) on first run. Single-token model; rotate by deleting the
+        file and restarting the daemon.
+
+  parameters:
+    MeetingIdPath:
+      in: path
+      name: meeting_id
+      required: true
+      schema: { $ref: "#/components/schemas/MeetingId" }
+
+  responses:
+    Unauthorized:
+      description: Bearer token missing or invalid.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+
+    MeetingId:
+      type: string
+      pattern: '^mtg_[0-9A-HJKMNP-TV-Z]+$'
+      description: |
+        Stripe-style prefixed UUIDv7 (base32, Crockford alphabet),
+        per spec §2. Time-ordered.
+
+    NullableMeetingId:
+      type: [string, "null"]
+      pattern: '^mtg_[0-9A-HJKMNP-TV-Z]+$'
+      description: |
+        `MeetingId` or `null`. Defined as a single typed alternative
+        rather than `oneOf` so JSON Schema 2020-12 validators and
+        codegen tools produce a single nullable Rust/TS type.
+
+    EventId:
+      type: string
+      pattern: '^evt_[0-9A-HJKMNP-TV-Z]+$'
+      description: |
+        Stripe-style prefixed UUIDv7 (base32, Crockford alphabet),
+        per spec §2. Time-ordered.
+
+    Platform:
+      type: string
+      enum: [zoom, google_meet, microsoft_teams, webex]
+      description: |
+        Native meeting client. **v1 actually serves only `zoom`**;
+        the other values are reserved for v1.1+ (Google Meet / Teams
+        once the WebRTC track-ID interception path lands; Webex
+        pending an accessibility-tree survey). A v1 daemon emitting
+        anything other than `zoom` is a bug — clients should still
+        accept the wider enum for forward compatibility.
+
+    MeetingStatus:
+      type: string
+      enum: [detected, armed, recording, ended, done, failed]
+      description: |
+        v1 desktop meeting lifecycle from `heron-cli::session` and
+        `architecture.md` — distinct from spec §3, which is the v2
+        bot FSM. `done` is terminal-success (transcript + summary
+        written + audio sidecar verified). `failed` is
+        terminal-failure (capture aborted, transcript orphaned).
+        Both terminal states emit a single `meeting.completed` event
+        on `/events` with `data.outcome` carrying success vs failure
+        per Invariant 9.
+
+    Confidence:
+      type: string
+      enum: [high, low]
+      description: |
+        AXObserver-attributed turns are `high`; turns marked `them`
+        without a real display name are `low` (per the README's
+        ~70/30 quality promise).
+
+    Participant:
+      type: object
+      required: [display_name, identifier_kind, is_user]
+      properties:
+        display_name:
+          type: string
+          description: |
+            Real display name when known (Zoom AX tree, WebRTC track
+            label). For low-confidence turns this is "them" or the
+            literal string "me".
+        identifier_kind:
+          type: string
+          enum: [ax_tree, webrtc_track, mic, fallback]
+        is_user:
+          type: boolean
+          description: True when this participant is the local user.
+
+    Meeting:
+      type: object
+      required: [id, status, platform, started_at]
+      properties:
+        id: { $ref: "#/components/schemas/MeetingId" }
+        status: { $ref: "#/components/schemas/MeetingStatus" }
+        platform: { $ref: "#/components/schemas/Platform" }
+        title: { type: [string, "null"] }
+        calendar_event_id:
+          type: [string, "null"]
+          description: |
+            EventKit identifier when correlation succeeded; `null`
+            when the meeting was captured ad-hoc. **Correlation
+            only** — never a heron operational input. Use `MeetingId`
+            for anything other than cross-referencing with the user's
+            calendar (Invariant 4).
+        started_at: { type: string, format: date-time }
+        ended_at: { type: [string, "null"], format: date-time }
+        duration_secs: { type: [integer, "null"] }
+        participants:
+          type: array
+          items: { $ref: "#/components/schemas/Participant" }
+        transcript_status:
+          type: string
+          enum: [pending, partial, complete, failed]
+        summary_status:
+          type: string
+          enum: [pending, ready, failed]
+
+    TranscriptSegment:
+      type: object
+      required: [speaker, text, start_secs, end_secs, is_final]
+      properties:
+        speaker: { $ref: "#/components/schemas/Participant" }
+        text: { type: string }
+        start_secs: { type: number }
+        end_secs: { type: number }
+        confidence: { $ref: "#/components/schemas/Confidence" }
+        is_final:
+          type: boolean
+          description: |
+            False segments are subject to revision in a later
+            partial. Only final segments persist to the vault.
+
+    Transcript:
+      type: object
+      required: [meeting_id, status, segments]
+      properties:
+        meeting_id: { $ref: "#/components/schemas/MeetingId" }
+        status:
+          type: string
+          enum: [pending, partial, complete, failed]
+          description: |
+            Lifecycle of the transcript itself, decoupled from the
+            parent meeting. `partial` means more segments are still
+            being added — subscribe to `/events` for live deltas.
+            `complete` means the transcript is sealed.
+        language:
+          type: string
+          example: en
+        segments:
+          type: array
+          items: { $ref: "#/components/schemas/TranscriptSegment" }
+
+    ActionItem:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string }
+        owner:
+          type: [string, "null"]
+          description: |
+            Display name of the person the item is assigned to, when
+            the LLM extracted one. Free text — heron does not resolve
+            this back to a Participant in v1.
+        due:
+          type: [string, "null"]
+          format: date
+
+    Summary:
+      type: object
+      required: [meeting_id, generated_at, text]
+      properties:
+        meeting_id: { $ref: "#/components/schemas/MeetingId" }
+        generated_at: { type: string, format: date-time }
+        text:
+          type: string
+          description: Markdown body, the same text written into the vault note.
+        action_items:
+          type: array
+          items: { $ref: "#/components/schemas/ActionItem" }
+        llm_provider: { type: string, example: anthropic }
+        llm_model: { type: string, example: claude-opus-4-7 }
+
+    CalendarEvent:
+      type: object
+      required: [id, title, start, end]
+      properties:
+        id:
+          type: string
+          description: |
+            EventKit identifier. Resolver-input shape; not a heron
+            primary key.
+        title: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        attendees:
+          type: array
+          items: { $ref: "#/components/schemas/AttendeeContext" }
+        meeting_url: { type: [string, "null"], format: uri }
+        related_meetings:
+          type: array
+          items: { $ref: "#/components/schemas/MeetingId" }
+          description: |
+            Prior captured meetings whose attendees overlap. Useful
+            for clients building a pre-meeting briefing on top of the
+            calendar event.
+
+    AttendeeContext:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        email: { type: [string, "null"], format: email }
+        last_seen_in: { $ref: "#/components/schemas/NullableMeetingId" }
+        relationship: { type: [string, "null"] }
+        notes: { type: [string, "null"] }
+
+    PreMeetingContext:
+      type: object
+      description: |
+        Mirrors `PreMeetingContext` in spec §8. Wire format is
+        snake_case throughout this spec; `serde(rename_all =
+        "snake_case")` on the Rust struct preserves the mapping.
+      properties:
+        agenda: { type: [string, "null"] }
+        attendees_known:
+          type: array
+          items: { $ref: "#/components/schemas/AttendeeContext" }
+        related_notes:
+          type: array
+          items: { type: string }
+          description: Vault-relative paths.
+        prior_decisions:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              source_meeting_id:
+                $ref: "#/components/schemas/MeetingId"
+        user_briefing: { type: [string, "null"] }
+
+    PreMeetingContextRequest:
+      type: object
+      description: |
+        Body shape for `PUT /context`. `calendar_event_id` is a
+        resolver input (Invariant 4), so it lives in the body — never
+        in a URL path.
+      required: [calendar_event_id, context]
+      properties:
+        calendar_event_id:
+          type: string
+          description: |
+            EventKit identifier of the calendar event the context
+            attaches to.
+        context: { $ref: "#/components/schemas/PreMeetingContext" }
+
+    Health:
+      type: object
+      required: [status, components]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        version:
+          type: string
+          description: herond build version.
+        components:
+          type: object
+          properties:
+            capture: { $ref: "#/components/schemas/HealthComponent" }
+            whisperkit: { $ref: "#/components/schemas/HealthComponent" }
+            vault: { $ref: "#/components/schemas/HealthComponent" }
+            eventkit: { $ref: "#/components/schemas/HealthComponent" }
+            llm: { $ref: "#/components/schemas/HealthComponent" }
+
+    HealthComponent:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [ok, degraded, down, permission_missing]
+        message: { type: [string, "null"] }
+        last_check: { type: [string, "null"], format: date-time }
+
+    EventEnvelopeBase:
+      type: object
+      description: |
+        Common envelope fields carried by every event. Concrete event
+        variants extend this via `allOf`, add a typed `data` payload,
+        and pin `event_type` to a `const` value used as the
+        `EventEnvelope` discriminator.
+      required: [event_id, event_type, api_version, created_at]
+      properties:
+        event_id: { $ref: "#/components/schemas/EventId" }
+        event_type:
+          type: string
+          description: Discriminator. See `EventEnvelope.discriminator.mapping`.
+        api_version:
+          type: string
+          example: "2026-04-25"
+        created_at: { type: string, format: date-time }
+        meeting_id: { $ref: "#/components/schemas/NullableMeetingId" }
+
+    MeetingDetectedEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.detected }
+            data: { $ref: "#/components/schemas/Meeting" }
+
+    MeetingArmedEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.armed }
+            data: { $ref: "#/components/schemas/Meeting" }
+
+    MeetingStartedEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.started }
+            data: { $ref: "#/components/schemas/Meeting" }
+
+    MeetingEndedEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.ended }
+            data: { $ref: "#/components/schemas/Meeting" }
+
+    MeetingCompletedEvent:
+      description: |
+        Single terminal event per Invariant 9 — every terminal
+        transition (success, failure, abort, permission revoked)
+        emits exactly one of these. Outcomes ride in `data.outcome`,
+        not in separate event types.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.completed }
+            data:
+              type: object
+              required: [meeting, outcome]
+              properties:
+                meeting: { $ref: "#/components/schemas/Meeting" }
+                outcome:
+                  type: string
+                  enum: [success, failed, aborted, permission_revoked]
+                failure_reason: { type: [string, "null"] }
+
+    MeetingParticipantJoinedEvent:
+      description: |
+        Emitted when a new participant joins mid-meeting. Useful for
+        late-arrival speaker attribution and (in v2) re-disclosure
+        timing per spec §4.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: meeting.participant_joined }
+            data: { $ref: "#/components/schemas/Participant" }
+
+    TranscriptPartialEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: transcript.partial }
+            data: { $ref: "#/components/schemas/TranscriptSegment" }
+
+    TranscriptFinalEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: transcript.final }
+            data: { $ref: "#/components/schemas/TranscriptSegment" }
+
+    SummaryReadyEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: summary.ready }
+            data: { $ref: "#/components/schemas/Summary" }
+
+    ActionItemsReadyEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: action_items.ready }
+            data:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/ActionItem" }
+
+    DoctorWarningEvent:
+      description: |
+        Soft warning surfaced from `heron-doctor` checks. Indicates
+        degraded conditions, not active failure.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: doctor.warning }
+            data:
+              type: object
+              required: [component, message]
+              properties:
+                component:
+                  type: string
+                  enum: [capture, whisperkit, vault, eventkit, llm]
+                message: { type: string }
+
+    DaemonErrorEvent:
+      description: |
+        Out-of-band daemon error not tied to a meeting lifecycle.
+        Examples: vault locked, capture permission revoked, EventKit
+        access lost, LLM provider failure during summarization.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: daemon.error }
+            data:
+              type: object
+              required: [code, message, recoverable]
+              properties:
+                code:
+                  type: string
+                  pattern: '^HERON_E_[A-Z0-9_]+$'
+                message: { type: string }
+                recoverable: { type: boolean }
+
+    EventEnvelope:
+      description: |
+        Discriminated union of every event the daemon emits. The
+        `event_type` field selects the variant; consumers should
+        switch on it. SSE framing (`id:` / `event:` / `data:`) wraps
+        a JSON payload conforming to this schema.
+      oneOf:
+        - $ref: "#/components/schemas/MeetingDetectedEvent"
+        - $ref: "#/components/schemas/MeetingArmedEvent"
+        - $ref: "#/components/schemas/MeetingStartedEvent"
+        - $ref: "#/components/schemas/MeetingEndedEvent"
+        - $ref: "#/components/schemas/MeetingCompletedEvent"
+        - $ref: "#/components/schemas/MeetingParticipantJoinedEvent"
+        - $ref: "#/components/schemas/TranscriptPartialEvent"
+        - $ref: "#/components/schemas/TranscriptFinalEvent"
+        - $ref: "#/components/schemas/SummaryReadyEvent"
+        - $ref: "#/components/schemas/ActionItemsReadyEvent"
+        - $ref: "#/components/schemas/DoctorWarningEvent"
+        - $ref: "#/components/schemas/DaemonErrorEvent"
+      discriminator:
+        propertyName: event_type
+        mapping:
+          meeting.detected: "#/components/schemas/MeetingDetectedEvent"
+          meeting.armed: "#/components/schemas/MeetingArmedEvent"
+          meeting.started: "#/components/schemas/MeetingStartedEvent"
+          meeting.ended: "#/components/schemas/MeetingEndedEvent"
+          meeting.completed: "#/components/schemas/MeetingCompletedEvent"
+          meeting.participant_joined: "#/components/schemas/MeetingParticipantJoinedEvent"
+          transcript.partial: "#/components/schemas/TranscriptPartialEvent"
+          transcript.final: "#/components/schemas/TranscriptFinalEvent"
+          summary.ready: "#/components/schemas/SummaryReadyEvent"
+          action_items.ready: "#/components/schemas/ActionItemsReadyEvent"
+          doctor.warning: "#/components/schemas/DoctorWarningEvent"
+          daemon.error: "#/components/schemas/DaemonErrorEvent"
+
+    Error:
+      type: object
+      description: |
+        MeetingBaaS-shape error envelope, adopted in spec §11 as
+        heron's internal taxonomy projected over HTTP.
+      required: [success, error, message, code, statusCode]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+          description: PascalCase machine-readable error name.
+          example: VaultLocked
+        message:
+          type: string
+          description: Human-readable explanation. May change between versions.
+        code:
+          type: string
+          pattern: '^HERON_E_[A-Z0-9_]+$'
+          example: HERON_E_VAULT_LOCKED
+        statusCode:
+          type: integer
+          example: 423
+        details:
+          type: object
+          additionalProperties: true
