@@ -1246,25 +1246,6 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             Some(raw) => Some(normalize_calendar_event_id(raw)?),
             None => None,
         };
-        // Singleton-per-platform per the trait docs: a second
-        // capture for the same platform while one is still non-
-        // terminal is a `409 Conflict`. Terminal entries are
-        // removed on `end_meeting`, so the scan stops at the active
-        // set. Done in its own scope so the `MutexGuard` (sync,
-        // !Send) cannot leak into the later `.await` on the live
-        // session factory.
-        {
-            let active = lock_or_recover(&self.active_meetings);
-            if active
-                .values()
-                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
-            {
-                return Err(SessionError::CaptureInProgress {
-                    platform: args.platform,
-                });
-            }
-        }
-
         let id = MeetingId::now_v7();
         let started_at = Utc::now();
         let mut meeting = Meeting {
@@ -1285,84 +1266,99 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         };
         let mut fsm = RecordingFsm::new();
 
-        publish_meeting_event(
-            &self.bus,
-            EventPayload::MeetingDetected(meeting.clone()),
-            id,
-        );
-
-        // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
-        // armed a capture" edge; `Invalid` here would mean the
-        // freshly-built FSM isn't actually `Idle`, which can't
-        // happen — map defensively rather than `unwrap` so a future
-        // FSM change surfaces as a typed error.
-        fsm.on_hotkey().map_err(transition_to_session_error)?;
-        meeting.status = MeetingStatus::Armed;
-        publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
-
-        // armed → recording.
-        fsm.on_yes().map_err(transition_to_session_error)?;
-        meeting.status = MeetingStatus::Recording;
-        publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
-
-        // Consume the pending context AFTER the FSM walk commits but
-        // BEFORE building `CliSessionConfig`, so the rendered briefing
-        // can feed both v1 (`CliSessionConfig.pre_meeting_briefing`)
-        // and v2 (`build_live_session_start_args`). An earlier read
-        // would silently delete context that a `transition_to_session_error`
-        // early-return path is expected to leave staged for retry.
-        let applied_context = normalized_event_id
-            .as_deref()
-            .and_then(|cid| self.pending_contexts.remove(cid));
-        let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
-
-        let runtime = if let Some(vault_root) = self.vault_root.clone() {
-            let (stop_tx, stop_rx) = oneshot::channel();
-            let config = CliSessionConfig {
-                session_id: id.0,
-                target_bundle_id: platform_target_bundle_id(args.platform).to_owned(),
-                cache_dir: self.cache_dir.clone(),
-                vault_root,
-                stt_backend_name: self.stt_backend_name.clone(),
-                llm_preference: self.llm_preference,
-                pre_meeting_briefing,
-            };
-            let handle = tokio::task::spawn_blocking(move || {
-                // CoreAudio/cpal handles in the capture path are not
-                // `Send` on macOS. Run the whole shared v1 pipeline on
-                // one blocking worker with its own current-thread
-                // runtime so those handles are never moved between
-                // Tokio worker threads.
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| CliSessionError::Pipeline(format!("tokio runtime: {e}")))?;
-                runtime.block_on(async move {
-                    let mut orchestrator = CliSessionOrchestrator::new(config);
-                    orchestrator.run(stop_rx).await
-                })
-            });
-            CaptureRuntime::Pipeline { stop_tx, handle }
-        } else {
-            CaptureRuntime::Synthetic
-        };
-
-        // Best-effort v2 composition. We release `active_meetings`
-        // before awaiting the factory because:
-        //  (a) the lock guard is `!Send` (sync `Mutex`), so it can't
-        //      be held across `.await`, and
-        //  (b) the factory call may take seconds (vendor HTTP +
-        //      WebSocket open) and must not block other capture
-        //      operations on this orchestrator.
-        // The trade-off: a concurrent `end_meeting(id)` on this same
-        // meeting could land in the brief gap between insert and
-        // factory completion. We close that race by inserting a
-        // placeholder entry first (without `live_session`) and
-        // attaching the live session via a second short critical
-        // section on success.
-        let context_attached = applied_context.is_some();
-        {
+        // Atomic singleton-check-and-claim. The platform-conflict scan
+        // and the placeholder insert have to share one critical section
+        // — otherwise two concurrent `start_capture` calls for the same
+        // platform could both pass the check before either inserted,
+        // producing parallel captures. Everything inside the scope is
+        // synchronous: bus broadcasts (`bus.send` is non-blocking),
+        // FSM transitions, `tokio::task::spawn_blocking` (returns a
+        // JoinHandle immediately; the blocking work runs off-thread),
+        // and a brief `pending_contexts` lock taken AFTER
+        // `active_meetings` per the lock-ordering rule. The lock is
+        // released before the v2 `factory.start(...).await` further
+        // down — that `.await` is why the live-session attachment runs
+        // in its own short critical section after the await rather
+        // than here.
+        let applied_context = {
             let mut active = lock_or_recover(&self.active_meetings);
+            if active
+                .values()
+                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
+            {
+                return Err(SessionError::CaptureInProgress {
+                    platform: args.platform,
+                });
+            }
+
+            publish_meeting_event(
+                &self.bus,
+                EventPayload::MeetingDetected(meeting.clone()),
+                id,
+            );
+
+            // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
+            // armed a capture" edge; `Invalid` here would mean the
+            // freshly-built FSM isn't actually `Idle`, which can't
+            // happen — map defensively rather than `unwrap` so a future
+            // FSM change surfaces as a typed error.
+            fsm.on_hotkey().map_err(transition_to_session_error)?;
+            meeting.status = MeetingStatus::Armed;
+            publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
+
+            // armed → recording.
+            fsm.on_yes().map_err(transition_to_session_error)?;
+            meeting.status = MeetingStatus::Recording;
+            publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
+
+            // Consume the pending context AFTER the FSM walk commits
+            // but BEFORE building `CliSessionConfig`, so the rendered
+            // briefing can feed both v1
+            // (`CliSessionConfig.pre_meeting_briefing`) and v2
+            // (`build_live_session_start_args`). A failed FSM
+            // transition above `?`-returns and drops the guard before
+            // we touch `pending_contexts`, so a retry still finds the
+            // staged entry.
+            let applied_context = normalized_event_id
+                .as_deref()
+                .and_then(|cid| self.pending_contexts.remove(cid));
+            let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
+
+            let runtime = if let Some(vault_root) = self.vault_root.clone() {
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let config = CliSessionConfig {
+                    session_id: id.0,
+                    target_bundle_id: platform_target_bundle_id(args.platform).to_owned(),
+                    cache_dir: self.cache_dir.clone(),
+                    vault_root,
+                    stt_backend_name: self.stt_backend_name.clone(),
+                    llm_preference: self.llm_preference,
+                    pre_meeting_briefing,
+                };
+                let handle = tokio::task::spawn_blocking(move || {
+                    // CoreAudio/cpal handles in the capture path are
+                    // not `Send` on macOS. Run the whole shared v1
+                    // pipeline on one blocking worker with its own
+                    // current-thread runtime so those handles are
+                    // never moved between Tokio worker threads.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| CliSessionError::Pipeline(format!("tokio runtime: {e}")))?;
+                    runtime.block_on(async move {
+                        let mut orchestrator = CliSessionOrchestrator::new(config);
+                        orchestrator.run(stop_rx).await
+                    })
+                });
+                CaptureRuntime::Pipeline { stop_tx, handle }
+            } else {
+                CaptureRuntime::Synthetic
+            };
+
+            // Placeholder insert: claims the platform slot before we
+            // release the lock. The v2 live session (if any) is
+            // attached below in a second critical section, after
+            // `factory.start(..).await` resolves.
             active.insert(
                 id,
                 ActiveMeeting {
@@ -1373,7 +1369,18 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     live_session: None,
                 },
             );
-        }
+
+            applied_context
+        };
+
+        // The v2 factory call is the only step that needs the lock
+        // released, because it `.await`s on vendor HTTP / WebSocket
+        // open. The trade-off: a concurrent `end_meeting(id)` on this
+        // same meeting could land in the brief gap between the insert
+        // above and the live-session attach below; that race is closed
+        // by the post-await scope checking that the entry is still
+        // present and tearing the orphan session down if it isn't.
+        let context_attached = applied_context.is_some();
 
         if let Some(factory) = self.live_session_factory.as_ref() {
             let live_args = build_live_session_start_args(
