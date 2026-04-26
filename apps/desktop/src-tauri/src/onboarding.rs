@@ -603,18 +603,46 @@ pub fn test_daemon() -> TestOutcome {
 }
 
 /// Async core of [`test_daemon`].
+///
+/// `probe_url` returns `running: true` for any 200 OK, even when
+/// the response body fails to parse as JSON (in which case it
+/// stashes the parse error in `status.error` and `version` is
+/// None). That keeps the lower-level probe honest — "the port
+/// answered" — but for an onboarding "is the daemon up?" Test
+/// button we want the conservative reading. If a different
+/// process is squatting on 7384 and returns 200 with non-JSON,
+/// flag it: `running == true && version.is_none() && error.is_some()`
+/// is the "wrong daemon" signature. Without this branch the wizard
+/// would silently green-light a misbound port.
 pub async fn test_daemon_async() -> TestOutcome {
-    let status = crate::daemon::probe().await;
-    if status.running {
-        match status.version {
-            Some(v) => TestOutcome::pass(format!("herond v{v} responding at /v1/health")),
-            None => TestOutcome::pass("herond responding at /v1/health"),
-        }
-    } else {
+    classify_daemon_status(crate::daemon::probe().await)
+}
+
+/// Pure mapping from `DaemonStatus` to `TestOutcome`. Split out so
+/// the unit tests can exercise every branch without spinning up
+/// a real axum server (the `daemon` module's own tests cover the
+/// probe-against-network path).
+fn classify_daemon_status(status: crate::daemon::DaemonStatus) -> TestOutcome {
+    if !status.running {
         let reason = status
             .error
             .unwrap_or_else(|| "no response from herond".to_owned());
-        TestOutcome::fail(format!("herond not reachable at 127.0.0.1:7384 ({reason})"))
+        return TestOutcome::fail(format!("herond not reachable at 127.0.0.1:7384 ({reason})"));
+    }
+    match (status.version, status.error) {
+        (Some(v), _) => TestOutcome::pass(format!("herond v{v} responding at /v1/health")),
+        // 200 OK + parseable body but no `version` field. Pass —
+        // the daemon answered with a JSON shape our parser
+        // accepted, just one without the optional version key.
+        (None, None) => TestOutcome::pass("herond responding at /v1/health"),
+        // 200 OK + body that didn't parse as JSON. Almost
+        // certainly a different process on 7384 (rogue daemon,
+        // local web server, etc.). Surface as Fail so the wizard
+        // doesn't green-light the wrong process.
+        (None, Some(parse_err)) => TestOutcome::fail(format!(
+            "127.0.0.1:7384 answered with an unrecognized response shape ({parse_err}); \
+             another process may be using port 7384"
+        )),
     }
 }
 
@@ -920,6 +948,66 @@ mod tests {
         match r {
             TestOutcome::Fail { details } => {
                 assert!(details.contains("async context"));
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// `classify_daemon_status` must surface the "wrong daemon on
+    /// 7384" signature (running + parse error + no version) as Fail
+    /// — otherwise the wizard would green-light a rogue process
+    /// that returned 200 with non-JSON. Pin every branch.
+    #[test]
+    fn classify_daemon_status_branches() {
+        use crate::daemon::DaemonStatus;
+        // (1) Not running → Fail with reason.
+        let r = classify_daemon_status(DaemonStatus {
+            running: false,
+            version: None,
+            error: Some("connection refused".into()),
+        });
+        match r {
+            TestOutcome::Fail { details } => assert!(details.contains("connection refused")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+
+        // (2) Running + version → Pass with version.
+        let r = classify_daemon_status(DaemonStatus {
+            running: true,
+            version: Some("0.1.0".into()),
+            error: None,
+        });
+        match r {
+            TestOutcome::Pass { details } => assert!(details.contains("v0.1.0")),
+            other => panic!("expected Pass, got {other:?}"),
+        }
+
+        // (3) Running + no version + no error → Pass without
+        // version (a healthy daemon that doesn't surface version
+        // is still a valid daemon per the OpenAPI Health schema —
+        // `version` is optional).
+        let r = classify_daemon_status(DaemonStatus {
+            running: true,
+            version: None,
+            error: None,
+        });
+        assert!(matches!(r, TestOutcome::Pass { .. }));
+
+        // (4) Running + no version + parse error → Fail (wrong
+        // daemon on 7384). This is the regression CodeRabbit
+        // flagged: without this branch the wizard silently passes
+        // when an unrelated process answers 200 with non-JSON.
+        let r = classify_daemon_status(DaemonStatus {
+            running: true,
+            version: None,
+            error: Some("expected value at line 1".into()),
+        });
+        match r {
+            TestOutcome::Fail { details } => {
+                assert!(
+                    details.contains("unrecognized response shape"),
+                    "expected wrong-daemon copy, got {details:?}",
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
