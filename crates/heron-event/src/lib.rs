@@ -41,20 +41,10 @@ pub use heron_types::prefixed_id::IdParseError;
 
 heron_types::prefixed_id! {
     /// Stripe-style prefixed UUIDv7 for an event. Wire form
-    /// `evt_<uuid>`. Time-ordered, so a sort by `EventId` is a sort
-    /// by emission time — the property the SSE replay window relies
-    /// on. Per `api-design-spec.md` §2 and the `EventId` schema in
-    /// the OpenAPI.
-    ///
-    /// **Wire-format follow-up.** The OpenAPI `EventId` pattern is
-    /// `^evt_[0-9A-HJKMNP-TV-Z]+$` (Crockford base32) while
-    /// `heron_types::prefixed_id!` currently emits lowercase
-    /// hyphenated UUIDs (e.g. `evt_550e8400-e29b-41d4-…`). The wire
-    /// shape Rust produces does NOT match the YAML regex; either
-    /// the macro grows a base32 codec or the YAML regex relaxes to
-    /// match what the macro produces. Tracked as a workspace-wide
-    /// alignment task — every existing prefixed ID (`bot_`,
-    /// `mtg_`, `utt_`, …) has the same mismatch.
+    /// `evt_<lowercase-hyphenated-uuid>`. Time-ordered, so a sort
+    /// by `EventId` is a sort by emission time — the property the
+    /// SSE replay window relies on. Per `api-design-spec.md` §2 and
+    /// the `EventId` schema in the OpenAPI.
     pub EventId, "evt"
 }
 
