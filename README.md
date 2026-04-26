@@ -152,6 +152,22 @@ target/release/heron        # main CLI: record / summarize / status / salvage / 
 target/release/herond       # localhost daemon on 127.0.0.1:7384
 ```
 
+Patch the rpath so the binaries can find the bundled ONNX runtime:
+
+```sh
+install_name_tool -add_rpath @executable_path/ target/release/heron
+install_name_tool -add_rpath @executable_path/ target/release/herond
+```
+
+`sherpa-rs` drops `libonnxruntime.1.17.1.dylib` next to the
+binary in `target/release/`, but the binaries it produces only
+have `LC_RPATH=/usr/lib/swift` baked in. Without the
+`@executable_path/` rpath added, dyld fails to load the dylib at
+launch (`Library not loaded: @rpath/libonnxruntime.1.17.1.dylib`).
+The patch is a one-time fix per build — re-run after each
+`cargo build --release`. Future versions may bake this in via a
+post-build hook.
+
 Smoke check:
 
 ```sh
