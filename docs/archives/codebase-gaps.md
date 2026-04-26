@@ -277,7 +277,7 @@ per-error copy.
 | 3 | Bot + bridge + policy live-session composition owner | `crates/heron-orchestrator/src/live_session.rs` | RESOLVED | `LiveSessionOwner` now owns startup and teardown; daemon capture wiring remains under #1/#2 |
 | 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
-| 5b | Onboarding model-download step was a stub | `apps/desktop/src/pages/Onboarding.tsx:443` | RESOLVED | `heron_download_model` Tauri command wired; wizard renders a real `<progress>` bar driven by the `model_download:progress` event |
+| 5b | Onboarding model-download step was a stub | `apps/desktop/src-tauri/src/model_download.rs` | RESOLVED | `heron_download_model` Tauri command wired; wizard renders a real `<progress>` bar driven by the `model_download:progress` event (entry point: `runModelDownload` in `apps/desktop/src/pages/Onboarding.tsx`) |
 | 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
 | 7 | CLI v2 commands do not delegate to `herond` | `crates/heron-cli/src/main.rs:322` | MAJOR | Use bearer token + localhost API |
 | 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | RESOLVED | Fixed in PR #124 (commit `30321bc`): per-call deadlines + `WK_TIMEOUT` |

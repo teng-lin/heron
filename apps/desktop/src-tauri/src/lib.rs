@@ -409,7 +409,7 @@ fn heron_test_model_download() -> TestOutcome {
     test_model_download()
 }
 
-/// Tauri command (gap #3): trigger the real WhisperKit model download.
+/// Tauri command (gap #5b): trigger the real WhisperKit model download.
 ///
 /// Replaces the prior step-5 placeholder badge that only checked
 /// whether a model was already on disk. Forwards 0..1 progress ticks
@@ -743,7 +743,7 @@ pub fn run() {
             heron_test_accessibility,
             heron_test_calendar,
             heron_test_model_download,
-            // Gap #3: wire the real WhisperKit fetch (was a TODO
+            // Gap #5b: wire the real WhisperKit fetch (was a TODO
             // placeholder badge in the wizard's step 5).
             heron_download_model,
             // Gap #7 (this PR): in-process daemon liveness +

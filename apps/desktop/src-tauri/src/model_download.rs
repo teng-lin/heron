@@ -1,4 +1,7 @@
-//! WhisperKit model-download Tauri command (gap #3 / phase 72+).
+//! WhisperKit model-download Tauri command (gap #5b / phase 72+).
+//!
+//! (Tracked as "gap #3" in some upstream notes — the canonical entry
+//! is row 5b of the punch list in `docs/archives/codebase-gaps.md`.)
 //!
 //! Wraps `heron_speech::WhisperKitBackend::ensure_model` behind a
 //! `#[tauri::command]` so the §13.3 onboarding wizard's step 5 can
@@ -76,6 +79,9 @@ pub struct ProgressPayload {
 ///   any non-Ok as failure.
 pub async fn run_download<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     let backend = build_backend("whisperkit").map_err(|e| format!("backend unavailable: {e}"))?;
+    // Clone for the progress closure so the outer `app` stays available
+    // for the post-`ensure_model` terminal-tick emit below.
+    let app_for_progress = app.clone();
     let progress: ProgressFn = Box::new(move |fraction: f32| {
         // Clamp belt-and-suspenders. WhisperKit's bridge sends values
         // in `[0, 1]` already; if a future bridge bug emits something
@@ -87,7 +93,7 @@ pub async fn run_download<R: Runtime>(app: AppHandle<R>) -> Result<String, Strin
         // progress tick is strictly cosmetic, and aborting the
         // download because the renderer disappeared would be worse
         // than letting the cache fill out anyway.
-        if let Err(err) = app.emit(
+        if let Err(err) = app_for_progress.emit(
             EVENT_MODEL_DOWNLOAD_PROGRESS,
             ProgressPayload { fraction: clamped },
         ) {
@@ -98,7 +104,24 @@ pub async fn run_download<R: Runtime>(app: AppHandle<R>) -> Result<String, Strin
         }
     });
 
-    classify_ensure_model_result(backend.ensure_model(progress).await)
+    let result = backend.ensure_model(progress).await;
+    if result.is_ok() {
+        // Belt-and-suspenders terminal tick. `WhisperKitBackend::ensure_model`
+        // already fires `1.0` just before resolving Ok, but if a future
+        // bridge change drops that tick the renderer's bar would stay
+        // pinned below 100% on a green-check success. Re-emit here so the
+        // contract holds even if the upstream guarantee softens.
+        if let Err(err) = app.emit(
+            EVENT_MODEL_DOWNLOAD_PROGRESS,
+            ProgressPayload { fraction: 1.0 },
+        ) {
+            tracing::warn!(
+                target: "heron_desktop::model_download",
+                "terminal progress emit failed: {err}",
+            );
+        }
+    }
+    classify_ensure_model_result(result)
 }
 
 /// Pure mapping from `Result<(), SttError>` to the Tauri command's

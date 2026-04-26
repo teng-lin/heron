@@ -355,7 +355,7 @@ export interface HeronCommands {
     returns: TestOutcome;
   };
   /**
-   * Gap #3: trigger the real WhisperKit model download. Replaces the
+   * Gap #5b: trigger the real WhisperKit model download. Replaces the
    * prior placeholder badge that only checked whether a model was
    * already on disk. Resolves to a human-readable success message
    * (e.g. "WhisperKit model ready") on success; rejects with a

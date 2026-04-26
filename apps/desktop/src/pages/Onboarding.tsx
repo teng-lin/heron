@@ -1,6 +1,6 @@
 /**
  * Onboarding wizard (§13.3 / PR-ι, phase 71; gap #5 added the daemon step;
- * gap #3 wired the real WhisperKit download).
+ * gap #5b wired the real WhisperKit download).
  *
  * Six-step Test-button walkthrough that exercises the §13.3 probes
  * (mic, audio-tap, accessibility, calendar, WhisperKit model fetch)
@@ -31,7 +31,7 @@
  * - "Re-run onboarding" entry point in Settings — defer.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
@@ -121,7 +121,7 @@ const STEP_COPY: Record<StepId, { title: string; body: string }> = {
   },
   model_download: {
     title: "Speech-to-text model",
-    body: "heron downloads ~1 GB of WhisperKit models for on-device transcription. Connect to wifi if you're on a metered link — clicking Download fetches the model into the system cache and reports progress as it goes. On non-Apple builds the wizard skips this step automatically.",
+    body: "heron downloads ~1 GB of WhisperKit models for on-device transcription. Connect to wifi if you're on a metered link — clicking Download fetches the model into the system cache and reports progress as it goes. On non-Apple builds, this step can be skipped.",
   },
   daemon: {
     title: "Background service",
@@ -146,6 +146,40 @@ export default function Onboarding() {
   // outcome — it resets every time the user clicks Download again and
   // doesn't survive Back/Next navigation.
   const [modelProgress, setModelProgress] = useState<number | null>(null);
+
+  // Lifecycle-bound listener for `model_download:progress` ticks.
+  // Registering inside the component (rather than inside the
+  // `runModelDownload` async helper) makes the cleanup deterministic:
+  // a user who navigates away mid-download triggers `unlisten()`
+  // synchronously, and a user who returns gets a fresh `setModelProgress`
+  // setter wired to the live component instance instead of a stale one
+  // captured in a long-lived background promise.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    void (async () => {
+      const u = await listen<ModelDownloadProgress>(
+        MODEL_DOWNLOAD_PROGRESS_EVENT,
+        (event) => {
+          const { fraction } = event.payload;
+          if (typeof fraction === "number" && Number.isFinite(fraction)) {
+            setModelProgress(fraction);
+          }
+        },
+      );
+      if (cancelled) {
+        u();
+        return;
+      }
+      unlisten = u;
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
 
   const stepId = STEPS[current];
   // STEPS is a fixed-size tuple, but TS narrows to `StepId | undefined`
@@ -174,7 +208,7 @@ export default function Onboarding() {
         // Reset to 0 so a re-run starts the bar at empty rather than
         // stuck at the previous run's terminal value.
         setModelProgress(0);
-        const outcome = await runModelDownload(setModelProgress);
+        const outcome = await runModelDownload();
         setOutcome(stepId, outcome);
         return;
       }
@@ -268,9 +302,10 @@ export default function Onboarding() {
 
         <div className="mt-4 space-y-3">
           {stepId === "audio_tap" && <AudioTapPicker />}
-          {stepId === "model_download" && step.loading && (
-            <ModelDownloadProgressBar fraction={modelProgress} />
-          )}
+          {stepId === "model_download" &&
+            (step.loading || modelProgress !== null) && (
+              <ModelDownloadProgressBar fraction={modelProgress} />
+            )}
 
           <div className="flex items-center gap-3">
             <Button
@@ -502,42 +537,24 @@ function ModelDownloadProgressBar({ fraction }: { fraction: number | null }) {
 }
 
 /**
- * Invoke `heron_download_model`, listen on the `model_download:progress`
- * Tauri event for 0..1 ticks, and synthesize a `TestOutcome` from the
- * resolved/rejected promise.
- *
- * The listener is registered **before** the invoke to avoid a race
- * where the first 0.0 tick lands during the IPC handshake and is
- * missed (Tauri's `emit` is fire-and-forget on the main loop). We
- * unregister in a `finally` so even an unexpected throw cleans up.
+ * Invoke `heron_download_model` and synthesize a `TestOutcome` from
+ * the resolved/rejected promise. Progress ticks land on the
+ * `model_download:progress` Tauri event, which the parent
+ * `<Onboarding>` component subscribes to in a `useEffect` (so the
+ * subscription is bound to the React lifecycle rather than to this
+ * promise's lifetime).
  *
  * On success we render the backend's "ready" message; on failure we
  * surface the stringified `SttError` directly, matching the per-error
  * copy in `model_download::classify_ensure_model_result`.
  */
-async function runModelDownload(
-  setProgress: (fraction: number) => void,
-): Promise<TestOutcome> {
-  let unlisten: UnlistenFn | null = null;
+async function runModelDownload(): Promise<TestOutcome> {
   try {
-    unlisten = await listen<ModelDownloadProgress>(
-      MODEL_DOWNLOAD_PROGRESS_EVENT,
-      (event) => {
-        const { fraction } = event.payload;
-        if (typeof fraction === "number" && Number.isFinite(fraction)) {
-          setProgress(fraction);
-        }
-      },
-    );
     const message = await invoke("heron_download_model");
     return { status: "pass", details: message };
   } catch (err) {
     const details = err instanceof Error ? err.message : String(err);
     return { status: "fail", details };
-  } finally {
-    if (unlisten) {
-      unlisten();
-    }
   }
 }
 
