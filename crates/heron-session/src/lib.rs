@@ -787,7 +787,11 @@ mod prefix_tests {
         // SessionError's variant count via a discriminator-based
         // pin: if a variant is added without extending this list,
         // the count below diverges.
-        assert_eq!(cases.len(), 9, "extend test when SessionError gains a variant");
+        assert_eq!(
+            cases.len(),
+            9,
+            "extend test when SessionError gains a variant"
+        );
         for err in &cases {
             let code = err.code();
             assert!(code.starts_with("HERON_E_"), "code {code} missing prefix");
