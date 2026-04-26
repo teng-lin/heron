@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 pub mod health;
 pub mod jitter;
 pub mod mix;
+pub mod naive;
 pub mod pcm;
 pub mod resample;
 pub use health::{
@@ -31,6 +32,7 @@ pub use health::{
 };
 pub use jitter::{InsertOutcome, JitterBuffer, JitterConfig};
 pub use mix::{average_saturating, mix_inplace_saturating, mix_saturating};
+pub use naive::{NaiveBridge, NaiveBridgeConfig};
 pub use pcm::{
     DEFAULT_SILENCE_THRESHOLD, PcmFrameExt, SAMPLE_RATE_HZ, ms_to_samples, samples_to_ms,
 };
