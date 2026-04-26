@@ -20,6 +20,7 @@ pub mod disk;
 pub mod event_bus;
 pub mod keychain;
 pub mod keychain_resolver;
+pub mod model_download;
 pub mod notes;
 pub mod onboarding;
 pub mod preflight;
@@ -408,6 +409,18 @@ fn heron_test_model_download() -> TestOutcome {
     test_model_download()
 }
 
+/// Tauri command (gap #3): trigger the real WhisperKit model download.
+///
+/// Replaces the prior step-5 placeholder badge that only checked
+/// whether a model was already on disk. Forwards 0..1 progress ticks
+/// onto the `model_download:progress` Tauri event the renderer
+/// listens on. See [`crate::model_download`] for the wire shape and
+/// the per-error mapping.
+#[tauri::command]
+async fn heron_download_model(app: tauri::AppHandle) -> Result<String, String> {
+    model_download::run_download(app).await
+}
+
 /// Tauri command: navigate the frontend to the named target.
 ///
 /// The frontend owns the router (`react-router-dom`), so the Rust side
@@ -730,6 +743,9 @@ pub fn run() {
             heron_test_accessibility,
             heron_test_calendar,
             heron_test_model_download,
+            // Gap #3: wire the real WhisperKit fetch (was a TODO
+            // placeholder badge in the wizard's step 5).
+            heron_download_model,
             // Gap #7 (this PR): in-process daemon liveness +
             // structured status surface.
             heron_test_daemon,
