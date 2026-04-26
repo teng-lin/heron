@@ -7,7 +7,10 @@
 //! boundary that creates them in order and returns one handle that owns
 //! their shared lifetime.
 
+use std::fmt::Display;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use heron_bot::{BotCreateArgs, BotError, BotId, MeetingBotDriver};
 use heron_bridge::{AudioBridge, BridgeHealth, NaiveBridge};
@@ -18,6 +21,13 @@ use heron_policy::{
 use heron_realtime::{RealtimeBackend, RealtimeError, SessionConfig, SessionId, validate_session};
 use heron_types::MeetingId;
 use thiserror::Error;
+use tokio::time::timeout;
+
+/// Default budget for best-effort cleanup after startup fails.
+pub const DEFAULT_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-step budget for normal async shutdown.
+pub const DEFAULT_SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Inputs needed to start one live v2 meeting session.
 #[derive(Debug, Clone)]
@@ -48,6 +58,8 @@ where
     bot_driver: Arc<D>,
     realtime_backend: Arc<B>,
     bridge_factory: F,
+    startup_cleanup_timeout: Duration,
+    shutdown_step_timeout: Duration,
 }
 
 impl<D, B, F, A> LiveSessionOwner<D, B, F, A>
@@ -62,7 +74,22 @@ where
             bot_driver,
             realtime_backend,
             bridge_factory,
+            startup_cleanup_timeout: DEFAULT_STARTUP_CLEANUP_TIMEOUT,
+            shutdown_step_timeout: DEFAULT_SHUTDOWN_STEP_TIMEOUT,
         }
+    }
+
+    /// Override the best-effort cleanup budget used when startup
+    /// creates a bot but cannot open realtime.
+    pub fn with_startup_cleanup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_cleanup_timeout = timeout;
+        self
+    }
+
+    /// Override the per-step budget used by [`LiveSession::shutdown`].
+    pub fn with_shutdown_step_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_step_timeout = timeout;
+        self
     }
 
     /// Start one live session by creating the bot, opening realtime,
@@ -85,12 +112,12 @@ where
         let realtime_session = match self.realtime_backend.session_open(args.realtime).await {
             Ok(id) => id,
             Err(err) => {
-                let cleanup = self
-                    .bot_driver
-                    .bot_terminate(bot_id)
-                    .await
-                    .err()
-                    .map(|e| e.to_string());
+                let cleanup = result_or_timeout(
+                    "bot_terminate",
+                    self.startup_cleanup_timeout,
+                    self.bot_driver.bot_terminate(bot_id),
+                )
+                .await;
                 return Err(LiveSessionError::RealtimeStartup {
                     source: err,
                     bot_cleanup_error: cleanup,
@@ -112,6 +139,7 @@ where
             realtime_backend: Arc::clone(&self.realtime_backend),
             bridge,
             controller,
+            shutdown_step_timeout: self.shutdown_step_timeout,
             shutdown: false,
         })
     }
@@ -153,6 +181,7 @@ where
     realtime_backend: Arc<B>,
     bridge: A,
     controller: DefaultSpeechController<B>,
+    shutdown_step_timeout: Duration,
     shutdown: bool,
 }
 
@@ -190,24 +219,24 @@ where
     /// every cleanup step: stop speech, close realtime, then leave the
     /// meeting bot.
     pub async fn shutdown(mut self) -> Result<(), LiveSessionError> {
-        let speech = self
-            .controller
-            .cancel_current_and_clear()
-            .await
-            .err()
-            .map(|e| e.to_string());
-        let realtime = self
-            .realtime_backend
-            .session_close(self.realtime_session)
-            .await
-            .err()
-            .map(|e| e.to_string());
-        let bot = self
-            .bot_driver
-            .bot_leave(self.bot_id)
-            .await
-            .err()
-            .map(|e| e.to_string());
+        let speech = result_or_timeout(
+            "cancel_current_and_clear",
+            self.shutdown_step_timeout,
+            self.controller.cancel_current_and_clear(),
+        )
+        .await;
+        let realtime = result_or_timeout(
+            "session_close",
+            self.shutdown_step_timeout,
+            self.realtime_backend.session_close(self.realtime_session),
+        )
+        .await;
+        let bot = result_or_timeout(
+            "bot_leave",
+            self.shutdown_step_timeout,
+            self.bot_driver.bot_leave(self.bot_id),
+        )
+        .await;
 
         self.shutdown = true;
         if speech.is_some() || realtime.is_some() || bot.is_some() {
@@ -218,6 +247,25 @@ where
             });
         }
         Ok(())
+    }
+}
+
+async fn result_or_timeout<T, E, F>(
+    operation: &'static str,
+    budget: Duration,
+    fut: F,
+) -> Option<String>
+where
+    E: Display,
+    F: Future<Output = Result<T, E>>,
+{
+    match timeout(budget, fut).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(err)) => Some(err.to_string()),
+        Err(_) => Some(format!(
+            "{operation} timed out after {}ms",
+            budget.as_millis()
+        )),
     }
 }
 
@@ -288,6 +336,16 @@ mod tests {
     }
 
     struct FailingRealtimeBackend;
+
+    #[derive(Default)]
+    struct HangingTerminateBotDriver {
+        created: Mutex<Vec<BotId>>,
+    }
+
+    #[derive(Default)]
+    struct HangingLeaveBotDriver {
+        created: Mutex<Vec<BotId>>,
+    }
 
     #[async_trait]
     impl RealtimeBackend for FailingRealtimeBackend {
@@ -368,6 +426,78 @@ mod tests {
             } else {
                 None
             }
+        }
+
+        fn subscribe_state(&self, _id: BotId) -> broadcast::Receiver<BotStateEvent> {
+            let (tx, rx) = broadcast::channel(1);
+            drop(tx);
+            rx
+        }
+
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                platforms: &[Platform::Zoom],
+                live_partial_transcripts: true,
+                granular_eject_reasons: true,
+                raw_pcm_access: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MeetingBotDriver for HangingTerminateBotDriver {
+        async fn bot_create(&self, _args: BotCreateArgs) -> Result<BotId, BotError> {
+            let id = BotId::now_v7();
+            self.created.lock().unwrap().push(id);
+            Ok(id)
+        }
+
+        async fn bot_leave(&self, _id: BotId) -> Result<(), BotError> {
+            Ok(())
+        }
+
+        async fn bot_terminate(&self, _id: BotId) -> Result<(), BotError> {
+            std::future::pending().await
+        }
+
+        fn current_state(&self, _id: BotId) -> Option<BotState> {
+            Some(BotState::Joining)
+        }
+
+        fn subscribe_state(&self, _id: BotId) -> broadcast::Receiver<BotStateEvent> {
+            let (tx, rx) = broadcast::channel(1);
+            drop(tx);
+            rx
+        }
+
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                platforms: &[Platform::Zoom],
+                live_partial_transcripts: true,
+                granular_eject_reasons: true,
+                raw_pcm_access: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MeetingBotDriver for HangingLeaveBotDriver {
+        async fn bot_create(&self, _args: BotCreateArgs) -> Result<BotId, BotError> {
+            let id = BotId::now_v7();
+            self.created.lock().unwrap().push(id);
+            Ok(id)
+        }
+
+        async fn bot_leave(&self, _id: BotId) -> Result<(), BotError> {
+            std::future::pending().await
+        }
+
+        async fn bot_terminate(&self, _id: BotId) -> Result<(), BotError> {
+            Ok(())
+        }
+
+        fn current_state(&self, _id: BotId) -> Option<BotState> {
+            Some(BotState::InMeeting)
         }
 
         fn subscribe_state(&self, _id: BotId) -> broadcast::Receiver<BotStateEvent> {
@@ -510,5 +640,48 @@ mod tests {
         ));
         assert_eq!(bot.created.lock().unwrap().len(), 1);
         assert_eq!(bot.terminated.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn realtime_start_failure_times_out_hung_bot_cleanup() {
+        let bot = Arc::new(HangingTerminateBotDriver::default());
+        let realtime = Arc::new(FailingRealtimeBackend);
+        let owner = LiveSessionOwner::new(Arc::clone(&bot), realtime, NaiveBridge::with_defaults)
+            .with_startup_cleanup_timeout(Duration::from_millis(1));
+
+        let err = match owner.start(start_args()).await {
+            Ok(_) => panic!("realtime startup should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            LiveSessionError::RealtimeStartup {
+                bot_cleanup_error: Some(cleanup),
+                ..
+            } => assert!(cleanup.contains("timed out after 1ms")),
+            other => panic!("expected cleanup timeout, got {other:?}"),
+        }
+        assert_eq!(bot.created.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_times_out_hung_cleanup_step() {
+        let bot = Arc::new(HangingLeaveBotDriver::default());
+        let realtime = Arc::new(MockRealtimeBackend::new());
+        let owner = LiveSessionOwner::new(Arc::clone(&bot), realtime, NaiveBridge::with_defaults)
+            .with_shutdown_step_timeout(Duration::from_millis(1));
+        let session = owner.start(start_args()).await.expect("start live session");
+
+        let err = session.shutdown().await.expect_err("shutdown timeout");
+
+        match err {
+            LiveSessionError::Shutdown {
+                speech: None,
+                realtime: None,
+                bot: Some(bot),
+            } => assert!(bot.contains("timed out after 1ms")),
+            other => panic!("expected bot shutdown timeout, got {other:?}"),
+        }
+        assert_eq!(bot.created.lock().unwrap().len(), 1);
     }
 }
