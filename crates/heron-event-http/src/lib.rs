@@ -129,14 +129,7 @@ impl<P: Clone + Send + 'static> InMemoryReplayCache<P> {
     pub fn record(&self, envelope: Envelope<P>) {
         let now = Instant::now();
         let mut entries = lock_or_recover(&self.entries);
-        // `checked_sub` so a window larger than the process uptime
-        // (possible on a freshly-started daemon with `with_window` set
-        // to e.g. 24h) doesn't underflow `Instant`.
-        if let Some(cutoff) = now.checked_sub(self.window) {
-            while entries.front().is_some_and(|e| e.recorded_at < cutoff) {
-                entries.pop_front();
-            }
-        }
+        evict_expired(&mut entries, now, self.window);
         while entries.len() >= self.capacity {
             entries.pop_front();
         }
@@ -162,7 +155,15 @@ impl<P: Clone + Send + 'static> InMemoryReplayCache<P> {
 #[async_trait]
 impl<P: Clone + Send + Sync + 'static> ReplayCache<P> for InMemoryReplayCache<P> {
     async fn replay_since(&self, since: EventId) -> Result<Vec<Envelope<P>>, ReplayError> {
-        let entries = lock_or_recover(&self.entries);
+        let mut entries = lock_or_recover(&self.entries);
+
+        // Evict on read too, not just on `record`. An idle daemon
+        // (no events flowing) would otherwise let an
+        // older-than-window entry match a resume request, silently
+        // violating the trait contract that an out-of-window
+        // `since` collapses to `WindowExceeded`. Same helper as
+        // `record` so the two paths can't drift.
+        evict_expired(&mut entries, Instant::now(), self.window);
 
         // The trait contract collapses "older than retention" and
         // "never recorded" into the same `WindowExceeded` outcome
@@ -195,6 +196,22 @@ impl<P: Clone + Send + Sync + 'static> ReplayCache<P> for InMemoryReplayCache<P>
 /// after another thread panicked.
 fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Drop entries older than `now - window` from the front of the
+/// deque. Shared between the `record` write path and the
+/// `replay_since` read path so an idle daemon can't accidentally
+/// preserve out-of-window resume anchors. `checked_sub` so a window
+/// larger than the process uptime (possible on a freshly-started
+/// daemon with `with_window` set to e.g. 24h) doesn't underflow
+/// `Instant`.
+fn evict_expired<P>(entries: &mut VecDeque<Entry<P>>, now: Instant, window: Duration) {
+    let Some(cutoff) = now.checked_sub(window) else {
+        return;
+    };
+    while entries.front().is_some_and(|e| e.recorded_at < cutoff) {
+        entries.pop_front();
+    }
 }
 
 // ── SSE wire format ───────────────────────────────────────────────────
@@ -837,6 +854,31 @@ mod tests {
         // The evicted id is now WindowExceeded.
         let result = cache.replay_since(first.event_id).await;
         assert!(matches!(result, Err(ReplayError::WindowExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn replay_since_evicts_expired_entries_on_idle_cache() {
+        // CodeRabbit-flagged regression guard: an idle daemon (no
+        // record traffic) used to let an out-of-window entry serve
+        // as a resume anchor. With read-time eviction wired in, the
+        // first replay request after the window expires must
+        // collapse to WindowExceeded — even if no record happened
+        // in between.
+        let cache: InMemoryReplayCache<u32> =
+            InMemoryReplayCache::with_window(8, Duration::from_millis(50));
+        let entry = Envelope::new(1u32);
+        cache.record(entry.clone());
+        assert_eq!(cache.len(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // No record() call — only replay. Read-time eviction must
+        // still kick in.
+        let result = cache.replay_since(entry.event_id).await;
+        assert!(matches!(result, Err(ReplayError::WindowExceeded { .. })));
+        assert_eq!(
+            cache.len(),
+            0,
+            "replay_since must drop the expired entry it scanned over",
+        );
     }
 
     #[test]
