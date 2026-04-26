@@ -22,11 +22,26 @@ heron-speech = { workspace = true }
 heron-zoom = { workspace = true }
 heron-llm = { workspace = true }
 heron-vault = { workspace = true }
+# Shared session enums + envelope shapes — the daemon-delegating
+# subcommands send/parse the same wire types `herond` projects, so we
+# pull the schema crates rather than re-defining duplicate JSON
+# structs that would drift on every OpenAPI change.
+heron-session = { workspace = true }
+heron-event = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+dirs = { workspace = true }
 hound = { workspace = true }
+reqwest = { workspace = true }
+# `bytes` is a transitive dep of `reqwest`, but we name the
+# `bytes::Bytes` type explicitly in the SSE stream signature, so
+# declare it here to keep the public API stable across reqwest minor
+# versions. Pinned through the same version reqwest 0.12 picks.
+bytes = "1"
+eventsource-stream = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -39,6 +54,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
+wiremock = "0.6"
 
 [lints]
 workspace = true
