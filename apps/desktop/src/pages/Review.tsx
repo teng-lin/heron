@@ -24,7 +24,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { RotateCcw } from "lucide-react";
 
@@ -68,6 +68,13 @@ function formatBackupTime(iso: string): string {
 
 export default function Review() {
   const { sessionId } = useParams<{ sessionId: string }>();
+  // PR-λ (phase 73): the tray-degraded toast's "View diagnostics"
+  // action navigates to `/review/<id>?tab=diagnostics`. Read the
+  // query param so the route lands on the right Tabs section instead
+  // of the default Note view. Unknown / missing values fall through
+  // to "note".
+  const [searchParams] = useSearchParams();
+  const initialTab = searchParams.get("tab") === "diagnostics" ? "diagnostics" : "note";
   const settings = useSettingsStore((s) => s.settings);
   const ensureLoaded = useSettingsStore((s) => s.ensureLoaded);
   const settingsLoading = useSettingsStore((s) => s.loading);
@@ -408,7 +415,7 @@ export default function Review() {
             )}
 
             {vaultRoot && sessionId && (
-              <Tabs defaultValue="note">
+              <Tabs defaultValue={initialTab}>
                 <TabsList>
                   <TabsTrigger value="note">Note</TabsTrigger>
                   <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>

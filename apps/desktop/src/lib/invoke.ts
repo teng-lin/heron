@@ -103,6 +103,52 @@ export interface Settings {
    * first-run detection branches on this field.
    */
   onboarded: boolean;
+  /**
+   * PR-λ (phase 73). Bundle IDs the user wants the Core Audio process
+   * tap to record. Defaults to `["us.zoom.xos"]` for backward compat
+   * with PR-α; the Settings → Audio "Recorded apps" card lets the
+   * user add Microsoft Teams / Google Chrome / other meeting clients.
+   */
+  target_bundle_ids: string[];
+}
+
+/**
+ * Discriminated union mirroring the Rust `DiskCheckOutcome`
+ * (`tag = "kind"`, lowercase variants). Returned by
+ * `heron_check_disk_for_recording`.
+ *
+ * - `ok` — free space ≥ threshold; `free_mib` is reported for the UI.
+ * - `below_threshold` — free space dipped below `threshold_mib`. The
+ *   recording-start gate shows a warning modal; the app-mount banner
+ *   surfaces a Sonner toast.
+ */
+export type DiskCheckOutcome =
+  | { kind: "ok"; free_mib: number }
+  | { kind: "below_threshold"; free_mib: number; threshold_mib: number };
+
+/**
+ * Discriminator for the `tray:degraded` event payload. Mirrors the
+ * Rust `DegradedKind` enum — three failure modes documented in
+ * `docs/plan.md` week 12.
+ */
+export type DegradedKind = "tap_lost" | "ax_unavailable" | "aec_overflow";
+
+/**
+ * Wire-format payload for the `tray:degraded` event. Mirrors the Rust
+ * `DegradedPayload` struct.
+ */
+export interface DegradedPayload {
+  kind: DegradedKind;
+  at_secs: number;
+  /** Optional target-app label, e.g. "Zoom". */
+  target: string | null;
+  /**
+   * Active recording's session id, set by the FSM dispatch path
+   * (post-pipeline-integration). The toast's "View diagnostics"
+   * action uses this as the navigation target. `null` / undefined →
+   * the toast falls back to "newest note in the vault".
+   */
+  session_id?: string | null;
 }
 
 /**
@@ -409,6 +455,33 @@ export interface HeronCommands {
   heron_purge_audio_older_than: {
     args: { vaultPath: string; days: number };
     returns: number;
+  };
+  /**
+   * Phase 73 (PR-λ): pre-flight disk-space gate. Reads
+   * `min_free_disk_mib` from the user's settings.json, asks the OS
+   * how much free space the cache volume has, and returns the
+   * decision as a discriminated union. The recording-start gate
+   * (Home page) and the app-mount banner (App.tsx) both call this.
+   */
+  heron_check_disk_for_recording: {
+    args: { settingsPath: string };
+    returns: DiskCheckOutcome;
+  };
+  /**
+   * Phase 73 (PR-λ): manually fire a `tray:degraded` event. Today
+   * this is the only path that produces the event — real wiring
+   * lands when the FSM's `CaptureDegraded` dispatch is integrated
+   * into the recording pipeline. Useful from devtools to verify the
+   * tray + Sonner toast UX without the audio pipeline running.
+   */
+  heron_emit_capture_degraded: {
+    args: {
+      kind: DegradedKind;
+      atSecs: number;
+      target: string | null;
+      sessionId: string | null;
+    };
+    returns: void;
   };
 }
 

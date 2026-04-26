@@ -35,11 +35,12 @@
 
 import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import ConsentGate from "./components/ConsentGate";
 import { useTrayNav } from "./hooks/useTrayNav";
-import { invoke } from "./lib/invoke";
+import { invoke, type DegradedPayload } from "./lib/invoke";
 import { resolvePostOnboardingDestination } from "./lib/postOnboardingDestination";
 import Home from "./pages/Home";
 import Onboarding from "./pages/Onboarding";
@@ -53,6 +54,8 @@ import { useSettingsStore } from "./store/settings";
 export default function App() {
   useTrayNav();
   useSalvagePrompt();
+  useDiskPreflightBanner();
+  useTrayDegradedToast();
 
   return (
     <>
@@ -228,4 +231,186 @@ function useSalvagePrompt() {
     // inside the effect so we don't need to subscribe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+}
+
+/**
+ * One-shot pre-flight disk-space banner (PR-λ phase 73).
+ *
+ * On app mount, asks the Rust side how much free disk is available on
+ * the cache volume relative to the user's `min_free_disk_mib`
+ * threshold. When `BelowThreshold`, pops a Sonner banner with the
+ * informational copy "Free disk is X MiB; threshold Y. Recording is
+ * degraded." — non-blocking by design (the recording-start gate on
+ * Home.tsx surfaces a confirmation modal that the user can override
+ * with "Continue anyway"). The app-mount banner exists so a user who
+ * never starts a recording still sees the warning.
+ *
+ * IPC failures are intentionally swallowed (logged only) — a missing
+ * settings.json on first launch is the most common path through here
+ * and shouldn't surface as a startup error.
+ *
+ * StrictMode double-mount note: same pattern as `useSalvagePrompt`
+ * — a module-scoped flag (`diskPromptedThisLaunch`) guards against
+ * the duplicate run.
+ */
+let diskPromptedThisLaunch = false;
+function useDiskPreflightBanner() {
+  useEffect(() => {
+    if (diskPromptedThisLaunch) {
+      return;
+    }
+    // Flip the flag *before* the await so React 18's StrictMode
+    // double-mount doesn't trigger two concurrent `invoke` calls. The
+    // second mount observes `true` and bails synchronously. If our
+    // mount is the one that gets unmounted before the IPC resolves,
+    // the next launch (a real one — StrictMode only doubles dev
+    // mounts) re-runs the check from scratch.
+    diskPromptedThisLaunch = true;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const settingsPath = await invoke("heron_default_settings_path");
+        const outcome = await invoke("heron_check_disk_for_recording", {
+          settingsPath,
+        });
+        if (cancelled) return;
+        if (outcome.kind === "below_threshold") {
+          toast.warning("Disk space low", {
+            description:
+              `Free disk is ${outcome.free_mib} MiB; threshold ${outcome.threshold_mib}. ` +
+              "Recording is degraded.",
+            duration: 10_000,
+          });
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[heron] disk pre-flight failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
+
+/**
+ * Listen for `tray:degraded` events (PR-λ phase 73) and pop a Sonner
+ * toast with the formatted "Tap lost <target> at HH:MM:SS — transcript
+ * may have gaps in that window" message + a "View diagnostics" action
+ * button that navigates to `/review/<latest>?tab=diagnostics`.
+ *
+ * Real wiring lands when the FSM dispatches `CaptureDegraded`; for
+ * now the only way to fire this is the manual
+ * `heron_emit_capture_degraded` command (see PR body).
+ */
+function useTrayDegradedToast() {
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      const fn = await listen<DegradedPayload>("tray:degraded", (event) => {
+        // Prefer the active recording's session id from the payload
+        // (post-pipeline-integration). When absent — today's only
+        // path, since the manual-fire command leaves it `null` —
+        // fall back to the newest saved note in the vault. The
+        // wiring PR will populate `session_id` so a degraded event
+        // mid-recording doesn't navigate the user to the *previous*
+        // session by mistake.
+        const fallbackToNewest = !event.payload.session_id;
+        const eventSessionId = event.payload.session_id ?? null;
+        toast.error(formatDegradedHeadline(event.payload), {
+          description: "Transcript may have gaps in that window.",
+          duration: 12_000,
+          action: {
+            label: "View diagnostics",
+            onClick: () =>
+              navigateToDiagnostics(navigate, eventSessionId, fallbackToNewest),
+          },
+        });
+      });
+      if (cancelled) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
+
+/**
+ * Map a degraded-kind discriminant to its toast verb. Centralised so
+ * adding a future kind (e.g. `"vad_unavailable"`) only needs an entry
+ * here.
+ */
+const DEGRADED_VERBS: Record<DegradedPayload["kind"], string> = {
+  tap_lost: "Tap lost",
+  ax_unavailable: "Accessibility unavailable",
+  aec_overflow: "Echo canceller overflow",
+};
+
+/**
+ * Navigate to a session's diagnostics tab. Prefers the explicit
+ * `eventSessionId` (the active recording, when the FSM dispatch path
+ * supplies it); when null and `fallbackToNewest` is true, looks up
+ * the newest saved note via `heron_last_note_session_id`. An empty
+ * vault silently no-ops — the toast itself has already surfaced the
+ * failure to the user.
+ */
+function navigateToDiagnostics(
+  navigate: (path: string) => void,
+  eventSessionId: string | null,
+  fallbackToNewest: boolean,
+) {
+  void (async () => {
+    try {
+      const id =
+        eventSessionId ??
+        (fallbackToNewest ? await invoke("heron_last_note_session_id") : null);
+      if (typeof id === "string" && id.length > 0) {
+        navigate(`/review/${encodeURIComponent(id)}?tab=diagnostics`);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[heron] could not resolve session for diagnostics:",
+        err,
+      );
+    }
+  })();
+}
+
+/**
+ * Render the toast headline for a `tray:degraded` event. Pulled out
+ * of `useTrayDegradedToast` so the formatter is unit-testable in
+ * isolation; missing target (`null` / empty string) collapses to the
+ * unattributed form.
+ */
+function formatDegradedHeadline({
+  kind,
+  at_secs,
+  target,
+}: DegradedPayload): string {
+  const verb = DEGRADED_VERBS[kind];
+  const stamp = formatHms(at_secs);
+  return target ? `${verb} ${target} at ${stamp}` : `${verb} at ${stamp}`;
+}
+
+function formatHms(at_secs: number): string {
+  // Mirror the Rust-side formatter (`tray::format_hms`). Negative or
+  // NaN inputs collapse to "00:00:00" so a malformed event can't
+  // render a runtime error.
+  const total = Number.isFinite(at_secs) && at_secs > 0 ? Math.floor(at_secs) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }

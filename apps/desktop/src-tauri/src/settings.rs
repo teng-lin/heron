@@ -100,6 +100,31 @@ pub struct Settings {
     /// contract so a future regression that drops the container-level
     /// `default` doesn't silently re-onboard every existing user.
     pub onboarded: bool,
+    /// Phase 73 (PR-λ): Bundle IDs the user wants the Core Audio
+    /// process tap to record. Defaults to the single Zoom desktop
+    /// bundle ID for backward compatibility with PR-α; the Settings →
+    /// Audio "Recorded apps" card lets the user add Microsoft Teams /
+    /// Google Chrome / other meeting clients.
+    ///
+    /// `#[serde(default = "default_target_bundle_ids")]` lets pre-PR-λ
+    /// settings.json files (which have no `target_bundle_ids` field)
+    /// deserialize cleanly: missing → `["us.zoom.xos"]` → identical
+    /// recording behavior to pre-phase-73 builds. The default is hand-
+    /// rolled in a free function rather than relying on
+    /// `Vec::default()` (the empty vec) — a missing field must
+    /// reproduce the pre-PR-λ "Zoom is recorded" contract, not silently
+    /// turn the user's existing recordings into mic-only sessions.
+    #[serde(default = "default_target_bundle_ids")]
+    pub target_bundle_ids: Vec<String>,
+}
+
+/// PR-λ default for [`Settings::target_bundle_ids`]: a one-item vec
+/// containing the Zoom desktop bundle ID. Lifted out as a free function
+/// so `#[serde(default = "...")]` can name it without serde's closure
+/// gymnastics, and so `Settings::default()` and the migration path
+/// share one source of truth.
+pub fn default_target_bundle_ids() -> Vec<String> {
+    vec!["us.zoom.xos".to_owned()]
 }
 
 impl Default for Settings {
@@ -117,6 +142,7 @@ impl Default for Settings {
             crash_telemetry: false,
             audio_retention_days: None,
             onboarded: false,
+            target_bundle_ids: default_target_bundle_ids(),
         }
     }
 }
@@ -431,6 +457,62 @@ mod tests {
         mark_onboarded(&path).expect("mark 2 (idempotent)");
         let parsed = read_settings(&path).expect("read");
         assert!(parsed.onboarded);
+    }
+
+    #[test]
+    fn default_target_bundle_ids_is_zoom_only() {
+        // PR-λ migration contract: the v1 single-target-bundle behavior
+        // is reproduced by a one-item vec containing the Zoom desktop
+        // bundle ID. The Settings → Audio "Recorded apps" card lets the
+        // user add Teams / Chrome / etc., but the post-upgrade default
+        // must record exactly what v1 recorded — anything else would
+        // silently change recording semantics for existing users.
+        let s = Settings::default();
+        assert_eq!(s.target_bundle_ids, vec!["us.zoom.xos".to_owned()]);
+    }
+
+    #[test]
+    fn target_bundle_ids_defaults_to_zoom_when_field_missing() {
+        // A pre-PR-λ settings.json that predates the
+        // `target_bundle_ids` field must deserialize cleanly with the
+        // single-Zoom default. `Vec::default()` (the empty vec) would
+        // silently break recording for every existing user — this test
+        // pins the migration contract so a future regression that drops
+        // `#[serde(default = "default_target_bundle_ids")]` (or that
+        // accidentally relies on `Vec`'s default impl) fails loudly.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
+                "vault_root":"","record_hotkey":"CmdOrCtrl+Shift+R","remind_interval_secs":30,
+                "recover_on_launch":true,"min_free_disk_mib":2048,"session_logging":true,
+                "crash_telemetry":false,"audio_retention_days":null}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        assert_eq!(s.target_bundle_ids, vec!["us.zoom.xos".to_owned()]);
+    }
+
+    #[test]
+    fn target_bundle_ids_round_trips_with_multiple_apps() {
+        // A user who has added Teams + Chrome via the Settings UI
+        // should see all three round-trip through serialize/deserialize
+        // unchanged, in declared order — order doubles as the user's
+        // intended "primary target first" hint for the audio tap.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        let s = Settings {
+            target_bundle_ids: vec![
+                "us.zoom.xos".to_owned(),
+                "com.microsoft.teams2".to_owned(),
+                "com.google.Chrome".to_owned(),
+            ],
+            ..Default::default()
+        };
+        write_settings(&path, &s).expect("write");
+        let parsed = read_settings(&path).expect("read");
+        assert_eq!(parsed.target_bundle_ids, s.target_bundle_ids);
     }
 
     #[test]
