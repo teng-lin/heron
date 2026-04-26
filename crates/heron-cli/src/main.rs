@@ -11,12 +11,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use heron_cli::daemon::{ClientConfig, DEFAULT_BASE_URL, DEFAULT_TIMEOUT, DaemonClient};
 use heron_cli::salvage::{
     SalvageFormat, default_cache_root, exit_code as salvage_exit, print_salvage_list,
 };
 use heron_cli::session;
 use heron_cli::summarize;
 use heron_cli::synthesize::{SynthOptions, synthesize_fixture};
+use heron_session::{MeetingId, Platform, StartCaptureArgs};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +70,147 @@ enum Commands {
     /// two dumps (one with someone speaking, one with everyone muted)
     /// to identify the indicator element.
     AxDump(AxDumpArgs),
+    /// v2 escape hatch: delegate session-control commands to the
+    /// localhost `herond` daemon over its OpenAPI surface. The legacy
+    /// `record` / `status` subcommands run an in-process orchestrator;
+    /// `daemon …` reaches the same daemon the desktop shell drives, so
+    /// CLI + GUI poke a single source of truth.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Show daemon health (`GET /v1/health`).
+    Status(DaemonStatusArgs),
+    /// Meeting-lifecycle commands.
+    #[command(subcommand)]
+    Meeting(DaemonMeetingCommand),
+    /// Tail the daemon event bus (SSE projection of `/v1/events`).
+    /// Defaults to a streaming follow; pass `--once` to print the
+    /// replay window and exit.
+    Events(DaemonEventsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonStatusArgs {
+    /// Reuses the same override flags every other daemon subcommand
+    /// accepts (see [`DaemonCommonArgs`]) — keeps the help output
+    /// uniform across `daemon status` / `daemon meeting *` /
+    /// `daemon events` and avoids two places to edit when a new
+    /// shared flag (e.g. an `--insecure` for self-signed prod
+    /// daemons) gets added.
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonMeetingCommand {
+    /// `POST /v1/meetings` — start a manual capture.
+    Start(DaemonMeetingStartArgs),
+    /// `POST /v1/meetings/{id}/end` — gracefully end a capture.
+    End(DaemonMeetingEndArgs),
+    /// `GET /v1/meetings` — list recent captures.
+    List(DaemonMeetingListArgs),
+    /// `GET /v1/meetings/{id}` — fetch a single meeting.
+    Get(DaemonMeetingGetArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonCommonArgs {
+    /// Override the daemon base URL. Defaults to
+    /// `http://127.0.0.1:7384/v1`.
+    #[arg(long, env = "HERON_DAEMON_URL", global = false)]
+    url: Option<String>,
+    /// Override the bearer-token file path. Defaults to
+    /// `~/.heron/cli-token`.
+    #[arg(long, env = "HERON_DAEMON_TOKEN_FILE", global = false)]
+    token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonMeetingStartArgs {
+    /// Native client to bind. v1 only serves `zoom`; the others are
+    /// reserved for v1.1+. The CLI value is forwarded verbatim.
+    #[arg(long, default_value = "zoom")]
+    platform: PlatformArg,
+    /// Optional free-form hint forwarded to the orchestrator (e.g.
+    /// window title, meeting URL). Not a primary identifier.
+    #[arg(long)]
+    hint: Option<String>,
+    /// Optional EventKit calendar event id to correlate this capture
+    /// with a previously `attach_context`-supplied
+    /// `PreMeetingContext`. When set and a context is pending for
+    /// this id, the daemon consumes it as part of session
+    /// materialization. Resolver-input shape per Invariant 4 — never
+    /// a heron primary key.
+    #[arg(long)]
+    calendar_event_id: Option<String>,
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonMeetingEndArgs {
+    /// Meeting ID returned by `daemon meeting start` or seen on the
+    /// `/v1/events` stream.
+    meeting_id: String,
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonMeetingListArgs {
+    /// Optional platform filter.
+    #[arg(long)]
+    platform: Option<PlatformArg>,
+    /// Page size. The daemon caps this server-side.
+    #[arg(long)]
+    limit: Option<u32>,
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonMeetingGetArgs {
+    meeting_id: String,
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct DaemonEventsArgs {
+    /// Resume after this `evt_*` ID. Maps to the spec's
+    /// `?since_event_id` query param.
+    #[arg(long)]
+    since_event_id: Option<String>,
+    /// Cap the number of events to print before exiting. `0` (the
+    /// default) means follow indefinitely until the user hits Ctrl-C.
+    #[arg(long, default_value_t = 0)]
+    limit: u32,
+    #[command(flatten)]
+    common: DaemonCommonArgs,
+}
+
+/// Wraps [`heron_session::Platform`] so clap can derive `ValueEnum`
+/// over it without forcing the upstream enum to depend on clap.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum PlatformArg {
+    Zoom,
+    GoogleMeet,
+    MicrosoftTeams,
+    Webex,
+}
+
+impl From<PlatformArg> for Platform {
+    fn from(p: PlatformArg) -> Self {
+        match p {
+            PlatformArg::Zoom => Platform::Zoom,
+            PlatformArg::GoogleMeet => Platform::GoogleMeet,
+            PlatformArg::MicrosoftTeams => Platform::MicrosoftTeams,
+            PlatformArg::Webex => Platform::Webex,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -265,11 +408,160 @@ fn dispatch(cmd: Commands, vault: Option<PathBuf>) -> Result<()> {
         Commands::VerifyM4a(args) => cmd_verify_m4a(args),
         Commands::Synthesize(args) => cmd_synthesize(args),
         Commands::AxDump(args) => cmd_ax_dump(args),
+        Commands::Daemon(cmd) => cmd_daemon(cmd),
         // Handled by `main` directly so it can pick its own exit
         // code; this arm is unreachable but keeps the match
         // exhaustive without a wildcard.
         Commands::Salvage(_) => unreachable!("salvage handled in main"),
     }
+}
+
+fn cmd_daemon(cmd: DaemonCommand) -> Result<()> {
+    // The daemon client is async (reqwest). Each top-level invocation
+    // spins up a fresh runtime — these commands are short-lived and
+    // share no state across calls, so keeping the runtime per-
+    // invocation is simpler than threading a global through `main`.
+    // `current_thread` is the right shape for a CLI: a single
+    // request/response (or one streaming SSE) at a time, and no
+    // need to pay for a multi-thread scheduler's worker pool.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+    runtime.block_on(async move {
+        match cmd {
+            DaemonCommand::Status(args) => daemon_status(args).await,
+            DaemonCommand::Meeting(meeting) => match meeting {
+                DaemonMeetingCommand::Start(args) => daemon_meeting_start(args).await,
+                DaemonMeetingCommand::End(args) => daemon_meeting_end(args).await,
+                DaemonMeetingCommand::List(args) => daemon_meeting_list(args).await,
+                DaemonMeetingCommand::Get(args) => daemon_meeting_get(args).await,
+            },
+            DaemonCommand::Events(args) => daemon_events(args).await,
+        }
+    })
+}
+
+/// Build a [`DaemonClient`] from the shared override flags. Resolves
+/// the bearer-token file (defaulting to `~/.heron/cli-token`) and
+/// surfaces the typed `DaemonError` directly so the CLI prints the
+/// actionable "is the daemon running?" message rather than the raw
+/// reqwest error chain.
+fn build_daemon_client(common: &DaemonCommonArgs) -> Result<DaemonClient> {
+    let token_path = match &common.token_file {
+        Some(p) => p.clone(),
+        None => heron_cli::daemon::default_token_path()
+            .map_err(|e| anyhow::anyhow!("resolving token path: {e}"))?,
+    };
+    let bearer = heron_cli::daemon::load_bearer(&token_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let base_url = common
+        .url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let client = DaemonClient::new(ClientConfig {
+        bearer,
+        base_url,
+        timeout: DEFAULT_TIMEOUT,
+    })
+    .map_err(|e| anyhow::anyhow!("building daemon client: {e}"))?;
+    Ok(client)
+}
+
+async fn daemon_status(args: DaemonStatusArgs) -> Result<()> {
+    let client = build_daemon_client(&args.common)?;
+    let health = client.health().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body = serde_json::to_string_pretty(&health)
+        .map_err(|e| anyhow::anyhow!("encoding health: {e}"))?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn daemon_meeting_start(args: DaemonMeetingStartArgs) -> Result<()> {
+    let client = build_daemon_client(&args.common)?;
+    let meeting = client
+        .start_capture(StartCaptureArgs {
+            platform: args.platform.into(),
+            hint: args.hint,
+            calendar_event_id: args.calendar_event_id,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body = serde_json::to_string_pretty(&meeting)
+        .map_err(|e| anyhow::anyhow!("encoding meeting: {e}"))?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn daemon_meeting_end(args: DaemonMeetingEndArgs) -> Result<()> {
+    let id = parse_meeting_id(&args.meeting_id)?;
+    let client = build_daemon_client(&args.common)?;
+    client
+        .end_meeting(&id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("ok");
+    Ok(())
+}
+
+async fn daemon_meeting_list(args: DaemonMeetingListArgs) -> Result<()> {
+    let client = build_daemon_client(&args.common)?;
+    let page = client
+        .list_meetings(args.platform.map(Into::into), args.limit)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body =
+        serde_json::to_string_pretty(&page).map_err(|e| anyhow::anyhow!("encoding page: {e}"))?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn daemon_meeting_get(args: DaemonMeetingGetArgs) -> Result<()> {
+    let id = parse_meeting_id(&args.meeting_id)?;
+    let client = build_daemon_client(&args.common)?;
+    let meeting = client
+        .get_meeting(&id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body = serde_json::to_string_pretty(&meeting)
+        .map_err(|e| anyhow::anyhow!("encoding meeting: {e}"))?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn daemon_events(args: DaemonEventsArgs) -> Result<()> {
+    let client = build_daemon_client(&args.common)?;
+    let mut stream = client
+        .events(args.since_event_id.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut printed: u32 = 0;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(env) => {
+                let line = serde_json::to_string(&env)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"encoding envelope: {e}\"}}"));
+                println!("{line}");
+                printed = printed.saturating_add(1);
+                if args.limit > 0 && printed >= args.limit {
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("event stream error: {e}");
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_meeting_id(s: &str) -> Result<MeetingId> {
+    // `prefixed_id!` macro stamps `FromStr` on every prefixed ID
+    // type, so the CLI inherits whatever validation `heron-types`
+    // enforces — no need to round-trip through serde just to reuse
+    // the same checker.
+    s.parse::<MeetingId>()
+        .map_err(|e| anyhow::anyhow!("invalid meeting id {s:?}: {e}"))
 }
 
 fn cmd_ax_dump(args: AxDumpArgs) -> Result<()> {
