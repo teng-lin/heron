@@ -566,14 +566,21 @@ components:
 
     MeetingId:
       type: string
-      pattern: '^mtg_[0-9A-HJKMNP-TV-Z]+$'
+      pattern: '^mtg_[0-9a-f-]+$'
       description: |
-        Stripe-style prefixed UUIDv7 (base32, Crockford alphabet),
-        per spec §2. Time-ordered.
+        Stripe-style prefixed UUIDv7. Wire form
+        `mtg_<lowercase-hyphenated-uuid>` (e.g.
+        `mtg_550e8400-e29b-71d4-a716-446655440000`); time-ordered
+        because the underlying UUID is v7. Spec §2 originally
+        named "Crockford base32" as the encoding, but the
+        `heron_types::prefixed_id!` macro emits hyphenated UUIDs
+        and that is what the daemon serves. A future migration to
+        base32 (for compactness) is a separate concerted change
+        with backward-compat parsing — out of scope for v1.
 
     NullableMeetingId:
       type: [string, "null"]
-      pattern: '^mtg_[0-9A-HJKMNP-TV-Z]+$'
+      pattern: '^mtg_[0-9a-f-]+$'
       description: |
         `MeetingId` or `null`. Defined as a single typed alternative
         rather than `oneOf` so JSON Schema 2020-12 validators and
@@ -581,10 +588,13 @@ components:
 
     EventId:
       type: string
-      pattern: '^evt_[0-9A-HJKMNP-TV-Z]+$'
+      pattern: '^evt_[0-9a-f-]+$'
       description: |
-        Stripe-style prefixed UUIDv7 (base32, Crockford alphabet),
-        per spec §2. Time-ordered.
+        Stripe-style prefixed UUIDv7. Wire form
+        `evt_<lowercase-hyphenated-uuid>`; time-ordered. Same
+        encoding caveat as `MeetingId` — the macro emits
+        hyphenated UUIDs, not Crockford base32, despite the
+        original spec wording.
 
     Platform:
       type: string

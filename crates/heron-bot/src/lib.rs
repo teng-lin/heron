@@ -51,11 +51,12 @@ heron_types::prefixed_id! {
     pub PersonaId, "persona"
 }
 
-heron_types::prefixed_id! {
-    /// Stripe-style prefixed UUID for a meeting. Wire form
-    /// `meeting_<uuid>`.
-    pub MeetingId, "meeting"
-}
+/// `MeetingId` lives in `heron-types` so the v1 desktop hub
+/// (`heron-session`) and this v2 driver layer reference the same
+/// type. Wire form is `mtg_<uuid>`. The pre-cleanup local
+/// definition used the prefix `meeting_`; if you find that string
+/// anywhere in surviving consumers, the migration missed a spot.
+pub use heron_types::MeetingId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

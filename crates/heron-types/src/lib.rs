@@ -33,6 +33,22 @@ pub type SessionId = uuid::Uuid;
 /// without an explicit timestamp field.
 pub type ItemId = uuid::Uuid;
 
+prefixed_id! {
+    /// Stripe-style prefixed UUIDv7 for a captured meeting. Wire form
+    /// `mtg_<uuid>`, per `docs/api-design-spec.md` §2 and the
+    /// `MeetingId` schema in `docs/api-desktop-openapi.yaml`.
+    ///
+    /// Lives in `heron-types` so that the v1 desktop hub
+    /// (`heron-session`) and the v2 vendor-bot driver
+    /// (`heron-bot`) reference the same type rather than each
+    /// declaring their own. Until phase-prefixed-id-cleanup the
+    /// two crates each defined a `MeetingId` (one with `mtg_`,
+    /// one with `meeting_`); the consolidation eliminates the
+    /// risk of a v1 ID flowing into a v2 trait field with no
+    /// type-system catch.
+    pub MeetingId, "mtg"
+}
+
 /// Display label written into transcript JSONL.
 ///
 /// By convention this is one of:
