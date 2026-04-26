@@ -118,13 +118,21 @@ to the herond HTTP endpoints yet.
 will block the calling thread forever. v1 ships this; the timeout was
 deferred per `docs/plan.md`.
 
-### 11. `EventBus` has no consumers outside `herond`
+### 11. `EventBus` multi-subscriber fan-out (resolved)
 
 `crates/heron-event/src/lib.rs` defines the bus and `heron-session`'s
-Invariant 12 mandates that all events flow through it first. Today
-only `heron-cli::session::Orchestrator` publishes and `herond`
-subscribes via the stub. Tauri UI and external API transports are not
-wired. Fine for v1; needed when v2 frontends multiply.
+Invariant 12 mandates that all events flow through it first. The full
+pipeline now ships: phase 80 wired
+[`heron_event_http::SseEventSink`](../crates/heron-event-http/src/lib.rs)
+into herond's `/events` endpoint, phase 82 wired
+[`heron_event_tauri::TauriEventSink`](../crates/heron-event-tauri/src/lib.rs)
+into the desktop's `event_bus::install`, and phase 83 added
+`LocalSessionOrchestrator::start_capture` / `end_meeting` as the first
+real publishers (FSM-driven `meeting.detected` / `.armed` / `.started`
+/ `.ended` / `.completed`). A multi-subscriber fan-out integration test
+in `apps/desktop/src-tauri/src/event_bus.rs` pins one publish reaching
+SSE, Tauri IPC, and the replay cache simultaneously (Invariant 13). No
+remaining gap.
 
 ### 12. v2 layer test counts are thin
 
