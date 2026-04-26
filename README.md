@@ -4,7 +4,7 @@ A private, on-device AI meeting agent. Two modes:
 
 - **Note-taker (v1, in flight).** Records, transcribes, and summarizes
   meetings without joining as a visible bot.
-- **Participant (v2, trait surfaces in place).** Attends meetings on
+- **Participant (v2, early implementation).** Attends meetings on
   the user's behalf — listening, taking turns, and speaking. Notes
   become a side effect of the agent's memory rather than the primary
   output. See [`docs/architecture-agent-participant.md`](docs/architecture-agent-participant.md).
@@ -22,9 +22,12 @@ In participant mode, a four-layer stack — driver / bridge / policy /
 realtime — joins the call through a meeting-bot driver, runs a
 bidirectional realtime LLM session, and gates what the agent says
 through an explicit policy contract (full contract in
-[`docs/api-design-spec.md`](docs/api-design-spec.md)). v2 ships v1's
-note-taker output as agent memory; the agent draws on prior meeting
-transcripts as long-term context.
+[`docs/api-design-spec.md`](docs/api-design-spec.md)). The first
+concrete driver path is Recall.ai; the daemon and event bus are wired
+far enough for health, SSE, vault reads, and manual capture lifecycle
+events, while realtime speech remains behind the v2 layer contracts.
+v2 ships v1's note-taker output as agent memory; the agent draws on
+prior meeting transcripts as long-term context.
 
 The product target is a business executive running many external
 client meetings, plus the author. Audio never leaves the device
@@ -80,32 +83,38 @@ A parallel v2 track is in flight (proposal in
 [`docs/architecture-agent-participant.md`](docs/architecture-agent-participant.md))
 that extends heron from passive note-taker into a meeting agent that
 can speak. v2 is a four-layer architecture — driver / bridge / policy
-/ realtime — captured as trait surfaces in `heron-bot`,
-`heron-bridge`, `heron-policy`, and `heron-realtime`. The full
-contract is [`docs/api-design-spec.md`](docs/api-design-spec.md);
-build-vs-buy ([`docs/build-vs-buy-decision.md`](docs/build-vs-buy-decision.md))
-selected Recall.ai as Path A, and the live spike findings are in
+/ realtime — spread across `heron-bot`, `heron-bridge`,
+`heron-policy`, and `heron-realtime`. The full contract is
+[`docs/api-design-spec.md`](docs/api-design-spec.md); build-vs-buy
+([`docs/build-vs-buy-decision.md`](docs/build-vs-buy-decision.md))
+selected Recall.ai as Path A, and `heron-bot` now includes the first
+`RecallDriver` implementation. The live spike findings are in
 [`docs/spike-findings.md`](docs/spike-findings.md). v1 ships first;
-v2 implementations land behind these traits.
+v2 implementation continues behind these layer boundaries.
 
 ## Status
 
-v1 implementation is well underway (currently at phase 77). The
+v1 implementation is well underway. The
 desktop shell, onboarding wizard, settings pane, menubar tray, review
 window with TipTap edit + transcript playback, re-summarize with diff
 modal, batch purge, native notifications, pre-flight checks, crash
-recovery / salvage, calendar wiring, and Keychain-backed API keys
-have all shipped. The `heron summarize` subcommand and the `ax-dump`
-diagnostic are wired in. Mobile (iOS / Android), other meeting apps
+recovery / salvage, diagnostics tab parser, calendar wiring, and
+Keychain-backed API keys have all shipped. The `heron record`,
+`heron summarize`, `heron status`, `heron salvage`, and `ax-dump`
+paths are wired in. Mobile (iOS / Android), other meeting apps
 (Meet / Teams / Webex), other desktop operating systems (Windows /
 Linux), ambient session detection, and an MCP server remain deferred
 to v1.1+.
 
-The v2 four-layer stack is currently trait surfaces only — the
-Recall.ai spike harness in `crates/heron-bot/examples/recall-spike.rs`
-validated the design against a live Zoom meeting on 2026-04-26
-(see [`docs/spike-findings.md`](docs/spike-findings.md)); the
-`RecallDriver: MeetingBotDriver` impl is the next gate.
+The v2 stack now has more than trait sketches: `heron-bot` includes a
+`RecallDriver`, `herond` serves the localhost desktop API, and
+`heron-orchestrator` publishes FSM-driven meeting lifecycle events
+through the canonical event bus. The Recall.ai spike harness in
+`crates/heron-bot/examples/recall-spike.rs` validated the design
+against a live Zoom meeting on 2026-04-26 (see
+[`docs/spike-findings.md`](docs/spike-findings.md)). Remaining v2
+work is the realtime speech path: speech-control, policy enforcement,
+audio bridge, and backend integration.
 
 ## Repository layout
 
@@ -122,10 +131,18 @@ validated the design against a live Zoom meeting on 2026-04-26
 │   ├── heron-llm/               # Summarizer trait + meeting.hbs + cost calibration
 │   ├── heron-vault/             # markdown writer + merge + EventKit bridge
 │   ├── heron-cli/               # `heron` CLI (record / summarize / status / …)
-│   ├── heron-doctor/            # `heron-doctor` log-anomaly CLI
+│   ├── heron-doctor/            # log anomalies + runtime preflight checks
 │   │
-│   │   # v2 trait surfaces (api-design-spec.md §1) — implementations deferred
-│   ├── heron-bot/               # Layer 1: meeting-bot driver trait + Recall spike
+│   │   # event + desktop daemon substrate
+│   ├── heron-event/             # canonical event envelope + broadcast bus
+│   ├── heron-event-http/        # replay cache + SSE/web transport helpers
+│   ├── heron-event-tauri/       # Tauri IPC event sink
+│   ├── heron-session/           # desktop SessionOrchestrator contract
+│   ├── heron-orchestrator/      # local orchestrator + vault read side + FSM events
+│   ├── herond/                  # localhost HTTP/SSE desktop daemon
+│   │
+│   │   # v2 participant layers (api-design-spec.md §1)
+│   ├── heron-bot/               # Layer 1: meeting-bot driver trait + RecallDriver
 │   ├── heron-bridge/            # Layer 2: PCM jitter buffer + resample + mix
 │   ├── heron-policy/            # Layer 3: speech-control contract + agent policy
 │   └── heron-realtime/          # Layer 4: bidirectional realtime LLM session
@@ -144,6 +161,9 @@ Binaries:
   `status`, `verify-m4a`, `synthesize`, `salvage`, `ax-dump`.
 - **`heron-doctor`** — offline diagnostics over `~/Library/Logs/heron/<date>.log`.
 - **`validate-vault`** — walks an Obsidian vault and reports integrity issues.
+- **`herond`** — localhost-only desktop daemon on `127.0.0.1:7384`.
+  It exposes `/health`, `/v1/meetings*`, `/v1/calendar/upcoming`,
+  `/v1/context`, and `/events` SSE per `docs/api-desktop-openapi.yaml`.
 - **`heron-desktop`** — Tauri v2 shell (in `apps/desktop`).
 
 ## Quick start
@@ -158,11 +178,19 @@ cargo build --workspace
 # Run the test suite.
 cargo test --workspace
 
-# Smoke the CLI scaffold.
+# Smoke the CLI.
 cargo run --bin heron -- status
+
+# Run the localhost desktop daemon.
+HERON_VAULT_ROOT=/path/to/vault cargo run --bin herond
 
 # Generate a stub fixture for offline regression.
 cargo run --bin heron -- synthesize /tmp/fixture-demo
+
+# Run the desktop frontend during development.
+cd apps/desktop
+bun install
+bun run tauri dev
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the polish + pr-workflow
@@ -188,6 +216,7 @@ v2 specs run alongside them as a parallel track.
 | [`docs/onboarding-tests.md`](docs/onboarding-tests.md) | Acceptance tests for the first-run wizard. |
 | [`docs/manual-test-matrix.md`](docs/manual-test-matrix.md) | Manual-validation matrix run before each release. |
 | [`docs/swift-bridge-pattern.md`](docs/swift-bridge-pattern.md) | Canonical `@_cdecl` shape every Swift helper follows. |
+| [`docs/api-desktop-openapi.yaml`](docs/api-desktop-openapi.yaml) | OpenAPI spec for the localhost desktop daemon (`herond`). |
 
 ### v2 — agent-as-meeting-participant
 
@@ -201,7 +230,6 @@ v2 specs run alongside them as a parallel track.
 | [`docs/backend-evaluations.md`](docs/backend-evaluations.md) | Realtime-backend evaluation (OpenAI Realtime / Gemini Live / LiveKit / Pipecat). |
 | [`docs/spike-findings.md`](docs/spike-findings.md) | Live Recall.ai spike results + per-invariant verdicts + recommendations for the `RecallDriver` impl. |
 | [`docs/api-bot-openapi.yaml`](docs/api-bot-openapi.yaml) | OpenAPI spec for the bot driver layer. |
-| [`docs/api-desktop-openapi.yaml`](docs/api-desktop-openapi.yaml) | OpenAPI spec for the `herond` desktop daemon. |
 
 If you only read one document, read [`docs/plan.md`](docs/plan.md).
 For v2 context, [`docs/api-design-spec.md`](docs/api-design-spec.md)
