@@ -164,7 +164,7 @@ async fn end_meeting_returns_unit_on_204() {
         .mount(&server)
         .await;
     let client = client_for(&server);
-    let mid: MeetingId = serde_json::from_value(serde_json::Value::String(id.into())).unwrap();
+    let mid: MeetingId = id.parse().unwrap();
     client.end_meeting(&mid).await.expect("end_meeting");
 }
 
@@ -185,7 +185,7 @@ async fn end_meeting_invalid_state_propagates_envelope() {
         .mount(&server)
         .await;
     let client = client_for(&server);
-    let mid: MeetingId = serde_json::from_value(serde_json::Value::String(id.into())).unwrap();
+    let mid: MeetingId = id.parse().unwrap();
     let err = client.end_meeting(&mid).await.expect_err("should fail");
     match err {
         DaemonError::Api {
@@ -235,7 +235,7 @@ async fn get_meeting_decodes_envelope() {
         .mount(&server)
         .await;
     let client = client_for(&server);
-    let mid: MeetingId = serde_json::from_value(serde_json::Value::String(id.into())).unwrap();
+    let mid: MeetingId = id.parse().unwrap();
     let m = client.get_meeting(&mid).await.expect("get_meeting");
     assert_eq!(m.id.to_string(), id);
 }

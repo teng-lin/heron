@@ -414,7 +414,10 @@ fn cmd_daemon(cmd: DaemonCommand) -> Result<()> {
     // spins up a fresh runtime — these commands are short-lived and
     // share no state across calls, so keeping the runtime per-
     // invocation is simpler than threading a global through `main`.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // `current_thread` is the right shape for a CLI: a single
+    // request/response (or one streaming SSE) at a time, and no
+    // need to pay for a multi-thread scheduler's worker pool.
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
@@ -549,12 +552,11 @@ async fn daemon_events(args: DaemonEventsArgs) -> Result<()> {
 }
 
 fn parse_meeting_id(s: &str) -> Result<MeetingId> {
-    // The OpenAPI pins `MeetingId` to `mt_<uuidv7>`; round-trip
-    // through serde so the CLI inherits whatever validation
-    // `heron-types` enforces (rather than re-implementing the prefix
-    // check here and risking drift).
-    let value = serde_json::Value::String(s.to_owned());
-    serde_json::from_value::<MeetingId>(value)
+    // `prefixed_id!` macro stamps `FromStr` on every prefixed ID
+    // type, so the CLI inherits whatever validation `heron-types`
+    // enforces — no need to round-trip through serde just to reuse
+    // the same checker.
+    s.parse::<MeetingId>()
         .map_err(|e| anyhow::anyhow!("invalid meeting id {s:?}: {e}"))
 }
 

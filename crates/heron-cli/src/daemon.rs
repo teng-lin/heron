@@ -434,11 +434,16 @@ impl DaemonClient {
 
     /// Map a low-level transport error into the actionable
     /// "daemon unreachable" message when the cause looks like a
-    /// connection refusal. Heuristic: `is_connect()` or
-    /// `is_timeout()` cover the two failure modes that map to "the
-    /// daemon isn't running" vs "everything else".
+    /// connection refusal. Only `is_connect()` is treated as
+    /// unreachable: a `is_timeout()` can fire after a successful
+    /// TCP connect (the daemon accepted the socket but is wedged
+    /// mid-handshake or in the middle of a long `start_capture`),
+    /// and surfacing that as "is `herond` running?" would mislead
+    /// the user. The non-connect timeout path falls through to
+    /// `Http(_)` so the original `reqwest` error message reaches
+    /// the CLI.
     fn classify_transport(&self, err: reqwest::Error) -> DaemonError {
-        if err.is_connect() || err.is_timeout() {
+        if err.is_connect() {
             DaemonError::Unreachable {
                 base_url: self.base_url.to_string(),
                 source: err,
@@ -481,21 +486,50 @@ impl EventStream {
     }
 }
 
+/// Cap on the size of any response body the daemon client will
+/// deserialize. A typical `Meeting` envelope is a few KB; a paged
+/// `ListMeetingsPage` for a long-running vault is a few hundred KB
+/// at most. 4 MiB is generous headroom while still preventing a
+/// runaway / hostile response from forcing an unbounded allocation.
+/// Mirrors the equivalent cap in [`heron_bot::recall::client`].
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Drain a `reqwest::Response` into bytes, capping the stream at
+/// [`MAX_RESPONSE_BYTES`] so a hostile/runaway daemon can't OOM the
+/// CLI. Streaming into a `Vec` chunk-by-chunk lets us short-circuit
+/// before allocating the whole thing — a cheaper failure mode than
+/// `resp.bytes()` (which buffers internally without bound when no
+/// `Content-Length` is set) or `resp.text()`.
+async fn drain_capped(resp: reqwest::Response) -> Result<Vec<u8>, DaemonError> {
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::with_capacity(8 * 1024);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(DaemonError::Http)?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(DaemonError::Decode(format!(
+                "response body exceeds {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 async fn decode_or_error<T: for<'de> serde::Deserialize<'de>>(
     resp: reqwest::Response,
 ) -> Result<T, DaemonError> {
     if !resp.status().is_success() {
         return Err(api_error(resp).await);
     }
-    resp.json::<T>()
-        .await
-        .map_err(|e| DaemonError::Decode(e.to_string()))
+    let body = drain_capped(resp).await?;
+    serde_json::from_slice::<T>(&body).map_err(|e| DaemonError::Decode(e.to_string()))
 }
 
 async fn api_error(resp: reqwest::Response) -> DaemonError {
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    match serde_json::from_str::<WireErrorBody>(&body) {
+    let raw = drain_capped(resp).await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&raw);
+    match serde_json::from_slice::<WireErrorBody>(&raw) {
         Ok(envelope) => DaemonError::Api {
             status: envelope.status_code.unwrap_or(status),
             code: envelope
@@ -504,13 +538,13 @@ async fn api_error(resp: reqwest::Response) -> DaemonError {
             message: envelope
                 .message
                 .or(envelope.error)
-                .unwrap_or_else(|| snippet(&body, 256)),
+                .unwrap_or_else(|| snippet(body.as_ref(), 256)),
             details: envelope.details,
         },
         Err(_) => DaemonError::Api {
             status,
             code: status_to_code(status).to_owned(),
-            message: snippet(&body, 256),
+            message: snippet(body.as_ref(), 256),
             details: serde_json::Value::Null,
         },
     }
