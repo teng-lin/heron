@@ -601,10 +601,10 @@ pub fn run() {
             // publishers exist in the desktop yet (cross-process
             // domain events flow over herond's HTTP/SSE), so the
             // wiring is dormant — but the slot is here for the
-            // moment a local publisher lands.
-            event_bus::install(app.handle()).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("event_bus install: {e}"))
-            })?;
+            // moment a local publisher lands. `InstallError` impls
+            // `std::error::Error` (via thiserror), so `?` boxes it
+            // directly into the setup hook's expected return type.
+            event_bus::install(app.handle())?;
             // Phase 68 (PR-ζ): register the saved hotkey at app
             // startup so the chord is live the moment the app
             // launches — not only when the user opens Settings →

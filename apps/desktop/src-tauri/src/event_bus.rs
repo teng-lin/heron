@@ -70,7 +70,21 @@ use heron_orchestrator::LocalSessionOrchestrator;
 // resolves through the trait method.
 use heron_session::SessionOrchestrator;
 use tauri::{AppHandle, Manager, Runtime};
+use thiserror::Error;
 use tokio::sync::broadcast::error::RecvError;
+
+/// Failure modes for [`install`]. Modeled as an enum so callers can
+/// `match` on the variant rather than parsing a string; `thiserror`
+/// gives us a `Display` impl for the setup-hook error path that
+/// boxes us as `dyn std::error::Error`.
+#[derive(Debug, Error)]
+pub enum InstallError {
+    /// `install` was called more than once on the same `AppHandle`.
+    /// Tauri's setup hook fires once per app, so a duplicate is a
+    /// programming bug rather than a recoverable runtime condition.
+    #[error("event_bus::install called twice on the same AppHandle")]
+    AlreadyInstalled,
+}
 
 /// Opaque label the [`TauriEventSink`] reports for diagnostics. We
 /// don't peer-multiplex (the Tauri runtime fans out to every webview
@@ -87,12 +101,13 @@ const SINK_LABEL: &str = "tauri-ipc:desktop";
 ///
 /// # Errors
 ///
-/// Returns `Err` if the [`LocalSessionOrchestrator`] is already
-/// managed (calling `install` twice). The Tauri `setup` hook fires
-/// once per app, so a duplicate is a programming error. We detect
-/// it via [`tauri::Manager::manage`]'s return value — `false`
-/// means the type was already in the state map, atomically.
-pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), &'static str> {
+/// Returns [`InstallError::AlreadyInstalled`] if the
+/// [`LocalSessionOrchestrator`] is already managed (calling `install`
+/// twice). The Tauri `setup` hook fires once per app, so a duplicate
+/// is a programming error. We detect it via
+/// [`tauri::Manager::manage`]'s return value — `false` means the
+/// type was already in the state map, atomically.
+pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), InstallError> {
     // Construct the orchestrator inside whatever runtime context is
     // available. `LocalSessionOrchestrator::new` calls
     // `tokio::spawn` internally (recorder task) so it requires a
@@ -115,7 +130,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), &'static str> {
     // free "set if absent" idiom without needing a separate guard
     // around `try_state`.
     if !app.manage(Arc::clone(&orchestrator)) {
-        return Err("event_bus::install called twice on the same AppHandle");
+        return Err(InstallError::AlreadyInstalled);
     }
 
     let mut rx = orchestrator.event_bus().subscribe();
@@ -202,6 +217,24 @@ mod tests {
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())
     }
 
+    /// Poll until the listener-callback capture has at least one
+    /// entry, panicking with `timeout_message` if it never does. The
+    /// forwarder runs on the same Tokio runtime as the test; the
+    /// generous 2s budget is a hedge against scheduler jitter, not
+    /// the expected delay.
+    async fn wait_for_capture(captured: &Arc<Mutex<Vec<String>>>, timeout_message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !captured.lock().expect("lock").is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("{timeout_message}");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[tokio::test]
     async fn published_envelope_reaches_tauri_listener() {
         let app = tauri::test::mock_app();
@@ -227,18 +260,11 @@ mod tests {
         let bus = orch.event_bus();
         bus.publish(sample_envelope());
 
-        // The forwarder runs on the same Tokio runtime; poll until
-        // the listener fires (or panic on a 2s budget).
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if !captured.lock().expect("lock").is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("forwarder never delivered the event to the listener");
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        wait_for_capture(
+            &captured,
+            "forwarder never delivered the event to the listener",
+        )
+        .await;
         let entries = captured.lock().expect("lock");
         assert_eq!(entries.len(), 1);
         assert!(
@@ -295,16 +321,11 @@ mod tests {
             .clone();
         orch.event_bus().publish(env);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if !captured.lock().expect("lock").is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("transcript.partial never reached the colon-sanitized listener");
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        wait_for_capture(
+            &captured,
+            "transcript.partial never reached the colon-sanitized listener",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -364,15 +385,10 @@ mod tests {
         let post_lag = sample_envelope();
         bus.publish(post_lag);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if !captured.lock().expect("lock").is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("forwarder didn't recover from Lagged; post-lag publish lost");
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        wait_for_capture(
+            &captured,
+            "forwarder didn't recover from Lagged; post-lag publish lost",
+        )
+        .await;
     }
 }
