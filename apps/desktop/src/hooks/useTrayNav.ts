@@ -4,15 +4,18 @@
  * navigations.
  *
  * Phase 64 (PR-β) shipped the static `nav:settings` / `nav:recording`
- * routes. Phase 69 (PR-η) extends the bridge with:
+ * routes. Phase 69 (PR-η) extended the bridge with `nav:review`
+ * (payload `{ sessionId: string }`) so the tray's "Open last note…"
+ * item can navigate to `/review/<sessionId>`.
  *
- *   - `nav:review` — payload `{ sessionId: string }` — the tray's
- *     "Open last note…" item picks the newest `.md` in the vault and
- *     emits this event so the React tree navigates to
- *     `/review/<sessionId>`.
- *   - `nav:no_last_note` — emitted when the vault is empty / unset;
- *     the listener pops a Sonner toast so the user gets feedback
- *     without us depending on `tauri-plugin-notification`.
+ * Phase 75 (PR-ν). The previous `nav:no_last_note` event + Sonner
+ * toast were replaced by a native macOS notification fired directly
+ * from the tray dispatch (see `tray.rs::notify_no_last_note`). The
+ * frontend listener and toast were removed because a toast that
+ * appeared in the React tree only when the focused window happened to
+ * be heron was the wrong surface — a real notification lands in
+ * Notification Center regardless of focus state. This hook now only
+ * handles route-style nav events.
  *
  * Mounted exactly once at the app shell level. The hook returns
  * nothing — its only side effect is the listener wiring.
@@ -21,7 +24,6 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { toast } from "sonner";
 
 /** Map from event name (Rust side) to React-router path. */
 const EVENT_TO_PATH: Readonly<Record<string, string>> = {
@@ -82,18 +84,7 @@ export function useTrayNav() {
         },
       );
 
-      // `nav:no_last_note` is payload-less — pop a toast.
-      const noLastUnlisten = await listen("nav:no_last_note", () => {
-        toast("No notes yet", {
-          description: "Record a meeting and the latest note will land here.",
-        });
-      });
-
-      const allResults: UnlistenFn[] = [
-        ...staticResults,
-        reviewUnlisten,
-        noLastUnlisten,
-      ];
+      const allResults: UnlistenFn[] = [...staticResults, reviewUnlisten];
       if (cancelled) {
         for (const u of allResults) {
           u();

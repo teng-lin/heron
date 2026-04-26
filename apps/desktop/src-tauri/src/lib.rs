@@ -563,6 +563,14 @@ pub fn run() {
                 })
                 .build(),
         )
+        // Phase 75 (PR-ν): native notification surface used by the
+        // tray's "Open last note…" no-notes-yet fallback. Registered
+        // unconditionally — on first use macOS prompts the user for
+        // notification permission, and our caller treats a denial as
+        // a silent no-op (see `tray::notify_no_last_note`) so a user
+        // who declines the prompt still gets the focus-the-window
+        // affordance from the tray click without any error.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Phase 64: install the menubar tray. The tray's polling
             // task lives on the Tauri async runtime, so it shuts down

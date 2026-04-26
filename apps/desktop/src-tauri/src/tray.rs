@@ -35,6 +35,7 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuEvent, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconId};
 use tauri::{AppHandle, Emitter, Manager, Runtime, image::Image};
+use tauri_plugin_notification::NotificationExt;
 use tokio::time::interval;
 
 use heron_types::RecordingState;
@@ -61,11 +62,28 @@ const EVENT_NAV_RECORDING: &str = "nav:recording";
 /// navigate to `/review/<id>`. Pure-route events (settings/recording)
 /// stay payloadless to avoid disturbing PR-β's hook.
 pub const EVENT_NAV_REVIEW: &str = "nav:review";
-/// Phase 69: emitted when "Open last note…" runs and the vault is
-/// empty. The frontend pops a Sonner toast — keeps the tray's
-/// system-notification line free of platform-specific plumbing while
-/// still surfacing the "no notes yet" affordance to the user.
-pub const EVENT_NO_LAST_NOTE: &str = "nav:no_last_note";
+/// Phase 75 (PR-ν): copy for the native macOS notification fired when
+/// the tray's "Open last note…" runs and the vault is empty / unset.
+/// Centralised here so the unit test can pin the exact wire shape and
+/// the frontend can mirror the message in any future fallback path
+/// without re-deriving it.
+///
+/// We dropped the previous `nav:no_last_note` event + Sonner toast in
+/// favour of a real macOS notification (Notification Center entry,
+/// banner, badge): the previous toast disappeared with the focused
+/// window and was easy to miss when the tray click landed on a
+/// background app.
+///
+/// **Hotkey hard-coded.** The body names `⌘⇧R` literally rather than
+/// reading `Settings::record_hotkey`, matching the PR-ν brief. A user
+/// who has remapped the chord still gets a useful action ("start a
+/// recording from the tray") and the heron app surfaces the active
+/// hotkey in Settings → Hotkey. A future PR can swap the literal for
+/// a formatted version of the user's bound chord without breaking the
+/// public surface — both constants stay `pub` for that path.
+pub const NOTIFY_NO_LAST_NOTE_TITLE: &str = "heron";
+pub const NOTIFY_NO_LAST_NOTE_BODY: &str =
+    "No notes yet \u{2014} start a recording from the tray or hit \u{2318}\u{21E7}R.";
 /// Phase 73 (PR-λ): contextual error event the frontend renders as a
 /// Sonner toast with a "View diagnostics" action button (per the
 /// `plan.md` week-12 line "Tap lost Zoom at 00:42:15 — transcript may
@@ -418,17 +436,24 @@ pub fn heron_last_note_session_id() -> Result<Option<String>, String> {
 /// Pick the newest note in the user's vault and either:
 /// - emit `nav:review` with the session id payload (frontend
 ///   navigates to `/review/<id>`), or
-/// - emit `nav:no_last_note` so the React tree pops a "no notes yet"
-///   toast.
+/// - fire a native macOS notification ("No notes yet …") via
+///   [`notify_no_last_note`].
 ///
-/// Settled on a frontend-toast over a true system notification so we
-/// avoid pulling in `tauri-plugin-notification` for a single string —
-/// the tray click already focuses the main window, so the user sees
-/// the toast immediately.
+/// **Phase 75 (PR-ν) note.** The previous draft emitted a payload-less
+/// `nav:no_last_note` event so `useTrayNav` could pop a Sonner toast.
+/// That worked but tied the affordance to the focused window — a tray
+/// click while a different app was foregrounded showed the toast
+/// behind whatever the user was looking at. The macOS notification
+/// surface is the right primitive: it lands in Notification Center
+/// (so the user sees it on return), shows a banner regardless of
+/// focus, and is exactly what `tauri-plugin-notification` exists for.
+/// The fallback degrades gracefully when the user has not granted
+/// notification permission (see [`notify_no_last_note`]).
 fn open_last_note_dispatch<R: Runtime>(app: &AppHandle<R>) {
-    // Always focus the main window so the user sees the toast or
-    // navigates to a route — kept up-front so every code path below
-    // shares the same UX (no "tray click did nothing" tail).
+    // Always focus the main window so the user sees the navigation
+    // outcome — the notification still fires whether or not the
+    // window is foregrounded, but a focus-front-and-center matches
+    // the tray click affordance.
     focus_main_window(app);
 
     let settings_path = crate::default_settings_path();
@@ -436,13 +461,13 @@ fn open_last_note_dispatch<R: Runtime>(app: &AppHandle<R>) {
         Ok(s) => s,
         Err(err) => {
             eprintln!("[heron-tray] open last note: failed to read settings: {err}");
-            emit_no_last_note(app);
+            notify_no_last_note(app);
             return;
         }
     };
 
     if settings.vault_root.is_empty() {
-        emit_no_last_note(app);
+        notify_no_last_note(app);
         return;
     }
 
@@ -451,13 +476,13 @@ fn open_last_note_dispatch<R: Runtime>(app: &AppHandle<R>) {
         Ok(value) => value,
         Err(err) => {
             eprintln!("[heron-tray] walking vault failed: {err}");
-            emit_no_last_note(app);
+            notify_no_last_note(app);
             return;
         }
     };
 
     let Some(session_id) = newest else {
-        emit_no_last_note(app);
+        notify_no_last_note(app);
         return;
     };
 
@@ -480,12 +505,85 @@ fn open_last_note_dispatch<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Emit the `nav:no_last_note` event so the React tree pops a Sonner
-/// toast. Logs (without panicking) on emit failure so the tray's
-/// caller doesn't have to repeat the boilerplate.
-fn emit_no_last_note<R: Runtime>(app: &AppHandle<R>) {
-    if let Err(e) = app.emit(EVENT_NO_LAST_NOTE, ()) {
-        eprintln!("[heron-tray] failed to emit {EVENT_NO_LAST_NOTE}: {e}");
+/// Phase 75 (PR-ν): fire the "no notes yet" macOS notification.
+///
+/// Replaces the previous `nav:no_last_note` Sonner toast. The plugin
+/// builder takes care of the platform plumbing (NSUserNotification on
+/// macOS); we only need to set title + body and call `.show()`.
+///
+/// Permission handling. The Tauri 2 desktop plugin reports
+/// `PermissionState::Granted` unconditionally — macOS handles the
+/// "do not disturb" / per-app authorisation transparently inside
+/// NSUserNotificationCenter, so the plugin doesn't need its own
+/// gate. We still respect a `Denied` state defensively in case a
+/// future plugin rev surfaces real macOS authorisation; on a
+/// `Prompt` state we run `request_permission()` once before showing.
+/// Either path that doesn't end in `Granted` short-circuits without
+/// attempting `.show()` — the user already has the window-focus
+/// affordance from the caller.
+///
+/// Every failure mode degrades to a no-op: the tray click has already
+/// focused the main window, so the user is not left wondering whether
+/// the click registered. Errors are logged to stderr for power-user
+/// diagnosis and never propagated upward.
+fn notify_no_last_note<R: Runtime>(app: &AppHandle<R>) {
+    use tauri::plugin::PermissionState;
+
+    let notification = app.notification();
+
+    // Probe the current permission state. An error here is logged but
+    // doesn't abort — a future plugin rev might restrict the probe to
+    // a permission-gated capability, in which case we'd rather try
+    // `.show()` and let it fail than refuse to surface anything.
+    let state = match notification.permission_state() {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("[heron-tray] notify permission_state probe failed: {err}");
+            // Fall through to .show(); the plugin may have its own
+            // graceful "permission denied" path.
+            PermissionState::Granted
+        }
+    };
+
+    let granted = match state {
+        PermissionState::Granted => true,
+        PermissionState::Denied => false,
+        // `Prompt` / `PromptWithRationale`: ask once. The desktop
+        // plugin returns `Granted` from `request_permission` without
+        // user interaction, so the prompt-then-show path is a single
+        // cheap call; the macOS authorisation prompt itself comes
+        // from AppKit when `.show()` runs.
+        PermissionState::Prompt | PermissionState::PromptWithRationale => {
+            match notification.request_permission() {
+                Ok(PermissionState::Granted) => true,
+                Ok(_) => false,
+                Err(err) => {
+                    eprintln!("[heron-tray] notify request_permission failed: {err}");
+                    false
+                }
+            }
+        }
+    };
+
+    if !granted {
+        // Honour the user's explicit denial. Re-prompting on every
+        // tray click would be hostile; the caller has already focused
+        // the main window, which is sufficient feedback.
+        return;
+    }
+
+    let result = notification
+        .builder()
+        .title(NOTIFY_NO_LAST_NOTE_TITLE)
+        .body(NOTIFY_NO_LAST_NOTE_BODY)
+        .show();
+    if let Err(e) = result {
+        // Notification permission may have been revoked between our
+        // probe and the .show() (rare but possible), or the runtime
+        // may be off-platform (Linux CI, no notification daemon).
+        // Either way the tray click has already focused the window,
+        // so we just log and move on.
+        eprintln!("[heron-tray] notify no-last-note failed: {e}");
     }
 }
 
@@ -851,5 +949,25 @@ mod tests {
             .expect("call")
             .expect("should pick");
         assert_eq!(out, "foo.bar");
+    }
+
+    #[test]
+    fn no_last_note_notification_copy_pinned() {
+        // The phase 75 brief specifies the user-facing strings; pin
+        // them so a future copy edit goes through code review rather
+        // than slipping in unnoticed. The keyboard chord uses the
+        // U+2318 (PLACE OF INTEREST SIGN, "Command") and U+21E7 (UPWARDS
+        // WHITE ARROW, "Shift") code points so the notification renders
+        // the real Mac glyphs in Notification Center.
+        assert_eq!(NOTIFY_NO_LAST_NOTE_TITLE, "heron");
+        assert_eq!(
+            NOTIFY_NO_LAST_NOTE_BODY,
+            "No notes yet — start a recording from the tray or hit \u{2318}\u{21E7}R.",
+        );
+        // Belt-and-braces: the body must contain the Mac chord glyphs
+        // verbatim, not the ASCII fallback ("Cmd+Shift+R") that an
+        // accidental copy edit might introduce.
+        assert!(NOTIFY_NO_LAST_NOTE_BODY.contains('\u{2318}'));
+        assert!(NOTIFY_NO_LAST_NOTE_BODY.contains('\u{21E7}'));
     }
 }

@@ -78,6 +78,15 @@ tauri-plugin-dialog = "2.7.0"
 # reports per-app state, which is why we also try-register the chord
 # in `heron_check_hotkey` and unregister immediately on success.
 tauri-plugin-global-shortcut = "2.3.1"
+# Phase 75 (PR-ν): native macOS notification surface for the tray's
+# "Open last note…" → "no notes yet" path. Replaces the previous
+# `nav:no_last_note` Sonner toast so the user gets a real system
+# notification (Notification Center entry, banner, badge) instead of an
+# in-window toast that disappears with the focused window. The plugin
+# is dual-licensed MIT/Apache-2.0 (already covered by `deny.toml`'s
+# allowlist) and is the canonical Tauri 2 way to talk to NSUserNotifi-
+# cationCenter / mac-notifications-rs without us hand-rolling FFI.
+tauri-plugin-notification = "2.3.3"
 # Phase 73 (PR-λ): the pre-flight disk-space gate calls `statvfs(2)` on
 # the cache root to ask the OS how much free space the volume has, then
 # compares against `Settings::min_free_disk_mib`. `libc` already sits

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "bun test"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",
@@ -20,6 +21,7 @@
     "@tailwindcss/vite": "^4.0.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "@tiptap/extension-placeholder": "^3.0.0",
     "@tiptap/extension-typography": "^3.0.0",
     "@tiptap/react": "^3.0.0",
