@@ -234,6 +234,26 @@ every async→sync hop through `runWithTimeout` bounded by `WK_INIT_TIMEOUT`
 bounded by `EK_REQUEST_TIMEOUT` (60s) and surfaces a recoverable
 `CalendarError::Timeout`, mirroring the WhisperKit pattern from PR #124.
 
+### Onboarding model-download step now triggers a real fetch
+
+`apps/desktop/src/pages/Onboarding.tsx` step 5 used to render a "Preview"
+badge with a `// TODO(phase 72+): wire heron_download_model` placeholder; the
+button only checked whether a model was already on disk and the wizard could
+finish without delivering an STT artifact, so the first capture would fail
+opaquely. Now the wizard:
+
+- invokes a new `heron_download_model` Tauri command that wraps
+  `heron_speech::WhisperKitBackend::ensure_model`,
+- forwards 0..1 progress ticks onto a `model_download:progress` Tauri event,
+- and renders a real `<progress>` bar driven by those ticks until the fetch
+  resolves Pass / Fail.
+
+Off-Apple builds receive a structured `NotYetImplemented` failure with a
+platform hint; the underlying backend is a stub on those targets and the
+wizard surfaces that as a `Fail` outcome the user can skip past. Implemented
+in `apps/desktop/src-tauri/src/model_download.rs` with unit tests pinning the
+per-error copy.
+
 ## README claims vs. reality
 
 - **"v2 four-layer stack is currently trait surfaces only."** Stale. Every

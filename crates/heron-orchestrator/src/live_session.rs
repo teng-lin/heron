@@ -12,6 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use heron_bot::{BotCreateArgs, BotError, BotId, MeetingBotDriver};
 use heron_bridge::{AudioBridge, BridgeHealth, NaiveBridge};
 use heron_policy::{
@@ -247,6 +248,98 @@ where
             });
         }
         Ok(())
+    }
+}
+
+/// Type-erased handle to a running [`LiveSession`].
+///
+/// `LocalSessionOrchestrator` stores one of these per active capture,
+/// so `start_capture` does not need to be generic over the bot driver,
+/// realtime backend, and bridge types. The trait is sealed-by-blanket-
+/// impl: every [`LiveSession`] satisfies it, and no production code
+/// outside this module is expected to implement it directly. Tests
+/// supply their own implementors as a stand-in for the
+/// `RecallDriver + OpenAiRealtime + NaiveBridge` stack so the daemon
+/// hot path can be exercised without live vendor calls.
+#[async_trait]
+pub trait DynLiveSession: Send + Sync {
+    /// Public meeting identity the session was minted for.
+    fn meeting_id(&self) -> MeetingId;
+    /// Vendor-bot id assigned by the bot driver.
+    fn bot_id(&self) -> BotId;
+    /// Realtime session id assigned by the backend.
+    fn realtime_session(&self) -> SessionId;
+    /// Best-effort bridge-health snapshot. Surfaced through the
+    /// daemon's `/health` projection once the bridge wiring lands.
+    fn bridge_health(&self) -> BridgeHealth;
+    /// Tear down the session in dependency order. Same semantics as
+    /// [`LiveSession::shutdown`]: best-effort, never panics.
+    /// Consumes the box because shutdown is one-shot.
+    async fn shutdown(self: Box<Self>) -> Result<(), LiveSessionError>;
+}
+
+#[async_trait]
+impl<D, B, A> DynLiveSession for LiveSession<D, B, A>
+where
+    D: MeetingBotDriver + 'static,
+    B: RealtimeBackend + 'static,
+    A: AudioBridge + 'static,
+{
+    fn meeting_id(&self) -> MeetingId {
+        LiveSession::meeting_id(self)
+    }
+
+    fn bot_id(&self) -> BotId {
+        LiveSession::bot_id(self)
+    }
+
+    fn realtime_session(&self) -> SessionId {
+        LiveSession::realtime_session(self)
+    }
+
+    fn bridge_health(&self) -> BridgeHealth {
+        LiveSession::bridge_health(self)
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<(), LiveSessionError> {
+        (*self).shutdown().await
+    }
+}
+
+/// Factory boundary that `LocalSessionOrchestrator` calls into on
+/// the daemon hot path.
+///
+/// Configuring a factory is what flips `start_capture` from "v1 vault
+/// pipeline only" to "v2 four-layer stack composed alongside v1." The
+/// factory is responsible for assembling its own
+/// `RecallDriver + OpenAiRealtime + NaiveBridge` (or a test stand-in)
+/// and translating per-call inputs into [`LiveSessionStartArgs`].
+///
+/// Implementors are expected to be cheap to clone or re-enter; the
+/// orchestrator calls `start` once per capture and never holds the
+/// factory across an `.await` longer than that one call.
+#[async_trait]
+pub trait LiveSessionFactory: Send + Sync {
+    async fn start(
+        &self,
+        args: LiveSessionStartArgs,
+    ) -> Result<Box<dyn DynLiveSession>, LiveSessionError>;
+}
+
+#[async_trait]
+impl<D, B, F, A> LiveSessionFactory for LiveSessionOwner<D, B, F, A>
+where
+    D: MeetingBotDriver + 'static,
+    B: RealtimeBackend + 'static,
+    F: Fn() -> A + Send + Sync + 'static,
+    A: AudioBridge + 'static,
+{
+    async fn start(
+        &self,
+        args: LiveSessionStartArgs,
+    ) -> Result<Box<dyn DynLiveSession>, LiveSessionError> {
+        let session = LiveSessionOwner::start(self, args).await?;
+        Ok(Box::new(session) as Box<dyn DynLiveSession>)
     }
 }
 
