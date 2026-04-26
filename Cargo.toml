@@ -92,6 +92,7 @@ heron-realtime = { path = "crates/heron-realtime" }
 # wired into heron-cli; they ship trait surfaces only until the
 # orchestrator hub consolidation lands.
 heron-event = { path = "crates/heron-event" }
+heron-event-http = { path = "crates/heron-event-http" }
 heron-session = { path = "crates/heron-session" }
 
 [profile.dev]
