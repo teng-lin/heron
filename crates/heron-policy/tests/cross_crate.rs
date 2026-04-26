@@ -185,8 +185,5 @@ async fn allowed_speech_propagates_through_to_backend_response_create() {
     assert!(recorded.voice_override.is_none());
     // Prove the speech event handle isn't all-zero — exercises
     // utterance_ids capability on the public boundary.
-    assert_ne!(
-        utt.to_string(),
-        heron_policy::UtteranceId::nil().to_string()
-    );
+    assert_ne!(utt, heron_policy::UtteranceId::nil());
 }
