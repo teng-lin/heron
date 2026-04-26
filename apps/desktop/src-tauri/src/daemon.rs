@@ -75,6 +75,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
 /// attacker-controlled webview could fabricate. The unit tests
 /// exercise the parameterized [`probe_url`] directly with an
 /// ephemeral port.
+///
+/// Drift between this constant and `herond::DEFAULT_BIND` /
+/// `herond::API_PREFIX` is caught by `health_url_matches_herond_constants`
+/// in the test module — `concat!` only accepts literals so we
+/// can't compose at const-eval time without a procedural-macro
+/// dep, and adding `const_format` for one assertion isn't worth
+/// the build-graph weight.
 pub(crate) const HEALTH_URL: &str = "http://127.0.0.1:7384/v1/health";
 
 /// Failure modes for [`install`]. Modeled as an enum so callers in
@@ -205,24 +212,30 @@ pub async fn install<R: Runtime>(
     // races a `herond` start converges on the same token regardless
     // of who got there first.
     //
-    // A failure here (e.g. unwritable home dir) downgrades to an
-    // empty-bearer config. The daemon will still answer `/health`
-    // (which carries `security: []`) so the status probe stays
-    // green; every other route returns 401 until the user fixes
-    // their home-dir perms and restarts. The alternative —
-    // crashing the desktop here — would block launch on a fixable
-    // file-permission problem.
+    // A failure here (e.g. unwritable home dir) downgrades to a
+    // **fresh transient UUID** rather than an empty bearer. An empty
+    // bearer is NOT fail-closed: `Authorization: Bearer ` (with an
+    // empty value) splits into the right shape and `bearer_eq("","")`
+    // succeeds — that would silently turn every protected localhost
+    // route into an unauthenticated one on a token-load failure. A
+    // transient UUID locks out external CLIs (which can't read it
+    // from disk, since we never persisted it) while still letting
+    // any future Tauri command in this process authenticate via the
+    // shared `Arc<AuthConfig>` in the `DaemonHandle`. The user's
+    // recovery path is "fix the home-dir perms and restart"; the CLI
+    // will then see the persisted token again on next launch.
     let auth = match herond::auth::default_token_path().and_then(|p| herond::auth::load_or_mint(&p))
     {
         Ok(a) => Arc::new(a),
         Err(e) => {
+            let transient = uuid::Uuid::now_v7().to_string();
             tracing::warn!(
                 error = %e,
-                "could not load bearer token; daemon will start without authenticated routes",
+                "could not load bearer token from ~/.heron/cli-token; \
+                 minted a transient in-memory token. External CLIs will \
+                 not be able to authenticate until the file is restored.",
             );
-            Arc::new(AuthConfig {
-                bearer: String::new(),
-            })
+            Arc::new(AuthConfig { bearer: transient })
         }
     };
 
@@ -456,23 +469,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_url_times_out_quickly_against_blackhole() {
-        // 192.0.2.0/24 is RFC 5737 TEST-NET-1: documented as
-        // unroutable. A connect attempt should hang until the OS
-        // gives up — the probe's 1 s `client.timeout` must beat
-        // that, otherwise the onboarding wizard would wait minutes.
-        // We allow a 3 s budget here to comfortably outlast the
-        // 1 s probe timeout plus scheduler jitter; if the assertion
-        // ever flakes, the regression is in the timeout wiring,
-        // not in the test budget.
+    async fn probe_url_honors_timeout_against_silent_server() {
+        // Deterministic timeout test: bind a TCP listener that
+        // accepts connections but never reads or responds. The
+        // probe's `client.timeout` must fire — no environment
+        // sensitivity (the previous TEST-NET-1 / blackhole-IP
+        // approach was non-deterministic in sandboxed CI, where
+        // the unroutable address fails immediately on connect
+        // rather than exercising the read-side timeout).
+        //
+        // We accept the connection so the connect-side completes
+        // and the test exercises the response-wait timeout, which
+        // is the path a wedged real daemon would take.
         use tokio::time::Instant;
-        let url = "http://192.0.2.1:7384/v1/health";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent");
+        let addr = listener.local_addr().expect("local_addr");
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Accept one connection and hold it open until the test
+            // finishes. Dropping the stream at end of select closes
+            // the connection — by then the probe has already
+            // observed its timeout.
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        // Hold the stream until close_rx fires.
+                        let _stream = stream;
+                        let _ = (&mut close_rx).await;
+                    }
+                }
+                _ = &mut close_rx => {}
+            }
+        });
+
+        let url = format!("http://{addr}/v1/health");
         let start = Instant::now();
-        let status = probe_url(url).await;
+        let status = probe_url(&url).await;
         let elapsed = start.elapsed();
+        let _ = close_tx.send(()); // release the silent server
+
         assert!(
             !status.running,
-            "expected running=false against blackhole, got {status:?}",
+            "expected running=false against silent server, got {status:?}",
+        );
+        // 1 s probe timeout + scheduler jitter; 3 s is generous.
+        // The lower bound (>= 800 ms) proves the timeout actually
+        // engaged rather than the request returning instantly.
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "probe returned too early; expected >= 800ms, took {elapsed:?}",
         );
         assert!(
             elapsed < Duration::from_secs(3),
@@ -487,6 +534,18 @@ mod tests {
         // ever fails, also update `herond::DEFAULT_BIND` and
         // `crates/herond/src/lib.rs::API_PREFIX`.
         assert_eq!(HEALTH_URL, "http://127.0.0.1:7384/v1/health");
+    }
+
+    /// Drift guard: [`HEALTH_URL`] must equal
+    /// `format!("http://{DEFAULT_BIND}{API_PREFIX}/health")`. If
+    /// herond ever changes either constant, this test catches it
+    /// before a probe silently starts hitting the wrong path on a
+    /// real daemon. We can't compose at const-eval (no
+    /// `const_format` dep) so the runtime check stands in.
+    #[test]
+    fn health_url_matches_herond_constants() {
+        let composed = format!("http://{}{}/health", DEFAULT_BIND, herond::API_PREFIX);
+        assert_eq!(HEALTH_URL, composed);
     }
 
     #[test]

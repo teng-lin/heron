@@ -760,18 +760,23 @@ pub fn run() {
         // We split the original `.run(generate_context!())`
         // shorthand into `.build(...)?.run(callback)` so we can
         // observe Tauri lifecycle events — specifically
-        // [`tauri::RunEvent::Exit`], which fires once after the
-        // event loop has drained but before the process exits.
-        // That window is where we ask the in-process `herond` axum
-        // service to gracefully stop (drains in-flight requests,
-        // closes the listener) instead of relying on
-        // process-teardown to abort the spawned task. Also see
-        // [`tauri::RunEvent::ExitRequested`], which fires *before*
-        // the loop drains — we don't bind that one because the
-        // user-driven close path (clicking Quit, Cmd+Q) already
-        // routes through `Exit` and we don't want to short-circuit
-        // the OS-level "are you sure?" dialog the API would let us
-        // override.
+        // [`tauri::RunEvent::Exit`], which fires after the event
+        // loop has drained but before the process exits. That
+        // window is where we ask the in-process `herond` axum
+        // service to begin its graceful-shutdown cleanup
+        // (`with_graceful_shutdown` stops accepting new connections
+        // and lets in-flight requests finish on a best-effort
+        // basis). The Exit callback is sync, so we cannot `await`
+        // the axum task to fully join here — the Tauri runtime
+        // proceeds with its own teardown and may abort the task
+        // before drain completes. For an in-process daemon serving
+        // a co-tenanted WebView this is acceptable: the only client
+        // is going away too. Also see [`tauri::RunEvent::ExitRequested`],
+        // which fires *before* drain — we don't bind that one
+        // because the user-driven close path (clicking Quit, Cmd+Q)
+        // already routes through `Exit` and we don't want to
+        // short-circuit the OS-level "are you sure?" dialog the
+        // ExitRequested API would let us override.
         .build(tauri::generate_context!())
         .expect("error while building heron-desktop")
         .run(|app_handle, event| {

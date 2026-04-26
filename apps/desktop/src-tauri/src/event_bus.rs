@@ -307,6 +307,70 @@ mod tests {
         assert!(result.is_err(), "second install should fail");
     }
 
+    /// `install_with` is the production entry point: `lib::run`'s
+    /// setup hook constructs one shared orchestrator and hands the
+    /// same `Arc` to both this forwarder and `daemon::install`. Pin
+    /// that path explicitly so a regression in `install_with` (e.g.
+    /// failing to subscribe before spawning the forwarder) doesn't
+    /// hide behind the zero-arg `install()`'s test coverage.
+    ///
+    /// Also pins the shared-orchestrator semantic: the `Arc` we
+    /// pass in is the same `Arc` that ends up in
+    /// `state::<Arc<LocalSessionOrchestrator>>`, so a publisher
+    /// holding the original `Arc` reaches the forwarder.
+    #[tokio::test]
+    async fn install_with_uses_supplied_orchestrator_and_forwards() {
+        let app = tauri::test::mock_app();
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+        install_with(app.handle(), Arc::clone(&orch)).expect("install_with");
+
+        // The Arc in state must be `ptr_eq` to the one we passed —
+        // a regression that constructs a *new* orchestrator inside
+        // `install_with` (the bug the refactor risks reintroducing)
+        // would surface as a different Arc here.
+        let stored = app
+            .handle()
+            .state::<Arc<LocalSessionOrchestrator>>()
+            .inner()
+            .clone();
+        assert!(
+            Arc::ptr_eq(&orch, &stored),
+            "install_with must store the supplied Arc, not a clone-of-clone of it",
+        );
+
+        // End-to-end: a publish on the supplied orchestrator's bus
+        // reaches a Tauri listener via the forwarder.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        app.handle().listen("meeting:detected", move |evt| {
+            captured_clone
+                .lock()
+                .expect("lock")
+                .push(evt.payload().to_owned());
+        });
+        orch.event_bus().publish(sample_envelope());
+        wait_for_capture(
+            &captured,
+            "install_with's forwarder didn't deliver the event",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn install_with_twice_returns_err() {
+        // Same idempotency guard as `install_twice_returns_err`, but
+        // exercising the new entry point directly. Both `install`
+        // and `install_with` route through the same `app.manage`
+        // check, but pinning the contract on each public surface
+        // stops a refactor that splits the manage call from
+        // returning Err on duplicate.
+        let app = tauri::test::mock_app();
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+        install_with(app.handle(), Arc::clone(&orch)).expect("first install_with");
+        let result = install_with(app.handle(), orch);
+        assert!(result.is_err(), "second install_with should fail");
+    }
+
     #[tokio::test]
     async fn dot_namespaced_event_type_arrives_under_colon_sanitized_name() {
         // End-to-end sanitization: `transcript.partial` becomes the
