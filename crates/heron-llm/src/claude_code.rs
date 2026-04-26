@@ -313,6 +313,7 @@ mod tests {
                 meeting_type: MeetingType::Other,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("summarize");
@@ -335,6 +336,7 @@ mod tests {
                 meeting_type: MeetingType::Internal,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("ok");
@@ -352,6 +354,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("missing binary");
@@ -374,6 +377,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("non-zero");
@@ -397,6 +401,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("malformed");
@@ -429,6 +434,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("should time out");
@@ -477,6 +483,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("ok");

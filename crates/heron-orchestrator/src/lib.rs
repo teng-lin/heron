@@ -812,27 +812,8 @@ fn build_live_session_start_args(
     meeting: &Meeting,
     applied_context: Option<&PreMeetingContext>,
 ) -> LiveSessionStartArgs {
-    // The bot driver carries its own typed `PreMeetingContext` shape
-    // (subset of the orchestrator-side one — no `prior_decisions`).
-    // Translate field-by-field rather than re-using a serde round
-    // trip so a missing field is a compile error, not a silent drop.
     let bot_context = applied_context
-        .map(|ctx| BotPreMeetingContext {
-            agenda: ctx.agenda.clone(),
-            attendees_known: ctx
-                .attendees_known
-                .iter()
-                .map(|a| BotAttendeeContext {
-                    name: a.name.clone(),
-                    email: a.email.clone(),
-                    last_seen_in: a.last_seen_in,
-                    relationship: a.relationship.clone(),
-                    notes: a.notes.clone(),
-                })
-                .collect(),
-            related_notes: ctx.related_notes.clone(),
-            user_briefing: ctx.user_briefing.clone(),
-        })
+        .map(translate_to_bot_context)
         .unwrap_or_default();
 
     // Render the system prompt as `<persona>\n\n<context>` when a
@@ -916,6 +897,61 @@ fn build_live_session_start_args(
             mute: false,
             escalation: EscalationMode::None,
         },
+    }
+}
+
+/// The bot driver carries its own typed `PreMeetingContext` shape
+/// (subset of the orchestrator-side one — no `prior_decisions`).
+/// Translate field-by-field rather than re-using a serde round trip
+/// so a missing field is a compile error, not a silent drop.
+fn translate_to_bot_context(ctx: &PreMeetingContext) -> BotPreMeetingContext {
+    BotPreMeetingContext {
+        agenda: ctx.agenda.clone(),
+        attendees_known: ctx
+            .attendees_known
+            .iter()
+            .map(|a| BotAttendeeContext {
+                name: a.name.clone(),
+                email: a.email.clone(),
+                last_seen_in: a.last_seen_in,
+                relationship: a.relationship.clone(),
+                notes: a.notes.clone(),
+            })
+            .collect(),
+        related_notes: ctx.related_notes.clone(),
+        user_briefing: ctx.user_briefing.clone(),
+    }
+}
+
+/// Render the staged pre-meeting context into a markdown preamble for
+/// the v1 LLM summarizer prompt. Mirrors what
+/// [`build_live_session_start_args`] does for the v2 system prompt
+/// (`heron_bot::render_context` with its 48 KiB cap from spec
+/// Invariant 10) so v1 and v2 agents see the same briefing copy when
+/// both paths run.
+///
+/// Returns `None` when no context is staged, when render fails (e.g.
+/// the rendered text would exceed the cap), or when the rendered
+/// output is empty whitespace. The summarizer prompt template
+/// suppresses its `## Pre-meeting context` block on `None`, so capture
+/// continues normally either way — context is a hint, not a
+/// precondition.
+fn pre_meeting_briefing_for_v1(
+    applied_context: Option<&PreMeetingContext>,
+    meeting_id: MeetingId,
+) -> Option<String> {
+    let bot_context = translate_to_bot_context(applied_context?);
+    match heron_bot::render_context(&bot_context) {
+        Ok(rendered) if !rendered.trim().is_empty() => Some(rendered),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                meeting_id = %meeting_id,
+                error = %err,
+                "v1 pre-meeting briefing exceeds spec budget; v1 summary will run without preamble",
+            );
+            None
+        }
     }
 }
 
@@ -1210,25 +1246,6 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             Some(raw) => Some(normalize_calendar_event_id(raw)?),
             None => None,
         };
-        // Singleton-per-platform per the trait docs: a second
-        // capture for the same platform while one is still non-
-        // terminal is a `409 Conflict`. Terminal entries are
-        // removed on `end_meeting`, so the scan stops at the active
-        // set. Done in its own scope so the `MutexGuard` (sync,
-        // !Send) cannot leak into the later `.await` on the live
-        // session factory.
-        {
-            let active = lock_or_recover(&self.active_meetings);
-            if active
-                .values()
-                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
-            {
-                return Err(SessionError::CaptureInProgress {
-                    platform: args.platform,
-                });
-            }
-        }
-
         let id = MeetingId::now_v7();
         let started_at = Utc::now();
         let mut meeting = Meeting {
@@ -1249,82 +1266,99 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         };
         let mut fsm = RecordingFsm::new();
 
-        publish_meeting_event(
-            &self.bus,
-            EventPayload::MeetingDetected(meeting.clone()),
-            id,
-        );
-
-        // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
-        // armed a capture" edge; `Invalid` here would mean the
-        // freshly-built FSM isn't actually `Idle`, which can't
-        // happen — map defensively rather than `unwrap` so a future
-        // FSM change surfaces as a typed error.
-        fsm.on_hotkey().map_err(transition_to_session_error)?;
-        meeting.status = MeetingStatus::Armed;
-        publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
-
-        // armed → recording.
-        fsm.on_yes().map_err(transition_to_session_error)?;
-        meeting.status = MeetingStatus::Recording;
-        publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
-
-        let runtime = if let Some(vault_root) = self.vault_root.clone() {
-            let (stop_tx, stop_rx) = oneshot::channel();
-            let config = CliSessionConfig {
-                session_id: id.0,
-                target_bundle_id: platform_target_bundle_id(args.platform).to_owned(),
-                cache_dir: self.cache_dir.clone(),
-                vault_root,
-                stt_backend_name: self.stt_backend_name.clone(),
-                llm_preference: self.llm_preference,
-            };
-            let handle = tokio::task::spawn_blocking(move || {
-                // CoreAudio/cpal handles in the capture path are not
-                // `Send` on macOS. Run the whole shared v1 pipeline on
-                // one blocking worker with its own current-thread
-                // runtime so those handles are never moved between
-                // Tokio worker threads.
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| CliSessionError::Pipeline(format!("tokio runtime: {e}")))?;
-                runtime.block_on(async move {
-                    let mut orchestrator = CliSessionOrchestrator::new(config);
-                    orchestrator.run(stop_rx).await
-                })
-            });
-            CaptureRuntime::Pipeline { stop_tx, handle }
-        } else {
-            CaptureRuntime::Synthetic
-        };
-
-        // Consume the pending context AFTER the FSM walk has
-        // committed — a `transition_to_session_error` early-return
-        // above would otherwise silently delete the staged context,
-        // which the next `start_capture` retry would expect to find.
-        // Per the lock-ordering contract on `pending_contexts`, this
-        // takes the second mutex while still holding `active_meetings`.
-        let applied_context = normalized_event_id
-            .as_deref()
-            .and_then(|cid| self.pending_contexts.remove(cid));
-
-        // Best-effort v2 composition. We release `active_meetings`
-        // before awaiting the factory because:
-        //  (a) the lock guard is `!Send` (sync `Mutex`), so it can't
-        //      be held across `.await`, and
-        //  (b) the factory call may take seconds (vendor HTTP +
-        //      WebSocket open) and must not block other capture
-        //      operations on this orchestrator.
-        // The trade-off: a concurrent `end_meeting(id)` on this same
-        // meeting could land in the brief gap between insert and
-        // factory completion. We close that race by inserting a
-        // placeholder entry first (without `live_session`) and
-        // attaching the live session via a second short critical
-        // section on success.
-        let context_attached = applied_context.is_some();
-        {
+        // Atomic singleton-check-and-claim. The platform-conflict scan
+        // and the placeholder insert have to share one critical section
+        // — otherwise two concurrent `start_capture` calls for the same
+        // platform could both pass the check before either inserted,
+        // producing parallel captures. Everything inside the scope is
+        // synchronous: bus broadcasts (`bus.send` is non-blocking),
+        // FSM transitions, `tokio::task::spawn_blocking` (returns a
+        // JoinHandle immediately; the blocking work runs off-thread),
+        // and a brief `pending_contexts` lock taken AFTER
+        // `active_meetings` per the lock-ordering rule. The lock is
+        // released before the v2 `factory.start(...).await` further
+        // down — that `.await` is why the live-session attachment runs
+        // in its own short critical section after the await rather
+        // than here.
+        let applied_context = {
             let mut active = lock_or_recover(&self.active_meetings);
+            if active
+                .values()
+                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
+            {
+                return Err(SessionError::CaptureInProgress {
+                    platform: args.platform,
+                });
+            }
+
+            publish_meeting_event(
+                &self.bus,
+                EventPayload::MeetingDetected(meeting.clone()),
+                id,
+            );
+
+            // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
+            // armed a capture" edge; `Invalid` here would mean the
+            // freshly-built FSM isn't actually `Idle`, which can't
+            // happen — map defensively rather than `unwrap` so a future
+            // FSM change surfaces as a typed error.
+            fsm.on_hotkey().map_err(transition_to_session_error)?;
+            meeting.status = MeetingStatus::Armed;
+            publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
+
+            // armed → recording.
+            fsm.on_yes().map_err(transition_to_session_error)?;
+            meeting.status = MeetingStatus::Recording;
+            publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
+
+            // Consume the pending context AFTER the FSM walk commits
+            // but BEFORE building `CliSessionConfig`, so the rendered
+            // briefing can feed both v1
+            // (`CliSessionConfig.pre_meeting_briefing`) and v2
+            // (`build_live_session_start_args`). A failed FSM
+            // transition above `?`-returns and drops the guard before
+            // we touch `pending_contexts`, so a retry still finds the
+            // staged entry.
+            let applied_context = normalized_event_id
+                .as_deref()
+                .and_then(|cid| self.pending_contexts.remove(cid));
+            let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
+
+            let runtime = if let Some(vault_root) = self.vault_root.clone() {
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let config = CliSessionConfig {
+                    session_id: id.0,
+                    target_bundle_id: platform_target_bundle_id(args.platform).to_owned(),
+                    cache_dir: self.cache_dir.clone(),
+                    vault_root,
+                    stt_backend_name: self.stt_backend_name.clone(),
+                    llm_preference: self.llm_preference,
+                    pre_meeting_briefing,
+                };
+                let handle = tokio::task::spawn_blocking(move || {
+                    // CoreAudio/cpal handles in the capture path are
+                    // not `Send` on macOS. Run the whole shared v1
+                    // pipeline on one blocking worker with its own
+                    // current-thread runtime so those handles are
+                    // never moved between Tokio worker threads.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| CliSessionError::Pipeline(format!("tokio runtime: {e}")))?;
+                    runtime.block_on(async move {
+                        let mut orchestrator = CliSessionOrchestrator::new(config);
+                        orchestrator.run(stop_rx).await
+                    })
+                });
+                CaptureRuntime::Pipeline { stop_tx, handle }
+            } else {
+                CaptureRuntime::Synthetic
+            };
+
+            // Placeholder insert: claims the platform slot before we
+            // release the lock. The v2 live session (if any) is
+            // attached below in a second critical section, after
+            // `factory.start(..).await` resolves.
             active.insert(
                 id,
                 ActiveMeeting {
@@ -1335,7 +1369,18 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     live_session: None,
                 },
             );
-        }
+
+            applied_context
+        };
+
+        // The v2 factory call is the only step that needs the lock
+        // released, because it `.await`s on vendor HTTP / WebSocket
+        // open. The trade-off: a concurrent `end_meeting(id)` on this
+        // same meeting could land in the brief gap between the insert
+        // above and the live-session attach below; that race is closed
+        // by the post-await scope checking that the entry is still
+        // present and tearing the orphan session down if it isn't.
+        let context_attached = applied_context.is_some();
 
         if let Some(factory) = self.live_session_factory.as_ref() {
             let live_args = build_live_session_start_args(
@@ -3370,5 +3415,51 @@ mod tests {
             1,
             "orphan live session shutdown invoked exactly once",
         );
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_is_none_without_context() {
+        let id = MeetingId::now_v7();
+        assert!(pre_meeting_briefing_for_v1(None, id).is_none());
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_is_none_for_empty_context() {
+        // A staged-but-empty `PreMeetingContext` (every field default)
+        // should not produce a stranded `## Pre-meeting context`
+        // header in the v1 summarizer prompt — the heron-llm template
+        // already suppresses empty briefings, but we suppress earlier
+        // here too so callers can rely on `Some`/`None` instead of
+        // re-checking emptiness.
+        let id = MeetingId::now_v7();
+        let ctx = PreMeetingContext::default();
+        assert!(pre_meeting_briefing_for_v1(Some(&ctx), id).is_none());
+    }
+
+    #[test]
+    fn pre_meeting_briefing_for_v1_renders_populated_context() {
+        let id = MeetingId::now_v7();
+        let ctx = PreMeetingContext {
+            agenda: Some("Q3 launch readiness review".into()),
+            attendees_known: vec![heron_session::AttendeeContext {
+                name: "Alice".into(),
+                email: Some("alice@example.com".into()),
+                last_seen_in: None,
+                relationship: Some("CFO".into()),
+                notes: None,
+            }],
+            related_notes: vec!["meetings/2026-04-12.md".into()],
+            // `prior_decisions` is dropped by the heron_bot translation
+            // (the bot shape doesn't carry it); we still exercise it
+            // here so the test pins the lossy translation rather than
+            // regressing silently if a future render adds support.
+            prior_decisions: Vec::new(),
+            user_briefing: Some("Alice will push for slipping the date.".into()),
+        };
+        let rendered =
+            pre_meeting_briefing_for_v1(Some(&ctx), id).expect("populated context renders");
+        assert!(rendered.contains("Q3 launch readiness review"));
+        assert!(rendered.contains("Alice"));
+        assert!(rendered.contains("Alice will push for slipping the date."));
     }
 }

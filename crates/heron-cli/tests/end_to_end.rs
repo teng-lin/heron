@@ -23,6 +23,7 @@ fn cfg(tmp: &TempDir) -> SessionConfig {
         vault_root: tmp.path().join("vault"),
         stt_backend_name: "sherpa".into(),
         llm_preference: heron_llm::Preference::Auto,
+        pre_meeting_briefing: None,
     }
 }
 

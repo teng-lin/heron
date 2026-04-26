@@ -167,6 +167,7 @@ mod tests {
                 meeting_type: MeetingType::Other,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("summarize");
@@ -187,6 +188,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("missing binary");

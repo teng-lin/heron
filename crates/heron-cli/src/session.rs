@@ -76,6 +76,15 @@ pub struct SessionConfig {
     /// surfaced via tracing so the diagnostics tab can render
     /// "we picked X because Y".
     pub llm_preference: heron_llm::Preference,
+    /// Pre-rendered pre-meeting context (agenda / attendees / related
+    /// notes / prior decisions / briefing) staged via the daemon's
+    /// `attach_context` and forwarded by the daemon orchestrator at
+    /// `start_capture` time. When `Some`, the LLM summarizer prompt
+    /// includes this as a "Pre-meeting context" preamble so the
+    /// generated summary can reference what the user staged ahead of
+    /// the call. `None` for ad-hoc captures or for `heron record` runs
+    /// from the CLI which never stage context.
+    pub pre_meeting_briefing: Option<String>,
 }
 
 /// Outcome of `run_no_op` and `run`.
@@ -286,6 +295,13 @@ impl Orchestrator {
             meeting_type,
             existing_action_items,
             existing_attendees,
+            // Re-summarize is a vault-side operation; pre-meeting
+            // context only flows in on a fresh capture (it lives in
+            // memory in the daemon and is consumed at `start_capture`
+            // time). After a meeting has been written to the vault,
+            // the action-items / attendees preservation block is the
+            // only context the LLM needs.
+            pre_meeting_briefing: None,
         };
         let mut output = summarizer.summarize(input).await?;
 
@@ -333,6 +349,7 @@ mod tests {
             // else falls back to a CLI; the test machine's
             // environment determines which path runs.
             llm_preference: heron_llm::Preference::Auto,
+            pre_meeting_briefing: None,
         }
     }
 

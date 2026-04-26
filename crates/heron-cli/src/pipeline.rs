@@ -266,7 +266,17 @@ pub async fn run_pipeline(
 
     // LLM summarize. A failure here is non-fatal — we still write a
     // transcript-only note so the user has the raw turns to read.
-    let llm_out = match summarize(llm.as_ref(), &transcript_path).await {
+    // `pre_meeting_briefing` is forwarded from the daemon orchestrator
+    // (when the v2 `attach_context` path staged a context for the
+    // calendar event matching this capture) and woven into the prompt
+    // template — the standard `heron record` CLI path never sets it.
+    let llm_out = match summarize(
+        llm.as_ref(),
+        &transcript_path,
+        config.pre_meeting_briefing.as_deref(),
+    )
+    .await
+    {
         Ok(out) => Some(out),
         Err(e) => {
             tracing::warn!(error = %e, "summarize failed; writing transcript-only note");
@@ -585,15 +595,23 @@ async fn run_stt(
 
 /// Run the LLM summarizer over the merged transcript. Failures
 /// surface as `SessionError::Llm` and are caught at the call site.
+///
+/// `pre_meeting_briefing` carries pre-rendered context that the
+/// daemon orchestrator staged via `attach_context`; when present, it
+/// is woven into the summarizer prompt so the LLM can reference what
+/// the user knew going into the call. `None` for the standard
+/// `heron record` CLI path which never stages context.
 async fn summarize(
     llm: &dyn heron_llm::Summarizer,
     transcript: &Path,
+    pre_meeting_briefing: Option<&str>,
 ) -> Result<heron_llm::SummarizerOutput, SessionError> {
     let input = heron_llm::SummarizerInput {
         transcript,
         meeting_type: MeetingType::Other,
         existing_action_items: None,
         existing_attendees: None,
+        pre_meeting_briefing,
     };
     Ok(llm.summarize(input).await?)
 }

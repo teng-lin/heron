@@ -118,6 +118,9 @@ pub async fn re_summarize_in_vault(
         vault_root: vault_root.to_path_buf(),
         stt_backend_name: "sherpa".into(),
         llm_preference: heron_llm::Preference::Auto,
+        // CLI re-summarize never carries pre-meeting context — that
+        // surface only flows through the daemon's `attach_context`.
+        pre_meeting_briefing: None,
     };
     let orch = session::Orchestrator::new(cfg);
     let output = orch

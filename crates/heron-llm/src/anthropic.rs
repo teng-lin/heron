@@ -741,6 +741,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("4xx should error");
@@ -894,6 +895,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("summarize");
@@ -932,6 +934,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("4xx must surface");
@@ -971,6 +974,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect_err("5xx must surface");
@@ -1029,6 +1033,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: Some(&priors),
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await
             .expect("ok");

@@ -62,12 +62,20 @@ const MEETING_TEMPLATE_NAME: &str = "meeting";
 /// On first summarize, `existing_action_items` and
 /// `existing_attendees` are `None`. On re-summarize the caller passes
 /// them from the **current** `<note>.md` (not `.md.bak`) — see §11.2.
+///
+/// `pre_meeting_briefing` carries pre-rendered pre-meeting context
+/// (agenda / attendees / prior decisions / user briefing) staged via
+/// the daemon's `attach_context` route. When `Some`, the prompt
+/// template emits a "Pre-meeting context" preamble so the LLM can
+/// reference what the user knew going into the call. Stays `None` for
+/// CLI / ad-hoc captures with no calendar correlation.
 #[derive(Debug)]
 pub struct SummarizerInput<'a> {
     pub transcript: &'a Path,
     pub meeting_type: MeetingType,
     pub existing_action_items: Option<&'a [ActionItem]>,
     pub existing_attendees: Option<&'a [Attendee]>,
+    pub pre_meeting_briefing: Option<&'a str>,
 }
 
 /// Structured LLM output. See `meeting.hbs` for the JSON shape the
@@ -221,6 +229,12 @@ pub fn render_meeting_prompt(input: &SummarizerInput<'_>) -> Result<String, LlmE
                 }))
                 .collect::<Vec<_>>()
         }),
+        // `trim_end` so a caller passing context that already ends in
+        // "\n" (the renderer's standard tail) doesn't produce a blank
+        // line inside the rendered prompt block.
+        "pre_meeting_briefing": input.pre_meeting_briefing
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
     });
     hb.render(MEETING_TEMPLATE_NAME, &ctx)
         .map_err(|e| LlmError::Backend(format!("template render: {e}")))
@@ -309,6 +323,7 @@ mod tests {
             meeting_type: MeetingType::Client,
             existing_action_items: Some(&items),
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .expect("render");
         assert!(prompt.contains("RETURN THE EXACT SAME `id`"));
@@ -324,6 +339,7 @@ mod tests {
             meeting_type: MeetingType::Client,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .expect("render");
         // The block header must NOT appear when there are no priors —
@@ -346,6 +362,7 @@ mod tests {
             meeting_type: MeetingType::Client,
             existing_action_items: None,
             existing_attendees: Some(&attendees),
+            pre_meeting_briefing: None,
         })
         .expect("render");
         assert!(prompt.contains(&id.to_string()));
@@ -361,6 +378,7 @@ mod tests {
             meeting_type: MeetingType::Client,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .expect("client");
         assert!(client.contains("EXTERNAL client meeting"));
@@ -370,6 +388,7 @@ mod tests {
             meeting_type: MeetingType::Internal,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .expect("internal");
         assert!(internal.contains("INTERNAL team meeting"));
@@ -379,9 +398,61 @@ mod tests {
             meeting_type: MeetingType::OneOnOne,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .expect("1:1");
         assert!(one_on_one.contains("This is a 1:1"));
+    }
+
+    #[test]
+    fn template_includes_pre_meeting_briefing_when_present() {
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let briefing = "## Agenda\nQ3 launch review\n\n## Attendees\n- Alice (CFO)\n";
+        let prompt = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: Some(briefing),
+        })
+        .expect("render with briefing");
+        assert!(prompt.contains("## Pre-meeting context"));
+        assert!(prompt.contains("Q3 launch review"));
+        assert!(prompt.contains("Alice (CFO)"));
+        // The transcript section is still authoritative — the prompt
+        // says so explicitly.
+        assert!(prompt.contains("transcript is still authoritative"));
+    }
+
+    #[test]
+    fn template_omits_pre_meeting_briefing_when_absent() {
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let prompt = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Other,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+        })
+        .expect("render without briefing");
+        assert!(!prompt.contains("Pre-meeting context"));
+    }
+
+    #[test]
+    fn template_omits_pre_meeting_briefing_when_whitespace_only() {
+        // A caller passing an all-whitespace briefing (every renderer
+        // field empty) should not produce a stranded
+        // "## Pre-meeting context" header.
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let prompt = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Other,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: Some("   \n\n   "),
+        })
+        .expect("render with empty briefing");
+        assert!(!prompt.contains("Pre-meeting context"));
     }
 
     #[tokio::test]
@@ -405,6 +476,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await;
         match result {
@@ -433,6 +505,7 @@ mod tests {
                 meeting_type: MeetingType::Client,
                 existing_action_items: None,
                 existing_attendees: None,
+                pre_meeting_briefing: None,
             })
             .await;
         // Two possible failures depending on order of operations:

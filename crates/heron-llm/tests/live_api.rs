@@ -126,6 +126,7 @@ async fn run_cli_smoke(binary: &str, backend: Backend) {
             meeting_type: MeetingType::Internal,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .await
     {
@@ -168,6 +169,7 @@ async fn live_anthropic_summarize_returns_non_empty() {
             meeting_type: MeetingType::Internal,
             existing_action_items: None,
             existing_attendees: None,
+            pre_meeting_briefing: None,
         })
         .await
         .expect("Anthropic summarize should succeed with a valid key");
