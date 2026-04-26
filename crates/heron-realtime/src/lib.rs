@@ -111,6 +111,24 @@ pub trait RealtimeBackend: Send + Sync {
     /// Close gracefully. Backend flushes any in-flight response.
     async fn session_close(&self, id: SessionId) -> Result<(), RealtimeError>;
 
+    /// Request the model produce a response containing the supplied
+    /// text, optionally overriding the session voice. Mirrors OpenAI
+    /// Realtime `response.create` with an injected assistant turn.
+    /// Returns the [`ResponseId`] the backend assigned, so the caller
+    /// (`heron-policy`) can correlate later `response_cancel`,
+    /// `ResponseAudioStarted`, and `ResponseDone` events.
+    ///
+    /// Backends without a "force this exact text" primitive emulate
+    /// by appending an assistant message to the conversation and
+    /// then triggering a response — the controller treats both shapes
+    /// identically.
+    async fn response_create(
+        &self,
+        session: SessionId,
+        text: &str,
+        voice_override: Option<String>,
+    ) -> Result<ResponseId, RealtimeError>;
+
     /// Cancel a specific in-flight response (utterance the LLM is
     /// currently producing). Mirrors OpenAI Realtime `response.cancel`.
     /// Idempotent: `Ok(())` if already done.
