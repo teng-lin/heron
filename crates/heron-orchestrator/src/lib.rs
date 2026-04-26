@@ -1156,8 +1156,11 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 last_check: Some(Utc::now()),
             },
             Some(root) => HealthComponent {
-                state: ComponentState::PermissionMissing,
-                message: Some(format!("vault root not found: {}", root.display())),
+                state: ComponentState::Down,
+                message: Some(format!(
+                    "configured vault root does not exist on disk: {}",
+                    root.display(),
+                )),
                 last_check: Some(Utc::now()),
             },
             None => not_yet_wired("vault writer"),
@@ -1720,6 +1723,34 @@ mod tests {
                 "expected 'not yet wired' in message, got {msg:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn health_reports_vault_down_when_configured_root_missing() {
+        // Configured-but-missing vault root must report `Down`, not
+        // `PermissionMissing`. The latter would route operators down a
+        // TCC-debugging dead end for what is really a misconfig — the
+        // path on disk doesn't exist.
+        let parent = tempfile::tempdir().expect("tempdir");
+        let missing = parent.path().join("vault-that-was-never-created");
+        assert!(!missing.exists());
+        let orch = Builder::default().vault_root(missing.clone()).build();
+        let h = orch.health().await;
+        let vault = &h.components.vault;
+        assert!(
+            matches!(vault.state, ComponentState::Down),
+            "expected Down for missing vault root, got {:?}",
+            vault.state,
+        );
+        let msg = vault.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "expected message to include path, got {msg:?}",
+        );
+        assert!(
+            msg.contains("does not exist"),
+            "expected message to say 'does not exist', got {msg:?}",
+        );
     }
 
     #[tokio::test]
