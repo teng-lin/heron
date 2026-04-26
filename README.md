@@ -107,6 +107,8 @@ yet — check back as the cross-platform work lands.
 heron is currently distributed as source — pre-built binaries will
 come once the cross-platform matrix is closer to filled in.
 
+Clone and run the pinned-toolchain bootstrap once:
+
 ```sh
 git clone https://github.com/teng-lin/heron.git
 cd heron
@@ -114,23 +116,77 @@ cd heron
 # Install pinned Rust toolchain + checks system deps. Idempotent —
 # safe to re-run after upgrades.
 ./scripts/setup-dev.sh
+```
 
-# Build the desktop app bundle.
+Then pick what you want to build.
+
+#### Desktop app (full UI)
+
+```sh
 cd apps/desktop
 bun install
-bun run tauri build
+bun run tauri build           # release .app
+# or:
+bun run tauri dev             # iterative dev loop
 ```
 
 The signed `.app` bundle lands in
 `apps/desktop/src-tauri/target/release/bundle/macos/heron.app`. Drag
 it into `/Applications` and launch it.
 
-For an iterative dev loop instead of a release build:
+#### CLI binaries (`heron` and `herond`)
+
+The workspace ships two binary crates: **`heron-cli`** (which
+produces a binary named `heron` — not `heron-cli`) and **`herond`**
+(the localhost daemon).
 
 ```sh
-cd apps/desktop
-bun run tauri dev
+# From the workspace root.
+cargo build -p heron-cli -p herond --release
 ```
+
+That writes:
+
+```text
+target/release/heron        # main CLI: record / summarize / status / salvage / …
+target/release/herond       # localhost daemon on 127.0.0.1:7384
+```
+
+Smoke check:
+
+```sh
+./target/release/heron --version
+./target/release/heron status
+./target/release/herond --version
+```
+
+If you'd rather run via cargo without picking the path manually:
+
+```sh
+cargo run --release --bin heron -- status
+cargo run --release --bin herond
+```
+
+##### Put them on `$PATH`
+
+```sh
+# Option A — symlink into ~/.local/bin (assuming it's on PATH)
+ln -sf "$(pwd)/target/release/heron"  ~/.local/bin/heron
+ln -sf "$(pwd)/target/release/herond" ~/.local/bin/herond
+
+# Option B — install via cargo (always release, copies into ~/.cargo/bin)
+cargo install --path crates/heron-cli
+cargo install --path crates/herond
+```
+
+#### Other useful binaries in the workspace
+
+```sh
+cargo build -p heron-doctor --release   # offline log-anomaly analyzer
+cargo build -p heron-vault --bin validate-vault --release   # vault integrity check
+```
+
+Both end up in `target/release/` next to `heron` and `herond`.
 
 ## Quick start
 
