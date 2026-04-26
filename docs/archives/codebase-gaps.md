@@ -22,8 +22,18 @@ v2 pieces now exist:
 - `heron_policy::DefaultSpeechController`
 - `heron_realtime::MockRealtimeBackend`
 - `heron_bridge::NaiveBridge`
+- `heron_orchestrator::live_session::LiveSessionOwner`
 - `heron_doctor::Doctor::run_runtime_checks`
 
+The remaining blocker is not "make traits compile"; it is wiring a real
+capture/realtime session end-to-end. `LiveSessionOwner` now composes the v2
+bot/bridge/realtime/policy layers behind one lifetime owner, but
+`LocalSessionOrchestrator` still only walks the meeting FSM and publishes
+lifecycle events; it does not yet connect live audio, STT, LLM summarization,
+bot playback, or vault writes into the daemon capture path.
+
+**Shipping blocker:** items 1 and 4 below must land before v2 can alpha-test.
+Items 5-8 block GA.
 The remaining blocker is not "make traits compile"; it is wiring the v2
 bot/realtime session end-to-end. `LocalSessionOrchestrator` now delegates
 vault-backed manual captures to the v1 audio -> STT -> LLM -> vault pipeline,
@@ -43,12 +53,12 @@ Items 5-7 block GA.
 `session.update`, creates/cancels responses, forwards tool results, and maps
 OpenAI server events into Heron's `RealtimeEvent` stream.
 
-This closes the standalone backend gap. The remaining blocker is composition:
-no production session owner yet instantiates `OpenAiRealtime`, binds audio
-through `heron-bridge`, routes the backend into `DefaultSpeechController`, and
-tears the session down with the bot lifecycle.
+This closes the standalone backend gap. The remaining blocker is daemon
+integration: `LocalSessionOrchestrator::start_capture` still needs to
+instantiate the live-session owner with `OpenAiRealtime`, bind real meeting
+audio through `heron-bridge`, and connect teardown to the capture lifecycle.
 
-### 3. v2 bot + bridge + policy are not integrated by an orchestrator
+### 3. v2 bot + bridge + policy composition owner is in place
 
 The concrete layer pieces exist:
 
@@ -56,16 +66,17 @@ The concrete layer pieces exist:
 - `NaiveBridge` implements `AudioBridge`.
 - `DefaultSpeechController` implements `SpeechController` and invokes
   `filter::evaluate()` before every `speak()`.
+- `LiveSessionOwner` creates the bot, opens realtime, installs the policy
+  controller, retains the bridge for audio adapters, and tears the stack down
+  in dependency order.
 
-What is missing is the composition point: no production session owner creates a
-Recall bot, binds meeting audio through an `AudioBridge`, opens a realtime
-session, installs a policy profile, routes TTS/audio back to the bot, and tears
-all of it down cleanly.
-
-`NaiveBridge` is also explicitly test-grade. A production bridge still needs
-real AEC/playback behavior (`WebRtcAecBridge` or equivalent), jitter handling
-under real network/device conditions, and integration tests against bot
-playback.
+This closes the old "no production session owner" gap. The remaining work is
+now narrower: wire this owner into `LocalSessionOrchestrator::start_capture`
+once a production realtime backend and meeting-audio adapters exist.
+`NaiveBridge` is still explicitly test-grade, so a production bridge still
+needs real AEC/playback behavior (`WebRtcAecBridge` or equivalent), jitter
+handling under real network/device conditions, and integration tests against
+bot playback.
 
 ### 4. Pre-meeting context storage is still 501
 
@@ -215,8 +226,9 @@ multi-subscriber behavior.
 ## README claims vs. reality
 
 - **"v2 four-layer stack is currently trait surfaces only."** No longer
-  accurate. Several concrete layer implementations exist, but they are not
-  orchestrated into a live production session.
+  accurate. Several concrete layer implementations exist, and
+  `LiveSessionOwner` now composes them, but the owner is not yet connected to
+  daemon capture with a production realtime backend.
 - **"The desktop shell, onboarding wizard, settings pane, menubar tray have
   all shipped."** Partial. The desktop app starts the daemon and the wizard
   exists, but the wizard still lacks a user-visible daemon/runtime-preflight
@@ -230,7 +242,7 @@ multi-subscriber behavior.
 | -- | --- | --- | --- | --- |
 | 1 | Orchestrator lacks real capture/STT/LLM/vault pipeline | `crates/heron-orchestrator/src/lib.rs` | RESOLVED | Vault-backed daemon capture now delegates to the v1 pipeline |
 | 2 | Production realtime backend | `crates/heron-realtime/src/openai.rs` | RESOLVED | `OpenAiRealtime` now opens OpenAI Realtime WebSocket sessions |
-| 3 | Bot + bridge + policy not composed into a live session | `crates/heron-bot/src/recall/mod.rs:367`, `crates/heron-bridge/src/naive.rs:475`, `crates/heron-policy/src/controller.rs:355` | BLOCKER | Build production session owner |
+| 3 | Bot + bridge + policy live-session composition owner | `crates/heron-orchestrator/src/live_session.rs` | RESOLVED | `LiveSessionOwner` now owns startup and teardown; daemon capture wiring remains under #1/#2 |
 | 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
 | 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
