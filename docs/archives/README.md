@@ -6,4 +6,3 @@ architecture reference.
 
 Use [`../architecture.md`](../architecture.md) for the current codebase
 architecture and the root OpenAPI YAML files for active wire contracts.
-

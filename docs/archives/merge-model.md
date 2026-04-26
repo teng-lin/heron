@@ -7,7 +7,7 @@ edits while pulling in new LLM-derived content.
 
 This document is the single source of truth for which fields belong
 to which side. Source: [`docs/archives/implementation.md`](implementation.md)
-§10. Implementation: [`crates/heron-vault/src/merge.rs`](../crates/heron-vault/src/merge.rs).
+§10. Implementation: [`crates/heron-vault/src/merge.rs`](../../crates/heron-vault/src/merge.rs).
 
 ## Inputs
 
@@ -64,7 +64,7 @@ didn't edit it, so let `theirs` overwrite. Otherwise, keep `ours`.
 
 ### List fields — merged via stable IDs
 
-`action_items` and `attendees` carry stable [`ItemId`](../crates/heron-types/src/lib.rs)
+`action_items` and `attendees` carry stable [`ItemId`](../../crates/heron-types/src/lib.rs)
 values. Per-id rules:
 
 | `base` | `ours` | `theirs` | result |
@@ -91,7 +91,7 @@ fenced code blocks, however, **always** count — re-indenting code is
 intentional.
 
 The check is in
-[`merge::body_changed_semantically`](../crates/heron-vault/src/merge.rs):
+[`merge::body_changed_semantically`](../../crates/heron-vault/src/merge.rs):
 
 1. Run both sides through `pulldown_cmark::html::push_html`. This
    strips authoring-time whitespace from prose, but preserves bytes
