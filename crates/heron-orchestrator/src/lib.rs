@@ -74,12 +74,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use heron_bot::{
+    AttendeeContext as BotAttendeeContext, BotCreateArgs, DisclosureProfile, PersonaId,
+    PreMeetingContext as BotPreMeetingContext,
+};
 use heron_cli::session::{
     Orchestrator as CliSessionOrchestrator, SessionConfig as CliSessionConfig,
     SessionError as CliSessionError, SessionOutcome as CliSessionOutcome,
 };
 use heron_event::{Envelope, EventBus, ReplayCache};
 use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
+use heron_policy::{EscalationMode, PolicyProfile};
+use heron_realtime::{SessionConfig as RealtimeSessionConfig, TurnDetection};
 use heron_session::{
     AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
     HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
@@ -89,6 +95,8 @@ use heron_session::{
     TranscriptLifecycle, TranscriptSegment,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
+
+use crate::live_session::{DynLiveSession, LiveSessionFactory, LiveSessionStartArgs};
 use heron_vault::{
     CalendarReader, EventKitCalendarReader, VaultError, epoch_seconds_to_utc, read_note,
 };
@@ -210,10 +218,14 @@ pub struct LocalSessionOrchestrator {
     /// a daemon restart drops staged context, matching the bus /
     /// cache resume contract.
     ///
-    /// **Lock-ordering contract**: `start_capture` holds
-    /// `active_meetings` while acquiring `pending_contexts`; no other
-    /// path takes both. Any future code that needs both MUST follow
-    /// the same order or this becomes a deadlock.
+    /// **Lock-ordering contract**: when both are taken in the same
+    /// scope, the order is `active_meetings` first, then
+    /// `pending_contexts`. `start_capture` no longer holds
+    /// `active_meetings` while taking `pending_contexts` (it now
+    /// scopes the active-meetings guard separately to keep the lock
+    /// off the live-session-factory `.await`), but the order
+    /// constraint is preserved as a forward-compatibility rule for
+    /// any future code path that needs both.
     pending_contexts: PendingContexts,
     /// Held in a `Mutex<Option<…>>` so [`Self::shutdown`] (taking
     /// `&self`) can still consume the sender. Real callers don't
@@ -223,10 +235,27 @@ pub struct LocalSessionOrchestrator {
     /// of the join handle without `&mut self`.
     recorder: Mutex<Option<JoinHandle<()>>>,
     /// Background waiters that finish STT/LLM/vault finalization
-    /// after `end_meeting` has returned. `shutdown()` drains them
-    /// before stopping the replay recorder so terminal events still
-    /// land in the cache.
+    /// (and live v2 session shutdown) after `end_meeting` has
+    /// returned. `shutdown()` drains them before stopping the
+    /// replay recorder so terminal events still land in the cache.
+    /// Pruned opportunistically by [`prune_finished_finalizers`]
+    /// each time a new handle is pushed, so a long-running daemon
+    /// does not accumulate handles for already-completed tasks.
     finalizers: Mutex<Vec<JoinHandle<()>>>,
+    /// Optional v2 live-session factory. When set, `start_capture`
+    /// composes the four-layer v2 stack
+    /// (`MeetingBotDriver` + `RealtimeBackend` + `AudioBridge` +
+    /// `SpeechController`) alongside the v1 vault pipeline. When
+    /// unset (the default), `start_capture` only runs the v1
+    /// pipeline, preserving the substrate-only behaviour every
+    /// existing test relies on.
+    ///
+    /// Failures to compose the v2 stack are logged and tolerated:
+    /// the v1 vault-backed path remains the fallback per
+    /// `docs/archives/codebase-gaps.md`. The factory is what
+    /// `apps/desktop/src-tauri` and `crates/herond` install at boot
+    /// once an `OPENAI_API_KEY` and `RECALL_API_KEY` are available.
+    live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
 }
 
 /// Per-meeting state tracked while a capture is in flight. The
@@ -243,6 +272,15 @@ struct ActiveMeeting {
     meeting: Meeting,
     runtime: CaptureRuntime,
     applied_context: Option<PreMeetingContext>,
+    /// Live v2 stack (bot + realtime + bridge + policy controller)
+    /// when the orchestrator is configured with a
+    /// [`LiveSessionFactory`] AND the factory accepted the start
+    /// args. `None` means either no factory was installed (vault-
+    /// only mode) or the factory call failed and `start_capture`
+    /// fell back to the v1 path. `end_meeting` shuts this down in
+    /// dependency order before — and independently of — the v1
+    /// pipeline finalizer.
+    live_session: Option<Box<dyn DynLiveSession>>,
 }
 
 /// Runtime backing for an active capture.
@@ -344,6 +382,7 @@ pub struct Builder {
     cache_dir: PathBuf,
     stt_backend_name: String,
     llm_preference: heron_llm::Preference,
+    live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
 }
 
 impl std::fmt::Debug for Builder {
@@ -357,6 +396,13 @@ impl std::fmt::Debug for Builder {
             .field("cache_dir", &self.cache_dir)
             .field("stt_backend_name", &self.stt_backend_name)
             .field("llm_preference", &self.llm_preference)
+            .field(
+                "live_session_factory",
+                &self
+                    .live_session_factory
+                    .as_ref()
+                    .map(|_| "<Arc<dyn LiveSessionFactory>>"),
+            )
             .finish()
     }
 }
@@ -372,6 +418,7 @@ impl Default for Builder {
             cache_dir: default_cache_dir(),
             stt_backend_name: "sherpa".to_owned(),
             llm_preference: heron_llm::Preference::Auto,
+            live_session_factory: None,
         }
     }
 }
@@ -444,6 +491,21 @@ impl Builder {
         self
     }
 
+    /// Install a [`LiveSessionFactory`] that `start_capture` invokes
+    /// to compose the v2 four-layer stack alongside the v1 vault
+    /// pipeline. Without this, `start_capture` only runs the v1
+    /// pipeline — the substrate-only behaviour every existing test
+    /// already relies on.
+    ///
+    /// Wired by the desktop / `herond` boot path once the
+    /// `OPENAI_API_KEY` and `RECALL_API_KEY` environment variables
+    /// are populated. Tests use a stand-in factory so the daemon
+    /// hot path can be exercised without live vendor calls.
+    pub fn live_session_factory(mut self, factory: Arc<dyn LiveSessionFactory>) -> Self {
+        self.live_session_factory = Some(factory);
+        self
+    }
+
     /// Construct the orchestrator and spawn its recorder task.
     ///
     /// # Panics
@@ -490,6 +552,7 @@ impl Builder {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
             finalizers: Mutex::new(Vec::new()),
+            live_session_factory: self.live_session_factory,
         }
     }
 }
@@ -558,6 +621,16 @@ impl LocalSessionOrchestrator {
             .and_then(|m| m.applied_context.clone())
     }
 
+    /// Whether `start_capture` successfully composed the v2 live
+    /// session (bot + realtime + bridge + speech controller) for
+    /// `id`. Diagnostic only — used by tests pinning the wiring
+    /// from gap #1 and by future health probes.
+    pub fn has_live_session(&self, id: &MeetingId) -> bool {
+        lock_or_recover(&self.active_meetings)
+            .get(id)
+            .is_some_and(|m| m.live_session.is_some())
+    }
+
     /// Signal the recorder task to exit and await its termination.
     /// Idempotent — repeated calls return `Ok(())` immediately
     /// after the first (the join handle is consumed). Use this in
@@ -596,6 +669,23 @@ impl Drop for LocalSessionOrchestrator {
         // but the shutdown signal still ends the recorder regardless.
         if let Some(tx) = lock_or_recover(&self.shutdown_tx).take() {
             let _ = tx.send(());
+        }
+        // Active v2 live sessions can't be torn down here — their
+        // shutdown calls are async and `Drop` cannot `await`. Each
+        // session's own `Drop` already logs a warning when shut
+        // down was skipped, but log here too with the orchestrator-
+        // level count so an operator sees one aggregate signal
+        // rather than N per-session lines. The fix is to call
+        // `shutdown().await` in the daemon's exit path.
+        let active = lock_or_recover(&self.active_meetings);
+        let live_count = active.values().filter(|m| m.live_session.is_some()).count();
+        if live_count > 0 {
+            tracing::warn!(
+                live_sessions = live_count,
+                "LocalSessionOrchestrator dropped with active v2 live sessions; \
+                 vendor bots may not be released cleanly. Call shutdown().await on \
+                 the graceful-exit path.",
+            );
         }
     }
 }
@@ -682,6 +772,150 @@ fn platform_target_bundle_id(platform: Platform) -> &'static str {
         Platform::GoogleMeet => "com.google.Chrome",
         Platform::MicrosoftTeams => "com.microsoft.teams2",
         Platform::Webex => "Cisco-Systems.Spark",
+    }
+}
+
+/// Default disclosure template used when the orchestrator composes
+/// the v2 stack itself. The `{user_name}` and `{meeting_title}`
+/// placeholders that `render_disclosure` understands are deliberately
+/// omitted: the bot driver currently substitutes a literal
+/// `"the user"` for `{user_name}` (see
+/// `crates/heron-bot/src/recall/mod.rs:391`), so referencing the
+/// placeholder would imply a real name will appear when it does
+/// not. A persona-authored template lands alongside the persona
+/// settings UI; for alpha this is enough to satisfy `bot_create`'s
+/// no-empty-disclosure invariant (Spec §4 Invariant 6).
+const DEFAULT_DISCLOSURE_TEMPLATE: &str = "Heron is recording and assisting in this meeting.";
+
+/// Default OpenAI Realtime voice. `alloy` is the documented sane
+/// default; the orchestrator will surface this as a settings field
+/// when persona authoring lands.
+const DEFAULT_REALTIME_VOICE: &str = "alloy";
+
+/// Default persona prompt used as the system-prompt prefix when no
+/// persona is configured. The persona authoring UI will replace
+/// this; for alpha it ensures the realtime backend has a non-empty
+/// `system_prompt` (validated by `heron_realtime::validate`).
+const DEFAULT_PERSONA_PROMPT: &str = "You are a concise meeting assistant.";
+
+/// Translate the orchestrator's per-capture inputs into the
+/// [`LiveSessionStartArgs`] the [`LiveSessionFactory`] consumes.
+///
+/// This is the consumer hand-off for the pre-meeting-context gap:
+/// when `applied_context` is `Some`, its agenda / attendees /
+/// briefing are rendered into the realtime session's system prompt
+/// AND threaded through to the bot driver so persona-aware behaviour
+/// is available from turn one.
+fn build_live_session_start_args(
+    meeting_id: MeetingId,
+    platform: Platform,
+    meeting: &Meeting,
+    applied_context: Option<&PreMeetingContext>,
+) -> LiveSessionStartArgs {
+    // The bot driver carries its own typed `PreMeetingContext` shape
+    // (subset of the orchestrator-side one — no `prior_decisions`).
+    // Translate field-by-field rather than re-using a serde round
+    // trip so a missing field is a compile error, not a silent drop.
+    let bot_context = applied_context
+        .map(|ctx| BotPreMeetingContext {
+            agenda: ctx.agenda.clone(),
+            attendees_known: ctx
+                .attendees_known
+                .iter()
+                .map(|a| BotAttendeeContext {
+                    name: a.name.clone(),
+                    email: a.email.clone(),
+                    last_seen_in: a.last_seen_in,
+                    relationship: a.relationship.clone(),
+                    notes: a.notes.clone(),
+                })
+                .collect(),
+            related_notes: ctx.related_notes.clone(),
+            user_briefing: ctx.user_briefing.clone(),
+        })
+        .unwrap_or_default();
+
+    // Render the system prompt as `<persona>\n\n<context>` when a
+    // context is present, else fall back to the persona prompt
+    // alone. `heron_bot::render_context` enforces the 48 KiB cap
+    // from spec Invariant 10 — on overflow we drop the rendered
+    // context (the persona prompt by itself is still a valid
+    // session config) and log so an operator can correlate with the
+    // attach-context call that staged a too-large payload.
+    let rendered_context = heron_bot::render_context(&bot_context).unwrap_or_else(|err| {
+        tracing::warn!(
+            meeting_id = %meeting_id,
+            error = %err,
+            "rendered context exceeds spec budget; dropping context from system prompt",
+        );
+        String::new()
+    });
+    let system_prompt = if rendered_context.is_empty() {
+        DEFAULT_PERSONA_PROMPT.to_owned()
+    } else {
+        format!("{DEFAULT_PERSONA_PROMPT}\n\n{rendered_context}")
+    };
+
+    // The hint is the closest thing to a meeting URL the
+    // orchestrator currently has. EventKit-sourced meetings carry a
+    // real URL on `CalendarEvent::meeting_url`; until that flows
+    // through `StartCaptureArgs`, we forward the hint and let the
+    // bot driver reject malformed inputs at `bot_create` time.
+    let meeting_url = meeting.title.clone().unwrap_or_default();
+
+    LiveSessionStartArgs {
+        meeting_id,
+        bot: BotCreateArgs {
+            meeting_url,
+            // PersonaId::nil() would be rejected by RecallDriver
+            // (Spec §4 Invariant 8). Mint a fresh per-capture id
+            // until persona authoring lands; identical to how the
+            // existing `live_session::tests::start_args` builds one.
+            persona_id: PersonaId::now_v7(),
+            disclosure: DisclosureProfile {
+                text_template: DEFAULT_DISCLOSURE_TEMPLATE.to_owned(),
+                objection_patterns: Vec::new(),
+                objection_timeout_secs: 30,
+                re_announce_on_join: false,
+            },
+            context: bot_context,
+            metadata: serde_json::json!({
+                "meeting_id": meeting_id.to_string(),
+                "platform": format!("{platform:?}"),
+            }),
+            // Minted fresh per `start_capture` because the
+            // orchestrator does not retry. If retry is added later,
+            // this MUST become a stable value derived from
+            // `meeting_id` so the bot driver's vendor-side
+            // idempotency holds (Spec §11 Invariant 14).
+            idempotency_key: Uuid::now_v7(),
+        },
+        realtime: RealtimeSessionConfig {
+            system_prompt,
+            tools: Vec::new(),
+            turn_detection: TurnDetection {
+                vad_threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500,
+                interrupt_response: true,
+                // OpenAiRealtime requires this to be `false` so the
+                // controller mints response IDs explicitly. See
+                // `crates/heron-realtime/src/openai.rs:117-122`.
+                auto_create_response: false,
+            },
+            voice: DEFAULT_REALTIME_VOICE.to_owned(),
+        },
+        policy: PolicyProfile {
+            allow_topics: Vec::new(),
+            // Conservative defaults until a settings surface lands.
+            // `mute: false` keeps the agent able to speak; deny
+            // list is empty (tighter rules belong in user-facing
+            // settings, not the orchestrator default). Escalation
+            // is `None` because there's no destination configured.
+            deny_topics: Vec::new(),
+            mute: false,
+            escalation: EscalationMode::None,
+        },
     }
 }
 
@@ -784,6 +1018,19 @@ fn complete_pipeline_meeting(
         }),
         id,
     );
+}
+
+/// Drop already-completed handles from the finalizers list and
+/// push `handle`. Without this prune, a long-running daemon
+/// would accumulate one `JoinHandle` per ended meeting until
+/// `shutdown()` was called. Tasks that have not yet finished are
+/// retained: `shutdown()` still needs to drain them so terminal
+/// events make it into the replay cache before the recorder
+/// stops.
+fn push_pruned_finalizer(finalizers: &Mutex<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    let mut guard = lock_or_recover(finalizers);
+    guard.retain(|h| !h.is_finished());
+    guard.push(handle);
 }
 
 fn insert_finalized_meeting(
@@ -963,19 +1210,23 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             Some(raw) => Some(normalize_calendar_event_id(raw)?),
             None => None,
         };
-        let mut active = lock_or_recover(&self.active_meetings);
         // Singleton-per-platform per the trait docs: a second
         // capture for the same platform while one is still non-
         // terminal is a `409 Conflict`. Terminal entries are
         // removed on `end_meeting`, so the scan stops at the active
-        // set.
-        if active
-            .values()
-            .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
+        // set. Done in its own scope so the `MutexGuard` (sync,
+        // !Send) cannot leak into the later `.await` on the live
+        // session factory.
         {
-            return Err(SessionError::CaptureInProgress {
-                platform: args.platform,
-            });
+            let active = lock_or_recover(&self.active_meetings);
+            if active
+                .values()
+                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
+            {
+                return Err(SessionError::CaptureInProgress {
+                    platform: args.platform,
+                });
+            }
         }
 
         let id = MeetingId::now_v7();
@@ -1058,17 +1309,106 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             .as_deref()
             .and_then(|cid| self.pending_contexts.remove(cid));
 
-        let returned = meeting.clone();
+        // Best-effort v2 composition. We release `active_meetings`
+        // before awaiting the factory because:
+        //  (a) the lock guard is `!Send` (sync `Mutex`), so it can't
+        //      be held across `.await`, and
+        //  (b) the factory call may take seconds (vendor HTTP +
+        //      WebSocket open) and must not block other capture
+        //      operations on this orchestrator.
+        // The trade-off: a concurrent `end_meeting(id)` on this same
+        // meeting could land in the brief gap between insert and
+        // factory completion. We close that race by inserting a
+        // placeholder entry first (without `live_session`) and
+        // attaching the live session via a second short critical
+        // section on success.
         let context_attached = applied_context.is_some();
-        active.insert(
-            id,
-            ActiveMeeting {
-                fsm,
-                meeting,
-                runtime,
-                applied_context,
-            },
-        );
+        {
+            let mut active = lock_or_recover(&self.active_meetings);
+            active.insert(
+                id,
+                ActiveMeeting {
+                    fsm,
+                    meeting: meeting.clone(),
+                    runtime,
+                    applied_context: applied_context.clone(),
+                    live_session: None,
+                },
+            );
+        }
+
+        if let Some(factory) = self.live_session_factory.as_ref() {
+            let live_args = build_live_session_start_args(
+                id,
+                args.platform,
+                &meeting,
+                applied_context.as_ref(),
+            );
+            match factory.start(live_args).await {
+                Ok(session) => {
+                    let bot_id = session.bot_id();
+                    let realtime_session = session.realtime_session();
+                    // Hold the lock only long enough to attach the
+                    // session, OR (when the entry has vanished) hand
+                    // the session back to the outer scope as an
+                    // orphan to tear down. Returning the box out of
+                    // the lock scope keeps the `MutexGuard` (sync,
+                    // !Send) off the `.await` that follows.
+                    let orphan: Option<Box<dyn DynLiveSession>> = {
+                        let mut active = lock_or_recover(&self.active_meetings);
+                        match active.get_mut(&id) {
+                            Some(entry) => {
+                                entry.live_session = Some(session);
+                                None
+                            }
+                            None => Some(session),
+                        }
+                    };
+                    if let Some(orphan) = orphan {
+                        // The capture was ended (or otherwise
+                        // removed) while the factory was running.
+                        // Best-effort tear the dangling session down
+                        // so we don't leak a vendor bot.
+                        tracing::warn!(
+                            meeting_id = %id,
+                            "active meeting disappeared during live session start; tearing down",
+                        );
+                        if let Err(err) = orphan.shutdown().await {
+                            tracing::warn!(
+                                meeting_id = %id,
+                                error = %err,
+                                "best-effort live-session shutdown failed",
+                            );
+                        }
+                    } else {
+                        tracing::info!(
+                            meeting_id = %id,
+                            bot_id = %bot_id,
+                            realtime_session = %realtime_session,
+                            "v2 live session composed",
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Falling back to the v1 vault path is documented
+                    // behaviour. The two most common reasons here on
+                    // alpha are:
+                    //   * `OPENAI_API_KEY` missing (parallel work),
+                    //   * Recall vendor flake on `bot_create`.
+                    // In either case the daemon should still record
+                    // and transcribe the meeting; only realtime bot
+                    // interaction is lost. The error rides into the
+                    // log so operators can correlate with the
+                    // vendor-side failure.
+                    tracing::warn!(
+                        meeting_id = %id,
+                        error = %err,
+                        "v2 live session composition failed; continuing with v1 vault pipeline only",
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             meeting_id = %id,
             platform = ?args.platform,
@@ -1076,7 +1416,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             context_attached,
             "capture started",
         );
-        Ok(returned)
+        Ok(meeting)
     }
 
     async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError> {
@@ -1099,7 +1439,38 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             mut meeting,
             runtime,
             applied_context: _,
+            live_session,
         } = entry;
+
+        // Tear the v2 stack down BEFORE the v1 finalizer runs so the
+        // realtime backend's WebSocket and the vendor bot are
+        // released as quickly as possible. We hand the shutdown off
+        // to a finalizer task because the request handler should not
+        // block on vendor leave HTTP calls.
+        if let Some(session) = live_session {
+            let bot_id = session.bot_id();
+            let realtime_session = session.realtime_session();
+            let id_copy = *id;
+            let live_finalizer = tokio::spawn(async move {
+                if let Err(err) = session.shutdown().await {
+                    tracing::warn!(
+                        meeting_id = %id_copy,
+                        bot_id = %bot_id,
+                        realtime_session = %realtime_session,
+                        error = %err,
+                        "live session shutdown reported errors",
+                    );
+                } else {
+                    tracing::info!(
+                        meeting_id = %id_copy,
+                        bot_id = %bot_id,
+                        realtime_session = %realtime_session,
+                        "live session shut down cleanly",
+                    );
+                }
+            });
+            push_pruned_finalizer(&self.finalizers, live_finalizer);
+        }
 
         // recording → transcribing. The `on_hotkey` from `Recording`
         // is the FSM's stop edge per `docs/archives/implementation.md` §14.2.
@@ -1170,7 +1541,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     };
                     complete_pipeline_meeting(&bus, &finalized_meetings, id, fsm, meeting, result);
                 });
-                lock_or_recover(&self.finalizers).push(finalizer);
+                push_pruned_finalizer(&self.finalizers, finalizer);
             }
         }
         tracing::info!(
@@ -2680,5 +3051,324 @@ mod tests {
         .expect("attach past cap");
         assert!(orch.pending_context("evt_0").is_none());
         assert!(orch.pending_context("evt_1").is_some());
+    }
+
+    // ── live session wiring (gap #1 + pre-meeting context hand-off) ───
+
+    use crate::live_session::LiveSessionError;
+    use heron_bot::BotId as LiveBotId;
+    use heron_realtime::SessionId as RealtimeId;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Test factory that records calls + returns a stub session
+    /// implementing [`DynLiveSession`]. Lets the wiring tests verify
+    /// `start_capture` -> factory -> attach, and `end_meeting` ->
+    /// shutdown, without spinning up real Recall / OpenAI / bridge.
+    struct RecordingFactory {
+        calls: Mutex<Vec<LiveSessionStartArgs>>,
+        fail: AtomicBool,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl RecordingFactory {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn fail_next(&self) {
+            self.fail.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn calls_snapshot(&self) -> Vec<LiveSessionStartArgs> {
+            lock_or_recover(&self.calls).clone()
+        }
+    }
+
+    struct StubLiveSession {
+        meeting_id: MeetingId,
+        bot_id: LiveBotId,
+        realtime_session: RealtimeId,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DynLiveSession for StubLiveSession {
+        fn meeting_id(&self) -> MeetingId {
+            self.meeting_id
+        }
+        fn bot_id(&self) -> LiveBotId {
+            self.bot_id
+        }
+        fn realtime_session(&self) -> RealtimeId {
+            self.realtime_session
+        }
+        fn bridge_health(&self) -> heron_bridge::BridgeHealth {
+            heron_bridge::BridgeHealth {
+                aec_tracking: true,
+                jitter_ms: 0.0,
+                recent_drops: 0,
+            }
+        }
+        async fn shutdown(self: Box<Self>) -> Result<(), LiveSessionError> {
+            self.shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl LiveSessionFactory for RecordingFactory {
+        async fn start(
+            &self,
+            args: LiveSessionStartArgs,
+        ) -> Result<Box<dyn DynLiveSession>, LiveSessionError> {
+            lock_or_recover(&self.calls).push(args.clone());
+            if self.fail.swap(false, AtomicOrdering::SeqCst) {
+                return Err(LiveSessionError::PolicyValidation(
+                    heron_policy::ValidationError::EmptyNotifyDestination,
+                ));
+            }
+            Ok(Box::new(StubLiveSession {
+                meeting_id: args.meeting_id,
+                bot_id: LiveBotId::now_v7(),
+                realtime_session: RealtimeId::now_v7(),
+                shutdowns: Arc::clone(&self.shutdowns),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn start_capture_invokes_live_session_factory_and_attaches_session() {
+        // Pin the headline behavior of gap #1: when a factory is
+        // installed, `start_capture` calls it, attaches the live
+        // session to the active meeting, and `end_meeting` tears it
+        // down. Without this assertion the wiring is invisible.
+        let factory = Arc::new(RecordingFactory::new());
+        let shutdowns = Arc::clone(&factory.shutdowns);
+        let orch = Builder::default()
+            .live_session_factory(Arc::clone(&factory) as Arc<dyn LiveSessionFactory>)
+            .build();
+
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: Some("https://zoom.us/j/123".into()),
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        assert!(orch.has_live_session(&started.id));
+        let calls = factory.calls_snapshot();
+        assert_eq!(
+            calls.len(),
+            1,
+            "factory called exactly once per start_capture",
+        );
+        assert_eq!(calls[0].meeting_id, started.id);
+        assert_eq!(calls[0].bot.meeting_url, "https://zoom.us/j/123");
+
+        orch.end_meeting(&started.id).await.expect("end_meeting");
+        // The shutdown happens on a background finalizer task; drain
+        // it through the explicit orchestrator shutdown path before
+        // asserting.
+        orch.shutdown().await.expect("orch shutdown");
+        assert_eq!(
+            shutdowns.load(AtomicOrdering::SeqCst),
+            1,
+            "live session shutdown invoked exactly once",
+        );
+    }
+
+    #[tokio::test]
+    async fn start_capture_falls_back_to_v1_when_live_session_factory_errors() {
+        // Gap #1 acceptance criterion: factory failure (e.g. missing
+        // OPENAI_API_KEY, vendor flake) MUST NOT fail the request.
+        // The v1 vault-backed path remains a fallback. Pin both
+        // (a) the meeting still starts and (b) no live session is
+        // attached.
+        let factory = Arc::new(RecordingFactory::new());
+        factory.fail_next();
+        let orch = Builder::default()
+            .live_session_factory(Arc::clone(&factory) as Arc<dyn LiveSessionFactory>)
+            .build();
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture must succeed despite factory failure");
+        assert!(matches!(started.status, MeetingStatus::Recording));
+        assert!(
+            !orch.has_live_session(&started.id),
+            "no live session attached on factory failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn live_session_args_carry_attached_pre_meeting_context() {
+        // Pre-meeting-context consumer-side: the staged
+        // `PreMeetingContext` must flow into `LiveSessionStartArgs`
+        // so the realtime backend sees the agenda / attendees /
+        // briefing in its system prompt and the bot driver sees the
+        // same context. Without this, calling `attach_context` is
+        // invisible to the v2 stack.
+        let factory = Arc::new(RecordingFactory::new());
+        let orch = Builder::default()
+            .live_session_factory(Arc::clone(&factory) as Arc<dyn LiveSessionFactory>)
+            .build();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: heron_session::PreMeetingContext {
+                agenda: Some("ship the alpha".into()),
+                attendees_known: vec![heron_session::AttendeeContext {
+                    name: "Ada".into(),
+                    email: Some("ada@example.com".into()),
+                    last_seen_in: None,
+                    relationship: None,
+                    notes: None,
+                }],
+                related_notes: vec![],
+                prior_decisions: vec![],
+                user_briefing: Some("focus on the wiring story".into()),
+            },
+        })
+        .await
+        .expect("attach");
+        orch.start_capture(StartCaptureArgs {
+            platform: Platform::Zoom,
+            hint: None,
+            calendar_event_id: Some("evt_alpha".into()),
+        })
+        .await
+        .expect("start");
+
+        let calls = factory.calls_snapshot();
+        assert_eq!(calls.len(), 1);
+        let prompt = &calls[0].realtime.system_prompt;
+        assert!(
+            prompt.contains("ship the alpha"),
+            "agenda must reach the realtime system prompt; got: {prompt}",
+        );
+        assert!(
+            prompt.contains("Ada"),
+            "attendee must reach the realtime system prompt; got: {prompt}",
+        );
+        assert!(
+            prompt.contains("focus on the wiring story"),
+            "briefing must reach the realtime system prompt; got: {prompt}",
+        );
+        let bot_ctx = &calls[0].bot.context;
+        assert_eq!(bot_ctx.agenda.as_deref(), Some("ship the alpha"));
+        assert_eq!(bot_ctx.attendees_known.len(), 1);
+        assert_eq!(bot_ctx.attendees_known[0].name, "Ada");
+    }
+
+    #[tokio::test]
+    async fn start_capture_without_factory_does_not_attach_live_session() {
+        // Regression guard: every existing test path constructs the
+        // orchestrator without a factory and expects the v1 substrate
+        // behavior. Confirm that staying on the default constructor
+        // leaves `live_session: None` so those tests don't change
+        // shape.
+        let orch = LocalSessionOrchestrator::new();
+        let started = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        assert!(!orch.has_live_session(&started.id));
+    }
+
+    /// Slow-start factory that lets the test deterministically drive
+    /// the race between `start_capture` finishing the factory call
+    /// and a concurrent `end_meeting` removing the active entry.
+    /// Without this, the orphan-cleanup branch in `start_capture` is
+    /// only reachable by chance.
+    struct GatedFactory {
+        gate: tokio::sync::Notify,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LiveSessionFactory for GatedFactory {
+        async fn start(
+            &self,
+            args: LiveSessionStartArgs,
+        ) -> Result<Box<dyn DynLiveSession>, LiveSessionError> {
+            self.gate.notified().await;
+            Ok(Box::new(StubLiveSession {
+                meeting_id: args.meeting_id,
+                bot_id: LiveBotId::now_v7(),
+                realtime_session: RealtimeId::now_v7(),
+                shutdowns: Arc::clone(&self.shutdowns),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn live_session_orphan_is_torn_down_when_meeting_ends_during_factory_call() {
+        // Race the orphan-cleanup branch: `end_meeting` removes the
+        // active entry before the factory returns, so the late
+        // session has no home. The orchestrator must shut it down
+        // rather than leak the vendor bot.
+        let factory = Arc::new(GatedFactory {
+            gate: tokio::sync::Notify::new(),
+            shutdowns: Arc::new(AtomicUsize::new(0)),
+        });
+        let shutdowns = Arc::clone(&factory.shutdowns);
+        let orch = Arc::new(
+            Builder::default()
+                .live_session_factory(Arc::clone(&factory) as Arc<dyn LiveSessionFactory>)
+                .build(),
+        );
+        let orch_clone = Arc::clone(&orch);
+        let start = tokio::spawn(async move {
+            orch_clone
+                .start_capture(StartCaptureArgs {
+                    platform: Platform::Zoom,
+                    hint: None,
+                    calendar_event_id: None,
+                })
+                .await
+                .expect("start_capture")
+        });
+
+        // Wait for the active entry to appear, then end the meeting
+        // before releasing the factory gate. The pending entry has
+        // `live_session: None` because the factory has not returned
+        // yet; `end_meeting` removes it cleanly. Snapshot the id
+        // outside the `.await` so the `MutexGuard` (sync, !Send)
+        // is dropped before yielding.
+        let id = loop {
+            let snapshot = lock_or_recover(&orch.active_meetings)
+                .keys()
+                .next()
+                .copied();
+            if let Some(id) = snapshot {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        };
+        orch.end_meeting(&id).await.expect("end_meeting");
+        // Now release the factory; `start_capture` will see the
+        // entry has vanished and tear the orphan down.
+        factory.gate.notify_one();
+        let _ = start.await.expect("start_capture join");
+        // Drain finalizers (the v1 finalizer task) AND give the
+        // orphan-cleanup `.await` a chance to run.
+        orch.shutdown().await.expect("orch shutdown");
+        assert_eq!(
+            shutdowns.load(AtomicOrdering::SeqCst),
+            1,
+            "orphan live session shutdown invoked exactly once",
+        );
     }
 }
