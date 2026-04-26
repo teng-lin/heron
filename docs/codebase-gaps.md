@@ -1,182 +1,245 @@
 # Codebase gap audit
 
-_Snapshot: 2026-04-26, branch `main` at phase 80 (`4181b87`)._
+_Snapshot: 2026-04-26, branch `main` at `c265e12`._
 
 A survey of the heron workspace looking for "big gaps" — places where the
 codebase has obvious holes that would block shipping or that suggest
-incomplete work. Scope: 17 Rust crates under `crates/`, the Tauri desktop
+incomplete work. Scope: Rust crates under `crates/`, the Tauri desktop
 app under `apps/desktop`, and the Swift helpers under `swift/`.
 
 The goal is a punch list to prioritize from, not an exhaustive TODO sweep.
 
 ## Summary
 
-v1 (phase 77) is a shipping note-taker. v2 trait surfaces are sketched
-across `heron-event`, `heron-session`, `heron-bot`, `heron-realtime`,
-`heron-policy`, and `heron-bridge`, but implementations are deferred —
-today the v2 daemon (`herond`) is a 501 appliance behind a real
-`/health` and `/events` SSE.
+v1 is still the only real note-taking pipeline. v2 is no longer just trait
+surfaces: the daemon has real routes, the desktop app starts an in-process
+`herond`, the event bus fans out over SSE + Tauri IPC, and the first concrete
+v2 pieces now exist:
 
-**Shipping blocker:** items 1–5 below (four trait impls + swapping
-`StubOrchestrator` for a real one) must land before v2 can alpha-test.
-Items 6–9 block GA.
+- `heron_orchestrator::LocalSessionOrchestrator`
+- `heron_bot::RecallDriver`
+- `heron_policy::DefaultSpeechController`
+- `heron_realtime::MockRealtimeBackend`
+- `heron_bridge::NaiveBridge`
+- `heron_doctor::Doctor::run_runtime_checks`
 
-## Blockers — v2 cannot run
+The remaining blocker is not "make traits compile"; it is wiring a real
+capture/realtime session end-to-end. Today `LocalSessionOrchestrator` can walk
+the meeting FSM and publish lifecycle events, but it does not yet connect live
+audio, STT, LLM summarization, realtime speech, bot playback, or vault writes
+into one production session.
 
-### 1. `herond` HTTP API is mostly 501
+**Shipping blocker:** items 1-4 below must land before v2 can alpha-test.
+Items 5-8 block GA.
 
-`crates/herond/src/routes/unimpl.rs:22` — 8 of 11 endpoints return
-`NotYetImplemented`:
+## Blockers — v2 cannot run a real session
 
-- `POST   /meetings`
-- `GET    /meetings/{id}`
-- `POST   /meetings/{id}/end`
-- `GET    /meetings/{id}/transcript`
-- `GET    /meetings/{id}/summary`
-- `GET    /meetings/{id}/audio`
-- `GET    /calendar/upcoming`
-- `GET    /context`
+### 1. `LocalSessionOrchestrator` has lifecycle, not a capture pipeline
 
-Only `/health` (`routes/health.rs`) and `/events` (`routes/events.rs`,
-SSE) are real.
+`crates/heron-orchestrator/src/lib.rs:563` implements
+`SessionOrchestrator::start_capture` by synchronously walking the FSM through
+`Detected -> Armed -> Recording` and publishing lifecycle events. It does not
+start Core Audio, launch a bot, bind a bridge, open realtime, or spawn STT/LLM
+tasks.
 
-### 2. `StubOrchestrator` is the only `SessionOrchestrator` impl
+`crates/heron-orchestrator/src/lib.rs:637` implements `end_meeting` by walking
+the FSM through terminal states and publishing `meeting.ended` /
+`meeting.completed`. The implementation is honest in comments: with no real
+STT / LLM wired through this orchestrator, transcript and summary completion
+are synthetic.
 
-`crates/herond/src/stub.rs:57` — every method on the orchestrator trait
-returns `NotYetImplemented`. The real `LocalSessionOrchestrator`
-referenced in spec docs does not exist yet.
+What is missing:
 
-### 3. `MeetingBotDriver` trait has zero implementations
+- Core Audio mic/process-tap startup from the daemon path.
+- STT task ownership and transcript persistence.
+- LLM summary generation and vault note write/finalization.
+- Background task lifecycle, cancellation, and crash recovery.
+- Idempotent `end_meeting` against finalized meetings once vault writes exist.
 
-`crates/heron-bot/src/lib.rs:194` defines the v2 driver layer.
-`crates/heron-bot/examples/recall-spike.rs` is a test harness from the
-2026-04-26 spike, not a production driver. No `RecallDriver`,
-`AttendeeDriver`, or `NativeZoomDriver` is checked in.
+### 2. No production realtime backend
 
-### 4. `SpeechController` + `RealtimeBackend` traits, no impls
+`crates/heron-realtime/src/lib.rs:7` still documents the production backend
+choice (`OpenAiRealtime`, `GeminiLive`, `LiveKitAgent`, `Pipecat`) as deferred.
+`MockRealtimeBackend` exists and is useful for policy/controller tests, but no
+backend opens a real realtime LLM session.
 
-`crates/heron-policy/src/lib.rs:140` (SpeechController) and
-`crates/heron-realtime/src/lib.rs:105` (RealtimeBackend) are surface
-only. No OpenAI Realtime, Gemini Live, or LiveKit Agent backends exist.
-Without them no realtime LLM session can run.
+Without a production `RealtimeBackend`, `DefaultSpeechController` cannot drive
+agent speech in a live meeting, even though policy enforcement and queueing are
+now implemented.
 
-### 5. `AudioBridge` trait, no impls
+### 3. v2 bot + bridge + policy are not integrated by an orchestrator
 
-`crates/heron-bridge/src/lib.rs:81` defines the bridge interface
-(fan-out meeting audio → realtime; agent TTS → driver playback). AEC,
-jitter buffer, and resample hooks are declared but no `WebRtcAecBridge`
-or naive test impl is checked in.
+The concrete layer pieces exist:
+
+- `RecallDriver` implements `MeetingBotDriver`.
+- `NaiveBridge` implements `AudioBridge`.
+- `DefaultSpeechController` implements `SpeechController` and invokes
+  `filter::evaluate()` before every `speak()`.
+
+What is missing is the composition point: no production session owner creates a
+Recall bot, binds meeting audio through an `AudioBridge`, opens a realtime
+session, installs a policy profile, routes TTS/audio back to the bot, and tears
+all of it down cleanly.
+
+`NaiveBridge` is also explicitly test-grade. A production bridge still needs
+real AEC/playback behavior (`WebRtcAecBridge` or equivalent), jitter handling
+under real network/device conditions, and integration tests against bot
+playback.
+
+### 4. Pre-meeting context storage is still 501
+
+`crates/heron-orchestrator/src/lib.rs:837` returns
+`SessionError::NotYetImplemented` from `attach_context`. Calendar reads are
+available through `list_upcoming_calendar`, but the daemon still cannot persist
+or apply pre-meeting context to a future capture.
+
+This blocks the spec path where calendar/persona/context is baked into the
+session before the agent joins.
 
 ## Major — blockers for GA
 
-### 6. `heron-doctor` missing runtime checks
+### 5. Onboarding has backend support, but the React wizard is still five steps
 
-`crates/heron-doctor/src/lib.rs` implements offline log parsing for
-anomaly detection but is missing the runtime preflight checks the
-onboarding wizard depends on:
+The desktop backend now starts an in-process `herond` during setup and exposes
+daemon health commands:
 
-- ONNX runtime health check (claimed in `docs/plan.md`).
-- Zoom process availability (heron-zoom wires `AXObserver`; doctor
-  doesn't verify Zoom is actually running).
-- Keychain ACL scope validation (`docs/security.md` §3.3 requires it).
-- Network reachability for Whisper / LLM backends.
+- `daemon::install` is called from the Tauri setup hook.
+- `heron_test_daemon` and `heron_daemon_status` are registered Tauri commands.
 
-Today users can ship without required deps and discover failures at
-runtime instead of at first run.
+The React onboarding store still lists only five steps:
 
-### 7. Onboarding wizard is not wired to `herond`
+- microphone
+- audio tap
+- accessibility
+- calendar
+- model download
 
-`apps/desktop/src-tauri/src/onboarding.rs:1` ships five Test buttons
-(mic, audio-tap, accessibility, calendar, model-download) that verify
-permissions in isolation. Nothing launches or validates `herond`
-afterwards — onboarding succeeds, then the daemon fails silently on
-first real use.
+So users can still finish onboarding without seeing the daemon liveness check
+or the richer `heron-doctor` runtime preflight results. The backend gap is
+mostly closed; the user-visible wizard wiring remains.
 
-### 8. Policy filter is defined but never invoked
+### 6. `heron-doctor` runtime checks are not surfaced in onboarding
 
-`crates/heron-policy/src/filter.rs:69` implements `evaluate()` (mute,
-deny_topics, allow_topics) per `docs/api-design-spec.md` §3. No
-caller exists today, because no `SpeechController` impl exists (see
-gap 4). Effective policy enforcement is zero.
+`heron-doctor` now has runtime preflight checks for ONNX/model artifacts, Zoom
+process availability, keychain ACL on macOS, and network reachability. The
+public facade is `Doctor::run_runtime_checks`.
 
-### 9. `heron-cli` v2 commands are stubs
+The remaining gap is integration: neither the React onboarding flow nor a Tauri
+command currently surfaces the full runtime-check set to the user. The wizard
+still runs individual probes, which misses the consolidated "is this machine
+ready to record?" answer the doctor now provides.
 
-`crates/heron-cli/src/main.rs` documents that subcommands per
-`docs/implementation.md` weeks 9–13 return
-`Err(anyhow::anyhow!("not yet implemented"))` until the corresponding
-crate's real implementation lands. v1's `heron summarize` works; the
-v2 manual-capture escape hatches (`heron record`, etc.) don't delegate
-to the herond HTTP endpoints yet.
+### 7. `heron-cli` does not delegate v2 capture to `herond`
+
+`crates/heron-cli/src/main.rs` has real v1-style functionality:
+
+- `heron record` runs the local `heron_cli::session::Orchestrator`.
+- `heron summarize` re-summarizes a vault note.
+- `heron status`, `salvage`, `synthesize`, and `ax-dump` are implemented.
+
+But the v2 escape hatch is still missing: CLI capture/status commands do not
+authenticate to localhost `herond` and call `POST /v1/meetings`,
+`POST /v1/meetings/{id}/end`, or `/v1/events`. This leaves two session-control
+surfaces instead of one.
+
+### 8. Read-side daemon behavior depends on an existing vault snapshot
+
+`LocalSessionOrchestrator` can list/get/read transcript/read summary/read audio
+from an existing vault root, and `herond` projects those methods over HTTP.
+But because the daemon capture path does not write finalized notes yet, the
+read endpoints only become useful for sessions produced elsewhere.
+
+This is less severe than the old "mostly 501" gap, but it still matters for
+GA: the API surface looks complete, while the daemon cannot yet create the
+durable artifacts those read endpoints are meant to serve.
 
 ## Minor — polish and post-v1
 
-### 10. WhisperKit Swift bridge has no timeout
+### 9. WhisperKit Swift bridge has no timeout
 
 `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78`
-— sync-via-semaphore bridge to async WhisperKit. There's no
-`DispatchTime` deadline on the semaphore wait, so a hung model load
-will block the calling thread forever. v1 ships this; the timeout was
-deferred per `docs/plan.md`.
+uses a semaphore bridge to async WhisperKit. There is no `DispatchTime`
+deadline on the semaphore wait, so a hung model load can block the calling
+thread forever.
 
-### 11. `EventBus` multi-subscriber fan-out (resolved)
+### 10. v2 integration test coverage is still thin
 
-`crates/heron-event/src/lib.rs` defines the bus and `heron-session`'s
-Invariant 12 mandates that all events flow through it first. The full
-pipeline now ships: phase 80 wired
-[`heron_event_http::SseEventSink`](../crates/heron-event-http/src/lib.rs)
-into herond's `/events` endpoint, phase 82 wired
-[`heron_event_tauri::TauriEventSink`](../crates/heron-event-tauri/src/lib.rs)
-into the desktop's `event_bus::install`, and phase 83 added
-`LocalSessionOrchestrator::start_capture` / `end_meeting` as the first
-real publishers (FSM-driven `meeting.detected` / `.armed` / `.started`
-/ `.ended` / `.completed`). A multi-subscriber fan-out integration test
-in `apps/desktop/src-tauri/src/event_bus.rs` pins one publish reaching
-SSE, Tauri IPC, and the replay cache simultaneously (Invariant 13). No
-remaining gap.
+The v2 crates have many unit tests around individual invariants, and the bus
+fan-out path now has integration coverage. The missing coverage is still the
+hard part: production-like cross-crate tests for bot + bridge + realtime +
+policy + orchestrator lifecycle.
 
-### 12. v2 layer test counts are thin
+Useful test seams to add with the remaining implementation:
 
-For a comparable LOC surface to v1 crates, v2 layers ship far fewer
-tests:
+- daemon `POST /meetings` starts a real session owner and publishes expected
+  events;
+- `end_meeting` drains tasks and persists transcript/summary/audio references;
+- policy-denied speech never reaches the backend in an orchestrated session;
+- bridge health degradation propagates to daemon/desktop status;
+- Recall shutdown leaves no active vendor bot on graceful exit.
 
-| Crate            | Tests | LOC (approx) |
-| ---------------- | ----- | ------------ |
-| heron-bot        | 3     | ~1,600       |
-| heron-realtime   | 3     | ~1,000       |
-| heron-bridge     | 5     | ~1,800       |
-| heron-policy     | 4     | ~1,400       |
-| heron-speech (v1)| 5     | ~2,500       |
-| heron-vault  (v1)| 7     | ~2,600       |
+## Resolved or downgraded from the previous audit
 
-Specs are heavily documented (`api-design-spec.md` >1,000 lines) but
-proof-of-concept tests only; real impls will need integration suites.
+### `herond` is no longer a 501 appliance
+
+`crates/herond/src/routes/meetings.rs` now forwards meetings, transcripts,
+summaries, audio, calendar, and context routes to `SessionOrchestrator`.
+Some methods can still return `NotYetImplemented` depending on orchestrator
+capability, but the router itself is no longer a static unimplemented surface.
+
+### `StubOrchestrator` is no longer the only orchestrator
+
+`heron_orchestrator::LocalSessionOrchestrator` exists and is wired into both
+the standalone `herond` binary and the desktop in-process daemon path.
+`StubOrchestrator` remains useful for tests.
+
+### `MeetingBotDriver` has a concrete Recall implementation
+
+`heron_bot::RecallDriver` implements `MeetingBotDriver` and has wiremock-driven
+coverage. Remaining work is orchestration and live-vendor hardening, not the
+absence of an implementation.
+
+### `SpeechController` and policy enforcement exist
+
+`heron_policy::DefaultSpeechController` implements `SpeechController` and calls
+`filter::evaluate()` on every `speak()` call. The old "policy filter is never
+invoked" gap is resolved at the controller layer; production session wiring is
+still pending.
+
+### `AudioBridge` has a naive implementation
+
+`heron_bridge::NaiveBridge` implements `AudioBridge` and is appropriate for
+tests/prototyping. A production-grade bridge remains a blocker for GA quality.
+
+### EventBus multi-subscriber fan-out is resolved
+
+The bus now reaches SSE, Tauri IPC, and replay cache consumers. `LocalSessionOrchestrator`
+publishes lifecycle events, and the desktop event-bus integration tests pin the
+multi-subscriber behavior.
 
 ## README claims vs. reality
 
-- **"v2 four-layer stack is currently trait surfaces only — the
-  Recall.ai spike harness validated the design against a live Zoom
-  meeting on 2026-04-26."** — Accurate. The spike ran; production
-  driver impl is the next gate.
-- **"mobile, other meeting apps, other desktop OSes remain deferred to
-  v1.1+."** — Accurate. v1 ships Zoom on macOS only as promised.
-- **"The desktop shell, onboarding wizard, settings pane, menubar tray
-  have all shipped."** — Partial. Onboarding UI exists; daemon
-  integration (gap 7) is missing. Tray exists; commands delegate to
-  unimplemented herond endpoints (gap 1).
+- **"v2 four-layer stack is currently trait surfaces only."** No longer
+  accurate. Several concrete layer implementations exist, but they are not
+  orchestrated into a live production session.
+- **"The desktop shell, onboarding wizard, settings pane, menubar tray have
+  all shipped."** Partial. The desktop app starts the daemon and the wizard
+  exists, but the wizard still lacks a user-visible daemon/runtime-preflight
+  step.
+- **"mobile, other meeting apps, other desktop OSes remain deferred to v1.1+."**
+  Still accurate for the shipping product posture.
 
 ## Punch list — priority order
 
-| #  | Gap                                 | File:Line                                                       | Severity | Notes                                       |
-| -- | ----------------------------------- | --------------------------------------------------------------- | -------- | ------------------------------------------- |
-| 1  | herond endpoints 501                | `crates/herond/src/routes/unimpl.rs:22`                         | BLOCKER  | swap once orchestrator real                 |
-| 2  | StubOrchestrator only impl          | `crates/herond/src/stub.rs:57`                                  | BLOCKER  | build LocalSessionOrchestrator              |
-| 3  | MeetingBotDriver no impl            | `crates/heron-bot/src/lib.rs:194`                               | BLOCKER  | RecallDriver next; spike findings exist     |
-| 4  | SpeechController/RealtimeBackend    | `crates/heron-policy/src/lib.rs:140`, `crates/heron-realtime/src/lib.rs:105` | BLOCKER  | OpenAI Realtime first                       |
-| 5  | AudioBridge no impl                 | `crates/heron-bridge/src/lib.rs:81`                             | BLOCKER  | WebRTC AEC; workspace dep exists            |
-| 6  | heron-doctor runtime checks         | `crates/heron-doctor/src/lib.rs`                                | MAJOR    | ~100 LOC per check, 5–6 checks              |
-| 7  | onboarding → herond wiring          | `apps/desktop/src-tauri/src/onboarding.rs:1`                    | MAJOR    | launch herond as managed Tauri service      |
-| 8  | policy enforcement in speech path   | `crates/heron-policy/src/filter.rs:69`                          | MAJOR    | wire evaluate() into SpeechController impl  |
-| 9  | heron-cli v2 commands               | `crates/heron-cli/src/main.rs`                                  | MAJOR    | delegate to herond HTTP                     |
-| 10 | WhisperKit semaphore timeout        | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | MINOR    | add DispatchTime deadline                   |
-| 11 | EventBus subscribers                | `crates/heron-event/src/lib.rs`                                 | MINOR    | post-v1; Tauri + HTTP transports            |
-| 12 | v2 layer test coverage              | (see table above)                                               | MINOR    | integration suites land with impls          |
+| # | Gap | File:Line | Severity | Notes |
+| -- | --- | --- | --- | --- |
+| 1 | Orchestrator lacks real capture/STT/LLM/vault pipeline | `crates/heron-orchestrator/src/lib.rs:563` | BLOCKER | Replace synthetic FSM-only lifecycle with real task ownership |
+| 2 | No production realtime backend | `crates/heron-realtime/src/lib.rs:7` | BLOCKER | OpenAI Realtime or chosen backend first |
+| 3 | Bot + bridge + policy not composed into a live session | `crates/heron-bot/src/recall/mod.rs:367`, `crates/heron-bridge/src/naive.rs:475`, `crates/heron-policy/src/controller.rs:355` | BLOCKER | Build production session owner |
+| 4 | `attach_context` unimplemented | `crates/heron-orchestrator/src/lib.rs:837` | BLOCKER | Persist/apply pre-meeting context |
+| 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
+| 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
+| 7 | CLI v2 commands do not delegate to `herond` | `crates/heron-cli/src/main.rs:322` | MAJOR | Use bearer token + localhost API |
+| 8 | Daemon read-side depends on external vault artifacts | `crates/heron-orchestrator/src/lib.rs:713` | MAJOR | Resolved by real daemon vault writes |
+| 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | MINOR | Add DispatchTime deadline |
+| 10 | Cross-crate v2 integration coverage | v2 crates | MINOR | Add end-to-end lifecycle suites with fakes |
