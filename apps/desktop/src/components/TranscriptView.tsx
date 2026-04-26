@@ -17,6 +17,7 @@
  * timestamp. The grouping logic itself is unchanged.
  */
 
+import { cn } from "../lib/cn";
 import {
   groupBySpeaker,
   parseClockToSeconds,
@@ -73,8 +74,36 @@ export function TranscriptView({ markdown, onSeek }: TranscriptViewProps) {
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline gap-2 text-xs text-muted-foreground">
-                <span className="font-semibold text-foreground">
+                <span
+                  className={cn(
+                    "font-semibold",
+                    // §3.4: low-confidence speakers render italic + a
+                    // muted color so the cue is visible without
+                    // dimming the transcript text itself. The text
+                    // body keeps the default foreground color (see
+                    // `<p>` below) so the user can still read every
+                    // word — only the speaker label is de-emphasized.
+                    g.isLowConfidence
+                      ? "italic text-muted-foreground"
+                      : "text-foreground",
+                  )}
+                  title={
+                    g.isLowConfidence
+                      ? "Low-confidence speaker attribution"
+                      : undefined
+                  }
+                >
                   {g.speaker}
+                  {g.isLowConfidence && (
+                    // Screen-reader-only annotation. `title` alone is
+                    // not announced reliably across AT software, so
+                    // we surface the cue as visually-hidden text the
+                    // reader walks past after the speaker name. The
+                    // leading space keeps speech natural ("Alice
+                    // (low-confidence)"); the parens are punctuation,
+                    // which most readers tone-shift on.
+                    <span className="sr-only"> (low-confidence)</span>
+                  )}
                 </span>
                 {onSeek && seekSeconds !== null ? (
                   <button

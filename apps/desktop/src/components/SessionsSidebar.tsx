@@ -9,15 +9,32 @@
  * renders an empty state so the user is never staring at a blank
  * canvas wondering what to do.
  *
+ * PR-κ (phase 72) groups sessions into Today / Yesterday / This week /
+ * Older buckets driven by the `YYYY-MM-DD-HHMM <slug>` filename prefix
+ * written by `crates/heron-vault`. Parsing the filename is offline,
+ * IPC-free, and keeps the sidebar render path identical between cold
+ * mount and post-save refresh.
+ *
  * Active session is highlighted by comparing the route param to each
  * basename in the list.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { ChevronDown, ChevronRight } from "lucide-react";
 
 import { invoke } from "../lib/invoke";
 import { cn } from "../lib/cn";
+import {
+  DEFAULT_EXPANDED_BUCKETS,
+  formatSessionLabel,
+  groupSessionsByBucket,
+  localDayKey,
+  type ParsedSessionName,
+  SESSION_BUCKET_LABELS,
+  SESSION_BUCKET_ORDER,
+  type SessionBucket,
+} from "../lib/sessions";
 import { useSettingsStore } from "../store/settings";
 
 interface SessionsSidebarProps {
@@ -42,6 +59,43 @@ export function SessionsSidebar({
 
   const [sessions, setSessions] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // `dayKey` triggers a re-bucket when the local day rolls over
+  // (otherwise a long-lived window would freeze "Today" on yesterday's
+  // sessions until the next save / refetch). We bump it via a timeout
+  // aimed at the next local midnight rather than polling.
+  const [dayKey, setDayKey] = useState(() => localDayKey(new Date()));
+  useEffect(() => {
+    const now = new Date();
+    const nextMidnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0,
+      0,
+      0,
+      // 1ms cushion past midnight so the timeout fires *into* the new
+      // day, not at the prior day's last instant.
+      1,
+    );
+    const ms = nextMidnight.getTime() - now.getTime();
+    const handle = setTimeout(() => setDayKey(localDayKey(new Date())), ms);
+    return () => clearTimeout(handle);
+  }, [dayKey]);
+  // Per-bucket expanded state. Today + Yesterday default open; older
+  // buckets default closed so a long-running vault doesn't dominate
+  // the sidebar.
+  //
+  // We build the record with an explicit literal so TypeScript catches
+  // any new `SessionBucket` member at compile time — `Object.fromEntries`
+  // would have erased the key set into `string`.
+  const [expanded, setExpanded] = useState<Record<SessionBucket, boolean>>(
+    () => ({
+      today: DEFAULT_EXPANDED_BUCKETS.has("today"),
+      yesterday: DEFAULT_EXPANDED_BUCKETS.has("yesterday"),
+      thisWeek: DEFAULT_EXPANDED_BUCKETS.has("thisWeek"),
+      older: DEFAULT_EXPANDED_BUCKETS.has("older"),
+    }),
+  );
   const navigate = useNavigate();
   const settingsReady = settings !== null;
 
@@ -76,6 +130,40 @@ export function SessionsSidebar({
       cancelled = true;
     };
   }, [vault, refreshKey]);
+
+  // Memoize on the basename array + `dayKey` so we re-bucket only when
+  // the session list changes or the local day rolls over —
+  // `groupSessionsByBucket` parses each filename and would be wasteful
+  // on every render. The `dayKey` dep covers the long-lived-window
+  // case where Today's sessions should slide into Yesterday at
+  // midnight.
+  const grouped = useMemo(
+    () => (sessions ? groupSessionsByBucket(sessions) : null),
+    // `dayKey` looks unused inside the body but is the trigger for
+    // recomputation across midnight: `groupSessionsByBucket` reads
+    // `new Date()` internally, so we just need any dep that flips
+    // when the day rolls over.
+    [sessions, dayKey],
+  );
+
+  // Auto-expand the bucket containing the active session, but only
+  // once per session id — if the user later collapses the bucket we
+  // don't fight them on a save-triggered refresh. The ref tracks
+  // the last id we auto-expanded for; we explicitly do NOT reset it
+  // on `refreshKey` so a re-fetched list with the same active session
+  // leaves the user's manual collapse alone.
+  const lastAutoExpandedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!grouped || !activeSessionId) return;
+    if (lastAutoExpandedRef.current === activeSessionId) return;
+    for (const key of SESSION_BUCKET_ORDER) {
+      if (grouped[key].some((s) => s.id === activeSessionId)) {
+        lastAutoExpandedRef.current = activeSessionId;
+        setExpanded((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
+        return;
+      }
+    }
+  }, [grouped, activeSessionId]);
 
   return (
     <aside className="w-[232px] shrink-0 border-r border-border bg-muted/30 flex flex-col">
@@ -115,31 +203,121 @@ export function SessionsSidebar({
           <p className="text-xs text-destructive p-2">{error}</p>
         )}
         {vault && sessions && sessions.length === 0 && !error && (
-          <p className="text-xs text-muted-foreground p-2">
-            No sessions yet.
-          </p>
+          <p className="text-xs text-muted-foreground p-2">No sessions yet.</p>
         )}
         {vault &&
-          sessions?.map((id) => {
-            const active = id === activeSessionId;
+          grouped &&
+          SESSION_BUCKET_ORDER.map((key) => {
+            const items = grouped[key];
+            // Skip empty buckets entirely per the PR-κ scope — no
+            // "no sessions today" placeholder.
+            if (items.length === 0) return null;
             return (
-              <button
-                key={id}
-                type="button"
-                onClick={() => navigate(`/review/${encodeURIComponent(id)}`)}
-                className={cn(
-                  "w-full text-left text-sm px-2 py-1.5 rounded-md truncate",
-                  active
-                    ? "bg-primary text-primary-foreground"
-                    : "hover:bg-muted text-foreground",
-                )}
-                title={id}
-              >
-                {id}
-              </button>
+              <SessionBucketDisclosure
+                key={key}
+                bucket={key}
+                items={items}
+                isOpen={expanded[key]}
+                onToggle={() =>
+                  setExpanded((prev) => ({ ...prev, [key]: !prev[key] }))
+                }
+                activeSessionId={activeSessionId}
+                onSelect={(id) =>
+                  navigate(`/review/${encodeURIComponent(id)}`)
+                }
+              />
             );
           })}
       </div>
     </aside>
+  );
+}
+
+interface SessionBucketDisclosureProps {
+  bucket: SessionBucket;
+  items: ParsedSessionName[];
+  isOpen: boolean;
+  onToggle: () => void;
+  activeSessionId?: string;
+  onSelect: (id: string) => void;
+}
+
+/**
+ * Radix-Disclosure-style collapsible group. We don't depend on
+ * `@radix-ui/react-accordion` here because the section is a plain
+ * `aria-expanded` button + a region that's either rendered or not —
+ * importing the accordion package for one toggle would pull in extra
+ * focus-management overhead the sidebar doesn't need.
+ */
+function SessionBucketDisclosure({
+  bucket,
+  items,
+  isOpen,
+  onToggle,
+  activeSessionId,
+  onSelect,
+}: SessionBucketDisclosureProps) {
+  const headerId = `sessions-bucket-${bucket}-header`;
+  const regionId = `sessions-bucket-${bucket}-region`;
+  const Chevron = isOpen ? ChevronDown : ChevronRight;
+  return (
+    <div className="space-y-0.5">
+      <button
+        id={headerId}
+        type="button"
+        onClick={onToggle}
+        aria-expanded={isOpen}
+        aria-controls={regionId}
+        // Compose the accessible name explicitly so screen readers
+        // announce e.g. "Today, 3 sessions, expanded" instead of just
+        // the visual label. Using `aria-label` rather than relying on
+        // a visually-hidden span keeps the markup simple — the count
+        // is the only auxiliary info we'd surface anyway.
+        aria-label={`${SESSION_BUCKET_LABELS[bucket]}, ${items.length} ${
+          items.length === 1 ? "session" : "sessions"
+        }`}
+        className="w-full flex items-center gap-1 px-2 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+      >
+        <Chevron className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+        <span aria-hidden="true">{SESSION_BUCKET_LABELS[bucket]}</span>
+        <span
+          className="ml-auto text-[10px] font-normal text-muted-foreground/80"
+          aria-hidden="true"
+        >
+          {items.length}
+        </span>
+      </button>
+      {isOpen && (
+        // `role="region"` belongs on a wrapper rather than the `<ul>`
+        // itself so screen readers still announce the list semantics
+        // (item count, "list of N") — putting `role="region"` on the
+        // `<ul>` would override its native role.
+        <div id={regionId} role="region" aria-labelledby={headerId}>
+          <ul className="space-y-0.5">
+            {items.map((parsed) => {
+              const active = parsed.id === activeSessionId;
+              const label = formatSessionLabel(parsed);
+              return (
+                <li key={parsed.id}>
+                  <button
+                    type="button"
+                    onClick={() => onSelect(parsed.id)}
+                    className={cn(
+                      "w-full text-left text-sm px-2 py-1.5 rounded-md truncate",
+                      active
+                        ? "bg-primary text-primary-foreground"
+                        : "hover:bg-muted text-foreground",
+                    )}
+                    title={parsed.id}
+                  >
+                    {label}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
