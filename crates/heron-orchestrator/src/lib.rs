@@ -182,6 +182,11 @@ pub struct LocalSessionOrchestrator {
     /// Same `Mutex<Option<…>>` rationale: lets `shutdown` move out
     /// of the join handle without `&mut self`.
     recorder: Mutex<Option<JoinHandle<()>>>,
+    /// Background waiters that finish STT/LLM/vault finalization
+    /// after `end_meeting` has returned. `shutdown()` drains them
+    /// before stopping the replay recorder so terminal events still
+    /// land in the cache.
+    finalizers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Per-meeting state tracked while a capture is in flight. The
@@ -372,6 +377,7 @@ impl Builder {
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
+            finalizers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -428,6 +434,10 @@ impl LocalSessionOrchestrator {
     /// Returns the task's `JoinError` if it panicked; success
     /// otherwise.
     pub async fn shutdown(&self) -> Result<(), tokio::task::JoinError> {
+        let finalizers = std::mem::take(&mut *lock_or_recover(&self.finalizers));
+        for handle in finalizers {
+            handle.await?;
+        }
         // Send the signal under the lock — the recorder selects on
         // `shutdown_rx` and the live bus, so a dropped sender
         // unblocks it whether or not the bus is closed.
@@ -931,6 +941,14 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         meeting.status = MeetingStatus::Ended;
         meeting.ended_at = Some(ended_at);
         meeting.duration_secs = Some(duration_secs);
+        insert_finalized_meeting(
+            &self.finalized_meetings,
+            *id,
+            FinalizedMeeting {
+                meeting: meeting.clone(),
+                note_path: None,
+            },
+        );
         publish_meeting_event(&self.bus, EventPayload::MeetingEnded(meeting.clone()), *id);
 
         match runtime {
@@ -962,18 +980,10 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             }
             CaptureRuntime::Pipeline { stop_tx, handle } => {
                 let _ = stop_tx.send(());
-                insert_finalized_meeting(
-                    &self.finalized_meetings,
-                    *id,
-                    FinalizedMeeting {
-                        meeting: meeting.clone(),
-                        note_path: None,
-                    },
-                );
                 let bus = self.bus.clone();
                 let finalized_meetings = Arc::clone(&self.finalized_meetings);
                 let id = *id;
-                tokio::spawn(async move {
+                let finalizer = tokio::spawn(async move {
                     let result = match handle.await {
                         Ok(Ok(outcome)) => Ok(outcome),
                         Ok(Err(err)) => Err(pipeline_to_session_error(err)),
@@ -983,6 +993,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     };
                     complete_pipeline_meeting(&bus, &finalized_meetings, id, fsm, meeting, result);
                 });
+                lock_or_recover(&self.finalizers).push(finalizer);
             }
         }
         tracing::info!(
