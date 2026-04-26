@@ -29,44 +29,83 @@ mod ffi {
     }
 }
 
+/// Pinned constants matching `swift/eventkit-helper/.../EventKitHelper.swift`.
+/// Drift here is caught at compile time by the unit tests below that
+/// assert each enum variant equals its raw constant.
+pub const EK_ACCESS_GRANTED_RAW: i32 = 1;
+pub const EK_ACCESS_DENIED_RAW: i32 = 0;
+pub const EK_TIMEOUT_RAW: i32 = -4;
+
+/// Outcome of an `ek_request_access` call. `Granted` and `Denied` map
+/// to user choices in the TCC dialog; `Timeout` means the Swift
+/// bridge gave up waiting for the prompt to be dismissed inside
+/// `EK_REQUEST_TIMEOUT`. Distinct from `Denied` because callers may
+/// want to retry on timeout (e.g., re-prompt later) but not on a hard
+/// denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EkAccessStatus {
+    Granted,
+    Denied,
+    Timeout,
+}
+
+impl EkAccessStatus {
+    pub fn from_raw(code: i32) -> Self {
+        match code {
+            EK_ACCESS_GRANTED_RAW => Self::Granted,
+            EK_TIMEOUT_RAW => Self::Timeout,
+            // Unknown codes collapse to Denied, matching the pre-timeout
+            // contract that "anything not 1" means "don't proceed".
+            _ => Self::Denied,
+        }
+    }
+}
+
 /// Request full calendar access.
 ///
 /// On the first call after a TCC reset (or first-run install) macOS
 /// will display a permission prompt. The call blocks the calling
-/// thread until the user makes a choice; subsequent calls return
+/// thread until the user makes a choice or the Swift bridge's
+/// `EK_REQUEST_TIMEOUT` watchdog fires; subsequent calls return
 /// immediately.
 ///
-/// Returns `true` only when the user has explicitly granted access.
+/// Returns `Ok(true)` when the user explicitly granted access,
+/// `Ok(false)` when the user denied access or the request errored,
+/// and `Err(CalendarError::Timeout)` when the bridge gave up waiting
+/// for the prompt to be dismissed.
 ///
 /// # Threading
 ///
 /// **Do not call from the UI/main thread on a fresh install** — the
 /// underlying `DispatchSemaphore.wait()` in the Swift bridge blocks
-/// the caller indefinitely until the user dismisses the TCC dialog,
-/// which would freeze the Tauri main loop. The week-11 onboarding
-/// flow (per §13) wraps this in `tokio::task::spawn_blocking` so the
-/// UI stays responsive.
+/// the caller until the user dismisses the TCC dialog (or the
+/// timeout fires), which would freeze the Tauri main loop. The
+/// week-11 onboarding flow (per §13) wraps this in
+/// `tokio::task::spawn_blocking` so the UI stays responsive.
 ///
 /// `Task.detached` in the Swift side prevents the same-queue
-/// deadlock called out in §5.4, but the wait remains *unbounded* —
-/// if `EKEventStore.requestFullAccessToEvents` never resumes (e.g.,
-/// a wedged TCC daemon), the caller hangs forever. There is no
-/// timeout knob in EventKit's request API; if this ever bites in
-/// practice, swap to a polling check on `EKEventStore.authorizationStatus`.
+/// deadlock called out in §5.4, and the bounded semaphore wait
+/// guarantees that a wedged TCC daemon eventually surfaces as a
+/// recoverable `Timeout` rather than a permanent hang.
 #[cfg(target_vendor = "apple")]
-pub fn calendar_has_access() -> bool {
+pub fn calendar_has_access() -> Result<bool, CalendarError> {
     // SAFETY: `ek_request_access` takes no arguments and returns an
     // i32. The Swift side dispatches the async request onto a
     // detached Task so re-entrancy on the caller's queue cannot
     // deadlock — see EventKitHelper.swift comment at `ek_request_access`.
-    unsafe { ffi::ek_request_access() == 1 }
+    let raw = unsafe { ffi::ek_request_access() };
+    match EkAccessStatus::from_raw(raw) {
+        EkAccessStatus::Granted => Ok(true),
+        EkAccessStatus::Denied => Ok(false),
+        EkAccessStatus::Timeout => Err(CalendarError::Timeout),
+    }
 }
 
-/// Off-Apple stub. Always returns `false` — there is no EventKit on
-/// non-Apple platforms.
+/// Off-Apple stub. Always returns `Ok(false)` — there is no EventKit
+/// on non-Apple platforms.
 #[cfg(not(target_vendor = "apple"))]
-pub fn calendar_has_access() -> bool {
-    false
+pub fn calendar_has_access() -> Result<bool, CalendarError> {
+    Ok(false)
 }
 
 /// One calendar event in the read window. Field shape matches the
@@ -100,6 +139,12 @@ pub enum CalendarError {
     InvalidUtf8(#[from] std::str::Utf8Error),
     #[error("invalid JSON from EventKit bridge: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    /// Swift bridge gave up waiting on the TCC permission prompt
+    /// inside `EK_REQUEST_TIMEOUT`. Distinct from `Denied` so the
+    /// orchestrator can decide between "retry later" (Timeout) and
+    /// "give up, the user said no" (Denied).
+    #[error("EventKit access request timed out")]
+    Timeout,
 }
 
 /// Read every calendar event whose `[start, end]` overlaps the given
@@ -131,7 +176,11 @@ pub fn calendar_read_one_shot(
     if start > end {
         return Err(CalendarError::InvalidWindow { start, end });
     }
-    if !calendar_has_access() {
+    // Honor the §12.2 denial contract: a denied user yields `Ok(None)`
+    // so callers degrade gracefully. A timed-out prompt, however, is a
+    // *recoverable* error the caller may want to retry — surface it
+    // verbatim instead of collapsing into the denial branch.
+    if !calendar_has_access()? {
         return Ok(None);
     }
 
@@ -262,11 +311,11 @@ mod tests {
     #[test]
     #[ignore = "TCC prompt; run manually with `--ignored`"]
     fn calendar_smoke() {
-        let granted = calendar_has_access();
+        let outcome = calendar_has_access();
         // The point of this test is to prove the Rust → Swift bridge
         // links and the `ek_request_access` symbol resolves. The grant
         // outcome is whatever the user clicked in the TCC dialog.
-        println!("calendar access: {granted}");
+        println!("calendar access: {outcome:?}");
     }
 
     #[test]
@@ -361,5 +410,34 @@ mod tests {
         let json = r#"{"title":"Solo work","start":0,"end":1}"#;
         let parsed: CalendarEvent = serde_json::from_str(json).expect("deserialize");
         assert!(parsed.attendees.is_empty());
+    }
+
+    #[test]
+    fn raw_constants_match_swift_side_verbatim() {
+        // The Swift side defines `private let EK_*: Int32 = …` with
+        // these exact values. Drift here is caught at compile time.
+        assert_eq!(EK_ACCESS_GRANTED_RAW, 1);
+        assert_eq!(EK_ACCESS_DENIED_RAW, 0);
+        assert_eq!(EK_TIMEOUT_RAW, -4);
+    }
+
+    #[test]
+    fn access_status_from_raw_round_trips_every_known_code() {
+        assert_eq!(
+            EkAccessStatus::from_raw(EK_ACCESS_GRANTED_RAW),
+            EkAccessStatus::Granted
+        );
+        assert_eq!(
+            EkAccessStatus::from_raw(EK_ACCESS_DENIED_RAW),
+            EkAccessStatus::Denied
+        );
+        assert_eq!(
+            EkAccessStatus::from_raw(EK_TIMEOUT_RAW),
+            EkAccessStatus::Timeout
+        );
+        // Unknown codes collapse to Denied so the post-timeout
+        // contract still defaults to "don't proceed".
+        assert_eq!(EkAccessStatus::from_raw(-99), EkAccessStatus::Denied);
+        assert_eq!(EkAccessStatus::from_raw(7), EkAccessStatus::Denied);
     }
 }

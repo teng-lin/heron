@@ -17,7 +17,8 @@ pub mod validate;
 pub mod writer;
 
 pub use calendar::{
-    CalendarAttendee, CalendarError, CalendarEvent, CalendarReader, EventKitCalendarReader,
+    CalendarAttendee, CalendarError, CalendarEvent, CalendarReader, EK_ACCESS_DENIED_RAW,
+    EK_ACCESS_GRANTED_RAW, EK_TIMEOUT_RAW, EkAccessStatus, EventKitCalendarReader,
     calendar_has_access, calendar_read_one_shot, epoch_seconds_to_utc,
 };
 pub use encode::{EncodeError, encode_to_m4a, verify_m4a};
