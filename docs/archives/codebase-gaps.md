@@ -1,6 +1,6 @@
 # Codebase gap audit
 
-_Snapshot: 2026-04-26, branch `main` at `c265e12`._
+_Snapshot: 2026-04-26, branch `main` at `8457d8d`._
 
 A survey of the heron workspace looking for "big gaps" — places where the
 codebase has obvious holes that would block shipping or that suggest
@@ -136,13 +136,6 @@ surfaces instead of one.
 
 ## Minor — polish and post-v1
 
-### 9. WhisperKit Swift bridge has no timeout
-
-`swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78`
-uses a semaphore bridge to async WhisperKit. There is no `DispatchTime`
-deadline on the semaphore wait, so a hung model load can block the calling
-thread forever.
-
 ### 10. v2 integration test coverage is still thin
 
 The v2 crates have many unit tests around individual invariants, and the bus
@@ -158,6 +151,17 @@ Useful test seams to add with the remaining implementation:
 - policy-denied speech never reaches the backend in an orchestrated session;
 - bridge health degradation propagates to daemon/desktop status;
 - Recall shutdown leaves no active vendor bot on graceful exit.
+
+### 11. EventKit Swift bridge `ek_request_access` had no timeout
+
+`swift/eventkit-helper/Sources/EventKitHelper/EventKitHelper.swift:36` blocked
+on an unbounded `DispatchSemaphore.wait()` while the TCC permission prompt
+was up. A wedged TCC daemon (or any path where
+`EKEventStore.requestFullAccessToEvents` never resumes) would pin the Rust
+`spawn_blocking` worker forever. Resolved on this PR — the bridge now bounds
+the wait at `EK_REQUEST_TIMEOUT` (60s) and surfaces a recoverable
+`CalendarError::Timeout` to the Rust caller, mirroring the WhisperKit bridge
+pattern from PR #124.
 
 ## Resolved or downgraded from the previous audit
 
@@ -223,6 +227,14 @@ The bus now reaches SSE, Tauri IPC, and replay cache consumers. `LocalSessionOrc
 publishes lifecycle events, and the desktop event-bus integration tests pin the
 multi-subscriber behavior.
 
+### WhisperKit Swift bridge has per-call timeouts
+
+`swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift` now
+runs every async→sync hop through a `runWithTimeout` helper bounded by
+`WK_INIT_TIMEOUT` (2m), `WK_FETCH_TIMEOUT` (30m), and `WK_TRANSCRIBE_TIMEOUT`
+(30m), and surfaces `WK_TIMEOUT` (-4) on expiry. Resolved in PR #124
+(commit `30321bc`); the previous audit's item #9 was stale.
+
 ## README claims vs. reality
 
 - **"v2 four-layer stack is currently trait surfaces only."** No longer
@@ -247,5 +259,6 @@ multi-subscriber behavior.
 | 5 | React onboarding lacks daemon/preflight step | `apps/desktop/src/store/onboarding.ts:37` | MAJOR | Backend command exists; UI still five steps |
 | 6 | Doctor runtime checks not surfaced to users | `crates/heron-doctor/src/lib.rs:57` | MAJOR | Add Tauri command + onboarding/status UI |
 | 7 | CLI v2 commands do not delegate to `herond` | `crates/heron-cli/src/main.rs:322` | MAJOR | Use bearer token + localhost API |
-| 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | MINOR | Add DispatchTime deadline |
+| 9 | WhisperKit semaphore timeout | `swift/whisperkit-helper/Sources/WhisperKitHelper/WhisperKitHelper.swift:78` | RESOLVED | Fixed in PR #124 (commit `30321bc`): per-call deadlines + `WK_TIMEOUT` |
 | 10 | Cross-crate v2 integration coverage | v2 crates | MINOR | Add end-to-end lifecycle suites with fakes |
+| 11 | EventKit `ek_request_access` had no timeout | `swift/eventkit-helper/Sources/EventKitHelper/EventKitHelper.swift:36` | RESOLVED | Bounded by `EK_REQUEST_TIMEOUT` (60s); surfaces `CalendarError::Timeout` |
