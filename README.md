@@ -130,9 +130,39 @@ bun run tauri build           # release .app
 bun run tauri dev             # iterative dev loop
 ```
 
-The signed `.app` bundle lands in
-`apps/desktop/src-tauri/target/release/bundle/macos/heron.app`. Drag
-it into `/Applications` and launch it.
+The `.app` bundle lands in `target/release/bundle/macos/heron.app`
+(workspace target — Cargo shares the target directory across all
+workspace crates). Drag it into `/Applications` and launch it.
+
+Tauri's bundler does not copy the `sherpa-rs` ONNX dylibs into the
+bundle, so a one-time post-build patch is needed before the `.app`
+will launch:
+
+```sh
+APP=target/release/bundle/macos/heron.app
+mkdir -p "$APP/Contents/Frameworks"
+cp -p target/release/libonnxruntime.1.17.1.dylib \
+      target/release/libsherpa-onnx-c-api.dylib \
+      target/release/libsherpa-onnx-cxx-api.dylib \
+      "$APP/Contents/Frameworks/"
+(cd "$APP/Contents/Frameworks" \
+  && ln -sf libonnxruntime.1.17.1.dylib libonnxruntime.dylib)
+install_name_tool -add_rpath @executable_path/../Frameworks \
+  "$APP/Contents/MacOS/heron-desktop"
+```
+
+If you're running directly out of cargo via
+`cargo run -p heron-desktop --release` (or via `bun run tauri dev`),
+patch the standalone binary instead — the dylibs already sit next to
+it in `target/release/` (or `target/debug/`):
+
+```sh
+install_name_tool -add_rpath @executable_path/ target/release/heron-desktop
+install_name_tool -add_rpath @executable_path/ target/debug/heron-desktop
+```
+
+Both patches are one-time per build; re-run after each rebuild
+until a Tauri post-build hook handles it automatically.
 
 #### CLI binaries (`heron` and `herond`)
 
