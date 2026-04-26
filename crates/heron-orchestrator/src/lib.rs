@@ -49,24 +49,46 @@
 //!   returning `WindowExceeded` on cross-restart resumes (the
 //!   client reconnects fresh).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use heron_event::{EventBus, ReplayCache};
 use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
 use heron_session::{
-    CalendarEvent, ComponentState, EventPayload, Health, HealthComponent, HealthComponents,
-    HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator, StartCaptureArgs,
-    Summary, Transcript,
+    AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
+    HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
+    MeetingId, MeetingStatus, Participant, Platform, PreMeetingContextRequest, SessionError,
+    SessionEventBus, SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
+    TranscriptLifecycle, TranscriptSegment,
+};
+use heron_vault::{
+    CalendarReader, EventKitCalendarReader, VaultError, epoch_seconds_to_utc, read_note,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+/// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
+/// a `MeetingId` from a vault-relative note path. The byte pattern
+/// is arbitrary but FIXED — changing it would re-key every meeting
+/// in every consumer cache and break `Last-Event-ID` resume
+/// expectations. If a future change really needs a different
+/// derivation, bump it AND emit a synthetic `daemon.error` so
+/// consumers know to invalidate their caches.
+pub const MEETING_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x68, 0x65, 0x72, 0x6f, 0x6e, 0x6d, 0x74, 0x67, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21,
+]);
+
+/// Cap on a single JSONL transcript line. A turn is a few hundred
+/// bytes typically; 1 MiB bounds the OOM blast radius for a
+/// malformed transcript that lost its newlines and presents as one
+/// gigantic line.
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
 
 /// Default broadcast bus capacity. 1024 covers a long meeting's
 /// worth of `transcript.partial` deltas without dropping for any
@@ -96,6 +118,16 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 4096;
 pub struct LocalSessionOrchestrator {
     bus: SessionEventBus,
     cache: Arc<InMemoryReplayCache<EventPayload>>,
+    /// `Some` when the daemon was launched with a configured vault;
+    /// read endpoints (`list_meetings`, `read_transcript`, etc.) use
+    /// this to scan notes on disk. `None` reverts every read method
+    /// to `NotYetImplemented` — the original phase 81 substrate
+    /// behavior, preserved as the test default so the bus / cache
+    /// fixtures don't need a tempdir.
+    vault_root: Option<PathBuf>,
+    /// Calendar bridge for `list_upcoming_calendar`. Defaults to the
+    /// EventKit reader; tests inject a fake to bypass macOS TCC.
+    calendar: Arc<dyn CalendarReader>,
     /// Held in a `Mutex<Option<…>>` so [`Self::shutdown`] (taking
     /// `&self`) can still consume the sender. Real callers don't
     /// touch the lock; the test seam takes it once.
@@ -108,11 +140,25 @@ pub struct LocalSessionOrchestrator {
 /// Builder for [`LocalSessionOrchestrator`] — exposed so the daemon
 /// (or tests) can tune capacities + retention without growing a
 /// constructor surface that pins every dial as positional args.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Builder {
     bus_capacity: usize,
     cache_capacity: usize,
     cache_window: Duration,
+    vault_root: Option<PathBuf>,
+    calendar: Option<Arc<dyn CalendarReader>>,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field("bus_capacity", &self.bus_capacity)
+            .field("cache_capacity", &self.cache_capacity)
+            .field("cache_window", &self.cache_window)
+            .field("vault_root", &self.vault_root)
+            .field("calendar", &"<Arc<dyn CalendarReader>>")
+            .finish()
+    }
 }
 
 impl Default for Builder {
@@ -121,6 +167,8 @@ impl Default for Builder {
             bus_capacity: DEFAULT_BUS_CAPACITY,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             cache_window: DEFAULT_REPLAY_WINDOW,
+            vault_root: None,
+            calendar: None,
         }
     }
 }
@@ -147,6 +195,25 @@ impl Builder {
     /// running with a different `?since_event_id` budget.
     pub fn cache_window(mut self, window: Duration) -> Self {
         self.cache_window = window;
+        self
+    }
+
+    /// Configure the on-disk vault root that the read endpoints
+    /// (`list_meetings` / `get_meeting` / `read_transcript` /
+    /// `read_summary` / `audio_path`) scan for `<vault>/meetings/*.md`
+    /// notes. Without this, every read method returns
+    /// `NotYetImplemented` (the substrate-only behavior).
+    pub fn vault_root(mut self, root: PathBuf) -> Self {
+        self.vault_root = Some(root);
+        self
+    }
+
+    /// Inject a custom [`CalendarReader`]. Tests use this to bypass
+    /// the EventKit Swift bridge (which on linux CI doesn't exist
+    /// and on macOS without TCC blocks waiting for the permission
+    /// prompt). Defaults to [`EventKitCalendarReader`] when unset.
+    pub fn calendar(mut self, reader: Arc<dyn CalendarReader>) -> Self {
+        self.calendar = Some(reader);
         self
     }
 
@@ -179,9 +246,14 @@ impl Builder {
         ));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let recorder = spawn_recorder(&bus, Arc::clone(&cache), shutdown_rx);
+        let calendar = self
+            .calendar
+            .unwrap_or_else(|| Arc::new(EventKitCalendarReader));
         LocalSessionOrchestrator {
             bus,
             cache,
+            vault_root: self.vault_root,
+            calendar,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
         }
@@ -199,6 +271,13 @@ impl LocalSessionOrchestrator {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Builder::default().build()
+    }
+
+    /// Shortcut: orchestrator with the read endpoints pointed at
+    /// `vault_root`. Equivalent to
+    /// `Builder::default().vault_root(root).build()`.
+    pub fn with_vault(vault_root: PathBuf) -> Self {
+        Builder::default().vault_root(vault_root).build()
     }
 
     /// Number of envelopes currently in the replay cache. Diagnostic
@@ -330,17 +409,25 @@ fn not_yet_wired(subsystem: &str) -> HealthComponent {
 
 #[async_trait]
 impl SessionOrchestrator for LocalSessionOrchestrator {
-    // ── data / FSM methods: NotYetImplemented until each
-    // subsystem is wired in its own follow-up PR. The trait surface
-    // is the contract; replacing one method at a time is safe
-    // because the rest still answer the same way.
+    // Read endpoints scan the configured vault when `vault_root` is
+    // `Some`, otherwise fall through to `NotYetImplemented` — same
+    // shape as the substrate-only behavior phase 81 shipped, so
+    // tests that don't configure a vault still get the original
+    // surface.
 
-    async fn list_meetings(&self, _q: ListMeetingsQuery) -> Result<ListMeetingsPage, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn list_meetings(&self, q: ListMeetingsQuery) -> Result<ListMeetingsPage, SessionError> {
+        let Some(root) = self.vault_root.as_deref() else {
+            return Err(SessionError::NotYetImplemented);
+        };
+        list_meetings_impl(root, q)
     }
 
-    async fn get_meeting(&self, _id: &MeetingId) -> Result<Meeting, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn get_meeting(&self, id: &MeetingId) -> Result<Meeting, SessionError> {
+        let Some(root) = self.vault_root.as_deref() else {
+            return Err(SessionError::NotYetImplemented);
+        };
+        let path = find_note_path_by_id(root, id)?;
+        meeting_from_note(root, &path)
     }
 
     async fn start_capture(&self, _args: StartCaptureArgs) -> Result<Meeting, SessionError> {
@@ -351,50 +438,169 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         Err(SessionError::NotYetImplemented)
     }
 
-    async fn read_transcript(&self, _id: &MeetingId) -> Result<Transcript, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn read_transcript(&self, id: &MeetingId) -> Result<Transcript, SessionError> {
+        let Some(root) = self.vault_root.as_deref() else {
+            return Err(SessionError::NotYetImplemented);
+        };
+        let path = find_note_path_by_id(root, id)?;
+        let (frontmatter, _) = read_note(&path).map_err(vault_to_session_err)?;
+        let transcript_path = resolve_vault_path(root, &frontmatter.transcript, "transcript")?;
+        let segments = read_transcript_segments(&transcript_path)?;
+        Ok(Transcript {
+            meeting_id: *id,
+            status: TranscriptLifecycle::Complete,
+            language: None,
+            segments,
+        })
     }
 
-    async fn read_summary(&self, _id: &MeetingId) -> Result<Option<Summary>, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn read_summary(&self, id: &MeetingId) -> Result<Option<Summary>, SessionError> {
+        let Some(root) = self.vault_root.as_deref() else {
+            return Err(SessionError::NotYetImplemented);
+        };
+        let path = find_note_path_by_id(root, id)?;
+        let (frontmatter, body) = read_note(&path).map_err(vault_to_session_err)?;
+        let action_items = frontmatter
+            .action_items
+            .iter()
+            .map(|a| heron_session::ActionItem {
+                text: a.text.clone(),
+                owner: if a.owner.is_empty() {
+                    None
+                } else {
+                    Some(a.owner.clone())
+                },
+                due: a.due.as_deref().and_then(parse_iso_date),
+            })
+            .collect();
+        Ok(Some(Summary {
+            meeting_id: *id,
+            generated_at: started_at_from_frontmatter(&frontmatter),
+            text: body,
+            action_items,
+            llm_provider: None,
+            llm_model: None,
+        }))
     }
 
-    async fn audio_path(&self, _id: &MeetingId) -> Result<PathBuf, SessionError> {
-        Err(SessionError::NotYetImplemented)
+    async fn audio_path(&self, id: &MeetingId) -> Result<PathBuf, SessionError> {
+        let Some(root) = self.vault_root.as_deref() else {
+            return Err(SessionError::NotYetImplemented);
+        };
+        let path = find_note_path_by_id(root, id)?;
+        let (frontmatter, _) = read_note(&path).map_err(vault_to_session_err)?;
+        let recording = resolve_vault_path(root, &frontmatter.recording, "recording")?;
+        if !recording.exists() {
+            // Don't echo the resolved host path into the wire error
+            // — keeps a vault-layout exfil channel closed even on
+            // an authenticated request. The meeting id is sufficient
+            // for the consumer to act on.
+            return Err(SessionError::NotFound {
+                what: format!("audio for meeting {id}"),
+            });
+        }
+        Ok(recording)
     }
 
     async fn list_upcoming_calendar(
         &self,
-        _from: Option<DateTime<Utc>>,
-        _to: Option<DateTime<Utc>>,
-        _limit: Option<u32>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: Option<u32>,
     ) -> Result<Vec<CalendarEvent>, SessionError> {
-        Err(SessionError::NotYetImplemented)
+        let now = Utc::now();
+        let from = from.unwrap_or(now);
+        let to = to.unwrap_or_else(|| from + chrono::Duration::days(7));
+        let raw = self
+            .calendar
+            .read_window(from, to)
+            .map_err(|e| match e {
+                heron_vault::CalendarError::Denied => SessionError::PermissionMissing {
+                    permission: "calendar",
+                },
+                other => SessionError::VaultLocked {
+                    detail: format!("calendar read failed: {other}"),
+                },
+            })?
+            .unwrap_or_default();
+        let cap = limit.unwrap_or(20).min(100) as usize;
+        let events = raw
+            .into_iter()
+            .take(cap)
+            .map(|ev| CalendarEvent {
+                // EventKit doesn't yet expose a stable per-event id
+                // through the Swift bridge; until it does, synthesize
+                // a deterministic id from `(start, end, title)` so a
+                // future `attach_context` impl can correlate. Long
+                // titles are SHA-collision-resistant — `format!` of
+                // the raw f64 bits + full title string is enough at
+                // this scope; collision-free across realistic vaults.
+                id: format!(
+                    "synth_{}_{}_{}",
+                    ev.start.to_bits(),
+                    ev.end.to_bits(),
+                    ev.title
+                ),
+                title: ev.title,
+                start: epoch_seconds_to_utc(ev.start),
+                end: epoch_seconds_to_utc(ev.end),
+                attendees: ev
+                    .attendees
+                    .into_iter()
+                    .map(|a| AttendeeContext {
+                        name: a.name,
+                        email: Some(a.email).filter(|s| !s.is_empty()),
+                        last_seen_in: None,
+                        relationship: None,
+                        notes: None,
+                    })
+                    .collect(),
+                meeting_url: None,
+                related_meetings: Vec::new(),
+            })
+            .collect();
+        Ok(events)
     }
 
     async fn attach_context(&self, _req: PreMeetingContextRequest) -> Result<(), SessionError> {
+        // Storage layer for pre-meeting context lands with the FSM-
+        // merge PR (the orchestrator that consumes the context at
+        // capture-start time also owns the storage seam).
         Err(SessionError::NotYetImplemented)
     }
 
     async fn health(&self) -> Health {
-        // Degraded with every component reporting `Down` plus a
-        // "not yet wired" message. Deliberately not
-        // `PermissionMissing` (the test-stub's choice) — that state
-        // means a TCC permission gap, and routing `/health` consumers
-        // to the System Settings → Privacy debugging path for an
-        // unimplemented subsystem is misleading. `Down` honestly
-        // says "this subsystem is unavailable"; the per-component
-        // message tells operators it's the implementation that's
-        // missing, not a permission. When a subsystem wires in, its
-        // branch flips to a real probe; everything else keeps
-        // reporting honestly.
+        // Substrate-only baseline (every component `Down + "not yet
+        // wired"`). When a `vault_root` is configured, flip the
+        // `vault` component to a real path-existence probe; the
+        // rest stay honest until their FSM-merge wires them.
+        // EventKit access is NOT probed here — `calendar_has_access`
+        // delegates to a Swift FFI that on a CI runner without
+        // pre-granted TCC blocks waiting for the system permission
+        // prompt. Real EventKit access surfaces on
+        // `/v1/calendar/upcoming`, which already returns 503 on
+        // `Denied`; that's the right contract for liveness to defer
+        // to.
+        let vault = match self.vault_root.as_deref() {
+            Some(root) if root.exists() => HealthComponent {
+                state: ComponentState::Ok,
+                message: Some(format!("vault root: {}", root.display())),
+                last_check: Some(Utc::now()),
+            },
+            Some(root) => HealthComponent {
+                state: ComponentState::PermissionMissing,
+                message: Some(format!("vault root not found: {}", root.display())),
+                last_check: Some(Utc::now()),
+            },
+            None => not_yet_wired("vault writer"),
+        };
         Health {
             status: HealthStatus::Degraded,
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             components: HealthComponents {
                 capture: not_yet_wired("audio capture"),
                 whisperkit: not_yet_wired("speech recognition"),
-                vault: not_yet_wired("vault writer"),
+                vault,
                 eventkit: not_yet_wired("EventKit calendar reads"),
                 llm: not_yet_wired("LLM summarizer"),
             },
@@ -409,6 +615,365 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     fn replay_cache(&self) -> Option<&dyn ReplayCache<EventPayload>> {
         Some(&*self.cache)
     }
+}
+
+// ── vault read helpers ────────────────────────────────────────────────
+
+fn list_meetings_impl(
+    vault_root: &Path,
+    q: ListMeetingsQuery,
+) -> Result<ListMeetingsPage, SessionError> {
+    let paths = note_paths_newest_first(vault_root)?;
+    let limit = q.limit.unwrap_or(50).min(200) as usize;
+    let after = q.cursor.as_deref();
+    let mut started_after = after.is_none();
+    let mut items = Vec::with_capacity(limit);
+    let mut next_cursor: Option<String> = None;
+    let mut last_kept_rel: Option<String> = None;
+    for path in paths {
+        let rel = path
+            .strip_prefix(vault_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.clone());
+        let rel_str = rel.to_string_lossy().to_string();
+        if !started_after {
+            if Some(rel_str.as_str()) == after {
+                started_after = true;
+            }
+            continue;
+        }
+        let meeting = match meeting_from_note(vault_root, &path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping malformed note in list_meetings",
+                );
+                continue;
+            }
+        };
+        if let Some(since) = q.since
+            && meeting.started_at < since
+        {
+            continue;
+        }
+        if let Some(status) = q.status
+            && meeting.status != status
+        {
+            continue;
+        }
+        if let Some(platform) = q.platform
+            && meeting.platform != platform
+        {
+            continue;
+        }
+        if items.len() == limit {
+            next_cursor = last_kept_rel.clone();
+            break;
+        }
+        items.push(meeting);
+        last_kept_rel = Some(rel_str);
+    }
+    Ok(ListMeetingsPage { items, next_cursor })
+}
+
+fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionError> {
+    let dir = vault_root.join("meetings");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| SessionError::VaultLocked {
+            detail: format!("read_dir({}): {e}", dir.display()),
+        })?
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && e.path().extension().and_then(|s| s.to_str()) == Some("md")
+        })
+        .map(|e| e.path())
+        .collect();
+    // Note filenames are `YYYY-MM-DD-HHMM <slug>.md` per `docs/plan.md`
+    // §3.2, so a lex-descending sort IS a date-descending sort.
+    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(entries)
+}
+
+/// Linear scan for the note whose derived `MeetingId` matches `id`.
+/// Used by every per-meeting read endpoint. Replaceable with an
+/// in-memory index when capture lifecycle ships and the bus starts
+/// publishing events (the index is the natural piggyback on the
+/// recorder).
+fn find_note_path_by_id(vault_root: &Path, id: &MeetingId) -> Result<PathBuf, SessionError> {
+    note_paths_newest_first(vault_root)?
+        .into_iter()
+        .find(|p| derive_meeting_id(vault_root, p) == *id)
+        .ok_or_else(|| SessionError::NotFound {
+            what: format!("meeting {id}"),
+        })
+}
+
+/// Resolve a frontmatter path field against the vault root,
+/// rejecting absolute paths and `..` traversal. Without this
+/// `read_transcript` and `audio_path` are file-read primitives over
+/// loopback-auth.
+fn resolve_vault_path(
+    vault_root: &Path,
+    candidate: &Path,
+    field: &'static str,
+) -> Result<PathBuf, SessionError> {
+    if candidate.is_absolute() {
+        return Err(SessionError::Validation {
+            detail: format!("{field} path must be vault-relative"),
+        });
+    }
+    // Canonicalize the vault root FIRST so the prefix check below
+    // compares apples to apples — on macOS, `/var/...` canonicalizes
+    // to `/private/var/...` (system symlink). Without this, a non-
+    // canonical vault_root + non-canonical candidate would fail the
+    // canonical prefix check, mistakenly rejecting a perfectly-
+    // relative path.
+    let root_canonical = vault_root
+        .canonicalize()
+        .unwrap_or_else(|_| vault_root.to_path_buf());
+    let safe_relative = normalize_no_traverse(candidate)?;
+    let joined = root_canonical.join(&safe_relative);
+    let resolved = if joined.exists() {
+        joined
+            .canonicalize()
+            .map_err(|e| SessionError::VaultLocked {
+                detail: format!("canonicalize {field}: {e}"),
+            })?
+    } else {
+        joined
+    };
+    if !resolved.starts_with(&root_canonical) {
+        return Err(SessionError::Validation {
+            detail: format!("{field} path escapes vault"),
+        });
+    }
+    Ok(resolved)
+}
+
+fn normalize_no_traverse(path: &Path) -> Result<PathBuf, SessionError> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                return Err(SessionError::Validation {
+                    detail: "path contains '..' which is forbidden".to_owned(),
+                });
+            }
+            Component::Normal(_)
+            | Component::RootDir
+            | Component::Prefix(_)
+            | Component::CurDir => {
+                out.push(c.as_os_str());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn derive_meeting_id(vault_root: &Path, note_path: &Path) -> MeetingId {
+    let rel = note_path.strip_prefix(vault_root).unwrap_or(note_path);
+    let bytes = rel.as_os_str().as_encoded_bytes();
+    MeetingId(Uuid::new_v5(&MEETING_ID_NAMESPACE, bytes))
+}
+
+fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionError> {
+    let (fm, body) = read_note(path).map_err(vault_to_session_err)?;
+    let id = derive_meeting_id(vault_root, path);
+    let started_at = started_at_from_frontmatter(&fm);
+    let ended_at = Some(started_at + chrono::Duration::minutes(fm.duration_min as i64));
+    let participants = fm
+        .attendees
+        .iter()
+        .map(|a| Participant {
+            display_name: a.name.clone(),
+            identifier_kind: IdentifierKind::Fallback,
+            is_user: false,
+        })
+        .collect();
+    let transcript_resolved = resolve_vault_path(vault_root, &fm.transcript, "transcript").ok();
+    let transcript_status = match transcript_resolved {
+        Some(p) if p.exists() => TranscriptLifecycle::Complete,
+        _ => TranscriptLifecycle::Failed,
+    };
+    let summary_status = if body.trim().is_empty() {
+        SummaryLifecycle::Pending
+    } else {
+        SummaryLifecycle::Ready
+    };
+    Ok(Meeting {
+        id,
+        // Notes are only finalized for completed meetings, so the
+        // status is always `Done`. A meeting still in `Recording`
+        // doesn't have a finalized note on disk for us to surface.
+        status: MeetingStatus::Done,
+        platform: platform_from_source_app(&fm.source_app),
+        title: fm.company.clone(),
+        calendar_event_id: None,
+        started_at,
+        ended_at,
+        duration_secs: Some((fm.duration_min as u64) * 60),
+        participants,
+        transcript_status,
+        summary_status,
+    })
+}
+
+fn platform_from_source_app(source_app: &str) -> Platform {
+    let s = source_app.to_ascii_lowercase();
+    if s.contains("zoom") {
+        Platform::Zoom
+    } else if s.contains("meet.google") || s.contains("googlemeet") || s.contains("google_meet") {
+        Platform::GoogleMeet
+    } else if s.contains("teams") || s.contains("microsoft") {
+        Platform::MicrosoftTeams
+    } else if s.contains("webex") {
+        Platform::Webex
+    } else {
+        if !source_app.is_empty() {
+            tracing::warn!(
+                source_app,
+                "unrecognized source_app; defaulting to Platform::Zoom"
+            );
+        }
+        Platform::Zoom
+    }
+}
+
+fn started_at_from_frontmatter(fm: &heron_types::Frontmatter) -> DateTime<Utc> {
+    let date: NaiveDate = fm.date;
+    let time = NaiveTime::parse_from_str(&fm.start, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(&fm.start, "%H:%M:%S"))
+        .unwrap_or_else(|_| NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default());
+    let naive = date.and_time(time);
+    // Frontmatter has no explicit timezone field. The vault writer
+    // records meetings in the user's local clock (the
+    // `YYYY-MM-DD-HHMM` filename matches the user's wall clock at
+    // capture time), so the API contract is "local time projected
+    // to UTC." Earliest mapping wins on the autumn DST overlap;
+    // the gap (spring) falls back to naive-as-UTC with a warn so a
+    // single missing-hour frontmatter doesn't fail the whole list.
+    use chrono::Local;
+    use chrono::offset::LocalResult;
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(local) => local.with_timezone(&Utc),
+        LocalResult::Ambiguous(earliest, _latest) => earliest.with_timezone(&Utc),
+        LocalResult::None => {
+            tracing::warn!(
+                date = %fm.date,
+                start = %fm.start,
+                "frontmatter datetime in DST gap; treating naive value as UTC",
+            );
+            Utc.from_utc_datetime(&naive)
+        }
+    }
+}
+
+fn read_transcript_segments(path: &Path) -> Result<Vec<TranscriptSegment>, SessionError> {
+    use std::io::{BufRead, Read};
+    if !path.exists() {
+        return Err(SessionError::NotFound {
+            what: format!("transcript file: {}", path.display()),
+        });
+    }
+    let file = std::fs::File::open(path).map_err(|e| SessionError::VaultLocked {
+        detail: format!("open transcript {}: {e}", path.display()),
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut segments = Vec::new();
+    let mut lineno = 0usize;
+    loop {
+        let mut buf = Vec::with_capacity(256);
+        // Cap each read at MAX_TRANSCRIPT_LINE_BYTES so a malformed
+        // transcript without newlines can't pull the whole file
+        // into one allocation. Lines longer than the cap are
+        // warn-skipped — corrupt entries don't stall the rest.
+        let n = (&mut reader)
+            .take(MAX_TRANSCRIPT_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| SessionError::VaultLocked {
+                detail: format!("read transcript line {lineno}: {e}"),
+            })?;
+        if n == 0 {
+            break;
+        }
+        if n > MAX_TRANSCRIPT_LINE_BYTES {
+            tracing::warn!(
+                line = lineno,
+                bytes = n,
+                "transcript line exceeds MAX_TRANSCRIPT_LINE_BYTES; skipping",
+            );
+            buf.clear();
+            let _ = reader.read_until(b'\n', &mut buf);
+            lineno += 1;
+            continue;
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s.trim_end_matches('\n').trim_end_matches('\r').to_owned(),
+            Err(_) => {
+                tracing::warn!(line = lineno, "non-utf8 transcript line; skipping");
+                lineno += 1;
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            lineno += 1;
+            continue;
+        }
+        match serde_json::from_str::<heron_types::Turn>(&line) {
+            Ok(turn) => {
+                let is_user = matches!(turn.speaker_source, heron_types::SpeakerSource::Self_);
+                let identifier_kind = match turn.speaker_source {
+                    heron_types::SpeakerSource::Self_ => IdentifierKind::Mic,
+                    heron_types::SpeakerSource::Ax => IdentifierKind::AxTree,
+                    heron_types::SpeakerSource::Channel => IdentifierKind::Fallback,
+                    heron_types::SpeakerSource::Cluster => IdentifierKind::Fallback,
+                };
+                let confidence = match turn.confidence {
+                    Some(c) if c >= 0.7 => heron_session::Confidence::High,
+                    _ => heron_session::Confidence::Low,
+                };
+                segments.push(TranscriptSegment {
+                    speaker: Participant {
+                        display_name: turn.speaker,
+                        identifier_kind,
+                        is_user,
+                    },
+                    text: turn.text,
+                    start_secs: turn.t0,
+                    end_secs: turn.t1,
+                    confidence,
+                    is_final: true,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(line = lineno, error = %e, "skipping malformed turn");
+            }
+        }
+        lineno += 1;
+    }
+    Ok(segments)
+}
+
+fn vault_to_session_err(err: VaultError) -> SessionError {
+    match err {
+        VaultError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => SessionError::NotFound {
+            what: format!("vault file io: {e}"),
+        },
+        other => SessionError::VaultLocked {
+            detail: other.to_string(),
+        },
+    }
+}
+
+fn parse_iso_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
 #[cfg(test)]
@@ -514,12 +1079,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_fsm_method_returns_not_yet_implemented() {
-        // Pin the "stub for now" contract per-method so a future
-        // accidental wiring (e.g. someone returning Ok(empty page)
-        // from list_meetings without implementing the underlying
-        // store) breaks loudly here. All 9 methods covered — codex
-        // review flagged the partial coverage as a regression hole.
+    async fn substrate_only_methods_return_not_yet_implemented_without_vault() {
+        // Pin the "stub for now" contract per-method when no
+        // `vault_root` is configured. Read endpoints fall back to
+        // `NotYetImplemented` because there's no on-disk source to
+        // scan; capture-lifecycle methods + attach_context stay
+        // `NotYetImplemented` regardless of vault config until
+        // FSM-merge wires the heron-cli session driver.
+        // `list_upcoming_calendar` is explicitly NOT in this set —
+        // it works as soon as a CalendarReader is configured, which
+        // is independent of the vault.
         let orch = LocalSessionOrchestrator::new();
         let id = MeetingId::now_v7();
 
@@ -553,10 +1122,6 @@ mod tests {
         ));
         assert!(matches!(
             orch.audio_path(&id).await,
-            Err(SessionError::NotYetImplemented)
-        ));
-        assert!(matches!(
-            orch.list_upcoming_calendar(None, None, None).await,
             Err(SessionError::NotYetImplemented)
         ));
         assert!(matches!(

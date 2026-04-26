@@ -460,7 +460,7 @@ pub struct ListMeetingsQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListMeetingsPage {
     pub items: Vec<Meeting>,
     /// `None` when this is the last page.

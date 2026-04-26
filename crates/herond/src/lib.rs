@@ -76,7 +76,7 @@ pub fn build_app(state: AppState) -> Router {
     let v1 = Router::new()
         .merge(routes::health::router())
         .merge(routes::events::router())
-        .merge(routes::unimpl::router());
+        .merge(routes::meetings::router());
     Router::new()
         .nest(API_PREFIX, v1)
         .layer(axum::middleware::from_fn_with_state(
