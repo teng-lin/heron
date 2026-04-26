@@ -33,11 +33,19 @@
 use std::time::Duration;
 
 use tauri::menu::{Menu, MenuEvent, MenuItem};
-use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconId};
 use tauri::{AppHandle, Emitter, Manager, Runtime, image::Image};
 use tokio::time::interval;
 
 use heron_types::RecordingState;
+
+/// Stable id for the menubar tray. `TrayIconBuilder::with_id` registers
+/// the tray under this label so [`heron_emit_capture_degraded`] (and a
+/// future FSM dispatch path) can look it up via
+/// [`AppHandle::tray_by_id`] without holding a `TrayIcon` clone in
+/// global state. Const because there is exactly one tray for the
+/// lifetime of the app.
+pub const TRAY_ID: &str = "heron-main-tray";
 
 /// IDs we use for the menu items so `MenuEvent`s carry a stable tag.
 const MENU_OPEN_LAST: &str = "open_last_note";
@@ -58,6 +66,76 @@ pub const EVENT_NAV_REVIEW: &str = "nav:review";
 /// system-notification line free of platform-specific plumbing while
 /// still surfacing the "no notes yet" affordance to the user.
 pub const EVENT_NO_LAST_NOTE: &str = "nav:no_last_note";
+/// Phase 73 (PR-λ): contextual error event the frontend renders as a
+/// Sonner toast with a "View diagnostics" action button (per the
+/// `plan.md` week-12 line "Tap lost Zoom at 00:42:15 — transcript may
+/// have gaps in that window").
+///
+/// Real wiring lands when the FSM's `CaptureDegraded` event is
+/// integrated into the recording pipeline; today the surface is
+/// reachable only through the [`heron_emit_capture_degraded`] manual-
+/// fire command so the tray + toast UX can be polished independently
+/// of the audio pipeline.
+pub const EVENT_TRAY_DEGRADED: &str = "tray:degraded";
+
+/// Discriminator for the `tray:degraded` payload's `kind` field. The
+/// three variants cover the failure modes documented in
+/// `docs/plan.md` week 12: tap-lost (process tap couldn't follow the
+/// target app), AX-unavailable (Accessibility went away mid-call), and
+/// AEC-overflow (echo canceller's input ringbuffer fell behind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedKind {
+    TapLost,
+    AxUnavailable,
+    AecOverflow,
+}
+
+impl DegradedKind {
+    /// Parse the wire-format discriminant the frontend / tests send.
+    /// Centralised so the command shim's error message is uniform.
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "tap_lost" => Ok(Self::TapLost),
+            "ax_unavailable" => Ok(Self::AxUnavailable),
+            "aec_overflow" => Ok(Self::AecOverflow),
+            other => Err(format!(
+                "unknown degraded kind: {other} (expected tap_lost / ax_unavailable / aec_overflow)",
+            )),
+        }
+    }
+
+    /// Human-facing copy for the tray tooltip on degraded state. The
+    /// frontend's Sonner toast formats its own message from the full
+    /// payload; this string is the tray-tooltip-only view, hence the
+    /// "—" continuation matches the rest of the tooltip family.
+    fn tooltip_suffix(self) -> &'static str {
+        match self {
+            Self::TapLost => "tap lost",
+            Self::AxUnavailable => "AX unavailable",
+            Self::AecOverflow => "AEC overflow",
+        }
+    }
+}
+
+/// Wire-format payload for `tray:degraded`. Field names match the
+/// frontend's `DegradedPayload` interface in `lib/invoke.ts`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DegradedPayload {
+    pub kind: DegradedKind,
+    pub at_secs: u64,
+    /// Optional target-app label (e.g. "Zoom") so the toast can render
+    /// "Tap lost Zoom at 00:42:15" rather than the unattributed
+    /// "Tap lost at 00:42:15".
+    pub target: Option<String>,
+    /// Active recording's session id when the FSM dispatches this
+    /// (post-pipeline-integration). The frontend uses it as the
+    /// navigation target for the toast's "View diagnostics" action.
+    /// `None` → the toast falls back to "newest note in the vault",
+    /// which is the only target available before the wiring PR lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
 
 /// Embedded icon bytes — 22×22 PNGs (44×44 @2x). The `@2x` files exist
 /// for HiDPI but tray-icon on macOS picks the right variant by hash,
@@ -81,7 +159,9 @@ enum TrayVisual {
     Recording,
     Transcribing,
     Summarizing,
-    #[allow(dead_code)] // reserved for the error path; see module docs
+    /// Phase 73 (PR-λ): rendered when [`heron_emit_capture_degraded`]
+    /// fires. The polling loop never produces this on its own — only
+    /// the explicit degraded-event path flips the tray red.
     Error,
 }
 
@@ -243,7 +323,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let initial_visual = TrayVisual::Idle;
     let initial_image = Image::from_bytes(initial_visual.icon_bytes())?;
 
-    let tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::with_id(TrayIconId::new(TRAY_ID))
         .icon(initial_image)
         .icon_as_template(true)
         .tooltip(initial_visual.tooltip())
@@ -409,6 +489,117 @@ fn emit_no_last_note<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Format a tray tooltip for a degraded-capture event. Pulled out of
+/// [`heron_emit_capture_degraded`] so the unit test below can pin the
+/// exact wire shape without spinning up a Tauri runtime.
+///
+/// Examples:
+///   - `tap_lost` + `target = Some("Zoom")` →
+///     `"heron — tap lost (Zoom) at 00:42:15"`
+///   - `ax_unavailable` + `target = None` →
+///     `"heron — AX unavailable at 00:00:09"`
+pub(crate) fn format_degraded_tooltip(payload: &DegradedPayload) -> String {
+    let suffix = payload.kind.tooltip_suffix();
+    let stamp = format_hms(payload.at_secs);
+    match &payload.target {
+        Some(target) if !target.is_empty() => {
+            format!("heron — {suffix} ({target}) at {stamp}")
+        }
+        _ => format!("heron — {suffix} at {stamp}"),
+    }
+}
+
+/// Format an `at_secs` count as `HH:MM:SS`. Matches the brief's
+/// example "00:42:15" and the existing review-UI convention so the
+/// tray and toast read identically.
+fn format_hms(at_secs: u64) -> String {
+    let hours = at_secs / 3600;
+    let minutes = (at_secs % 3600) / 60;
+    let seconds = at_secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// Tauri command (PR-λ): emit a `tray:degraded` event the frontend
+/// renders as a Sonner toast, and flip the tray to its error variant
+/// with a contextual tooltip.
+///
+/// The brief intentionally exposes this as a manual-fire surface so
+/// the tray + toast UX can be polished before the audio pipeline
+/// lands its real `CaptureDegraded` emission. Once the FSM dispatch
+/// path is integrated, the recording orchestrator calls this command
+/// verbatim — no further frontend or tray work is required.
+///
+/// **Known limitation, intentional for this PR.** The tray's error
+/// icon is sticky: the 1 s polling loop diffs against `last_visual`
+/// (its own internal cache), and because the live FSM is always
+/// `Idle` today the diff never fires and the error icon never gets
+/// repainted away. The Sonner toast still auto-dismisses after 12 s,
+/// so the dominant signal is transient; the menubar icon stays red
+/// until a future FSM state change. The wiring PR is expected to
+/// replace `spawn_status_poll` with an event-driven repaint hook
+/// that knows about the degraded → idle transition, at which point
+/// the icon will clear naturally.
+///
+/// Errors stringly so the JS caller (and a future Rust caller) can
+/// surface a uniform message; the only error today is an unknown
+/// `kind` discriminant.
+#[tauri::command]
+pub fn heron_emit_capture_degraded(
+    app: tauri::AppHandle,
+    kind: String,
+    at_secs: u64,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let parsed_kind = DegradedKind::from_str(&kind)?;
+    let payload = DegradedPayload {
+        kind: parsed_kind,
+        at_secs,
+        target,
+        session_id,
+    };
+    flip_tray_to_error(&app, &payload);
+    app.emit(EVENT_TRAY_DEGRADED, payload)
+        .map_err(|e| e.to_string())
+}
+
+/// Look up the menubar tray by [`TRAY_ID`] and apply the error visual
+/// plus a contextual tooltip. Best-effort: a missing tray (tests, or
+/// a pre-`setup` window) is not fatal — the event still fires for the
+/// frontend toast regardless.
+///
+/// **Race note for future readers.** The 1 s polling loop in
+/// [`spawn_status_poll`] only repaints when it observes a changed
+/// `TrayVisual`; because the current FSM never produces `Error` (and
+/// the poll never reads our error icon), the loop's diff check skips
+/// the repaint and our error visual sticks. When the FSM gains real
+/// `CaptureDegraded` emission, the polling path and this flip path
+/// will need to coordinate (most likely by replacing the poll with an
+/// event-bus subscriber).
+fn flip_tray_to_error<R: Runtime>(app: &AppHandle<R>, payload: &DegradedPayload) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        // First-paint races, tests without a tray, or a future
+        // off-macOS build that omits the tray will fall through here.
+        // The emitter still pushes the event so the frontend toast
+        // fires regardless.
+        return;
+    };
+    match Image::from_bytes(TrayVisual::Error.icon_bytes()) {
+        Ok(image) => {
+            if let Err(err) = tray.set_icon(Some(image)) {
+                eprintln!("[heron-tray] degraded set_icon failed: {err}");
+            }
+        }
+        Err(err) => {
+            eprintln!("[heron-tray] degraded decode icon failed: {err}");
+        }
+    }
+    let tooltip = format_degraded_tooltip(payload);
+    if let Err(err) = tray.set_tooltip(Some(tooltip.as_str())) {
+        eprintln!("[heron-tray] degraded set_tooltip failed: {err}");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -535,6 +726,117 @@ mod tests {
             .expect("call")
             .expect("notes.md should win");
         assert_eq!(out, "notes");
+    }
+
+    #[test]
+    fn degraded_kind_round_trips_known_strings() {
+        // The frontend emits these literal strings via
+        // `invoke("heron_emit_capture_degraded", { kind: "..." })`.
+        // Pinning the round-trip catches a future serde rename that
+        // would silently drop the toast.
+        for s in ["tap_lost", "ax_unavailable", "aec_overflow"] {
+            let parsed = DegradedKind::from_str(s).expect("known kind");
+            let serialised = serde_json::to_string(&parsed).expect("serialise");
+            assert_eq!(serialised, format!("\"{s}\""));
+        }
+    }
+
+    #[test]
+    fn degraded_kind_rejects_unknown_string() {
+        let err = DegradedKind::from_str("bogus_kind").expect_err("unknown");
+        assert!(err.contains("bogus_kind"));
+    }
+
+    #[test]
+    fn format_degraded_tooltip_with_target_renders_target_in_parens() {
+        // Brief: "Tap lost Zoom at 00:42:15 — transcript may have gaps".
+        // The tray tooltip is a shorter form ("heron — tap lost (Zoom)
+        // at 00:42:15"); the React toast renders the long sentence.
+        let payload = DegradedPayload {
+            kind: DegradedKind::TapLost,
+            at_secs: 42 * 60 + 15,
+            target: Some("Zoom".to_owned()),
+            session_id: None,
+        };
+        assert_eq!(
+            format_degraded_tooltip(&payload),
+            "heron — tap lost (Zoom) at 00:42:15",
+        );
+    }
+
+    #[test]
+    fn format_degraded_tooltip_without_target_omits_parens() {
+        // No target — the tooltip falls back to a clean "kind at HMS"
+        // shape rather than rendering "() at ...".
+        let payload = DegradedPayload {
+            kind: DegradedKind::AxUnavailable,
+            at_secs: 9,
+            target: None,
+            session_id: None,
+        };
+        assert_eq!(
+            format_degraded_tooltip(&payload),
+            "heron — AX unavailable at 00:00:09",
+        );
+    }
+
+    #[test]
+    fn format_degraded_tooltip_treats_empty_target_as_missing() {
+        // A frontend bug that passes `target: ""` shouldn't render
+        // "(empty parens) at 00:01:00" — the empty-string branch
+        // collapses to the no-target form.
+        let payload = DegradedPayload {
+            kind: DegradedKind::AecOverflow,
+            at_secs: 60,
+            target: Some(String::new()),
+            session_id: None,
+        };
+        assert_eq!(
+            format_degraded_tooltip(&payload),
+            "heron — AEC overflow at 00:01:00",
+        );
+    }
+
+    #[test]
+    fn degraded_payload_serialises_with_optional_session_id() {
+        // Pin both shapes the wiring PR will produce: today's
+        // manual-fire path (no session id; field omitted via
+        // `skip_serializing_if`) and tomorrow's FSM-emit path (active
+        // recording's id present). The frontend's listener depends on
+        // `session_id` being undefined when absent so the
+        // `fallbackToNewest` branch in `App.tsx` fires.
+        let no_id = DegradedPayload {
+            kind: DegradedKind::TapLost,
+            at_secs: 5,
+            target: Some("Zoom".to_owned()),
+            session_id: None,
+        };
+        let s = serde_json::to_string(&no_id).expect("serialise");
+        // No `session_id` key when the value is `None` — keeps the
+        // wire shape compact and lets the frontend's `?? null`
+        // pattern observe undefined.
+        assert!(!s.contains("session_id"), "got: {s}");
+
+        let with_id = DegradedPayload {
+            kind: DegradedKind::TapLost,
+            at_secs: 5,
+            target: Some("Zoom".to_owned()),
+            session_id: Some("abc-123".to_owned()),
+        };
+        let s = serde_json::to_string(&with_id).expect("serialise");
+        assert!(s.contains(r#""session_id":"abc-123""#), "got: {s}");
+    }
+
+    #[test]
+    fn format_hms_rolls_over_at_hour_boundary() {
+        // Plain integer division — pin the rollover so a future
+        // refactor doesn't accidentally produce "01:60:00" for one
+        // hour.
+        assert_eq!(format_hms(0), "00:00:00");
+        assert_eq!(format_hms(59), "00:00:59");
+        assert_eq!(format_hms(60), "00:01:00");
+        assert_eq!(format_hms(3_600), "01:00:00");
+        assert_eq!(format_hms(3_661), "01:01:01");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod disk;
 pub mod keychain;
 pub mod notes;
 pub mod onboarding;
+pub mod preflight;
 pub mod resummarize;
 pub mod salvage;
 pub mod settings;
@@ -38,6 +39,7 @@ pub use onboarding::{
     test_audio_tap_async, test_calendar, test_calendar_async, test_microphone,
     test_microphone_async, test_model_download,
 };
+pub use preflight::{DiskCheckOutcome, check_disk, heron_check_disk_for_recording};
 
 // Tauri's command-handler macro requires the function names it
 // generates wrappers for to live at the same path the macro is in;
@@ -617,6 +619,9 @@ pub fn run() {
             heron_unregister_hotkey,
             heron_disk_usage,
             heron_purge_audio_older_than,
+            // Phase 73 (PR-λ) — pre-flight checks.
+            heron_check_disk_for_recording,
+            tray::heron_emit_capture_degraded,
         ])
         .run(tauri::generate_context!())
         .expect("error while running heron-desktop");

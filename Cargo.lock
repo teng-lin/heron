@@ -1946,6 +1946,7 @@ dependencies = [
  "heron-types",
  "heron-vault",
  "heron-zoom",
+ "libc",
  "security-framework",
  "serde",
  "serde_json",

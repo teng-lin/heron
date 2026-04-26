@@ -78,6 +78,14 @@ tauri-plugin-dialog = "2.7.0"
 # reports per-app state, which is why we also try-register the chord
 # in `heron_check_hotkey` and unregister immediately on success.
 tauri-plugin-global-shortcut = "2.3.1"
+# Phase 73 (PR-λ): the pre-flight disk-space gate calls `statvfs(2)` on
+# the cache root to ask the OS how much free space the volume has, then
+# compares against `Settings::min_free_disk_mib`. `libc` already sits
+# in the transitive dep graph (cidre + cpal both pull it in); surfacing
+# it here keeps the binding obvious. We use the raw FFI rather than the
+# `nix` crate or `sysinfo` because the call site is one syscall — a
+# bigger crate would dwarf the value it added.
+libc = "0.2"
 # `tracing` already lives in the transitive dep graph via `heron-zoom`;
 # surfacing it here lets `lib.rs` log the hotkey-fired stub line without
 # pulling a second log crate. The `tracing-subscriber` set up by the
