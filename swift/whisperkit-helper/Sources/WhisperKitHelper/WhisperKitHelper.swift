@@ -5,9 +5,12 @@
 // The @_cdecl surface — `wk_init`, `wk_transcribe`, `wk_free_string` —
 // is the stable wire to Rust (see whisperkit_bridge.rs). Both entry
 // points are *synchronous* C functions, so we bridge to WhisperKit's
-// async-only API by blocking on a `DispatchSemaphore`. The Rust side
-// is expected to call us from `tokio::task::spawn_blocking` so we
-// never block the async runtime.
+// async-only API by blocking on a `DispatchSemaphore` with a per-call
+// deadline (`WK_INIT_TIMEOUT` / `WK_FETCH_TIMEOUT` /
+// `WK_TRANSCRIBE_TIMEOUT`). On deadline expiry we return `WK_TIMEOUT`
+// rather than wedge the calling thread. The Rust side is expected to
+// call us from `tokio::task::spawn_blocking` so we never block the
+// async runtime even when waiting near the upper bound.
 
 import Foundation
 import WhisperKit
@@ -18,12 +21,106 @@ private let WK_OK: Int32 = 0
 private let WK_NOT_IMPLEMENTED: Int32 = -1
 private let WK_MODEL_MISSING: Int32 = -2
 private let WK_INTERNAL: Int32 = -3
+private let WK_TIMEOUT: Int32 = -4
 
 /// Default WhisperKit variant downloaded by `wk_fetch_model` when the
 /// caller passes a NULL `variant`. Mirrors the Rust-side default in
 /// `whisperkit_bridge.rs::DEFAULT_WK_VARIANT`. ~1GB CoreML bundle per
 /// `docs/plan.md` week-9 onboarding step 5.
 private let WK_DEFAULT_VARIANT = "openai_whisper-small.en"
+
+/// Per-call deadlines for the async→sync semaphore bridge.
+///
+/// WhisperKit is async-only; we block the C caller on a
+/// `DispatchSemaphore` until the Task finishes. Without a deadline a
+/// hung model load (CoreML JIT regression, network stall, etc.) would
+/// pin the Rust `spawn_blocking` worker forever. These bounds turn
+/// "block forever" into a recoverable `WK_TIMEOUT` so the orchestrator
+/// can surface a clear error instead of wedging.
+///
+/// Values are intentionally generous — the deadline is a watchdog,
+/// not a performance budget. Each call site picks its own bound based
+/// on how slow the slow-but-still-healthy case can legitimately be:
+///
+///   - `WK_INIT_TIMEOUT` (2m): first-run model load is mostly CoreML
+///     graph compile; ~30s on Apple Silicon, longer on Intel. 2m
+///     covers the slow-Intel + cold-disk case with headroom.
+///   - `WK_FETCH_TIMEOUT` (30m): ~1GB CoreML bundle on a slow link
+///     (~500 KB/s) takes ~33m, which is a real corporate-network
+///     edge case but not the median; 30m is the watchdog upper bound.
+///     A timed-out fetch may leave partial bytes under
+///     `<dest_dir>/...`; WhisperKit's HubApi resumes on retry.
+///   - `WK_TRANSCRIBE_TIMEOUT` (30m): a single archived session can
+///     be 30+ minutes of audio, and on a slow Intel Mac the realtime
+///     factor sits well below 1×. We pick 30m to match
+///     "longest reasonable session × slowest expected RTF" without
+///     becoming a budget. Per-chunk streaming would let us tighten
+///     this; v1 transcribes the whole WAV in one call.
+private let WK_INIT_TIMEOUT: DispatchTimeInterval = .seconds(120)
+private let WK_FETCH_TIMEOUT: DispatchTimeInterval = .seconds(30 * 60)
+private let WK_TRANSCRIBE_TIMEOUT: DispatchTimeInterval = .seconds(30 * 60)
+
+/// Run an async `body` from a synchronous C entry point with a
+/// deadline. Returns `true` if the work finished before the deadline,
+/// `false` on timeout. On timeout the spawned Task is **not**
+/// cancelled — Swift `Task` cancellation is cooperative and we have no
+/// way to abort an in-flight CoreML model load. The Task may still
+/// complete in the background and write to its captured variables;
+/// callers must therefore not read those variables after a timeout
+/// (and the captures themselves must be either `Sendable` or
+/// internally-locked, since the Task and the caller can otherwise
+/// touch them on different threads).
+///
+/// This helper exists so each `@_cdecl` body has a single, audited
+/// shape for the async→sync bridge instead of three subtly different
+/// open-coded copies.
+private func runWithTimeout(
+    _ timeout: DispatchTimeInterval,
+    _ body: @escaping () async -> Void
+) -> Bool {
+    let sem = DispatchSemaphore(value: 0)
+    // The bare `Task { ... }` form here is the same shape the v0
+    // pre-timeout bridge used; it inherits the calling actor context
+    // (none, for these `@_cdecl` functions). The body is permitted to
+    // capture non-Sendable C-ABI pointers (e.g. `progress_userdata`)
+    // because the C ABI is single-threaded — Rust serializes calls
+    // through `spawn_blocking` per `whisperkit_bridge.rs`.
+    Task {
+        await body()
+        sem.signal()
+    }
+    return sem.wait(timeout: .now() + timeout) == .success
+}
+
+/// Lock-guarded handoff slot for the async→sync outcome of the three
+/// `@_cdecl` bodies. The Task writes through `set` on completion; the
+/// C caller reads through `take` after the semaphore signals (success
+/// path) or never reads at all (timeout path).
+///
+/// The explicit lock makes the Sendable contract auditable: every
+/// access goes through `NSLock`, so the Task and the caller cannot
+/// race on the field even on the timeout-then-late-write path. We use
+/// `final class` (rather than a struct) because the value is shared
+/// by reference between the Task closure and the synchronous caller —
+/// a struct would copy and the Task's writes would never be visible.
+private final class OutcomeSlot<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+
+    func set(_ v: T) {
+        lock.lock()
+        value = v
+        lock.unlock()
+    }
+
+    func take() -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        let v = value
+        value = nil
+        return v
+    }
+}
 
 // MARK: - Global instance (single-init contract)
 //
@@ -45,7 +142,9 @@ private let box = InstanceBox()
 ///
 /// Blocks the calling thread (Rust passes us through
 /// `spawn_blocking`). Returns `WK_OK` on success, `WK_MODEL_MISSING`
-/// if the directory is absent, `WK_INTERNAL` for any other failure.
+/// if the directory is absent, `WK_TIMEOUT` if the load doesn't
+/// finish within `WK_INIT_TIMEOUT`, `WK_INTERNAL` for any other
+/// failure.
 @_cdecl("wk_init")
 public func wk_init(_ model_dir: UnsafePointer<CChar>?) -> Int32 {
     guard let model_dir = model_dir else {
@@ -62,25 +161,39 @@ public func wk_init(_ model_dir: UnsafePointer<CChar>?) -> Int32 {
     // Bridge async → sync via DispatchSemaphore. WhisperKit's README
     // recommends `Task { try await WhisperKit(...) }.value` from
     // synchronous contexts; we wrap that in a semaphore so the C
-    // caller actually blocks until the load completes.
-    let sem = DispatchSemaphore(value: 0)
-    var initErr: Error?
-    var instance: WhisperKit?
+    // caller actually blocks until the load completes — bounded by
+    // `WK_INIT_TIMEOUT` so a hung load surfaces as a recoverable
+    // error instead of wedging the spawn_blocking worker forever.
+    let outcome = OutcomeSlot<Result<WhisperKit, Error>>()
 
-    Task {
+    let finished = runWithTimeout(WK_INIT_TIMEOUT) {
         do {
-            instance = try await WhisperKit(modelFolder: path)
+            let inst = try await WhisperKit(modelFolder: path)
+            outcome.set(.success(inst))
         } catch {
-            initErr = error
+            outcome.set(.failure(error))
         }
-        sem.signal()
     }
-    sem.wait()
+    if !finished {
+        // The Task is still running and may eventually call
+        // `outcome.set` — that's safe because the slot serializes
+        // through its own lock. We deliberately don't `take` here:
+        // any value the Task produces is dropped inside the slot
+        // when the Task's closure goes out of scope.
+        return WK_TIMEOUT
+    }
 
-    if initErr != nil {
+    let instance: WhisperKit
+    switch outcome.take() {
+    case .some(.success(let inst)):
+        instance = inst
+    case .some(.failure):
         return WK_INTERNAL
-    }
-    guard let instance = instance else {
+    case .none:
+        // Task signaled but didn't store an outcome — a programmer
+        // error in this file, not a runtime path. Surface as
+        // Internal rather than crash so the caller still gets a
+        // clean error code.
         return WK_INTERNAL
     }
 
@@ -109,7 +222,8 @@ public func wk_init(_ model_dir: UnsafePointer<CChar>?) -> Int32 {
 /// `Box<dyn FnMut(f32)>` thunk.
 ///
 /// Returns `WK_OK`, `WK_MODEL_MISSING` for an unknown variant (the
-/// HubApi search returns zero matches), or `WK_INTERNAL` for any
+/// HubApi search returns zero matches), `WK_TIMEOUT` if the download
+/// doesn't finish within `WK_FETCH_TIMEOUT`, or `WK_INTERNAL` for any
 /// network / write failure.
 @_cdecl("wk_fetch_model")
 public func wk_fetch_model(
@@ -157,14 +271,14 @@ public func wk_fetch_model(
 
     // Bridge async → sync via DispatchSemaphore, mirroring `wk_init`.
     // Rust passes us through `spawn_blocking`, so blocking here is
-    // expected.
-    let sem = DispatchSemaphore(value: 0)
-    var fetchErr: Error?
-    var resolvedFolder: URL?
+    // expected. Bounded by `WK_FETCH_TIMEOUT` (~30m) — generous
+    // because a ~1GB CoreML bundle on a slow link is legitimately
+    // long, but finite so a stalled download eventually surfaces.
+    let outcome = OutcomeSlot<Result<URL, Error>>()
 
-    Task {
+    let finished = runWithTimeout(WK_FETCH_TIMEOUT) {
         do {
-            resolvedFolder = try await WhisperKit.download(
+            let url = try await WhisperKit.download(
                 variant: variantStr,
                 downloadBase: destURL,
                 progressCallback: { progress in
@@ -177,14 +291,24 @@ public func wk_fetch_model(
                     }
                 }
             )
+            outcome.set(.success(url))
         } catch {
-            fetchErr = error
+            outcome.set(.failure(error))
         }
-        sem.signal()
     }
-    sem.wait()
+    if !finished {
+        // The Rust caller leaks the userdata box on `WK_TIMEOUT` so
+        // late `progress_cb` invocations from the lingering Task
+        // remain valid; see `whisperkit_fetch` in the Rust bridge.
+        writeOut(nil)
+        return WK_TIMEOUT
+    }
 
-    if let err = fetchErr {
+    switch outcome.take() {
+    case .some(.success(let resolvedFolder)):
+        writeOut(resolvedFolder.path)
+        return WK_OK
+    case .some(.failure(let err)):
         // WhisperKit raises `WhisperError.modelsUnavailable` when the
         // variant search returns zero matches; surface that as
         // ModelMissing so the orchestrator distinguishes "bad variant"
@@ -194,13 +318,10 @@ public func wk_fetch_model(
             return WK_MODEL_MISSING
         }
         return WK_INTERNAL
-    }
-    guard let resolvedFolder = resolvedFolder else {
+    case .none:
         writeOut(nil)
         return WK_INTERNAL
     }
-    writeOut(resolvedFolder.path)
-    return WK_OK
 }
 
 // MARK: - wk_transcribe
@@ -251,22 +372,33 @@ public func wk_transcribe(
         return WK_INTERNAL
     }
 
-    // Sync wrapper around WhisperKit's async transcribe call.
-    let sem = DispatchSemaphore(value: 0)
-    var results: [TranscriptionResult] = []
-    var transcribeErr: Error?
+    // Sync wrapper around WhisperKit's async transcribe call. The
+    // call is bounded by `WK_TRANSCRIBE_TIMEOUT` so a wedged decode
+    // (CoreML driver hang, runaway loop) surfaces as a recoverable
+    // error rather than blocking the spawn_blocking worker forever.
+    let outcome = OutcomeSlot<Result<[TranscriptionResult], Error>>()
 
-    Task {
+    let finished = runWithTimeout(WK_TRANSCRIBE_TIMEOUT) {
         do {
-            results = try await instance.transcribe(audioPath: path)
+            let r = try await instance.transcribe(audioPath: path)
+            outcome.set(.success(r))
         } catch {
-            transcribeErr = error
+            outcome.set(.failure(error))
         }
-        sem.signal()
     }
-    sem.wait()
+    if !finished {
+        writeEmpty()
+        return WK_TIMEOUT
+    }
 
-    if transcribeErr != nil {
+    let results: [TranscriptionResult]
+    switch outcome.take() {
+    case .some(.success(let r)):
+        results = r
+    case .some(.failure):
+        writeEmpty()
+        return WK_INTERNAL
+    case .none:
         writeEmpty()
         return WK_INTERNAL
     }
