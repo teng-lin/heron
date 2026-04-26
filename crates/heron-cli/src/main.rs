@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use heron_cli::daemon::{ClientConfig, DEFAULT_BASE_URL, DEFAULT_TIMEOUT, DaemonClient};
+use heron_cli::record_delegate::{
+    DelegateConfig, drive_delegated_session, wait_for_stop as wait_for_record_stop,
+};
 use heron_cli::salvage::{
     SalvageFormat, default_cache_root, exit_code as salvage_exit, print_salvage_list,
 };
@@ -279,6 +282,30 @@ struct RecordArgs {
     /// Recording + Accessibility grants.
     #[arg(long)]
     no_op: bool,
+    /// v2 escape hatch: delegate session control to the localhost
+    /// `herond` daemon over its OpenAPI surface (`POST /v1/meetings`,
+    /// `/v1/events`, `POST /v1/meetings/{id}/end`) instead of running
+    /// the v1 in-process pipeline. Used to exercise the same code
+    /// path the desktop shell drives so CLI + GUI converge on one
+    /// session-control surface.
+    #[arg(long)]
+    daemon: bool,
+    /// Daemon-mode platform (forwarded as the `platform` field on
+    /// `POST /v1/meetings`). Ignored unless `--daemon` is set.
+    #[arg(long, value_enum, default_value_t = PlatformArg::Zoom)]
+    platform: PlatformArg,
+    /// Daemon-mode free-form hint (e.g. window title). Ignored unless
+    /// `--daemon` is set.
+    #[arg(long)]
+    hint: Option<String>,
+    /// Daemon-mode EventKit calendar event id to attach. Ignored
+    /// unless `--daemon` is set.
+    #[arg(long)]
+    calendar_event_id: Option<String>,
+    /// Daemon-mode override flags (`--url`, `--token-file`). Ignored
+    /// unless `--daemon` is set.
+    #[command(flatten)]
+    daemon_common: DaemonCommonArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -616,6 +643,23 @@ fn cmd_synthesize(args: SynthesizeArgs) -> Result<()> {
 fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
     tracing::info!(?args, "record requested");
 
+    if args.daemon {
+        // The v1 `--no-op` flag walks the in-process FSM; it has no
+        // analogue on the daemon HTTP surface, so refuse rather than
+        // silently ignoring it. `--app` / `--out` / `--fake-stt-lag`
+        // are similarly v1-only — accept them for backwards-compat
+        // (so existing scripts still parse) but they have no effect
+        // on the delegated path.
+        if args.no_op {
+            return Err(anyhow::anyhow!(
+                "--no-op cannot be combined with --daemon (the no-op path \
+                 walks the v1 in-process FSM; the daemon has no equivalent). \
+                 Drop one of the flags."
+            ));
+        }
+        return cmd_record_via_daemon(args);
+    }
+
     let cache = args
         .out
         .clone()
@@ -676,6 +720,36 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
             None => println!("session complete: no note written ({:?})", outcome.last_idle_reason),
         }
         Ok::<_, anyhow::Error>(())
+    })
+}
+
+/// `heron record --daemon` entry point. Spins up a single-threaded
+/// tokio runtime (HTTP + SSE only — no audio threads to feed) and
+/// dispatches to [`drive_delegated_session`]. Mirrors the runtime
+/// shape of [`cmd_daemon`] so the two HTTP-driven CLI paths look the
+/// same to a reader.
+fn cmd_record_via_daemon(args: RecordArgs) -> Result<()> {
+    let client = build_daemon_client(&args.daemon_common)?;
+    let duration_cap = args.duration.map(|d| d.0);
+    let config = DelegateConfig {
+        start: StartCaptureArgs {
+            platform: args.platform.into(),
+            hint: args.hint.clone(),
+            calendar_event_id: args.calendar_event_id.clone(),
+        },
+        duration_cap,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+    runtime.block_on(async move {
+        let stop = wait_for_record_stop(duration_cap);
+        drive_delegated_session(&client, config, stop)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     })
 }
 
