@@ -25,10 +25,14 @@
 //! - `https://github.com/` — used to fetch the sherpa-onnx model.
 //!   GitHub HEAD returns 200 / 301 unauthenticated.
 //!
-//! Each target is probed sequentially with the supplied deadline as a
-//! per-call timeout. A `Fail` if **all** probes fail (no network);
-//! `Warn` if *some* fail (one backend is reachable, the user can
-//! still summarize). `Pass` if every probe gets a TCP+TLS handshake.
+//! Each target is probed sequentially. The per-call timeout is
+//! recomputed before each probe as `remaining_budget /
+//! probes_left`, then floored at 500 ms (anything tighter false-
+//! fails on slow corp wifi handshakes). Total wall-time is bounded
+//! by `max(opts.deadline, N × 500 ms)`. A `Fail` if **all** probes
+//! fail (no network); `Warn` if *some* fail (one backend is
+//! reachable, the user can still summarize). `Pass` if every probe
+//! gets a TCP+TLS handshake.
 //!
 //! ## Why not just one connect()?
 //!
@@ -51,7 +55,7 @@
 //!   reachable host that isn't actually api.anthropic.com would
 //!   pass. Cert pinning would catch it; deferred.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{CheckSeverity, RuntimeCheck, RuntimeCheckOptions, RuntimeCheckResult};
 
@@ -183,18 +187,25 @@ impl RuntimeCheck for NetworkReachabilityCheck {
             );
         }
 
-        // Split the per-check deadline across the N probes so the
-        // total wall-time stays bounded by `opts.deadline` rather
-        // than `N * opts.deadline`. Floor at 500 ms — anything
-        // smaller starts to false-fail on a healthy-but-slow corp
-        // wifi handshake.
+        // Track elapsed time and shrink the remaining budget per
+        // probe so cumulative wall-time stays bounded by
+        // `opts.deadline`. We still apply a 500 ms-per-probe floor
+        // — slamming a probe with 50 ms causes false fails on a
+        // healthy-but-slow corp wifi handshake. The honest worst
+        // case (per Gemini PR #125 review): with `total` targets
+        // and a small deadline, late probes can each consume up to
+        // 500 ms, so total wall-time ≤
+        // `max(opts.deadline, total × 500 ms)`. The module doc was
+        // overstating the bound; this comment is the precise one.
         let total = self.targets.len();
-        let per_probe_timeout = (opts.deadline / total as u32).max(Duration::from_millis(500));
-
-        // We only need the failures + the pass-count for the summary,
-        // so don't allocate a parallel Vec of pass names.
+        let started = Instant::now();
         let mut failures: Vec<(String, String)> = Vec::new();
-        for target in &self.targets {
+        for (i, target) in self.targets.iter().enumerate() {
+            let elapsed = started.elapsed();
+            let remaining = opts.deadline.saturating_sub(elapsed);
+            let probes_left = (total - i) as u32;
+            let per_probe_timeout =
+                (remaining / probes_left.max(1)).max(Duration::from_millis(500));
             if let ProbeOutcome::Unreachable { reason } =
                 self.probe.probe(target, per_probe_timeout)
             {
@@ -385,9 +396,12 @@ mod tests {
 
     #[test]
     fn deadline_is_split_across_targets() {
-        // With 3s deadline and 2 targets we expect ~1.5s per probe,
-        // not 3s per probe (which would let the cumulative wall-time
-        // hit 6s — see Gemini review note).
+        // With 3s deadline and 2 targets, the *first* probe gets
+        // ~1.5s (3s remaining / 2 probes left). The second probe,
+        // because the stub returns immediately, sees nearly the full
+        // 3s budget remaining (the elapsed-aware logic gives the
+        // last probe whatever's left). Both bounds are still safe:
+        // each individual probe ≤ opts.deadline.
         let (stub, inner) = SharedStub::new(vec![ProbeOutcome::Reachable, ProbeOutcome::Reachable]);
         let opts = RuntimeCheckOptions {
             deadline: Duration::from_secs(3),
@@ -397,14 +411,23 @@ mod tests {
 
         let timeouts = inner.timeouts.lock().expect("timeouts lock").clone();
         assert_eq!(timeouts.len(), 2);
+        // First probe: opts.deadline / 2 = 1.5s (allow a little slop
+        // for elapsed-time calls).
+        assert!(
+            timeouts[0] <= Duration::from_millis(1_600),
+            "first probe timeout {:?} should be ≈ deadline / N",
+            timeouts[0],
+        );
+        assert!(
+            timeouts[0] >= Duration::from_millis(500),
+            "first probe timeout {:?} must respect the 500ms floor",
+            timeouts[0],
+        );
+        // Both probes must stay within opts.deadline overall.
         for t in &timeouts {
             assert!(
-                *t <= Duration::from_secs(2),
-                "per-probe timeout {t:?} should be ≤ deadline / N"
-            );
-            assert!(
-                *t >= Duration::from_millis(500),
-                "per-probe timeout {t:?} must respect the 500ms floor"
+                *t <= opts.deadline,
+                "per-probe timeout {t:?} must not exceed opts.deadline"
             );
         }
     }

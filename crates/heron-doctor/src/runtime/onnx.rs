@@ -116,6 +116,10 @@ impl OnnxProbe for RealProbe {
         // `HERON_SHERPA_MODEL_DIR` so a user / CI rig can point at a
         // pre-staged bundle.
         let sherpa_dir = match std::env::var_os("HERON_SHERPA_MODEL_DIR") {
+            // `OsStr::is_empty` is stable since Rust 1.84; workspace
+            // MSRV is 1.88 (`Cargo.toml::workspace.package.rust-version`)
+            // so this is safe. `len() > 0` would also work but
+            // clippy's `len_zero` lint flags it.
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => match dirs::cache_dir() {
                 Some(p) => p.join("heron").join("sherpa"),
@@ -135,12 +139,15 @@ impl OnnxProbe for RealProbe {
         ];
 
         for path in &required {
-            // Treat "doesn't exist" and "exists but is empty" as
-            // ModelMissing — the second case happens when a partial
-            // download leaves a 0-byte file behind. Either way the
-            // remediation is the same: re-run the download step.
+            // Treat "doesn't exist", "exists but is empty", and "is
+            // a directory not a file" as ModelMissing. Empty files
+            // happen when a partial download leaves a 0-byte file
+            // behind; the directory check guards against an out-of-
+            // sync test fixture that pre-creates a same-named dir.
+            // Remediation in every case is "re-run the download
+            // step." (Per Gemini review at PR #125.)
             let present = std::fs::metadata(path)
-                .map(|m| m.len() > 0)
+                .map(|m| m.is_file() && m.len() > 0)
                 .unwrap_or(false);
             if !present {
                 return OnnxProbeOutcome::ModelMissing {
