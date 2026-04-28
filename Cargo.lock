@@ -2235,6 +2235,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "filetime",
+ "futures-util",
  "heron-audio",
  "heron-cli",
  "heron-doctor",

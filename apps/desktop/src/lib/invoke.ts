@@ -20,6 +20,13 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
+import type {
+  DaemonResult,
+  ListMeetingsPage,
+  ListMeetingsQuery,
+  Summary,
+} from "./types";
+
 // ---- Domain types --------------------------------------------------
 
 /**
@@ -110,7 +117,17 @@ export interface Settings {
    * user add Microsoft Teams / Google Chrome / other meeting clients.
    */
   target_bundle_ids: string[];
+  /**
+   * UI revamp PR 2: which companion mode the TitleBar pill is set to.
+   * The Rust `ActiveMode` enum serializes to these lowercase strings
+   * via `#[serde(rename_all = "lowercase")]`; pre-revamp settings.json
+   * files default to `"clio"` via the container's `#[serde(default)]`.
+   * Pinned by `active_mode_serializes_lowercase` Rust-side.
+   */
+  active_mode: ActiveMode;
 }
+
+export type ActiveMode = "clio" | "athena" | "pollux";
 
 /**
  * Discriminated union mirroring the Rust `DiskCheckOutcome`
@@ -606,6 +623,43 @@ export interface HeronCommands {
   heron_run_runtime_checks: {
     args: Record<string, never>;
     returns: RuntimeCheckEntry[];
+  };
+  /**
+   * UI revamp PR 3: proxy `GET /v1/meetings`. Returns the
+   * `DaemonResult<ListMeetingsPage>` discriminated union so the
+   * frontend Zustand store can branch on transport failure (the
+   * daemon-down banner) without parsing error strings.
+   */
+  heron_list_meetings: {
+    args: { query: ListMeetingsQuery };
+    returns: DaemonResult<ListMeetingsPage>;
+  };
+  /**
+   * UI revamp PR 3: proxy `GET /v1/meetings/{id}/summary`. Used by
+   * the Home page's lazy-preview hover to render the first ~120
+   * chars of the meeting summary.
+   */
+  heron_meeting_summary: {
+    args: { meetingId: string };
+    returns: DaemonResult<Summary>;
+  };
+  /**
+   * UI revamp PR 4: ensure the Tauri-side SSE bridge is running.
+   * Idempotent — `useSseEvents` calls this on mount; multiple
+   * subscribers share one bridge.
+   */
+  heron_subscribe_events: {
+    args: Record<string, never>;
+    returns: void;
+  };
+  /**
+   * UI revamp PR 4: cancel the SSE bridge. Called from the
+   * `RunEvent::Exit` hook in Rust; the React side normally doesn't
+   * call this directly.
+   */
+  heron_unsubscribe_events: {
+    args: Record<string, never>;
+    returns: void;
   };
 }
 

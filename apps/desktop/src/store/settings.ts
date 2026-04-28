@@ -141,17 +141,25 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ settings: { ...current, ...patch }, dirty: true });
   },
   save: async () => {
-    if (inFlightSave !== null) {
-      // Piggy-back on the in-flight write. The caller gets the same
-      // outcome as the original `save()` rather than queueing a
-      // second write that would clobber its result.
-      return inFlightSave;
+    // Wait out any in-flight save, then re-check whether ours still
+    // needs to persist. The previous code returned `inFlightSave`
+    // directly, which would resolve `true` for a write that never
+    // actually persisted the latest state — a real lost-write under
+    // rapid mode-pill clicks. The loop catches the 3+-call case where
+    // a second save spins up while we were awaiting the first.
+    while (inFlightSave !== null) {
+      await inFlightSave;
     }
     const { settings, settingsPath } = get();
     if (settings === null || settingsPath === null) {
       const message = "Settings not loaded";
       set({ error: message });
       return false;
+    }
+    if (!get().dirty) {
+      // The piggy-backed in-flight write already persisted whatever we
+      // had. Nothing to do.
+      return true;
     }
     // Snapshot the reference we're persisting. If `update()` mutates
     // `settings` while the write is in flight, the post-save `dirty`

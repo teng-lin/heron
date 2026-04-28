@@ -101,7 +101,12 @@ axum = { workspace = true }
 # macOS); we re-enable `rustls-tls` even though the probe target is
 # always plain `http://` so a future migration to https loopback
 # (e.g. mTLS for a paired companion app) doesn't need a Cargo edit.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# UI revamp PR 4: the SSE bridge in `events_bridge.rs` parses
+# `reqwest::Response::bytes_stream()` line-by-line; `StreamExt::next`
+# is the iteration combinator. Workspace pin keeps the version aligned
+# with `heron-realtime` and the rest of the streaming surface.
+futures-util = { workspace = true }
 # Probes that hit TCC (mic, calendar) need `spawn_blocking`, and the
 # tap probe is async — pull `tokio` in for the shared runtime. The
 # `rt` + `time` features are the minimum the probes need (timeout +
