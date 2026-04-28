@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { Settings as SettingsIcon, Shield } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import {
+  ArrowLeft,
+  Settings as SettingsIcon,
+  Shield,
+} from "lucide-react";
 
 import { HeronWordmark } from "../ui/heron-wordmark";
 import { useRecordingStore } from "../../store/recording";
@@ -19,8 +23,17 @@ import { ModePill } from "./mode-pill";
  */
 export function TitleBar() {
   const navigate = useNavigate();
+  const location = useLocation();
   const recordingStart = useRecordingStore((s) => s.recordingStart);
   const elapsed = useElapsed(recordingStart);
+
+  // Show a back button on detail-level routes. /home, /recording,
+  // /athena, /pollux are top-level destinations the sidebar already
+  // covers — a back arrow there feels redundant — but /review/:id,
+  // /settings, /privacy, /salvage benefit from a one-tap return.
+  const showBack = /^\/(review|settings|privacy|salvage)(\/|$)/.test(
+    location.pathname,
+  );
 
   return (
     <header
@@ -39,6 +52,28 @@ export function TitleBar() {
       >
         <HeronWordmark size={14} />
       </Link>
+
+      {showBack && (
+        <button
+          type="button"
+          aria-label="Back"
+          className="inline-flex h-7 items-center gap-1 rounded px-2 text-xs text-ink-3 hover:bg-paper-3"
+          title="Back"
+          onClick={() => {
+            // History.length is 1 for fresh sessions or first-mount
+            // deep-links; in that case fall through to /home so the
+            // user is never stranded on a dead end.
+            if (window.history.length > 1) {
+              navigate(-1);
+            } else {
+              navigate("/home");
+            }
+          }}
+        >
+          <ArrowLeft size={14} aria-hidden="true" />
+          <span>Back</span>
+        </button>
+      )}
 
       <div className="flex-1" data-tauri-drag-region />
 
