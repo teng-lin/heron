@@ -18,6 +18,11 @@ import { create } from "zustand";
 
 import type { MeetingId, TranscriptSegment } from "../lib/types";
 
+// 5 000 finals covers ~4–5 hours at 3–5 s/segment with comfortable
+// headroom. A real Clio meeting caps at ~2 hours; this is defence-in-depth
+// so a daemon replay bug or runaway reconnect can't pin the renderer.
+const MAX_SEGMENTS_PER_MEETING = 5_000;
+
 interface TranscriptState {
   /** segments keyed by meetingId, append-only per meeting. */
   segments: Record<MeetingId, TranscriptSegment[]>;
@@ -62,6 +67,31 @@ export const useTranscriptStore = create<TranscriptState>((set) => ({
         );
         next = [...truncated, seg];
       }
+
+      // Evict oldest finals when the cap is exceeded. Partials are
+      // never dropped — an in-flight partial has no sealed successor
+      // yet, so removing it would leave the UI with a stale utterance.
+      if (next.length > MAX_SEGMENTS_PER_MEETING) {
+        const finalCount = next.filter((s) => s.is_final).length;
+        if (finalCount === 0) {
+          // Pathological: every entry is a partial — skip eviction rather
+          // than corrupting in-flight utterances.
+          console.warn(
+            `[transcript] meetingId=${meetingId}: segment count ${next.length} exceeds cap but no finals to evict`,
+          );
+        } else {
+          const excess = next.length - MAX_SEGMENTS_PER_MEETING;
+          let dropped = 0;
+          next = next.filter((s) => {
+            if (s.is_final && dropped < excess) {
+              dropped++;
+              return false;
+            }
+            return true;
+          });
+        }
+      }
+
       return { segments: { ...state.segments, [meetingId]: next } };
     }),
   reset: (meetingId) =>
