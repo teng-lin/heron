@@ -231,12 +231,12 @@ Engineering ships the technical primitives. Launch readiness for each mode inclu
 4. **Cross-platform Windows/Linux**: Clio and Athena are most portable (no virtual mic needed); Pollux requires platform-specific routing (Windows: `IAudioPolicyConfigFactory` private API; Linux: PipeWire native). Out of scope for v1.
 
 ### Pollux-specific
-5. **Disclosure default direction** (locked OFF with TPC override; reviewers preferred ON): user owns this call. Re-evaluate after Athena ships and we have real adoption data.
-6. **TTS provider** (S0.1): ElevenLabs, OpenAI, or local model.
-7. **HAL plug-in distribution** (S0.4): admin install + `coreaudiod` restart UX flow.
-8. **Notification fan-out**: desktop only vs. watch + phone. Defer to P3 retrospective.
-9. **AX-driving Zoom's mic picker**: brittle but eliminates the user-side device-selection step. Investigate post-P4 if friction warrants.
+1. **Disclosure default direction** (locked OFF with TPC override; reviewers preferred ON): user owns this call. Re-evaluate after Athena ships and we have real adoption data.
+2. **TTS provider** (S0.1): ElevenLabs, OpenAI, or local model.
+3. **HAL plug-in distribution** (S0.4): admin install + `coreaudiod` restart UX flow.
+4. **Notification fan-out**: desktop only vs. watch + phone. Defer to P3 retrospective.
+5. **AX-driving Zoom's mic picker**: brittle but eliminates the user-side device-selection step. Investigate post-P4 if friction warrants.
 
 ### Athena-specific
-10. **Sidebar surface**: in heron's existing window vs. floating overlay (Cluely) vs. Watch. v1 ships sidebar; overlay + Watch are post-MVP.
-11. **Suggestion density**: how often does the LLM speak up? Tunable; defaults to "high signal only" (≤ 1 suggestion per 30 s).
+1. **Sidebar surface**: in heron's existing window vs. floating overlay (Cluely) vs. Watch. v1 ships sidebar; overlay + Watch are post-MVP.
+2. **Suggestion density**: how often does the LLM speak up? Tunable; defaults to "high signal only" (≤ 1 suggestion per 30 s).
