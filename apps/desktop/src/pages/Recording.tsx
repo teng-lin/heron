@@ -7,19 +7,23 @@
  * the TitleBar replaces the page-level "RECORDING · Microphone"
  * label that lived here before.
  *
- * Recording capture itself is not yet wired from the desktop UI
- * (Gap #7 in `docs/archives/codebase-gaps.md`); when the daemon
- * emits `meeting.started` for any path (CLI start, future Gap #7
- * resolution), this page populates from the SSE stream.
+ * Gap #7 (this PR): the Stop & Save button now actually ends the
+ * daemon-side capture via `heron_end_meeting`. The Start path lives
+ * on the Home page; this page accepts arrivals from either Start or
+ * an existing CLI/detector-driven meeting (in which case
+ * `useRecordingStore.meetingId` is null and we fall back to the
+ * meetings store's active meeting id).
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { Mic } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
 import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
+import { invoke } from "../lib/invoke";
 import type { Meeting, TranscriptSegment } from "../lib/types";
 import { useMeetingsStore } from "../store/meetings";
 import { formatElapsed, useRecordingStore } from "../store/recording";
@@ -32,9 +36,11 @@ const EMPTY_SEGMENTS: TranscriptSegment[] = [];
 export default function Recording() {
   const navigate = useNavigate();
   const recordingStart = useRecordingStore((s) => s.recordingStart);
+  const recordingMeetingId = useRecordingStore((s) => s.meetingId);
   const paused = useRecordingStore((s) => s.paused);
   const togglePause = useRecordingStore((s) => s.togglePause);
   const stop = useRecordingStore((s) => s.stop);
+  const [stopping, setStopping] = useState(false);
 
   const meetings = useMeetingsStore((s) => s.items);
   const loadMeetings = useMeetingsStore((s) => s.load);
@@ -86,8 +92,42 @@ export default function Recording() {
   const elapsedMs =
     recordingStart === null ? 0 : Math.max(0, now - recordingStart);
 
-  const handleStop = () => {
-    // TODO Gap #7: invoke `heron_stop_recording` once it exists.
+  // Resolve which meeting Stop should end. Prefer the id we got back
+  // from `heron_start_capture` (set on the Home page's Start button).
+  // Fall back to the meetings store's active meeting — covers the
+  // CLI / external-detector path where the user navigated to
+  // /recording without our Home button starting the session. The
+  // button is disabled when neither is available.
+  const stopTargetId = recordingMeetingId ?? activeMeeting?.id ?? null;
+
+  const handleStop = async () => {
+    if (stopping) return;
+    if (stopTargetId === null) {
+      // Defence in depth: the button is `disabled` when this is
+      // null, but a hotkey or programmatic click could still race.
+      toast.error("No active meeting to stop.");
+      return;
+    }
+    setStopping(true);
+    try {
+      const outcome = await invoke("heron_end_meeting", {
+        meetingId: stopTargetId,
+      });
+      if (outcome.kind !== "ok") {
+        // Surface the daemon's error and stay on the page — clearing
+        // local state would lie about the daemon's view of the
+        // session. The user can retry; if the daemon really is gone,
+        // the daemon-down banner takes over.
+        toast.error(`Could not stop recording: ${outcome.detail}`);
+        return;
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not stop recording: ${message}`);
+      return;
+    } finally {
+      setStopping(false);
+    }
     stop();
     navigate("/home");
   };
@@ -194,8 +234,13 @@ export default function Recording() {
           <Button variant="outline" onClick={togglePause} aria-pressed={paused}>
             {paused ? "Resume" : "Pause"}
           </Button>
-          <Button variant="destructive" onClick={handleStop}>
-            Stop &amp; save
+          <Button
+            variant="destructive"
+            onClick={() => void handleStop()}
+            disabled={stopping || stopTargetId === null}
+            aria-busy={stopping}
+          >
+            {stopping ? "Stopping…" : "Stop & save"}
           </Button>
         </div>
       </main>

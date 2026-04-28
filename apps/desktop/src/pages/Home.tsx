@@ -56,10 +56,38 @@ export default function Home() {
 
   async function proceedToConsent() {
     const decision = await requestConsent();
-    if (decision === "confirmed") {
-      startRecording();
-      navigate("/recording");
+    if (decision !== "confirmed") {
+      return;
     }
+    // Gap #7: ask the daemon to actually start a capture before we
+    // navigate. Pre-PR the button only flipped local recording-store
+    // state; now Start = `POST /v1/meetings`. The platform default is
+    // Zoom — same escape-hatch behaviour as `heron-cli`. A future
+    // patch can preselect from the most recent `meeting.detected`
+    // event or surface a picker; for v1 the most common case (a
+    // running Zoom call) is the right default.
+    let outcome;
+    try {
+      outcome = await invoke("heron_start_capture", { platform: "zoom" });
+    } catch (err) {
+      // Reaching here means the Tauri IPC bridge itself failed — the
+      // daemon never even saw the request. Surface and stay; the
+      // recording-store stays clean so a retry from the same button
+      // works.
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not start recording: ${message}`);
+      return;
+    }
+    if (outcome.kind !== "ok") {
+      // Daemon-side failure (409 already-recording, 5xx
+      // platform-not-running, transport error). The detail string
+      // comes from the daemon's error envelope; surfacing it
+      // verbatim lets the user act on it (e.g., "open Zoom").
+      toast.error(`Could not start recording: ${outcome.detail}`);
+      return;
+    }
+    startRecording(outcome.data.id);
+    navigate("/recording");
   }
 
   async function onStart() {

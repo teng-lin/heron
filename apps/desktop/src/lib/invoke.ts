@@ -24,6 +24,9 @@ import type {
   DaemonResult,
   ListMeetingsPage,
   ListMeetingsQuery,
+  Meeting,
+  MeetingId,
+  Platform,
   Summary,
 } from "./types";
 
@@ -250,6 +253,19 @@ export interface RuntimeCheckEntry {
  * compile time.
  */
 export type KeychainAccount = "anthropic_api_key" | "openai_api_key";
+
+/**
+ * Synthetic ack the Tauri proxy returns for a successful end-meeting
+ * call. Mirrors `apps/desktop/src-tauri/src/meetings.rs::EndMeetingAck`.
+ *
+ * The daemon's HTTP endpoint emits `204 No Content`; the proxy echoes
+ * the validated meeting id back inside this struct so the JS side has a
+ * typed handle to clear local recording state without re-deriving the
+ * id from the request payload.
+ */
+export interface EndMeetingAck {
+  meeting_id: MeetingId;
+}
 
 /**
  * One row in the crash-recovery salvage list. Mirrors the Rust
@@ -642,6 +658,40 @@ export interface HeronCommands {
   heron_meeting_summary: {
     args: { meetingId: string };
     returns: DaemonResult<Summary>;
+  };
+  /**
+   * Gap #7 recording-capture wiring: proxy `POST /v1/meetings`. The
+   * Home page's Start recording button funnels through here after
+   * the consent gate. Returns the freshly-created Meeting on success
+   * (the daemon's 202 body); on transport / 4xx / 5xx failure
+   * collapses to `unavailable` with the error in `detail` so the UI
+   * can toast and stay on /home rather than navigate into a
+   * recording page with no meeting.
+   *
+   * `hint` and `calendarEventId` are optional — the daemon's
+   * orchestrator uses them to disambiguate when multiple platforms
+   * are running (hint), or to attach pre-meeting calendar context
+   * (calendarEventId). v1 desktop callers leave both undefined and
+   * default to Zoom; the picker / detection lands in a follow-up.
+   */
+  heron_start_capture: {
+    args: {
+      platform: Platform;
+      hint?: string | null;
+      calendarEventId?: string | null;
+    };
+    returns: DaemonResult<Meeting>;
+  };
+  /**
+   * Gap #7 recording-capture wiring: proxy `POST /v1/meetings/{id}/end`.
+   * The Recording page's Stop & Save button funnels through here.
+   * The daemon emits `204 No Content`; this proxy synthesizes an
+   * `EndMeetingAck { meeting_id }` so the JS side has a typed handle
+   * to clear local recording state on success.
+   */
+  heron_end_meeting: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<EndMeetingAck>;
   };
   /**
    * UI revamp PR 4: ensure the Tauri-side SSE bridge is running.
