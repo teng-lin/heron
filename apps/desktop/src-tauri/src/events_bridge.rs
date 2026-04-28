@@ -74,10 +74,12 @@ pub const BRIDGE_STATUS_EVENT: &str = "heron://bridge-status";
 
 /// After this many consecutive `Reconnect` outcomes without a
 /// successful frame, emit a `down{reconnect_exhausted}` status event.
-/// 3 consecutive failures ≈ 1+2+4 = 7 s of back-off — enough to
+/// 4 consecutive failures ≈ 1+2+4 = 7 s of back-off — enough to
 /// distinguish a transient blip (usually recovers in < 3 s) from a
 /// real outage, without making the user wait 30 s at MAX_BACKOFF.
-const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+/// (Failures 1–3 each trigger a backoff sleep before the next attempt,
+/// so the down event fires after 1+2+4 s have actually elapsed.)
+const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 4;
 
 /// Initial reconnect delay. Doubles up to [`MAX_BACKOFF`] on
 /// successive failures.
@@ -578,10 +580,11 @@ mod tests {
     }
 
     #[test]
-    fn threshold_is_three() {
+    fn threshold_is_four() {
         // Pin the constant so a reviewer who changes it gets a
         // compile-time reminder to reconsider the comment in the PR.
-        assert_eq!(CONSECUTIVE_FAILURE_THRESHOLD, 3);
+        // 4 failures → 3 completed backoff sleeps (1+2+4 s) before down fires.
+        assert_eq!(CONSECUTIVE_FAILURE_THRESHOLD, 4);
     }
 
     #[test]

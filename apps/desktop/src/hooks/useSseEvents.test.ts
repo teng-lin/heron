@@ -35,6 +35,28 @@ describe("dispatchBridgeStatus", () => {
     expect(useMeetingsStore.getState().daemonDown).toBe(true);
   });
 
+  test("down payload clears items, nextCursor, summaries, loading to mirror load() failure shape", () => {
+    // Pre-populate store with a non-empty state.
+    useMeetingsStore.setState({
+      items: [{ id: "m1" } as never],
+      nextCursor: "cursor-abc",
+      loading: true,
+      summaries: { m1: "some summary" as never },
+      daemonDown: false,
+      error: null,
+    });
+
+    dispatchBridgeStatus({ state: "down", reason: "reconnect_exhausted" });
+
+    const state = useMeetingsStore.getState();
+    expect(state.daemonDown).toBe(true);
+    expect(state.items).toEqual([]);
+    expect(state.nextCursor).toBeNull();
+    expect(state.loading).toBe(false);
+    expect(state.summaries).toEqual({});
+    expect(state.error).toBe("reconnect_exhausted");
+  });
+
   test("down payload with reconnect_exhausted reason also flips daemonDown", () => {
     dispatchBridgeStatus({ state: "down", reason: "reconnect_exhausted" });
     expect(useMeetingsStore.getState().daemonDown).toBe(true);

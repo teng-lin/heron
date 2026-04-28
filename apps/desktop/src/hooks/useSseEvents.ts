@@ -96,7 +96,17 @@ export function useSseEvents() {
  */
 export function dispatchBridgeStatus(payload: BridgeStatusPayload) {
   if (payload.state === "down") {
-    useMeetingsStore.setState({ daemonDown: true });
+    // Mirror the invariant established by `load()`'s failure path: when the
+    // daemon is unreachable, clear items/pagination/summaries so the
+    // DaemonDownBanner renders against a consistent empty-store shape.
+    useMeetingsStore.setState({
+      items: [],
+      nextCursor: null,
+      loading: false,
+      daemonDown: true,
+      summaries: {},
+      error: payload.reason,
+    });
   } else {
     void useMeetingsStore.getState().load();
   }
