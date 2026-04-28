@@ -28,7 +28,12 @@ export function MeetingsTable({ query, filter }: MeetingsTableProps) {
       if (q.length === 0) return true;
       const title = (m.title ?? "").toLowerCase();
       const matchesTitle = title.includes(q);
-      const matchesPlatform = m.platform.includes(q);
+      // Match against the rendered label ("Google Meet") as well as
+      // the wire value ("google_meet") so a query like "google meet"
+      // hits the row the user is actually looking at.
+      const platformLabel = PLATFORM_LABEL[m.platform].toLowerCase();
+      const matchesPlatform =
+        platformLabel.includes(q) || m.platform.includes(q);
       const matchesParticipant = m.participants.some((p) =>
         p.display_name.toLowerCase().includes(q),
       );

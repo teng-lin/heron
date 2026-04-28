@@ -113,9 +113,12 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
     return inFlightLoad;
   },
   fetchSummary: async (id) => {
-    if (get().summaries[id] !== undefined) {
-      // Already in cache (or already in flight as `null`). The first
-      // hover lost the race; later hovers get a cache hit.
+    const cached = get().summaries[id];
+    // `undefined` → never fetched; `null` → fetch in flight; a Summary
+    // object → cached. We DO retry on `"unavailable"` (the previous
+    // attempt failed) so a transient daemon hiccup doesn't permanently
+    // poison the row's preview.
+    if (cached === null || (cached !== undefined && cached !== "unavailable")) {
       return;
     }
     set((state) => ({ summaries: { ...state.summaries, [id]: null } }));

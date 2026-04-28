@@ -89,8 +89,25 @@ function extractActionItems(markdown: string): string[] {
 
 export default function Review() {
   const { sessionId } = useParams<{ sessionId: string }>();
-  const [searchParams] = useSearchParams();
-  const initialTab = searchParams.get("tab") === "diagnostics" ? "diagnostics" : "summary";
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Controlled, not uncontrolled — when the user is already on
+  // /review/{id} and the tray's "View diagnostics" toast pushes
+  // ?tab=diagnostics, the route doesn't remount, so a defaultValue
+  // would leave the visible tab stuck on "summary".
+  const activeTab =
+    searchParams.get("tab") === "diagnostics" ? "diagnostics" : "summary";
+  const onTabChange = useCallback(
+    (next: string) => {
+      const params = new URLSearchParams(searchParams);
+      if (next === "summary") {
+        params.delete("tab");
+      } else {
+        params.set("tab", next);
+      }
+      setSearchParams(params, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
   const settings = useSettingsStore((s) => s.settings);
   const ensureLoaded = useSettingsStore((s) => s.ensureLoaded);
   const settingsLoading = useSettingsStore((s) => s.loading);
@@ -447,7 +464,7 @@ export default function Review() {
             )}
 
             {vaultRoot && sessionId && (
-              <Tabs defaultValue={initialTab}>
+              <Tabs value={activeTab} onValueChange={onTabChange}>
                 <TabsList>
                   <TabsTrigger value="summary">Summary</TabsTrigger>
                   <TabsTrigger value="notes">Notes</TabsTrigger>

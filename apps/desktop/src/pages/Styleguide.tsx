@@ -35,10 +35,21 @@ export default function Styleguide() {
     } else {
       delete document.documentElement.dataset.theme;
     }
+    // Persist for `public/fouc-init.js` to pick up on the next reload.
+    try {
+      localStorage.setItem("heron:theme", t);
+    } catch {
+      /* private mode / quota — non-fatal, theme will reset on reload */
+    }
   };
   const applyAccent = (a: Accent) => {
     setAccent(a);
     document.documentElement.dataset.accent = a;
+    try {
+      localStorage.setItem("heron:accent", a);
+    } catch {
+      /* see applyTheme */
+    }
   };
 
   return (

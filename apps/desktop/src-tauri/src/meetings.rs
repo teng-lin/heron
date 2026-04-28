@@ -95,7 +95,11 @@ pub async fn heron_list_meetings(
     query: TsListMeetingsQuery,
 ) -> Result<DaemonOutcome<ListMeetingsPage>, String> {
     let bearer = state.auth.bearer.clone();
-    Ok(list_meetings_at(BASE_URL, &bearer, query.into()).await)
+    let parsed = match ListMeetingsQuery::try_from(query) {
+        Ok(q) => q,
+        Err(detail) => return Ok(DaemonOutcome::Unavailable { detail }),
+    };
+    Ok(list_meetings_at(BASE_URL, &bearer, parsed).await)
 }
 
 /// Tauri command: fetch the summary for a meeting. Proxies
@@ -142,18 +146,31 @@ pub struct TsListMeetingsQuery {
     pub cursor: Option<String>,
 }
 
-impl From<TsListMeetingsQuery> for ListMeetingsQuery {
-    fn from(q: TsListMeetingsQuery) -> Self {
-        ListMeetingsQuery {
-            since: q
-                .since
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc)),
+impl TryFrom<TsListMeetingsQuery> for ListMeetingsQuery {
+    type Error = String;
+
+    /// Convert the TS query mirror into the daemon's
+    /// [`ListMeetingsQuery`]. Fallible on `since`: a malformed
+    /// RFC3339 string surfaces as a parse error rather than silently
+    /// dropping the filter and widening the request to "everything".
+    /// The frontend renders the resulting `Unavailable` outcome via
+    /// the daemon-down banner.
+    fn try_from(q: TsListMeetingsQuery) -> Result<Self, Self::Error> {
+        let since = match q.since {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| format!("invalid `since` (RFC3339 expected): {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(ListMeetingsQuery {
+            since,
             status: q.status,
             platform: q.platform,
             limit: q.limit,
             cursor: q.cursor,
-        }
+        })
     }
 }
 
@@ -286,16 +303,17 @@ mod tests {
     //! `ListMeetingsPage` / `Summary` JSON.
     use super::*;
     use axum::{
-        Json, Router, extract::Path, http::StatusCode, middleware, response::IntoResponse,
-        routing::get,
+        Json, Router, extract::Path, extract::Query, http::StatusCode, middleware,
+        response::IntoResponse, routing::get,
     };
     use chrono::Utc;
     use heron_session::{
         IdentifierKind, Meeting, Participant, SummaryLifecycle, TranscriptLifecycle,
     };
     use heron_types::MeetingId;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
 
     fn sample_meeting() -> Meeting {
@@ -353,13 +371,24 @@ mod tests {
         }
     }
 
-    async fn spawn(meeting: Arc<Meeting>) -> (SocketAddr, oneshot::Sender<()>) {
+    /// Captures the last query string the mock list-meetings handler
+    /// observed, so tests can assert that proxy serialization actually
+    /// makes it onto the wire.
+    type LastQuery = Arc<Mutex<Option<HashMap<String, String>>>>;
+
+    async fn spawn(meeting: Arc<Meeting>) -> (SocketAddr, oneshot::Sender<()>, LastQuery) {
         let summary = Arc::new(sample_summary(meeting.id));
+        let last_query: LastQuery = Arc::new(Mutex::new(None));
 
         let m = Arc::clone(&meeting);
-        let list_handler = move || {
+        let lq = Arc::clone(&last_query);
+        let list_handler = move |Query(params): Query<HashMap<String, String>>| {
             let m = Arc::clone(&m);
+            let lq = Arc::clone(&lq);
             async move {
+                if let Ok(mut slot) = lq.lock() {
+                    *slot = Some(params);
+                }
                 Json(ListMeetingsPage {
                     items: vec![(*m).clone()],
                     next_cursor: None,
@@ -390,13 +419,13 @@ mod tests {
                 })
                 .await;
         });
-        (addr, tx)
+        (addr, tx, last_query)
     }
 
     #[tokio::test]
     async fn list_meetings_happy_path() {
         let m = Arc::new(sample_meeting());
-        let (addr, _tx) = spawn(Arc::clone(&m)).await;
+        let (addr, _tx, _q) = spawn(Arc::clone(&m)).await;
         let base = format!("http://{addr}/v1");
 
         let outcome = list_meetings_at(&base, "test", ListMeetingsQuery::default()).await;
@@ -416,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn list_meetings_unauthorized_when_bearer_wrong() {
         let m = Arc::new(sample_meeting());
-        let (addr, _tx) = spawn(m).await;
+        let (addr, _tx, _q) = spawn(m).await;
         let base = format!("http://{addr}/v1");
 
         let outcome = list_meetings_at(&base, "wrong-token", ListMeetingsQuery::default()).await;
@@ -450,7 +479,7 @@ mod tests {
     async fn get_summary_happy_path() {
         let m = Arc::new(sample_meeting());
         let id = m.id;
-        let (addr, _tx) = spawn(m).await;
+        let (addr, _tx, _q) = spawn(m).await;
         let base = format!("http://{addr}/v1");
 
         let outcome = get_summary_at(&base, "test", &id.to_string()).await;
@@ -468,14 +497,9 @@ mod tests {
     #[tokio::test]
     async fn list_meetings_propagates_query_params() {
         let m = Arc::new(sample_meeting());
-        let (addr, _tx) = spawn(Arc::clone(&m)).await;
+        let (addr, _tx, last_query) = spawn(Arc::clone(&m)).await;
         let base = format!("http://{addr}/v1");
 
-        // The mock handler ignores the query, but the request should
-        // still succeed with the params attached. This pins that the
-        // ?status / ?platform / ?limit serialization doesn't break the
-        // request shape (e.g. by emitting an empty-string param that
-        // the daemon would reject as a parse error).
         let q = ListMeetingsQuery {
             status: Some(MeetingStatus::Done),
             platform: Some(Platform::Zoom),
@@ -484,5 +508,30 @@ mod tests {
         };
         let outcome = list_meetings_at(&base, "test", q).await;
         assert!(matches!(outcome, DaemonOutcome::Ok { .. }));
+
+        // The mock handler captured the parsed query map. Assert each
+        // param actually rode the wire, with the wire-format values the
+        // daemon expects (lowercase enum strings, decimal limit), and
+        // that no extra/empty params snuck in.
+        let params = last_query
+            .lock()
+            .expect("last_query mutex")
+            .clone()
+            .expect("list-meetings handler should have observed a request");
+        assert_eq!(params.get("status").map(String::as_str), Some("done"));
+        assert_eq!(params.get("platform").map(String::as_str), Some("zoom"));
+        assert_eq!(params.get("limit").map(String::as_str), Some("50"));
+        assert!(!params.contains_key("since"));
+        assert!(!params.contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn try_from_ts_query_rejects_malformed_since() {
+        let bad = TsListMeetingsQuery {
+            since: Some("not-an-rfc3339-string".to_owned()),
+            ..TsListMeetingsQuery::default()
+        };
+        let result = ListMeetingsQuery::try_from(bad);
+        assert!(result.is_err(), "malformed `since` should be rejected");
     }
 }

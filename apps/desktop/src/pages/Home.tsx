@@ -140,9 +140,15 @@ export default function Home() {
             className="relative flex flex-1 min-w-[240px] items-center"
             style={{ color: "var(--color-ink-3)" }}
           >
-            <Search size={14} className="pointer-events-none absolute left-3" />
+            <span className="sr-only">Search meetings</span>
+            <Search
+              size={14}
+              aria-hidden="true"
+              className="pointer-events-none absolute left-3"
+            />
             <input
               type="text"
+              aria-label="Search meetings"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search title, platform, or attendee"

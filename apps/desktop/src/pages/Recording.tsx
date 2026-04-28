@@ -32,12 +32,17 @@ export default function Recording() {
   const stop = useRecordingStore((s) => s.stop);
 
   const meetings = useMeetingsStore((s) => s.items);
+  const loadMeetings = useMeetingsStore((s) => s.load);
   const activeMeeting = useMemo<Meeting | null>(
     () =>
       meetings.find((m) => m.status === "recording" || m.status === "armed") ??
       null,
     [meetings],
   );
+  // Track whether the meetings store has settled at least once on this
+  // mount, so we don't bounce the user back to /home before we know
+  // whether the daemon has a live meeting (deeplink case).
+  const [meetingsSettled, setMeetingsSettled] = useState(false);
   const segments = useTranscriptStore((s) =>
     activeMeeting ? (s.segments[activeMeeting.id] ?? []) : [],
   );
@@ -49,13 +54,30 @@ export default function Recording() {
     return () => clearInterval(id);
   }, [recordingStart]);
 
+  // Deeplink case: user lands on /recording with no local
+  // recordingStart. We need to wait for the meetings store to resolve
+  // before deciding to redirect — otherwise we'd race the SSE-driven
+  // load and bounce them home moments before activeMeeting populates.
+  useEffect(() => {
+    if (recordingStart !== null) return;
+    let cancelled = false;
+    void loadMeetings().finally(() => {
+      if (!cancelled) setMeetingsSettled(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [recordingStart, loadMeetings]);
+
   // If neither the local timer nor a daemon-side meeting is active,
   // bail back to home so the user can start a recording from there.
   useEffect(() => {
-    if (recordingStart === null && activeMeeting === null) {
+    if (recordingStart !== null) return;
+    if (!meetingsSettled) return;
+    if (activeMeeting === null) {
       navigate("/home", { replace: true });
     }
-  }, [recordingStart, activeMeeting, navigate]);
+  }, [recordingStart, meetingsSettled, activeMeeting, navigate]);
 
   const elapsedMs =
     recordingStart === null ? 0 : Math.max(0, now - recordingStart);

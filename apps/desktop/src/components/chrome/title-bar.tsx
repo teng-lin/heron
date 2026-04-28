@@ -64,19 +64,21 @@ export function TitleBar() {
 
       <button
         type="button"
+        aria-label="Privacy"
         className="inline-flex h-7 w-7 items-center justify-center rounded text-ink-3 hover:bg-paper-3"
         title="Where your data goes"
         onClick={() => navigate("/privacy")}
       >
-        <Shield size={14} />
+        <Shield size={14} aria-hidden="true" />
       </button>
       <button
         type="button"
+        aria-label="Settings"
         className="inline-flex h-7 w-7 items-center justify-center rounded text-ink-3 hover:bg-paper-3"
         title="Settings"
         onClick={() => navigate("/settings")}
       >
-        <SettingsIcon size={14} />
+        <SettingsIcon size={14} aria-hidden="true" />
       </button>
     </header>
   );

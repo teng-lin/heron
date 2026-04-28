@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 
-import { useActiveMode } from "../../store/mode";
+import { setActiveMode, useActiveMode } from "../../store/mode";
 import { useMeetingsStore } from "../../store/meetings";
 import { useRecordingStore } from "../../store/recording";
 import { Avatar } from "../ui/avatar";
@@ -149,14 +149,20 @@ export function Sidebar() {
         icon={Zap}
         label={mode === "athena" ? "Athena live" : "Athena"}
         selected={isOn("/athena")}
-        onClick={() => navigate("/athena")}
+        onClick={() => {
+          void setActiveMode("athena");
+          navigate("/athena");
+        }}
       />
       <NavItem
         to="/pollux"
         icon={Speaker}
         label={mode === "pollux" ? "Pollux setup" : "Pollux"}
         selected={isOn("/pollux")}
-        onClick={() => navigate("/pollux")}
+        onClick={() => {
+          void setActiveMode("pollux");
+          navigate("/pollux");
+        }}
       />
 
       {/*

@@ -37,14 +37,19 @@ export function useSseEvents() {
       }
       if (cancelled) return;
 
-      const handle = await listen<EventEnvelope>(FRONTEND_EVENT, (event) => {
-        dispatch(event.payload);
-      });
-      if (cancelled) {
-        handle();
-        return;
+      try {
+        const handle = await listen<EventEnvelope>(FRONTEND_EVENT, (event) => {
+          dispatch(event.payload);
+        });
+        if (cancelled) {
+          handle();
+          return;
+        }
+        unlisten = handle;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[heron] SSE listen() failed:", err);
       }
-      unlisten = handle;
     })();
 
     return () => {
