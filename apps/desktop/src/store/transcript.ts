@@ -50,11 +50,15 @@ export const useTranscriptStore = create<TranscriptState>((set) => ({
         next = [...truncated, seg];
       } else {
         // Final: drop matching non-finals at the same start, append.
+        // The next utterance's `start_secs` typically equals this
+        // utterance's `end_secs` (contiguous transcripts), so the
+        // upper bound is `>=`, not `>` — otherwise a partial that
+        // begins exactly when this utterance ends would be deleted.
         const truncated = prior.filter(
           (s) =>
             s.is_final ||
             s.start_secs < seg.start_secs ||
-            s.start_secs > seg.end_secs,
+            s.start_secs >= seg.end_secs,
         );
         next = [...truncated, seg];
       }

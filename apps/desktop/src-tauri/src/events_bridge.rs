@@ -81,6 +81,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// connection as dead and reconnect.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Cap on the per-connection SSE chunk buffer. A single frame in
+/// practice is well under a kilobyte (one transcript segment, one
+/// state transition, etc). 1 MiB is wildly generous and exists
+/// only to bound memory if the daemon (or an intermediate proxy)
+/// streams data without ever emitting a terminator. Past the cap
+/// we drop the buffer and reconnect rather than OOM.
+const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// State stashed in Tauri's manager for the lifetime of the app.
 /// The mutex guards the "is the bridge running?" flag (the join
 /// handle) and the cancellation channel together so a parallel
@@ -283,7 +291,12 @@ async fn run_once<R: Runtime>(
 
     let mut received_any = false;
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    // Byte buffer (not String) so a multi-byte UTF-8 codepoint split
+    // across chunk boundaries doesn't get U+FFFD'd by from_utf8_lossy
+    // on each side of the split. We decode only when a complete frame
+    // is in hand — at which point every byte of a multi-byte sequence
+    // is necessarily already present.
+    let mut buffer: Vec<u8> = Vec::new();
 
     use futures_util::StreamExt;
     loop {
@@ -291,10 +304,22 @@ async fn run_once<R: Runtime>(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        buffer.extend_from_slice(&bytes);
+                        if buffer.len() > MAX_BUFFER_BYTES {
+                            tracing::warn!(
+                                bytes = buffer.len(),
+                                "SSE bridge: buffer exceeded {MAX_BUFFER_BYTES} bytes without a terminator; reconnecting"
+                            );
+                            return if received_any {
+                                ConnectOutcome::ResetBackoff
+                            } else {
+                                ConnectOutcome::Reconnect
+                            };
+                        }
                         while let Some((idx, term_len)) = find_event_terminator(&buffer) {
-                            let frame = buffer[..idx].to_string();
+                            let frame_bytes = buffer[..idx].to_vec();
                             buffer.drain(..idx + term_len);
+                            let frame = String::from_utf8_lossy(&frame_bytes);
                             if let Some(envelope) = parse_event_frame(&frame) {
                                 if let Some(id) = json_event_id(&envelope) {
                                     *last_event_id = Some(id);
@@ -335,12 +360,12 @@ async fn run_once<R: Runtime>(
 
 /// Find the next event terminator in the buffer. Returns `(idx,
 /// terminator_len)` so the caller can drain `idx + terminator_len`
-/// without ambiguity — `\n\n` is 2 bytes, `\r\n\r\n` is 4. The
-/// previous "drop 2" form left `\r\n` stuck at the front of the
-/// buffer when the daemon (or an intermediate proxy) emitted CRLF.
-fn find_event_terminator(buf: &str) -> Option<(usize, usize)> {
-    let lf = buf.find("\n\n");
-    let crlf = buf.find("\r\n\r\n");
+/// without ambiguity — `\n\n` is 2 bytes, `\r\n\r\n` is 4. Operates
+/// on raw bytes so it works against the un-decoded chunk buffer; the
+/// terminators are pure ASCII so a windowed-byte scan is safe.
+fn find_event_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
     match (lf, crlf) {
         (Some(l), Some(c)) if l <= c => Some((l, 2)),
         (Some(_), Some(c)) => Some((c, 4)),
@@ -446,17 +471,17 @@ mod tests {
 
     #[test]
     fn find_event_terminator_returns_lf_index() {
-        let buf = "id: evt_001\ndata: {}\n\nleftover";
+        let buf = b"id: evt_001\ndata: {}\n\nleftover";
         let (idx, len) = find_event_terminator(buf).expect("terminator");
-        assert_eq!(&buf[..idx], "id: evt_001\ndata: {}");
+        assert_eq!(&buf[..idx], b"id: evt_001\ndata: {}");
         assert_eq!(len, 2);
     }
 
     #[test]
     fn find_event_terminator_handles_crlf() {
-        let buf = "id: evt_001\r\ndata: {}\r\n\r\nleftover";
+        let buf = b"id: evt_001\r\ndata: {}\r\n\r\nleftover";
         let (idx, len) = find_event_terminator(buf).expect("terminator");
-        assert!(buf[..idx].ends_with("data: {}"));
+        assert!(buf[..idx].ends_with(b"data: {}"));
         assert_eq!(len, 4);
     }
 
@@ -468,12 +493,10 @@ mod tests {
         // `find_event_terminator` return the wrong index for frame 2
         // (the residual `\r\n` plus the next CRLF is `\r\n\r\n`,
         // matching the wrong terminator earlier in the stream).
-        let mut buf = String::from(
-            "id: 1\r\ndata: {\"event_id\":\"a\"}\r\n\r\nid: 2\r\ndata: {\"event_id\":\"b\"}\r\n\r\n",
-        );
-        let mut frames = Vec::new();
+        let mut buf: Vec<u8> = b"id: 1\r\ndata: {\"event_id\":\"a\"}\r\n\r\nid: 2\r\ndata: {\"event_id\":\"b\"}\r\n\r\n".to_vec();
+        let mut frames: Vec<String> = Vec::new();
         while let Some((idx, len)) = find_event_terminator(&buf) {
-            let frame = buf[..idx].to_string();
+            let frame = String::from_utf8(buf[..idx].to_vec()).expect("ascii frame");
             buf.drain(..idx + len);
             frames.push(frame);
         }
@@ -482,5 +505,37 @@ mod tests {
         assert!(frames[1].starts_with("id: 2"));
         assert!(frames[1].contains("\"event_id\":\"b\""));
         assert!(buf.is_empty(), "buffer should be drained, got {buf:?}");
+    }
+
+    #[test]
+    fn utf8_codepoint_split_across_chunks_round_trips() {
+        // The previous String-based buffer corrupted multi-byte
+        // codepoints (e.g. CJK characters in a meeting title) at chunk
+        // boundaries: from_utf8_lossy substituted U+FFFD on each side
+        // of the split. With the byte buffer, we accumulate raw bytes
+        // and only decode when a full frame is in hand — by which
+        // point the multi-byte sequence is intact.
+        let frame_with_japanese: &[u8] =
+            "data: {\"event_id\":\"x\",\"title\":\"日本語\"}\n\n".as_bytes();
+        // Split right inside the leading byte of `日` (3 bytes:
+        // E6 97 A5). Chunk A ends at E6, chunk B starts at 97.
+        let split_at = frame_with_japanese
+            .iter()
+            .position(|&b| b == 0xE6)
+            .expect("test fixture contains the kanji prefix")
+            + 1;
+        let chunk_a = &frame_with_japanese[..split_at];
+        let chunk_b = &frame_with_japanese[split_at..];
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(chunk_a);
+        // No terminator yet — the partial byte sits in the buffer.
+        assert!(find_event_terminator(&buf).is_none());
+        buf.extend_from_slice(chunk_b);
+        let (idx, len) = find_event_terminator(&buf).expect("terminator");
+        let frame = String::from_utf8_lossy(&buf[..idx]).into_owned();
+        buf.drain(..idx + len);
+        assert!(frame.contains("日本語"), "got: {frame}");
+        assert!(buf.is_empty());
     }
 }
