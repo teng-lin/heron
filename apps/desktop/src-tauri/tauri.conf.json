@@ -14,10 +14,14 @@
     "windows": [
       {
         "title": "heron",
-        "width": 720,
-        "height": 540,
+        "width": 1180,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": { "x": 14, "y": 16 }
       }
     ],
     "security": {

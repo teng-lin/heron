@@ -29,6 +29,22 @@ pub enum SettingsError {
     Parse(#[from] serde_json::Error),
 }
 
+/// Companion-mode taxonomy per the v2 architecture pivot
+/// (see `docs/heron-vision.md`). The TitleBar's mode pill flips this
+/// field; the rest of the UI gates Athena/Pollux affordances on it.
+///
+/// Default: [`ActiveMode::Clio`] — the silent note-taker, which is
+/// the only mode shipping today. Athena and Pollux ship later but
+/// are routable stubs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ActiveMode {
+    #[default]
+    Clio,
+    Athena,
+    Pollux,
+}
+
 /// User-facing settings persisted by the Settings pane.
 ///
 /// Defaults match the §16.1 v1 starting values: STT runs WhisperKit
@@ -116,6 +132,14 @@ pub struct Settings {
     /// turn the user's existing recordings into mic-only sessions.
     #[serde(default = "default_target_bundle_ids")]
     pub target_bundle_ids: Vec<String>,
+    /// UI revamp PR 2: which companion mode the TitleBar pill is
+    /// currently set to. Drives sidebar / mode-gating behavior across
+    /// the React tree. Pre-revamp settings.json files have no
+    /// `active_mode` field; the container-level `#[serde(default)]`
+    /// fills the missing field with `ActiveMode::Clio`, the only mode
+    /// shipping today. Pinned by
+    /// `read_pre_revamp_settings_fills_active_mode_default`.
+    pub active_mode: ActiveMode,
 }
 
 /// PR-λ default for [`Settings::target_bundle_ids`]: a one-item vec
@@ -143,6 +167,7 @@ impl Default for Settings {
             audio_retention_days: None,
             onboarded: false,
             target_bundle_ids: default_target_bundle_ids(),
+            active_mode: ActiveMode::default(),
         }
     }
 }
@@ -513,6 +538,76 @@ mod tests {
         write_settings(&path, &s).expect("write");
         let parsed = read_settings(&path).expect("read");
         assert_eq!(parsed.target_bundle_ids, s.target_bundle_ids);
+    }
+
+    /// Pre-revamp settings.json files have no `active_mode` field. The
+    /// container-level `#[serde(default)]` must let those deserialize
+    /// cleanly with `active_mode = Clio`, so existing users land on the
+    /// only-shipping mode rather than seeing the deserialize fail.
+    /// Sister test to `read_pre_phase_71_settings_fills_onboarded_default`.
+    #[test]
+    fn read_pre_revamp_settings_fills_active_mode_default() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // Field-set heron-desktop wrote between PR-λ (phase 73 added
+        // `target_bundle_ids`) and the UI revamp (added `active_mode`).
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
+                "vault_root":"/tmp/vault","record_hotkey":"CmdOrCtrl+Shift+R",
+                "remind_interval_secs":30,"recover_on_launch":true,
+                "min_free_disk_mib":2048,"session_logging":true,"crash_telemetry":false,
+                "audio_retention_days":null,"onboarded":true,
+                "target_bundle_ids":["us.zoom.xos","com.microsoft.teams2"]}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        assert_eq!(
+            s.active_mode,
+            ActiveMode::Clio,
+            "missing active_mode field must default to Clio"
+        );
+        // Other fields the file carried must survive untouched —
+        // belt-and-suspenders against a regression that confuses
+        // container-level default with field-level reset.
+        assert_eq!(s.vault_root, "/tmp/vault");
+        assert!(s.onboarded);
+        assert_eq!(
+            s.target_bundle_ids,
+            vec!["us.zoom.xos".to_owned(), "com.microsoft.teams2".to_owned(),]
+        );
+    }
+
+    #[test]
+    fn active_mode_round_trips_through_disk() {
+        // The Settings pane's mode pill writes one of the three
+        // variants; round-trip must preserve the choice across an app
+        // restart so the user lands back on the mode they selected.
+        for mode in [ActiveMode::Clio, ActiveMode::Athena, ActiveMode::Pollux] {
+            let tmp = tempfile::TempDir::new().expect("tmp");
+            let path = tmp.path().join("settings.json");
+            let s_in = Settings {
+                active_mode: mode,
+                ..Default::default()
+            };
+            write_settings(&path, &s_in).expect("write");
+            let s_out = read_settings(&path).expect("read");
+            assert_eq!(s_out.active_mode, mode);
+        }
+    }
+
+    #[test]
+    fn active_mode_serializes_lowercase() {
+        // The TS Settings interface in `lib/invoke.ts` declares
+        // `active_mode: "clio" | "athena" | "pollux"`; the Rust enum
+        // must serialize to those exact lowercase strings so the cross-
+        // boundary contract holds without a manual mapping layer.
+        let s = Settings {
+            active_mode: ActiveMode::Athena,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(json["active_mode"], "athena");
     }
 
     #[test]

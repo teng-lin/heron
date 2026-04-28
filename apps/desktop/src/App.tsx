@@ -40,7 +40,9 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import ConsentGate from "./components/ConsentGate";
+import { RootLayout } from "./components/chrome/root-layout";
 import SalvageBanner from "./components/SalvageBanner";
+import { useSseEvents } from "./hooks/useSseEvents";
 import { useTrayNav } from "./hooks/useTrayNav";
 import { invoke, type DegradedPayload } from "./lib/invoke";
 import { resolvePostOnboardingDestination } from "./lib/postOnboardingDestination";
@@ -48,8 +50,12 @@ import Home from "./pages/Home";
 import Onboarding from "./pages/Onboarding";
 import Recording from "./pages/Recording";
 import Review from "./pages/Review";
+import Athena from "./pages/Athena";
+import Pollux from "./pages/Pollux";
+import Privacy from "./pages/Privacy";
 import Salvage from "./pages/Salvage";
 import Settings from "./pages/Settings";
+import Styleguide from "./pages/Styleguide";
 import { useSalvagePromptStore } from "./store/salvage";
 import { useSettingsStore } from "./store/settings";
 
@@ -58,6 +64,7 @@ export default function App() {
   useSalvagePrompt();
   useDiskPreflightBanner();
   useTrayDegradedToast();
+  useSseEvents();
 
   return (
     <>
@@ -70,13 +77,29 @@ export default function App() {
        */}
       <SalvageBanner />
       <Routes>
+        {/*
+         * `/onboarding` lives outside the new chrome layout — the
+         * wizard owns the full window until the user finishes setup.
+         * Every other authenticated route mounts inside RootLayout
+         * (TitleBar + Sidebar). The `/` first-run gate is layout-less
+         * because it only renders a tiny loading placeholder before
+         * redirecting.
+         */}
         <Route path="/" element={<FirstRunGate />} />
-        <Route path="/home" element={<Home />} />
         <Route path="/onboarding" element={<Onboarding />} />
-        <Route path="/recording" element={<Recording />} />
-        <Route path="/review/:sessionId" element={<Review />} />
-        <Route path="/salvage" element={<Salvage />} />
-        <Route path="/settings" element={<Settings />} />
+        <Route element={<RootLayout />}>
+          <Route path="/home" element={<Home />} />
+          <Route path="/recording" element={<Recording />} />
+          <Route path="/review/:sessionId" element={<Review />} />
+          <Route path="/salvage" element={<Salvage />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="/privacy" element={<Privacy />} />
+          <Route path="/athena" element={<Athena />} />
+          <Route path="/pollux" element={<Pollux />} />
+          {import.meta.env.DEV && (
+            <Route path="/__styleguide" element={<Styleguide />} />
+          )}
+        </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       <ConsentGate />

@@ -1,33 +1,26 @@
 /**
- * Home / dashboard route — the post-onboarding landing surface.
+ * Home / Library — the post-onboarding landing surface.
  *
- * App.tsx routes returning users here when there's no `heron_last_note_session_id`
- * to deep-link into a Review window, so the copy + affordances need to read as a
- * "ready to record" state, not a scaffold.
+ * Shows the meetings list pulled from `useMeetingsStore` (which calls
+ * `heron_list_meetings` against the in-process daemon). The
+ * "Start recording" CTA preserves the existing PR-λ disk-space gate +
+ * ConsentGate flow before navigating to /recording.
  *
- * Phase 64 (PR-β) adds the "Start recording" entry point: it routes
- * through the consent gate (`useConsentStore.requestConsent()`) and,
- * on confirm, seeds `useRecordingStore` with `Date.now()` and
- * navigates to `/recording`.
- *
- * Phase 73 (PR-λ) adds a pre-flight disk-space gate ahead of the
- * consent modal: `heron_check_disk_for_recording` is called first;
- * if the cache volume is below the user's `min_free_disk_mib`
- * threshold, a warning modal explains the shortfall and offers
- * "Continue anyway" / "Cancel" / "Open vault folder". Only on
- * confirm/override does the consent gate run.
- *
- * The Status / Onboarding / Settings links double as a diagnostic surface
- * during dogfood: Status pretty-prints `heron_status` for FSM-state
- * verification; Onboarding lets a user re-run the wizard manually until
- * a Settings-side "Re-run onboarding" entry ships.
+ * Daemon-down handling: when the meetings list call returns
+ * `{ kind: "unavailable" }`, the store flips `daemonDown = true` and
+ * the shared `<DaemonDownBanner />` renders the retry UI. Settings
+ * and Salvage routes are deliberately layout-mounted so they keep
+ * working even when the meetings table is unreachable.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Link, useNavigate } from "react-router-dom";
+import { Search } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
+import { DaemonDownBanner } from "../components/DaemonDownBanner";
+import { MeetingsTable, type StatusFilter } from "../components/home/meetings-table";
 import { Button } from "../components/ui/button";
 import {
   DialogContent,
@@ -35,10 +28,11 @@ import {
   DialogTitle,
 } from "../components/ui/dialog";
 import { invoke } from "../lib/invoke";
+import { cn } from "../lib/cn";
 import { useConsentStore } from "../store/consent";
+import { useMeetingsStore } from "../store/meetings";
 import { useRecordingStore } from "../store/recording";
 import { useSettingsStore } from "../store/settings";
-import { useStatusStore } from "../store/status";
 
 interface DiskWarning {
   freeMib: number;
@@ -46,29 +40,29 @@ interface DiskWarning {
 }
 
 export default function Home() {
-  const { status, error, loading, refresh } = useStatusStore();
   const requestConsent = useConsentStore((s) => s.requestConsent);
   const startRecording = useRecordingStore((s) => s.start);
   const ensureLoaded = useSettingsStore((s) => s.ensureLoaded);
+  const loadMeetings = useMeetingsStore((s) => s.load);
   const navigate = useNavigate();
+
   const [diskWarning, setDiskWarning] = useState<DiskWarning | null>(null);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<StatusFilter>("all");
+
+  useEffect(() => {
+    void loadMeetings();
+  }, [loadMeetings]);
 
   async function proceedToConsent() {
     const decision = await requestConsent();
     if (decision === "confirmed") {
-      // Seed the UI store before navigating so the Recording page's
-      // first paint shows `00:00:00` rather than reading a stale
-      // `recordingStart` from a previous session.
       startRecording();
       navigate("/recording");
     }
   }
 
   async function onStart() {
-    // PR-λ pre-flight disk-space gate. The check runs ahead of consent
-    // so a user who's out of room never sees the consent modal — the
-    // disk warning is the higher-priority signal. On `Ok` we proceed
-    // straight to consent.
     try {
       const settingsPath = await invoke("heron_default_settings_path");
       const outcome = await invoke("heron_check_disk_for_recording", {
@@ -82,9 +76,7 @@ export default function Home() {
         return;
       }
     } catch (err) {
-      // The pre-flight check is non-blocking on IPC failure: we'd
-      // rather let the user start recording than fail the start
-      // because settings.json couldn't be read. Log + fall through.
+      // Pre-flight check is non-blocking on IPC failure.
       // eslint-disable-next-line no-console
       console.warn("[heron] disk pre-flight failed at start:", err);
     }
@@ -97,10 +89,6 @@ export default function Home() {
   }
 
   async function openVaultFolder() {
-    // The brief calls for "@tauri-apps/plugin-shell if available, else
-    // just prints the path". `plugin-shell` isn't a current dep; fall
-    // back to a toast that surfaces the path so the user can navigate
-    // to it manually. Keeps the diff small.
     try {
       const settings = await ensureLoaded();
       const target = settings?.vault_root ?? "";
@@ -119,31 +107,59 @@ export default function Home() {
   }
 
   return (
-    <main className="p-6 space-y-4">
-      <h1 className="text-2xl font-semibold">Welcome back</h1>
-      <p className="text-muted-foreground">
-        Start a meeting recording from the tray, hit ⌘⇧R, or use the button below.
-      </p>
-      <div className="flex gap-2 flex-wrap">
-        <Button onClick={() => void onStart()}>Start recording</Button>
-        <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
-          {loading ? "Refreshing…" : "Status"}
-        </Button>
-        <Button variant="outline" asChild>
-          <Link to="/onboarding">Onboarding</Link>
-        </Button>
-        <Button variant="outline" asChild>
-          <Link to="/settings">Settings</Link>
-        </Button>
-      </div>
-      {error && (
-        <pre className="text-destructive whitespace-pre-wrap">{`error: ${error}`}</pre>
-      )}
-      {status && (
-        <pre className="bg-muted text-foreground p-3 rounded-md overflow-auto">
-          {JSON.stringify(status, null, 2)}
-        </pre>
-      )}
+    <>
+      <DaemonDownBanner />
+      <main className="mx-auto w-full max-w-5xl px-8 py-10">
+        <header className="mb-8">
+          <p
+            className="font-mono text-xs uppercase tracking-[0.12em]"
+            style={{ color: "var(--color-ink-3)" }}
+          >
+            Library
+          </p>
+          <h1
+            className="mt-1 font-serif text-[32px] leading-tight"
+            style={{ color: "var(--color-ink)", letterSpacing: "-0.02em" }}
+          >
+            Welcome back
+          </h1>
+          <p
+            className="mt-2 max-w-prose text-sm"
+            style={{ color: "var(--color-ink-2)" }}
+          >
+            Start a recording from the tray, ⌘⇧R, or the button below. Past
+            meetings show up here once the daemon finishes summarizing.
+          </p>
+          <div className="mt-4 flex items-center gap-2">
+            <Button onClick={() => void onStart()}>Start recording</Button>
+          </div>
+        </header>
+
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <label
+            className="relative flex flex-1 min-w-[240px] items-center"
+            style={{ color: "var(--color-ink-3)" }}
+          >
+            <Search size={14} className="pointer-events-none absolute left-3" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search title, platform, or attendee"
+              className="w-full rounded border py-2 pl-9 pr-3 text-sm outline-none transition-shadow focus:shadow-[0_0_0_3px_var(--color-accent-soft)]"
+              style={{
+                background: "var(--color-paper)",
+                borderColor: "var(--color-rule-2)",
+                color: "var(--color-ink)",
+              }}
+            />
+          </label>
+          <FilterChips value={filter} onChange={setFilter} />
+        </div>
+
+        <MeetingsTable query={search} filter={filter} />
+      </main>
+
       <Dialog.Root
         open={diskWarning !== null}
         onOpenChange={(next) => {
@@ -156,12 +172,12 @@ export default function Home() {
           </DialogHeader>
           {diskWarning && (
             <p className="text-sm">
-              Only <strong>{diskWarning.freeMib} MiB</strong> free, threshold
-              is <strong>{diskWarning.thresholdMib} MiB</strong>. Free up disk
+              Only <strong>{diskWarning.freeMib} MiB</strong> free, threshold is{" "}
+              <strong>{diskWarning.thresholdMib} MiB</strong>. Free up disk
               before recording.
             </p>
           )}
-          <div className="flex flex-wrap justify-end gap-2 mt-2">
+          <div className="mt-2 flex flex-wrap justify-end gap-2">
             <Button variant="ghost" onClick={() => setDiskWarning(null)}>
               Cancel
             </Button>
@@ -174,6 +190,48 @@ export default function Home() {
           </div>
         </DialogContent>
       </Dialog.Root>
-    </main>
+    </>
+  );
+}
+
+function FilterChips({
+  value,
+  onChange,
+}: {
+  value: StatusFilter;
+  onChange: (next: StatusFilter) => void;
+}) {
+  const options: { id: StatusFilter; label: string }[] = [
+    { id: "all", label: "All" },
+    { id: "active", label: "In progress" },
+    { id: "done", label: "Done" },
+  ];
+  return (
+    <div
+      className="inline-flex overflow-hidden rounded border"
+      style={{ borderColor: "var(--color-rule)" }}
+    >
+      {options.map((opt) => {
+        const active = opt.id === value;
+        return (
+          <button
+            type="button"
+            key={opt.id}
+            onClick={() => onChange(opt.id)}
+            className={cn(
+              "px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] transition-colors",
+            )}
+            style={{
+              background: active
+                ? "var(--color-accent)"
+                : "var(--color-paper)",
+              color: active ? "var(--color-paper)" : "var(--color-ink-3)",
+            }}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }

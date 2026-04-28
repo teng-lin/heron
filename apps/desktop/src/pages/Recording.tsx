@@ -1,29 +1,28 @@
 /**
  * In-progress recording view — `/recording`.
  *
- * Phase 64 (PR-β) UI affordances only:
+ * UI revamp PR 4: shows the live transcript pane (driven by SSE
+ * events through `useTranscriptStore`) plus participants from the
+ * currently-recording meeting (if any). The chrome's REC pill in
+ * the TitleBar replaces the page-level "RECORDING · Microphone"
+ * label that lived here before.
  *
- *   - Centred monospaced HH:MM:SS timer (driven by `recordingStart` in
- *     `store/recording.ts` + a `setInterval` tick).
- *   - Red blinking dot + "RECORDING · Microphone" label.
- *   - Pause button (UI-only stub — `togglePause` flips a flag we don't
- *     yet thread to the audio pipeline).
- *   - Stop & Save button — clears the recording state, navigates back
- *     to `/home`. Once `heron_stop_recording` exists the button will
- *     `invoke()` it before navigating; for now the TODO below carries
- *     the contract.
- *   - Waveform placeholder: an empty `bg-muted/20` block where the
- *     real WaveSurfer / `Visualizer` ships in phase 64.5.
- *
- * Layout aesthetic borrows from oh-my-whisper's `RecordingView.swift`:
- * dark accent, centred content, minimal chrome.
+ * Recording capture itself is not yet wired from the desktop UI
+ * (Gap #7 in `docs/archives/codebase-gaps.md`); when the daemon
+ * emits `meeting.started` for any path (CLI start, future Gap #7
+ * resolution), this page populates from the SSE stream.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+import { DaemonDownBanner } from "../components/DaemonDownBanner";
+import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
-import { useRecordingStore, formatElapsed } from "../store/recording";
+import type { Meeting, TranscriptSegment } from "../lib/types";
+import { useMeetingsStore } from "../store/meetings";
+import { formatElapsed, useRecordingStore } from "../store/recording";
+import { useTranscriptStore } from "../store/transcript";
 
 export default function Recording() {
   const navigate = useNavigate();
@@ -32,89 +31,187 @@ export default function Recording() {
   const togglePause = useRecordingStore((s) => s.togglePause);
   const stop = useRecordingStore((s) => s.stop);
 
-  // Tick once per second to redraw the timer. We keep a `now` in
-  // useState rather than reading `Date.now()` inside JSX so React
-  // re-renders deterministically; the interval cleans itself up on
-  // unmount.
-  //
-  // The Pause button is a stub: the label flips and `paused` is
-  // tracked in the store, but the timer keeps incrementing because
-  // the audio pipeline isn't yet wired through Tauri (so there's
-  // nothing to actually pause). Once `heron_pause_recording` lands,
-  // the FSM will own the elapsed-at-pause and this component will
-  // read the freeze value from the backend.
+  const meetings = useMeetingsStore((s) => s.items);
+  const activeMeeting = useMemo<Meeting | null>(
+    () =>
+      meetings.find((m) => m.status === "recording" || m.status === "armed") ??
+      null,
+    [meetings],
+  );
+  const segments = useTranscriptStore((s) =>
+    activeMeeting ? (s.segments[activeMeeting.id] ?? []) : [],
+  );
+
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const handle = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(handle);
-  }, []);
+    if (recordingStart === null) return;
+    const id = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(id);
+  }, [recordingStart]);
 
-  // If a user lands on `/recording` directly without seeding the
-  // store (e.g. a deep-link from the tray with no consent flow), bail
-  // out to home. This keeps the timer from showing an obviously-stale
-  // duration (or `Date.now() - 0`).
+  // If neither the local timer nor a daemon-side meeting is active,
+  // bail back to home so the user can start a recording from there.
   useEffect(() => {
-    if (recordingStart === null) {
+    if (recordingStart === null && activeMeeting === null) {
       navigate("/home", { replace: true });
     }
-  }, [recordingStart, navigate]);
+  }, [recordingStart, activeMeeting, navigate]);
 
-  const elapsedMs = recordingStart === null ? 0 : now - recordingStart;
+  const elapsedMs =
+    recordingStart === null ? 0 : Math.max(0, now - recordingStart);
 
   const handleStop = () => {
-    // TODO: once the Rust orchestrator exposes `heron_stop_recording`,
-    // call it here via the typed `invoke()` wrapper before clearing
-    // the local state. Today the audio pipeline isn't wired through
-    // Tauri yet, so we just reset the UI.
+    // TODO Gap #7: invoke `heron_stop_recording` once it exists.
     stop();
     navigate("/home");
   };
 
   return (
-    <main className="min-h-screen bg-foreground text-background flex flex-col items-center justify-center gap-8 px-6 py-10">
-      <div className="flex items-center gap-3 text-sm uppercase tracking-[0.2em] text-background/70">
-        <span
-          aria-hidden="true"
-          className={
-            "inline-block h-2.5 w-2.5 rounded-full bg-destructive " +
-            (paused ? "" : "animate-pulse")
-          }
-        />
-        <span>{paused ? "PAUSED · Microphone" : "RECORDING · Microphone"}</span>
-      </div>
+    <>
+      <DaemonDownBanner />
+      <main className="mx-auto w-full max-w-5xl px-8 py-8">
+        <header className="mb-6 flex items-end justify-between">
+          <div>
+            <p
+              className="font-mono text-xs uppercase tracking-[0.12em]"
+              style={{ color: "var(--color-ink-3)" }}
+            >
+              Live · {paused ? "Paused" : "Recording"}
+            </p>
+            <h1
+              className="mt-1 font-serif text-[28px] leading-tight"
+              style={{ color: "var(--color-ink)", letterSpacing: "-0.02em" }}
+            >
+              {activeMeeting?.title ?? "Untitled meeting"}
+            </h1>
+          </div>
+          <div
+            className="font-mono text-3xl tabular-nums"
+            style={{ color: "var(--color-ink-2)" }}
+            aria-label={`Elapsed time ${formatElapsed(elapsedMs)}`}
+          >
+            {formatElapsed(elapsedMs)}
+          </div>
+        </header>
 
-      {/* No `aria-live` — that would force a screen-reader
-          announcement every second once the value updates. The
-          implicit reading on focus + the "RECORDING" label above is
-          sufficient for AT users; sighted users have the visible
-          digits. */}
-      <div
-        className="font-mono text-6xl tabular-nums tracking-wide"
-        aria-label={`Elapsed time ${formatElapsed(elapsedMs)}`}
-      >
-        {formatElapsed(elapsedMs)}
-      </div>
+        {activeMeeting && activeMeeting.participants.length > 0 && (
+          <section className="mb-6">
+            <p
+              className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em]"
+              style={{ color: "var(--color-ink-3)" }}
+            >
+              In the room
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              {activeMeeting.participants.map((p) => (
+                <span
+                  key={p.display_name}
+                  className="inline-flex items-center gap-2 rounded-full border px-2 py-0.5 text-xs"
+                  style={{
+                    background: "var(--color-paper-2)",
+                    borderColor: "var(--color-rule)",
+                    color: "var(--color-ink-2)",
+                  }}
+                >
+                  <Avatar name={p.display_name} size={16} />
+                  {p.display_name}
+                </span>
+              ))}
+            </div>
+          </section>
+        )}
 
-      {/* TODO: waveform — phase 64.5 */}
-      <div
-        className="h-20 w-full max-w-md rounded-md bg-muted/20"
-        aria-hidden="true"
-      />
+        <TranscriptPane segments={segments} />
 
-      <div className="flex gap-3">
-        <Button
-          variant="outline"
-          onClick={togglePause}
-          // The text + aria-pressed flip together; screen readers
-          // announce the new state on click.
-          aria-pressed={paused}
-        >
-          {paused ? "Resume" : "Pause"}
-        </Button>
-        <Button variant="destructive" onClick={handleStop}>
-          Stop &amp; Save
-        </Button>
-      </div>
-    </main>
+        <div className="mt-6 flex gap-3">
+          <Button variant="outline" onClick={togglePause} aria-pressed={paused}>
+            {paused ? "Resume" : "Pause"}
+          </Button>
+          <Button variant="destructive" onClick={handleStop}>
+            Stop &amp; save
+          </Button>
+        </div>
+      </main>
+    </>
   );
+}
+
+function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {
+  if (segments.length === 0) {
+    return (
+      <div
+        className="rounded border px-6 py-12 text-center"
+        style={{
+          background: "var(--color-paper-2)",
+          borderColor: "var(--color-rule)",
+          color: "var(--color-ink-3)",
+        }}
+      >
+        <p
+          className="font-serif text-lg"
+          style={{ color: "var(--color-ink-2)" }}
+        >
+          Listening…
+        </p>
+        <p className="mt-1 text-xs">
+          Live captions appear here once the daemon emits transcript
+          segments.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div
+      className="overflow-hidden rounded border"
+      style={{
+        background: "var(--color-paper)",
+        borderColor: "var(--color-rule)",
+      }}
+    >
+      <div
+        className="max-h-[60vh] overflow-y-auto p-4"
+        // Live regions are noisy with screen readers; the visible
+        // ticker is enough for sighted users and the Review page
+        // hosts the canonical transcript for AT users.
+      >
+        {segments.map((seg, i) => (
+          <Line key={`${seg.start_secs}-${i}`} segment={seg} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Line({ segment }: { segment: TranscriptSegment }) {
+  return (
+    <div className="mb-3 flex gap-3">
+      <Avatar name={segment.speaker.display_name} size={20} />
+      <div className="min-w-0 flex-1">
+        <div
+          className="font-mono text-[10px] uppercase tracking-[0.12em]"
+          style={{ color: "var(--color-ink-3)" }}
+        >
+          {segment.speaker.display_name}
+          <span className="ml-2">{formatStamp(segment.start_secs)}</span>
+        </div>
+        <p
+          className={
+            segment.is_final
+              ? "text-sm leading-relaxed"
+              : "text-sm leading-relaxed italic opacity-70"
+          }
+          style={{ color: "var(--color-ink)" }}
+        >
+          {segment.text}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function formatStamp(secs: number): string {
+  const total = Math.max(0, Math.floor(secs));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }

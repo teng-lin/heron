@@ -18,8 +18,10 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod disk;
 pub mod event_bus;
+pub mod events_bridge;
 pub mod keychain;
 pub mod keychain_resolver;
+pub mod meetings;
 pub mod model_download;
 pub mod notes;
 pub mod onboarding;
@@ -766,6 +768,10 @@ pub fn run() {
                 };
                 event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
                 daemon::install(&app_handle, orchestrator).await?;
+                // UI revamp PR 4: install the SSE bridge state slot.
+                // The bridge task itself is started by the
+                // `heron_subscribe_events` command on app mount.
+                events_bridge::install(&app_handle);
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
             // Phase 68 (PR-ζ): register the saved hotkey at app
@@ -832,6 +838,19 @@ pub fn run() {
             // probes stay in place; this one returns the cross-cutting
             // "is this machine ready to record?" verdict.
             heron_run_runtime_checks,
+            // UI revamp PR 3: meetings list + summary proxy. Routes
+            // `GET /v1/meetings` and `GET /v1/meetings/{id}/summary`
+            // through Rust because the daemon's bearer auth + Origin
+            // policy + the Tauri CSP all block direct webview access.
+            meetings::heron_list_meetings,
+            meetings::heron_meeting_summary,
+            // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
+            // `/v1/events` stream. Same auth/Origin/CSP rationale as
+            // the meetings proxy — the webview cannot connect
+            // directly. The bridge is app-lifetime; the frontend
+            // listens via @tauri-apps/api/event::listen("heron://event").
+            events_bridge::heron_subscribe_events,
+            events_bridge::heron_unsubscribe_events,
         ])
         // We split the original `.run(generate_context!())`
         // shorthand into `.build(...)?.run(callback)` so we can
@@ -863,6 +882,11 @@ pub fn run() {
                 // `daemon::install` never ran, which is a
                 // programming bug we want to surface in the system
                 // log rather than swallow.
+                // UI revamp PR 4: cancel the SSE bridge first so its
+                // streaming reqwest call doesn't hold the daemon's
+                // axum graceful-shutdown waiting on a draining
+                // response.
+                events_bridge::shutdown_from_state(app_handle);
                 if let Some(handle) = app_handle.try_state::<DaemonHandle>() {
                     handle.signal_shutdown();
                     tracing::info!("Exit hook: shutdown signaled to in-process herond");
