@@ -25,6 +25,7 @@ pub mod meetings;
 pub mod model_download;
 pub mod notes;
 pub mod onboarding;
+pub mod platform_detect;
 pub mod preflight;
 pub mod resummarize;
 pub mod runtime_checks;
@@ -844,6 +845,16 @@ pub fn run() {
             // policy + the Tauri CSP all block direct webview access.
             meetings::heron_list_meetings,
             meetings::heron_meeting_summary,
+            // Wire the Home page Start-recording / Stop & save buttons
+            // through to the daemon's `POST /v1/meetings` and
+            // `POST /v1/meetings/{id}/end`. Before this, the buttons
+            // only flipped a Zustand flag and the audio pipeline was
+            // CLI-only. `heron_detect_meeting_platform` picks which
+            // `Platform` to send by scanning running processes — the
+            // Home button has no implicit platform context.
+            meetings::heron_start_capture,
+            meetings::heron_end_meeting,
+            platform_detect::heron_detect_meeting_platform,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

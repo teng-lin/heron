@@ -151,6 +151,15 @@ libc = "0.2"
 # pulling a second log crate. The `tracing-subscriber` set up by the
 # binary's `main.rs` (or by tests) routes the line to stderr.
 tracing = { workspace = true }
+# Platform auto-detect (`platform_detect.rs`) enumerates running
+# processes to pick which `Platform` to send to `start_capture` when
+# the user clicks the Home Start-recording button without a calendar-
+# event hint. `heron-doctor` already pulls `sysinfo` in transitively
+# (its Zoom preflight uses the same crate); pinning matches doctor's
+# `0.32 + features = ["system"]` to keep one version resolving across
+# the workspace. `default-features = false` skips disk / network /
+# memory monitoring we don't need for a one-shot process scan.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"

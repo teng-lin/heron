@@ -56,9 +56,33 @@ export default function Home() {
 
   async function proceedToConsent() {
     const decision = await requestConsent();
-    if (decision === "confirmed") {
-      startRecording();
-      navigate("/recording");
+    if (decision !== "confirmed") {
+      return;
+    }
+    // `startRecording()` invokes the Tauri start-capture proxy
+    // (POST /v1/meetings via the daemon) and only resolves once the
+    // daemon-side FSM walks `idle → armed → recording`. Navigate
+    // only on a successful start; on `unavailable` surface a toast
+    // so the user gets the same daemon-down feedback the meetings
+    // list uses, without leaving them on a /recording page that
+    // would render "no active session" anyway.
+    //
+    // The try/catch covers IPC-layer failures (Tauri command
+    // panicked, JSON envelope malformed) — `DaemonOutcome` already
+    // carries the daemon-down case. We don't expect this path in
+    // practice but bubbling an unhandled rejection out of a click
+    // handler would make the React error boundary fire on what
+    // should just be a toast.
+    try {
+      const outcome = await startRecording();
+      if (outcome.kind === "ok") {
+        navigate("/recording");
+      } else {
+        toast.error(`Could not start recording: ${outcome.detail}`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not start recording: ${message}`);
     }
   }
 

@@ -52,9 +52,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use heron_session::{
-    ListMeetingsPage, ListMeetingsQuery, MeetingId, MeetingStatus, Platform, Summary,
+    ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus, Platform, Summary,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::daemon::DaemonHandle;
@@ -131,6 +131,76 @@ pub async fn heron_meeting_summary(
     Ok(get_summary_at(BASE_URL, &bearer, &parsed.to_string()).await)
 }
 
+/// TS-side body mirror for the "start a capture" call. The frontend
+/// passes `{ platform, hint? }`; `calendar_event_id` is daemon-only
+/// (set when a calendar correlation triggered the capture, not for
+/// the manual Home-page button), so it's not exposed here.
+///
+/// Length-bound on `hint`: the daemon doesn't currently enforce one,
+/// but a renderer-controlled string flowing into the meeting title is
+/// a vector for log-injection / display-corruption if it ever grows
+/// unbounded. 256 chars matches the practical window-title cap on
+/// macOS and is well above any human-typed hint. Strings longer than
+/// that are truncated; we don't fail the request because the user
+/// might be pasting a long calendar-event title.
+#[derive(Debug, Deserialize)]
+pub struct TsStartCaptureBody {
+    pub platform: Platform,
+    pub hint: Option<String>,
+}
+
+/// Tauri command: start a capture session. Proxies `POST /v1/meetings`.
+///
+/// Returns the [`Meeting`] envelope the daemon emits (status =
+/// `recording`, fresh `id`, `started_at` set). The frontend stores
+/// `id` so [`heron_end_meeting`] can target the same session.
+///
+/// On success the daemon also publishes `meeting.detected` →
+/// `meeting.armed` → `meeting.started` envelopes onto the SSE bus
+/// (`heron-orchestrator/src/lib.rs:1294-1312`); the frontend's
+/// `useTranscriptStore` already subscribes through
+/// `events_bridge::heron_subscribe_events`, so the `/recording` page
+/// hydrates from those events without an explicit poll.
+///
+/// Conflict (`HERON_E_CAPTURE_IN_PROGRESS`) maps to
+/// [`DaemonOutcome::Unavailable`] with the daemon's status code in
+/// `detail` — the frontend renders the same daemon-down banner. v1
+/// doesn't surface a separate "another platform is already recording"
+/// affordance; if that becomes important we add a `Conflict` variant.
+#[tauri::command]
+pub async fn heron_start_capture(
+    state: State<'_, DaemonHandle>,
+    body: TsStartCaptureBody,
+) -> Result<DaemonOutcome<Meeting>, String> {
+    let bearer = state.auth.bearer.clone();
+    let hint = body.hint.map(|h| h.chars().take(256).collect::<String>());
+    Ok(start_capture_at(BASE_URL, &bearer, body.platform, hint).await)
+}
+
+/// Tauri command: end a capture session. Proxies
+/// `POST /v1/meetings/{id}/end`.
+///
+/// The renderer-supplied `meeting_id` is validated with
+/// [`MeetingId::from_str`] before it touches the URL — same
+/// defence-in-depth rationale as [`heron_meeting_summary`]. Returns
+/// `DaemonOutcome<()>`; the daemon emits 204 on success.
+#[tauri::command]
+pub async fn heron_end_meeting(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<()>, String> {
+    let parsed = match MeetingId::from_str(&meeting_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(DaemonOutcome::Unavailable {
+                detail: format!("invalid meeting_id: {e}"),
+            });
+        }
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(end_meeting_at(BASE_URL, &bearer, &parsed.to_string()).await)
+}
+
 /// TS-side query mirror. Tauri's serde plumbing renames camelCase
 /// argument keys (the JS side passes `{ query: { status, limit } }`)
 /// into snake_case, so this struct accepts the exact TS shape.
@@ -200,6 +270,34 @@ fn platform_str(p: Platform) -> &'static str {
     }
 }
 
+/// Build a reqwest client wired to [`REQUEST_TIMEOUT`]. The four
+/// proxy entry points all need the same configuration; pulling the
+/// builder behind one call site keeps the timeout / TLS knobs in
+/// one place if either ever needs changing.
+fn build_client<T>() -> Result<reqwest::Client, DaemonOutcome<T>>
+where
+    T: Serialize,
+{
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| DaemonOutcome::Unavailable {
+            detail: format!("client build: {e}"),
+        })
+}
+
+/// Map a `reqwest` send error to [`DaemonOutcome::Unavailable`]. The
+/// four proxy entry points all surface transport failures with the
+/// same shape; this keeps the call sites tight.
+fn transport_error<T>(e: reqwest::Error) -> DaemonOutcome<T>
+where
+    T: Serialize,
+{
+    DaemonOutcome::Unavailable {
+        detail: e.to_string(),
+    }
+}
+
 /// Parameterized list — split out so unit tests can drive it against
 /// an ephemeral-port axum server.
 pub async fn list_meetings_at(
@@ -207,13 +305,9 @@ pub async fn list_meetings_at(
     bearer: &str,
     query: ListMeetingsQuery,
 ) -> DaemonOutcome<ListMeetingsPage> {
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    let client = match build_client() {
         Ok(c) => c,
-        Err(e) => {
-            return DaemonOutcome::Unavailable {
-                detail: format!("client build: {e}"),
-            };
-        }
+        Err(outcome) => return outcome,
     };
     let mut request = client
         .get(format!("{base_url}/meetings"))
@@ -239,9 +333,7 @@ pub async fn list_meetings_at(
     }
     match request.send().await {
         Ok(resp) => parse_response(resp).await,
-        Err(e) => DaemonOutcome::Unavailable {
-            detail: e.to_string(),
-        },
+        Err(e) => transport_error(e),
     }
 }
 
@@ -255,20 +347,14 @@ pub async fn get_summary_at(
     bearer: &str,
     meeting_id: &str,
 ) -> DaemonOutcome<Summary> {
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    let client = match build_client() {
         Ok(c) => c,
-        Err(e) => {
-            return DaemonOutcome::Unavailable {
-                detail: format!("client build: {e}"),
-            };
-        }
+        Err(outcome) => return outcome,
     };
     let url = format!("{base_url}/meetings/{meeting_id}/summary");
     match client.get(url).bearer_auth(bearer).send().await {
         Ok(resp) => parse_response(resp).await,
-        Err(e) => DaemonOutcome::Unavailable {
-            detail: e.to_string(),
-        },
+        Err(e) => transport_error(e),
     }
 }
 
@@ -287,6 +373,78 @@ where
         Err(e) => DaemonOutcome::Unavailable {
             detail: format!("response body parse: {e}"),
         },
+    }
+}
+
+/// Parameterized start. Posts the start-capture body the daemon's
+/// `StartCaptureBody` extractor expects (`platform`, `hint`,
+/// `calendar_event_id`); the renderer doesn't pass `calendar_event_id`
+/// today (the home button is the manual path), so it's always `None`.
+/// The daemon responds with 202 + a `Meeting` JSON body, which we
+/// hand back via [`parse_response`] — `is_success()` covers 200..=299
+/// so 202 deserializes the same as 200.
+pub async fn start_capture_at(
+    base_url: &str,
+    bearer: &str,
+    platform: Platform,
+    hint: Option<String>,
+) -> DaemonOutcome<Meeting> {
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(outcome) => return outcome,
+    };
+    // The daemon's `StartCaptureBody` derives `Deserialize` directly,
+    // so we serialize a JSON object whose field names match. Wrapping
+    // in a small private struct (rather than `serde_json::json!`)
+    // keeps the wire shape compile-checked: a future field rename on
+    // the daemon's side will land here as a typed error rather than
+    // a runtime "missing field" 4xx.
+    #[derive(Serialize)]
+    struct Body<'a> {
+        platform: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<&'a str>,
+    }
+    let body = Body {
+        platform: platform_str(platform),
+        hint: hint.as_deref(),
+    };
+    let url = format!("{base_url}/meetings");
+    match client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => parse_response(resp).await,
+        Err(e) => transport_error(e),
+    }
+}
+
+/// Parameterized end. The daemon emits 204 No Content on success —
+/// no JSON body to parse — so we short-circuit [`parse_response`] and
+/// return [`DaemonOutcome::Ok`] with `()`. 4xx/5xx (404 unknown id,
+/// 409 already-ended) maps to [`DaemonOutcome::Unavailable`] with the
+/// status code in `detail`, same shape as [`list_meetings_at`].
+pub async fn end_meeting_at(base_url: &str, bearer: &str, meeting_id: &str) -> DaemonOutcome<()> {
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(outcome) => return outcome,
+    };
+    let url = format!("{base_url}/meetings/{meeting_id}/end");
+    match client.post(url).bearer_auth(bearer).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                DaemonOutcome::Ok { data: () }
+            } else {
+                DaemonOutcome::Unavailable {
+                    detail: format!("daemon returned {status}"),
+                }
+            }
+        }
+        Err(e) => transport_error(e),
     }
 }
 
@@ -533,5 +691,280 @@ mod tests {
         };
         let result = ListMeetingsQuery::try_from(bad);
         assert!(result.is_err(), "malformed `since` should be rejected");
+    }
+
+    // ── start / end-meeting proxy tests ──────────────────────────────
+    //
+    // Separate `spawn_capture_routes` helper rather than extending the
+    // GET-only `spawn` above. Splitting keeps the existing read-path
+    // tests untouched (less review churn) and gives the POST tests a
+    // self-contained mock that captures the request body / path
+    // segments the proxy emits.
+
+    use axum::extract::Json as JsonExtract;
+    use axum::http::header;
+    use axum::routing::post;
+
+    /// Captured raw JSON body of the most recent `POST /v1/meetings`
+    /// the mock observed. We capture `serde_json::Value` rather than
+    /// the deserialized `TsStartCaptureBody` because `Option<String>`
+    /// can't distinguish "field omitted" from "field present as
+    /// `null`" — both deserialize to `None`. The `skip_serializing_if`
+    /// assertion in `start_capture_happy_path` checks key presence on
+    /// the raw Value, which is the only way to actually prove the
+    /// field rode the wire as omitted.
+    type LastStartBody = Arc<Mutex<Option<serde_json::Value>>>;
+
+    /// Captured `meeting_id` path segment for the most recent
+    /// `POST /v1/meetings/{id}/end`. `None` until the first request.
+    type LastEndedId = Arc<Mutex<Option<String>>>;
+
+    /// Mock that serves both POST routes. The start handler returns a
+    /// 202 + the synthetic `Meeting` so [`parse_response`]'s
+    /// `is_success()` branch matches. The end handler returns 204
+    /// No Content; we add a `Location` header on start to mirror the
+    /// real daemon's response shape (`crates/herond/.../meetings.rs:103`).
+    async fn spawn_capture_routes(
+        meeting: Arc<Meeting>,
+    ) -> (SocketAddr, oneshot::Sender<()>, LastStartBody, LastEndedId) {
+        let last_body: LastStartBody = Arc::new(Mutex::new(None));
+        let last_ended: LastEndedId = Arc::new(Mutex::new(None));
+
+        let m = Arc::clone(&meeting);
+        let lb = Arc::clone(&last_body);
+        let start_handler = move |JsonExtract(body): JsonExtract<serde_json::Value>| {
+            let m = Arc::clone(&m);
+            let lb = Arc::clone(&lb);
+            async move {
+                if let Ok(mut slot) = lb.lock() {
+                    *slot = Some(body);
+                }
+                let location = format!("/v1/meetings/{}", m.id);
+                let mut res = (StatusCode::ACCEPTED, Json((*m).clone())).into_response();
+                if let Ok(v) = location.parse() {
+                    res.headers_mut().insert(header::LOCATION, v);
+                }
+                res
+            }
+        };
+
+        let le = Arc::clone(&last_ended);
+        let end_handler = move |Path(id): Path<String>| {
+            let le = Arc::clone(&le);
+            async move {
+                if let Ok(mut slot) = le.lock() {
+                    *slot = Some(id);
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+        };
+
+        let app = Router::new()
+            .route("/v1/meetings", post(start_handler))
+            .route("/v1/meetings/{id}/end", post(end_handler))
+            .layer(middleware::from_fn(require_bearer));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (addr, tx, last_body, last_ended)
+    }
+
+    #[tokio::test]
+    async fn start_capture_happy_path() {
+        let m = Arc::new(sample_meeting());
+        let (addr, _tx, last_body, _le) = spawn_capture_routes(Arc::clone(&m)).await;
+        let base = format!("http://{addr}/v1");
+
+        // First call: with a hint. Asserts the request body rides the
+        // wire with both fields populated and the daemon's response
+        // round-trips back as `DaemonOutcome::Ok`.
+        let outcome = start_capture_at(
+            &base,
+            "test",
+            Platform::Zoom,
+            Some("Sprint review".to_owned()),
+        )
+        .await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.id, m.id);
+                assert_eq!(data.platform, Platform::Zoom);
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+        // Reach into the captured raw JSON Value so we can assert on
+        // the wire shape directly.
+        {
+            let body = last_body.lock().expect("last_body mutex");
+            let body = body
+                .as_ref()
+                .expect("start handler should have observed a request");
+            assert_eq!(body.get("platform").and_then(|v| v.as_str()), Some("zoom"));
+            assert_eq!(
+                body.get("hint").and_then(|v| v.as_str()),
+                Some("Sprint review")
+            );
+        }
+
+        // Second call: hint = None. `skip_serializing_if =
+        // "Option::is_none"` should drop the field entirely. Checking
+        // key *presence* on the raw `Value` is the only way to
+        // distinguish "omitted" from "rode the wire as `null`" —
+        // both would deserialize to `None` on a typed `Option<String>`
+        // extractor.
+        let outcome = start_capture_at(&base, "test", Platform::GoogleMeet, None).await;
+        assert!(matches!(outcome, DaemonOutcome::Ok { .. }));
+        let body = last_body.lock().expect("last_body mutex");
+        let body = body
+            .as_ref()
+            .expect("start handler should have observed a request");
+        assert!(
+            !body.as_object().unwrap().contains_key("hint"),
+            "hint should be omitted from the wire entirely; raw body: {body}",
+        );
+        assert_eq!(
+            body.get("platform").and_then(|v| v.as_str()),
+            Some("google_meet")
+        );
+    }
+
+    #[tokio::test]
+    async fn start_capture_unavailable_when_port_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let base = format!("http://{addr}/v1");
+
+        let outcome = start_capture_at(&base, "test", Platform::Zoom, None).await;
+        assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn start_capture_unauthorized_when_bearer_wrong() {
+        let m = Arc::new(sample_meeting());
+        let (addr, _tx, _lb, _le) = spawn_capture_routes(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = start_capture_at(&base, "wrong", Platform::Zoom, None).await;
+        match outcome {
+            DaemonOutcome::Unavailable { detail } => {
+                assert!(
+                    detail.contains("401"),
+                    "expected 401 in detail, got: {detail}"
+                );
+            }
+            DaemonOutcome::Ok { .. } => panic!("expected Unavailable on bad bearer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn end_meeting_happy_path() {
+        let m = Arc::new(sample_meeting());
+        let id = m.id;
+        let (addr, _tx, _lb, last_ended) = spawn_capture_routes(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = end_meeting_at(&base, "test", &id.to_string()).await;
+        assert!(matches!(outcome, DaemonOutcome::Ok { .. }));
+
+        let observed = last_ended
+            .lock()
+            .expect("last_ended mutex")
+            .clone()
+            .expect("end handler should have observed a request");
+        assert_eq!(observed, id.to_string());
+    }
+
+    #[tokio::test]
+    async fn end_meeting_unavailable_when_port_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let base = format!("http://{addr}/v1");
+
+        let outcome = end_meeting_at(&base, "test", "mtg_01h0a").await;
+        assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn start_capture_truncates_oversize_hint() {
+        // Renderer-side `heron_start_capture` clamps `hint` to 256
+        // chars before [`start_capture_at`] runs. Drive the command
+        // surface directly with the same `take(256)` the Tauri command
+        // applies and assert the clamp lands on the wire — the mock
+        // captures the body so we can read the field length back.
+        let m = Arc::new(sample_meeting());
+        let (addr, _tx, last_body, _le) = spawn_capture_routes(Arc::clone(&m)).await;
+        let base = format!("http://{addr}/v1");
+
+        let clamped: String = "A".repeat(1000).chars().take(256).collect();
+        let outcome = start_capture_at(&base, "test", Platform::Zoom, Some(clamped)).await;
+        assert!(matches!(outcome, DaemonOutcome::Ok { .. }));
+
+        let body = last_body.lock().expect("last_body mutex");
+        let observed = body
+            .as_ref()
+            .and_then(|b| b.get("hint"))
+            .and_then(|v| v.as_str())
+            .expect("start handler should have observed hint");
+        assert_eq!(observed.chars().count(), 256);
+    }
+
+    #[tokio::test]
+    async fn start_capture_unavailable_on_malformed_response_body() {
+        // Cover the `parse_response::resp.json::<Meeting>()` failure
+        // branch. A 200 status with a body that doesn't deserialize
+        // into `Meeting` should land as `Unavailable`, not `Ok` with
+        // garbage data — the discriminator is what the frontend
+        // banner-routing logic switches on.
+        let app = Router::new()
+            .route(
+                "/v1/meetings",
+                post(|| async {
+                    (StatusCode::ACCEPTED, "this is not valid Meeting JSON").into_response()
+                }),
+            )
+            .layer(middleware::from_fn(require_bearer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (_tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        let base = format!("http://{addr}/v1");
+        let outcome = start_capture_at(&base, "test", Platform::Zoom, None).await;
+        match outcome {
+            DaemonOutcome::Unavailable { detail } => {
+                assert!(
+                    detail.contains("parse"),
+                    "expected parse-error detail, got: {detail}"
+                );
+            }
+            DaemonOutcome::Ok { .. } => {
+                panic!("expected Unavailable on malformed body")
+            }
+        }
     }
 }

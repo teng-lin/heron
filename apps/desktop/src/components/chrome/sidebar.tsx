@@ -228,7 +228,7 @@ function RecordButton({ recording }: { recording: boolean }) {
         background: recording ? "var(--color-ink-2)" : "var(--color-rec)",
       }}
       disabled
-      title="Recording is started from Home (PR 3+)"
+      title="Use the Start recording button on Home (or ⌘⇧R)"
     >
       {recording ? (
         <Square size={11} />

@@ -6,16 +6,15 @@
 //! map [`heron_session::SessionError`] to the OpenAPI `Error`
 //! envelope.
 //!
-//! Endpoints `start_capture` (`POST /meetings`),
-//! `end_meeting` (`POST /meetings/{id}/end`), and
-//! `attach_context` (`PUT /context`) delegate to the orchestrator
-//! same as the read endpoints. Today
-//! [`heron_session::LocalSessionOrchestrator`] returns
-//! `NotYetImplemented` for those three (the FSM-merge PR fills them
-//! in); the wire response is `501` with the
-//! `HERON_E_NOT_YET_IMPLEMENTED` envelope. The router doesn't know
-//! the difference between "trait stubs" and "real impl" — it just
-//! forwards.
+//! `start_capture` (`POST /meetings`), `end_meeting`
+//! (`POST /meetings/{id}/end`), and `attach_context` (`PUT /context`)
+//! all run the real FSM-driven implementation in
+//! `heron_orchestrator::LocalSessionOrchestrator`: the start
+//! handler walks `idle → armed → recording`, spawns the audio
+//! pipeline, and returns the freshly-created `Meeting`; end
+//! drains the pipeline and finalizes WAV writers. The router
+//! doesn't know the difference between trait stubs and the live
+//! impl — it just forwards.
 
 use axum::Json;
 use axum::Router;

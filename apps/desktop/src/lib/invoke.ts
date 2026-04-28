@@ -24,6 +24,9 @@ import type {
   DaemonResult,
   ListMeetingsPage,
   ListMeetingsQuery,
+  Meeting,
+  MeetingId,
+  Platform,
   Summary,
 } from "./types";
 
@@ -642,6 +645,45 @@ export interface HeronCommands {
   heron_meeting_summary: {
     args: { meetingId: string };
     returns: DaemonResult<Summary>;
+  };
+  /**
+   * Start a capture session via the daemon. Proxies
+   * `POST /v1/meetings`. The daemon walks the recording FSM
+   * `idle → armed → recording`, spawns the audio pipeline (mic
+   * capture + macOS process tap), and returns the freshly-created
+   * `Meeting` with `id` set. Surfaces `DaemonResult` so the caller
+   * can branch on transport failure (daemon-down banner) vs. happy
+   * path. The Home page's Start-recording button is the only call
+   * site today.
+   */
+  heron_start_capture: {
+    args: { body: { platform: Platform; hint?: string } };
+    returns: DaemonResult<Meeting>;
+  };
+  /**
+   * End an in-progress capture session via the daemon. Proxies
+   * `POST /v1/meetings/{id}/end`. The daemon stops the FSM, drains
+   * the audio pipeline, and finalizes the WAV writers; `data` is
+   * the unit type since the daemon emits 204 No Content.
+   * `useRecordingStore.stop()` calls this from the `/recording`
+   * page's "Stop & save" button.
+   */
+  heron_end_meeting: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<null>;
+  };
+  /**
+   * Detect which meeting platform is currently running. Pure local
+   * scan via `sysinfo` (no daemon round-trip). Returns the
+   * highest-priority match (Zoom > Google Meet > Teams > Webex)
+   * from running processes, or `null` when nothing matches. The
+   * Home button's start flow falls back to `Platform::Zoom` on
+   * `null` so the FSM still gets a valid `target_bundle_id` —
+   * `mic.wav` records even if no meeting app is open.
+   */
+  heron_detect_meeting_platform: {
+    args: Record<string, never>;
+    returns: Platform | null;
   };
   /**
    * UI revamp PR 4: ensure the Tauri-side SSE bridge is running.

@@ -1,21 +1,23 @@
 /**
  * In-progress recording view — `/recording`.
  *
- * UI revamp PR 4: shows the live transcript pane (driven by SSE
- * events through `useTranscriptStore`) plus participants from the
- * currently-recording meeting (if any). The chrome's REC pill in
- * the TitleBar replaces the page-level "RECORDING · Microphone"
- * label that lived here before.
+ * Shows the live transcript pane (driven by SSE events through
+ * `useTranscriptStore`) plus participants from the currently-
+ * recording meeting (if any). The chrome's REC pill in the
+ * TitleBar replaces the page-level "RECORDING · Microphone" label
+ * that lived here before.
  *
- * Recording capture itself is not yet wired from the desktop UI
- * (Gap #7 in `docs/archives/codebase-gaps.md`); when the daemon
- * emits `meeting.started` for any path (CLI start, future Gap #7
- * resolution), this page populates from the SSE stream.
+ * The Stop & save button calls `useRecordingStore::stop()`, which
+ * dispatches `heron_end_meeting` for the active session. The
+ * daemon's `meeting.completed` SSE event is what flips the
+ * meetings-list entry from `recording` to `done`; this page only
+ * cares about clearing local UI state and navigating home.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { Mic } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
 import { Avatar } from "../components/ui/avatar";
@@ -87,8 +89,21 @@ export default function Recording() {
     recordingStart === null ? 0 : Math.max(0, now - recordingStart);
 
   const handleStop = () => {
-    // TODO Gap #7: invoke `heron_stop_recording` once it exists.
-    stop();
+    // Fire-and-forget: navigate immediately so the UI doesn't hang
+    // on the daemon's drain (the audio task can take a few seconds
+    // to flush WAV writers). On `unavailable`, `stop()` keeps
+    // `meetingId` set so the sidebar's REC indicator stays honest
+    // — we just toast the failure here so the user knows.
+    //
+    // Pass `activeMeeting?.id` as a fallback for sessions this
+    // renderer didn't start (CLI launch, app reload mid-capture).
+    // Without it, clicking Stop on a rehydrated session would
+    // silently no-op while the daemon kept recording.
+    void stop(activeMeeting?.id).then((outcome) => {
+      if (outcome.kind === "unavailable") {
+        toast.error(`Stop request failed: ${outcome.detail}`);
+      }
+    });
     navigate("/home");
   };
 
