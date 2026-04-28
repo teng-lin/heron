@@ -16,14 +16,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import type { TranscriptSegment } from "../lib/types";
-import { useTranscriptStore } from "./transcript";
+import { MAX_SEGMENTS_PER_MEETING, useTranscriptStore } from "./transcript";
 
 const MID = "meeting-test-001" as const;
 
-// Internal cap exported only for tests via the module boundary;
-// we infer it rather than hard-code a magic number in assertions.
-// 5 000 is the value set in transcript.ts — kept in sync by the test.
-const CAP = 5_000;
+// Internal cap exported from transcript.ts; we use it here to keep
+// the test in sync with the implementation.
+const CAP = MAX_SEGMENTS_PER_MEETING;
 
 afterEach(() => {
   useTranscriptStore.getState().reset(MID);
