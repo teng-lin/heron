@@ -66,6 +66,19 @@ const EVENTS_URL: &str = "http://127.0.0.1:7384/v1/events";
 /// `@tauri-apps/api/event::listen("heron://event", ...)`.
 pub const FRONTEND_EVENT: &str = "heron://event";
 
+/// Tauri event name the bridge emits to signal its own health. Shape:
+/// `{ "state": "up"|"down", "reason": "..." }`. The frontend
+/// `useSseEvents` hook listens and flips `daemonDown` without waiting
+/// for the next `heron_list_meetings` call.
+pub const BRIDGE_STATUS_EVENT: &str = "heron://bridge-status";
+
+/// After this many consecutive `Reconnect` outcomes without a
+/// successful frame, emit a `down{reconnect_exhausted}` status event.
+/// 3 consecutive failures ≈ 1+2+4 = 7 s of back-off — enough to
+/// distinguish a transient blip (usually recovers in < 3 s) from a
+/// real outage, without making the user wait 30 s at MAX_BACKOFF.
+const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+
 /// Initial reconnect delay. Doubles up to [`MAX_BACKOFF`] on
 /// successive failures.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -183,6 +196,24 @@ pub fn heron_unsubscribe_events(bridge: State<'_, SseBridge>) -> Result<(), Stri
     Ok(())
 }
 
+/// Determine whether the consecutive-failure counter has just crossed
+/// the threshold that warrants a `down` status emit. Pure function so
+/// it's straightforward to unit-test without spawning a task.
+fn should_emit_down(consecutive_failures: u32) -> bool {
+    consecutive_failures == CONSECUTIVE_FAILURE_THRESHOLD
+}
+
+/// Emit a bridge-status event. `state` is `"up"` or `"down"`;
+/// `reason` is one of `"connected"`, `"auth_failed"`,
+/// `"reconnect_exhausted"`, or `"stream_closed"`. Only called when the
+/// state actually changes (edge-triggered via `last_emitted`).
+fn emit_bridge_status<R: Runtime>(app: &AppHandle<R>, state: &'static str, reason: &'static str) {
+    let payload = serde_json::json!({ "state": state, "reason": reason });
+    if let Err(e) = app.emit(BRIDGE_STATUS_EVENT, payload) {
+        tracing::warn!(error = %e, "SSE bridge: status emit failed");
+    }
+}
+
 /// Reconnect loop. Owns the lifecycle of one streaming reqwest call;
 /// on error it backs off and re-issues with the last seen
 /// `event_id` as the replay cursor.
@@ -193,6 +224,10 @@ async fn run_loop<R: Runtime>(
 ) {
     let mut last_event_id: Option<String> = None;
     let mut backoff = INITIAL_BACKOFF;
+    let mut consecutive_failures: u32 = 0;
+    // "up" / "down" — tracks what was last emitted so transitions are
+    // edge-triggered and we don't spam identical status events.
+    let mut last_emitted: Option<&'static str> = None;
 
     loop {
         // Fast-fail check — if shutdown fired between iterations,
@@ -222,9 +257,17 @@ async fn run_loop<R: Runtime>(
                 tracing::warn!(
                     "SSE bridge: bearer rotated mid-stream (401). Stopping; user must restart."
                 );
+                if last_emitted != Some("down") {
+                    emit_bridge_status(&app, "down", "auth_failed");
+                }
                 return;
             }
             ConnectOutcome::Reconnect => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if should_emit_down(consecutive_failures) && last_emitted != Some("down") {
+                    emit_bridge_status(&app, "down", "reconnect_exhausted");
+                    last_emitted = Some("down");
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = &mut shutdown_rx => return,
@@ -235,6 +278,11 @@ async fn run_loop<R: Runtime>(
                 // We received at least one event before the stream
                 // closed — reset the backoff so a transient blip
                 // doesn't push us into the 30 s cap.
+                consecutive_failures = 0;
+                if last_emitted == Some("down") {
+                    emit_bridge_status(&app, "up", "connected");
+                    last_emitted = Some("up");
+                }
                 backoff = INITIAL_BACKOFF;
             }
         }
@@ -505,6 +553,35 @@ mod tests {
         assert!(frames[1].starts_with("id: 2"));
         assert!(frames[1].contains("\"event_id\":\"b\""));
         assert!(buf.is_empty(), "buffer should be drained, got {buf:?}");
+    }
+
+    // --- Bridge-status threshold tests ---
+
+    #[test]
+    fn should_emit_down_triggers_at_threshold() {
+        // Below threshold: no emit yet.
+        assert!(!should_emit_down(0));
+        assert!(!should_emit_down(1));
+        assert!(!should_emit_down(2));
+        // Exactly at threshold: emit once.
+        assert!(should_emit_down(CONSECUTIVE_FAILURE_THRESHOLD));
+    }
+
+    #[test]
+    fn should_emit_down_does_not_trigger_above_threshold() {
+        // After the first crossing, subsequent increments must NOT
+        // re-trigger (the edge-triggered `last_emitted` guard handles
+        // dedup in the loop, but the predicate itself is only true at
+        // the threshold value to keep the logic simple to reason about).
+        assert!(!should_emit_down(CONSECUTIVE_FAILURE_THRESHOLD + 1));
+        assert!(!should_emit_down(CONSECUTIVE_FAILURE_THRESHOLD + 10));
+    }
+
+    #[test]
+    fn threshold_is_three() {
+        // Pin the constant so a reviewer who changes it gets a
+        // compile-time reminder to reconsider the comment in the PR.
+        assert_eq!(CONSECUTIVE_FAILURE_THRESHOLD, 3);
     }
 
     #[test]

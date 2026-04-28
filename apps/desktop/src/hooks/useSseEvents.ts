@@ -20,10 +20,18 @@ import { useMeetingsStore } from "../store/meetings";
 import { useTranscriptStore } from "../store/transcript";
 
 const FRONTEND_EVENT = "heron://event";
+const BRIDGE_STATUS_EVENT = "heron://bridge-status";
+
+/** Shape emitted by the Rust bridge on `BRIDGE_STATUS_EVENT`. */
+interface BridgeStatusPayload {
+  state: "up" | "down";
+  reason: "connected" | "auth_failed" | "reconnect_exhausted" | "stream_closed";
+}
 
 export function useSseEvents() {
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
+    let unlistenEvent: (() => void) | null = null;
+    let unlistenStatus: (() => void) | null = null;
     let cancelled = false;
 
     void (async () => {
@@ -45,18 +53,53 @@ export function useSseEvents() {
           handle();
           return;
         }
-        unlisten = handle;
+        unlistenEvent = handle;
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn("[heron] SSE listen() failed:", err);
+      }
+
+      try {
+        const handle = await listen<BridgeStatusPayload>(
+          BRIDGE_STATUS_EVENT,
+          (event) => {
+            dispatchBridgeStatus(event.payload);
+          }
+        );
+        if (cancelled) {
+          handle();
+          return;
+        }
+        unlistenStatus = handle;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[heron] SSE bridge-status listen() failed:", err);
       }
     })();
 
     return () => {
       cancelled = true;
-      if (unlisten) unlisten();
+      if (unlistenEvent) unlistenEvent();
+      if (unlistenStatus) unlistenStatus();
     };
   }, []);
+}
+
+/**
+ * Handle a bridge-status payload from `BRIDGE_STATUS_EVENT`. Kept
+ * outside the hook so it can be unit-tested directly.
+ *
+ * On `down`: flip `daemonDown` immediately so the Home banner renders
+ * without waiting for the next `load()` call. On `up`: re-run `load()`
+ * so the store re-fetches and clears `daemonDown` via the normal
+ * success path.
+ */
+export function dispatchBridgeStatus(payload: BridgeStatusPayload) {
+  if (payload.state === "down") {
+    useMeetingsStore.setState({ daemonDown: true });
+  } else {
+    void useMeetingsStore.getState().load();
+  }
 }
 
 /**
