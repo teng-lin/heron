@@ -30,8 +30,13 @@ export function MeetingsTable({ query, filter }: MeetingsTableProps) {
       const matchesTitle = title.includes(q);
       // Match against the rendered label ("Google Meet") as well as
       // the wire value ("google_meet") so a query like "google meet"
-      // hits the row the user is actually looking at.
-      const platformLabel = PLATFORM_LABEL[m.platform].toLowerCase();
+      // hits the row the user is actually looking at. The label
+      // lookup is defensive against platforms the daemon emits ahead
+      // of a frontend update — we fall back to the wire value rather
+      // than crashing the whole table.
+      const platformLabel = (
+        PLATFORM_LABEL[m.platform] ?? m.platform
+      ).toLowerCase();
       const matchesPlatform =
         platformLabel.includes(q) || m.platform.includes(q);
       const matchesParticipant = m.participants.some((p) =>
@@ -212,7 +217,7 @@ function PlatformBadge({ platform }: { platform: Platform }) {
         background: "var(--color-paper-2)",
       }}
     >
-      {PLATFORM_LABEL[platform]}
+      {PLATFORM_LABEL[platform] ?? platform}
     </span>
   );
 }
@@ -227,7 +232,10 @@ const STATUS_TONE: Record<MeetingStatus, { color: string; bg: string }> = {
 };
 
 function StatusBadge({ status }: { status: MeetingStatus }) {
-  const tone = STATUS_TONE[status];
+  const tone = STATUS_TONE[status] ?? {
+    color: "var(--color-ink-3)",
+    bg: "var(--color-paper-2)",
+  };
   return (
     <span
       className="inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.08em]"

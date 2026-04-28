@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import { Mic } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
@@ -23,6 +24,10 @@ import type { Meeting, TranscriptSegment } from "../lib/types";
 import { useMeetingsStore } from "../store/meetings";
 import { formatElapsed, useRecordingStore } from "../store/recording";
 import { useTranscriptStore } from "../store/transcript";
+
+// Stable empty-segments sentinel. See the selector in Recording for
+// why we can't `?? []` inline.
+const EMPTY_SEGMENTS: TranscriptSegment[] = [];
 
 export default function Recording() {
   const navigate = useNavigate();
@@ -43,9 +48,15 @@ export default function Recording() {
   // mount, so we don't bounce the user back to /home before we know
   // whether the daemon has a live meeting (deeplink case).
   const [meetingsSettled, setMeetingsSettled] = useState(false);
-  const segments = useTranscriptStore((s) =>
-    activeMeeting ? (s.segments[activeMeeting.id] ?? []) : [],
+  // NB: don't `?? []` inside the selector — that returns a new array
+  // ref every call, which makes zustand's useSyncExternalStore see a
+  // different snapshot on every render and triggers an infinite
+  // re-render loop. Keep the selector pure and substitute the empty
+  // sentinel outside.
+  const meetingSegments = useTranscriptStore((s) =>
+    activeMeeting ? s.segments[activeMeeting.id] : undefined,
   );
+  const segments = meetingSegments ?? EMPTY_SEGMENTS;
 
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -54,10 +65,11 @@ export default function Recording() {
     return () => clearInterval(id);
   }, [recordingStart]);
 
-  // Deeplink case: user lands on /recording with no local
-  // recordingStart. We need to wait for the meetings store to resolve
-  // before deciding to redirect — otherwise we'd race the SSE-driven
-  // load and bounce them home moments before activeMeeting populates.
+  // Deeplink / sidebar-click case: user opens /recording without an
+  // active recording. Kick off a meetings load so the SSE-driven
+  // `meeting.started` cache is fresh, then render the "nothing live"
+  // empty state below — we don't bounce them anywhere because that
+  // looked broken (page flickered before snapping back to /home).
   useEffect(() => {
     if (recordingStart !== null) return;
     let cancelled = false;
@@ -69,15 +81,7 @@ export default function Recording() {
     };
   }, [recordingStart, loadMeetings]);
 
-  // If neither the local timer nor a daemon-side meeting is active,
-  // bail back to home so the user can start a recording from there.
-  useEffect(() => {
-    if (recordingStart !== null) return;
-    if (!meetingsSettled) return;
-    if (activeMeeting === null) {
-      navigate("/home", { replace: true });
-    }
-  }, [recordingStart, meetingsSettled, activeMeeting, navigate]);
+  const isLive = recordingStart !== null || activeMeeting !== null;
 
   const elapsedMs =
     recordingStart === null ? 0 : Math.max(0, now - recordingStart);
@@ -87,6 +91,47 @@ export default function Recording() {
     stop();
     navigate("/home");
   };
+
+  if (!isLive) {
+    return (
+      <>
+        <DaemonDownBanner />
+        <main className="mx-auto w-full max-w-5xl px-8 py-10">
+          <header className="mb-8">
+            <p
+              className="font-mono text-xs uppercase tracking-[0.12em]"
+              style={{ color: "var(--color-ink-3)" }}
+            >
+              In progress
+            </p>
+            <h1
+              className="mt-1 font-serif text-[32px] leading-tight"
+              style={{
+                color: "var(--color-ink)",
+                letterSpacing: "-0.02em",
+              }}
+            >
+              No recording right now
+            </h1>
+            <p
+              className="mt-2 max-w-prose text-sm"
+              style={{ color: "var(--color-ink-2)" }}
+            >
+              {meetingsSettled
+                ? "Start a recording from Home, the tray, or ⌘⇧R. Live captions and participants will appear here once a meeting is detected or you press record."
+                : "Checking for an active session…"}
+            </p>
+            <div className="mt-4 flex items-center gap-2">
+              <Button onClick={() => navigate("/home")}>
+                <Mic size={14} aria-hidden="true" />
+                Go to Home
+              </Button>
+            </div>
+          </header>
+        </main>
+      </>
+    );
+  }
 
   return (
     <>
