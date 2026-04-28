@@ -30,6 +30,9 @@ settings.local.toml
 *.swp
 *.swo
 
+# Git worktrees (Claude superpowers convention)
+.worktrees/
+
 # Local vault / recordings (never commit user data)
 /heron-vault/
 /recordings/
