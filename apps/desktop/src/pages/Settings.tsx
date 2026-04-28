@@ -201,6 +201,7 @@ export default function Settings() {
       <Tabs defaultValue="general" orientation="vertical" className="flex gap-6">
         <TabsList className="w-[180px] shrink-0">
           <TabsTrigger value="general">General</TabsTrigger>
+          <TabsTrigger value="appearance">Appearance</TabsTrigger>
           <TabsTrigger value="audio">Audio</TabsTrigger>
           <TabsTrigger value="calendar">Calendar</TabsTrigger>
           <TabsTrigger value="summarizer">Summarizer</TabsTrigger>
@@ -211,6 +212,9 @@ export default function Settings() {
         <div className="flex-1 min-w-0">
           <TabsContent value="general">
             <GeneralTab />
+          </TabsContent>
+          <TabsContent value="appearance">
+            <AppearanceTab />
           </TabsContent>
           <TabsContent value="audio">
             <AudioTab />
@@ -354,6 +358,222 @@ function GeneralTab() {
     </section>
   );
 }
+
+// ---- AppearanceTab -------------------------------------------------
+
+/**
+ * Theme preference stored in localStorage["heron:theme"].
+ * "system" (or missing key) → follow prefers-color-scheme.
+ * "light"  → force light (no data-theme attribute).
+ * "dark"   → force dark (data-theme="dark").
+ */
+type ThemePref = "system" | "light" | "dark";
+
+/**
+ * Accent color stored in localStorage["heron:accent"].
+ * "" (empty / missing key) → bronze (default, baked into @theme).
+ */
+type AccentPref = "" | "ink" | "heron" | "sage";
+
+const THEME_OPTIONS: { value: ThemePref; label: string; description: string }[] =
+  [
+    {
+      value: "system",
+      label: "System",
+      description: "Follow your macOS appearance setting.",
+    },
+    {
+      value: "light",
+      label: "Light",
+      description: "Always use the light palette.",
+    },
+    {
+      value: "dark",
+      label: "Dark",
+      description: "Always use the dark palette.",
+    },
+  ];
+
+const ACCENT_OPTIONS: { value: AccentPref; label: string }[] = [
+  { value: "", label: "Bronze (default)" },
+  { value: "ink", label: "Ink" },
+  { value: "heron", label: "Heron" },
+  { value: "sage", label: "Sage" },
+];
+
+/**
+ * Read the stored theme preference.  Missing key → "system".
+ */
+function readThemePref(): ThemePref {
+  try {
+    const stored = localStorage.getItem("heron:theme");
+    if (stored === "light" || stored === "dark" || stored === "system") {
+      return stored;
+    }
+  } catch {
+    // localStorage not available (unlikely in Tauri, but be defensive)
+  }
+  return "system";
+}
+
+/**
+ * Read the stored accent preference.  Missing key → "" (Bronze).
+ */
+function readAccentPref(): AccentPref {
+  try {
+    const stored = localStorage.getItem("heron:accent");
+    if (stored === "ink" || stored === "heron" || stored === "sage") {
+      return stored;
+    }
+  } catch {
+    // localStorage not available
+  }
+  return "";
+}
+
+/**
+ * Apply a theme pref to the live document and persist it.
+ *
+ * "system" → resolve via matchMedia immediately so the page reflects
+ * the OS preference without a reload; also remove the stored key so
+ * fouc-init.js treats the next launch as "system" too.
+ *
+ * "light" / "dark" → set / clear data-theme and persist.
+ */
+function applyTheme(pref: ThemePref): void {
+  const html = document.documentElement;
+
+  // Resolve the effective theme to apply to the DOM, independent of storage.
+  let effectiveDark: boolean;
+  if (pref === "system") {
+    effectiveDark =
+      window.matchMedia != null &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches;
+  } else {
+    effectiveDark = pref === "dark";
+  }
+
+  if (effectiveDark) {
+    html.dataset.theme = "dark";
+  } else {
+    delete html.dataset.theme;
+  }
+
+  // Persist the raw preference so fouc-init.js can re-apply it on next launch.
+  try {
+    if (pref === "system") {
+      localStorage.removeItem("heron:theme");
+    } else {
+      localStorage.setItem("heron:theme", pref);
+    }
+  } catch {
+    // localStorage unavailable — DOM already updated above, so the session
+    // reflects the choice even though it won't survive a reload.
+  }
+}
+
+/**
+ * Apply an accent pref to the live document and persist it.
+ *
+ * "" (Bronze) → remove data-accent and remove the localStorage key
+ * so fouc-init.js restores the default on next launch.
+ */
+function applyAccent(pref: AccentPref): void {
+  const html = document.documentElement;
+
+  // Update the DOM first — independent of storage availability.
+  if (pref === "") {
+    delete html.dataset.accent;
+  } else {
+    html.dataset.accent = pref;
+  }
+
+  // Persist so fouc-init.js can re-apply on next launch.
+  try {
+    if (pref === "") {
+      localStorage.removeItem("heron:accent");
+    } else {
+      localStorage.setItem("heron:accent", pref);
+    }
+  } catch {
+    // localStorage unavailable — DOM already updated above.
+  }
+}
+
+function AppearanceTab() {
+  const [theme, setTheme] = useState<ThemePref>(readThemePref);
+  const [accent, setAccent] = useState<AccentPref>(readAccentPref);
+
+  function handleThemeChange(value: ThemePref) {
+    setTheme(value);
+    applyTheme(value);
+  }
+
+  function handleAccentChange(value: AccentPref) {
+    setAccent(value);
+    applyAccent(value);
+  }
+
+  return (
+    <section className="space-y-6">
+      <h2 className="text-lg font-medium">Appearance</h2>
+
+      <fieldset className="space-y-3">
+        <legend className="text-sm font-medium">Theme</legend>
+        <div className="space-y-2">
+          {THEME_OPTIONS.map((opt) => (
+            <label
+              key={opt.value}
+              className="flex items-start gap-2 text-sm cursor-pointer"
+            >
+              <input
+                type="radio"
+                name="theme"
+                value={opt.value}
+                checked={theme === opt.value}
+                onChange={() => handleThemeChange(opt.value)}
+                className="mt-0.5 h-4 w-4 accent-primary"
+              />
+              <div>
+                <div>{opt.label}</div>
+                <div className="text-xs text-muted-foreground">
+                  {opt.description}
+                </div>
+              </div>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <fieldset className="space-y-3">
+        <legend className="text-sm font-medium">Accent color</legend>
+        <div className="space-y-2">
+          {ACCENT_OPTIONS.map((opt) => (
+            <label
+              key={opt.value === "" ? "bronze" : opt.value}
+              className="flex items-center gap-2 text-sm cursor-pointer"
+            >
+              <input
+                type="radio"
+                name="accent"
+                value={opt.value}
+                checked={accent === opt.value}
+                onChange={() => handleAccentChange(opt.value)}
+                className="h-4 w-4 accent-primary"
+              />
+              {opt.label}
+            </label>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Changes apply immediately. Reload is not required.
+        </p>
+      </fieldset>
+    </section>
+  );
+}
+
+// ---- AudioTab ------------------------------------------------------
 
 /**
  * Default retention window when the user flips the radio to "purge"
