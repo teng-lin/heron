@@ -844,6 +844,14 @@ pub fn run() {
             // policy + the Tauri CSP all block direct webview access.
             meetings::heron_list_meetings,
             meetings::heron_meeting_summary,
+            // Gap #7 recording-capture wiring: Start / Stop in the
+            // desktop UI now actually drive the daemon's
+            // `POST /v1/meetings` and `POST /v1/meetings/{id}/end`
+            // endpoints (previously the buttons only flipped local
+            // recording-store state). Same auth/Origin/CSP rationale
+            // as the read proxies above.
+            meetings::heron_start_capture,
+            meetings::heron_end_meeting,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

@@ -1,47 +1,66 @@
 /**
  * Recording-session UI state.
  *
- * Phase 64 (PR-β) only owns the *frontend* affordances — the actual
- * audio capture pipeline still lives behind `heron-cli` and gets wired
- * in a later phase. This store tracks the UI's view of "we think we
- * are recording", so the timer + Stop & Save button can render
- * without round-tripping every tick to Rust.
+ * Owns the *frontend* affordances around an active capture — the timer
+ * + Pause/Stop button row + the meeting handle returned by
+ * `heron_start_capture`. The actual audio pipeline lives behind the
+ * daemon (Gap #7 wired Start/Stop in the desktop UI to
+ * `POST /v1/meetings` and `POST /v1/meetings/{id}/end`); this store
+ * tracks "we asked the daemon to record, here's the meeting id it
+ * gave us back" so the Stop button has a typed handle without
+ * re-querying the meetings list.
  *
  * Fields:
  *
  *   - `recordingStart` — `Date.now()` when the user confirmed the
  *     consent gate. The `<Recording>` page derives the elapsed-time
  *     display from this; `null` when no session is active.
- *   - `paused` — UI flag for the Pause button. Stub-only in this PR;
- *     the real audio pipeline doesn't yet expose pause/resume.
+ *   - `meetingId` — id of the daemon-side meeting started for this
+ *     session. `null` when idle, OR when a meeting started outside
+ *     this app (e.g., CLI start) drove us to /recording — in that
+ *     case the Stop handler falls back to the active-meeting id from
+ *     `useMeetingsStore`.
+ *   - `paused` — UI flag for the Pause button. Stub-only; the real
+ *     audio pipeline doesn't yet expose pause/resume.
  *
  * Actions:
  *
- *   - `start()` — seed `recordingStart` with `Date.now()` and reset
- *     `paused`. Called from the consent-gate's confirm handler.
- *   - `stop()`  — clear `recordingStart`. Called by the
- *     "Stop & Save" button after dispatching the (currently absent)
- *     `heron_stop_recording` Tauri command.
+ *   - `start(meetingId)` — seed `recordingStart` + remember the
+ *     daemon-issued meeting handle. Called from the Home page after
+ *     `heron_start_capture` resolves Ok and the consent gate
+ *     confirmed.
+ *   - `stop()`  — clear `recordingStart` and `meetingId`. Called by
+ *     the "Stop & Save" button after `heron_end_meeting` resolves.
  *   - `togglePause()` — flip the local `paused` flag. UI-only.
  */
 
 import { create } from "zustand";
 
+import type { MeetingId } from "../lib/types";
+
 interface RecordingState {
   /** `Date.now()` when the consent gate confirmed; `null` when idle. */
   recordingStart: number | null;
+  /**
+   * Meeting id returned by the most recent `heron_start_capture`.
+   * `null` when idle, or when the user navigated to /recording for a
+   * meeting that wasn't started by this app (CLI / detector path).
+   */
+  meetingId: MeetingId | null;
   /** UI-only pause flag — does not currently affect capture. */
   paused: boolean;
-  start: () => void;
+  start: (meetingId: MeetingId | null) => void;
   stop: () => void;
   togglePause: () => void;
 }
 
 export const useRecordingStore = create<RecordingState>((set) => ({
   recordingStart: null,
+  meetingId: null,
   paused: false,
-  start: () => set({ recordingStart: Date.now(), paused: false }),
-  stop: () => set({ recordingStart: null, paused: false }),
+  start: (meetingId) =>
+    set({ recordingStart: Date.now(), meetingId, paused: false }),
+  stop: () => set({ recordingStart: null, meetingId: null, paused: false }),
   togglePause: () => set((s) => ({ paused: !s.paused })),
 }));
 

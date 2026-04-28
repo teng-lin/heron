@@ -52,9 +52,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use heron_session::{
-    ListMeetingsPage, ListMeetingsQuery, MeetingId, MeetingStatus, Platform, Summary,
+    ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus, Platform, Summary,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::daemon::DaemonHandle;
@@ -129,6 +129,88 @@ pub async fn heron_meeting_summary(
     };
     let bearer = state.auth.bearer.clone();
     Ok(get_summary_at(BASE_URL, &bearer, &parsed.to_string()).await)
+}
+
+/// Tauri command: start a manual capture. Proxies `POST /v1/meetings`.
+///
+/// Mirrors the heron-cli "manual capture escape hatch" — the user
+/// clicks Start Recording on the Home page and we ask the daemon to
+/// arm + start a session for the requested platform. Without this
+/// command the desktop UI was a passive observer of meetings started
+/// by some other path (CLI, future detector); Gap #7's whole point is
+/// closing that loop.
+///
+/// Daemon error mapping mirrors the read commands: any non-2xx HTTP
+/// status (the orchestrator rejects with 409 if a session is already
+/// live, 5xx if the platform isn't running) collapses to
+/// `Unavailable` with the detail string. The frontend surfaces that
+/// via toast and stays on `/home` rather than navigating into a
+/// recording page that has no meeting.
+#[tauri::command]
+pub async fn heron_start_capture(
+    state: State<'_, DaemonHandle>,
+    platform: Platform,
+    hint: Option<String>,
+    calendar_event_id: Option<String>,
+) -> Result<DaemonOutcome<Meeting>, String> {
+    let bearer = state.auth.bearer.clone();
+    Ok(start_capture_at(BASE_URL, &bearer, platform, hint, calendar_event_id).await)
+}
+
+/// Tauri command: end a live capture. Proxies
+/// `POST /v1/meetings/{id}/end`.
+///
+/// Stop & save on the Recording page funnels through here. The
+/// daemon's 204 carries no body, so we synthesize an
+/// [`EndMeetingAck`] echoing the meeting id back so the frontend
+/// has a typed handle to clear local state on success.
+///
+/// `meeting_id` is validated with [`MeetingId::from_str`] before it
+/// touches the URL — same defence-in-depth as
+/// [`heron_meeting_summary`].
+#[tauri::command]
+pub async fn heron_end_meeting(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<EndMeetingAck>, String> {
+    let parsed = match MeetingId::from_str(&meeting_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(DaemonOutcome::Unavailable {
+                detail: format!("invalid meeting_id: {e}"),
+            });
+        }
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(end_meeting_at(BASE_URL, &bearer, &parsed).await)
+}
+
+/// Body shape for `POST /v1/meetings`. Mirrors
+/// [`herond::routes::meetings::StartCaptureBody`] (and
+/// `heron_cli::daemon::StartCaptureBody`); we don't share the cli
+/// crate's struct because pulling `heron-cli` into the desktop crate
+/// just for one wire-format mirror would balloon compile times for
+/// no real reuse.
+#[derive(Debug, Serialize)]
+struct StartCaptureBody<'a> {
+    platform: Platform,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calendar_event_id: Option<&'a str>,
+}
+
+/// Synthetic ack for a successful `POST /v1/meetings/{id}/end`.
+///
+/// The daemon emits `204 No Content` (per the OpenAPI), so the JSON
+/// body is empty; the TS side wants the meeting id back to flush its
+/// local stores without re-deriving it from the request payload. We
+/// echo the parsed id rather than the input string so the
+/// [`MeetingId::from_str`] validation result is the source of truth
+/// — guards against accidental ID drift on future refactors.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EndMeetingAck {
+    pub meeting_id: MeetingId,
 }
 
 /// TS-side query mirror. Tauri's serde plumbing renames camelCase
@@ -268,6 +350,87 @@ pub async fn get_summary_at(
         Ok(resp) => parse_response(resp).await,
         Err(e) => DaemonOutcome::Unavailable {
             detail: e.to_string(),
+        },
+    }
+}
+
+/// Parameterized start — same split-out rationale as
+/// [`list_meetings_at`]. Posts the [`StartCaptureBody`] envelope, then
+/// decodes the daemon's 202 body into a [`Meeting`]. Any non-2xx
+/// (including the orchestrator's 409 "already recording" and the 5xx
+/// platform-not-running cases) collapses to [`DaemonOutcome::Unavailable`]
+/// with the status code in `detail`, matching the existing read
+/// proxies' behaviour.
+pub async fn start_capture_at(
+    base_url: &str,
+    bearer: &str,
+    platform: Platform,
+    hint: Option<String>,
+    calendar_event_id: Option<String>,
+) -> DaemonOutcome<Meeting> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let body = StartCaptureBody {
+        platform,
+        hint: hint.as_deref(),
+        calendar_event_id: calendar_event_id.as_deref(),
+    };
+    let url = format!("{base_url}/meetings");
+    let response = client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await;
+    match response {
+        Ok(resp) => parse_response(resp).await,
+        Err(e) => DaemonOutcome::Unavailable {
+            detail: e.to_string(),
+        },
+    }
+}
+
+/// Parameterized end — same split-out rationale as
+/// [`list_meetings_at`]. The daemon emits `204 No Content` on success;
+/// we synthesize an [`EndMeetingAck`] echoing the validated meeting id
+/// so the JS side has a typed handle without parsing an empty body.
+pub async fn end_meeting_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &MeetingId,
+) -> DaemonOutcome<EndMeetingAck> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/meetings/{meeting_id}/end");
+    let resp = match client.post(url).bearer_auth(bearer).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: EndMeetingAck {
+            meeting_id: *meeting_id,
         },
     }
 }
@@ -533,5 +696,205 @@ mod tests {
         };
         let result = ListMeetingsQuery::try_from(bad);
         assert!(result.is_err(), "malformed `since` should be rejected");
+    }
+
+    // ---- Gap #7 capture-wiring tests ----------------------------------
+    //
+    // The list/summary `spawn` above is read-only. The capture proxies
+    // POST and consume `204 No Content`, so we use a purpose-built
+    // server here rather than overloading the existing fixture — keeps
+    // the read-side tests' invariants (one captured query map, fixed
+    // meeting body) untangled from the capture handlers' state.
+
+    /// Captures the last POST body the start handler observed, plus the
+    /// path the end handler was hit with, so tests assert the wire
+    /// payload + URL shape.
+    type LastCapture = Arc<Mutex<Option<serde_json::Value>>>;
+    type LastEndPath = Arc<Mutex<Option<String>>>;
+
+    async fn spawn_capture(
+        meeting: Meeting,
+    ) -> (SocketAddr, oneshot::Sender<()>, LastCapture, LastEndPath) {
+        let last_body: LastCapture = Arc::new(Mutex::new(None));
+        let last_path: LastEndPath = Arc::new(Mutex::new(None));
+
+        let m = Arc::new(meeting);
+        let mc = Arc::clone(&m);
+        let body_slot = Arc::clone(&last_body);
+        let start_handler = move |Json(body): Json<serde_json::Value>| {
+            let mc = Arc::clone(&mc);
+            let body_slot = Arc::clone(&body_slot);
+            async move {
+                if let Ok(mut slot) = body_slot.lock() {
+                    *slot = Some(body);
+                }
+                // Mirror the daemon's 202-with-Meeting body. The
+                // `Location` header isn't asserted by the proxy, so a
+                // bare `Json` response is enough.
+                (StatusCode::ACCEPTED, Json((*mc).clone()))
+            }
+        };
+
+        let path_slot = Arc::clone(&last_path);
+        let end_handler = move |Path(id): Path<String>| {
+            let path_slot = Arc::clone(&path_slot);
+            async move {
+                if let Ok(mut slot) = path_slot.lock() {
+                    *slot = Some(id);
+                }
+                StatusCode::NO_CONTENT
+            }
+        };
+
+        let app = Router::new()
+            .route("/v1/meetings", axum::routing::post(start_handler))
+            .route("/v1/meetings/{id}/end", axum::routing::post(end_handler))
+            .layer(middleware::from_fn(require_bearer));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (addr, tx, last_body, last_path)
+    }
+
+    #[tokio::test]
+    async fn start_capture_happy_path_returns_meeting() {
+        let m = sample_meeting();
+        let id = m.id;
+        let platform = m.platform;
+        let (addr, _tx, _body, _path) = spawn_capture(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = start_capture_at(&base, "test", platform, None, None).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.id, id);
+                assert_eq!(data.platform, platform);
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_capture_propagates_hint_and_calendar_id() {
+        let m = sample_meeting();
+        let (addr, _tx, last_body, _path) = spawn_capture(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let _ = start_capture_at(
+            &base,
+            "test",
+            Platform::Zoom,
+            Some("1:1 with Alex".to_owned()),
+            Some("EVT-123".to_owned()),
+        )
+        .await;
+
+        // Wire format: `platform` + optional `hint` + optional
+        // `calendar_event_id`. None-shaped fields skip serialization
+        // (matches the daemon's `Option` shape and avoids sending
+        // explicit `null`s the orchestrator would have to ignore).
+        let body = last_body
+            .lock()
+            .expect("body mutex")
+            .clone()
+            .expect("start handler should have observed a body");
+        assert_eq!(body["platform"], "zoom");
+        assert_eq!(body["hint"], "1:1 with Alex");
+        assert_eq!(body["calendar_event_id"], "EVT-123");
+    }
+
+    #[tokio::test]
+    async fn start_capture_omits_none_fields() {
+        let m = sample_meeting();
+        let (addr, _tx, last_body, _path) = spawn_capture(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let _ = start_capture_at(&base, "test", Platform::Zoom, None, None).await;
+
+        let body = last_body
+            .lock()
+            .expect("body mutex")
+            .clone()
+            .expect("start handler should have observed a body");
+        // The proxy skips serializing `None`s entirely so a future
+        // daemon that warns on unknown explicit-null fields stays
+        // green. (Belt-and-suspenders — serde already does this for
+        // us via `skip_serializing_if`.)
+        assert!(body.get("hint").is_none());
+        assert!(body.get("calendar_event_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_capture_unauthorized_when_bearer_wrong() {
+        let m = sample_meeting();
+        let (addr, _tx, _body, _path) = spawn_capture(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = start_capture_at(&base, "wrong-token", Platform::Zoom, None, None).await;
+        match outcome {
+            DaemonOutcome::Unavailable { detail } => {
+                assert!(
+                    detail.contains("401"),
+                    "expected 401 in detail, got: {detail}"
+                );
+            }
+            DaemonOutcome::Ok { .. } => panic!("expected Unavailable on bad bearer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn end_meeting_happy_path_returns_ack() {
+        let m = sample_meeting();
+        let id = m.id;
+        let (addr, _tx, _body, last_path) = spawn_capture(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = end_meeting_at(&base, "test", &id).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.meeting_id, id);
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+        // The handler captured the path the proxy hit — assert it
+        // matches the meeting id, no path traversal or extra
+        // segments.
+        let path = last_path
+            .lock()
+            .expect("path mutex")
+            .clone()
+            .expect("end handler should have observed a request");
+        assert_eq!(path, id.to_string());
+    }
+
+    #[tokio::test]
+    async fn end_meeting_unavailable_when_port_closed() {
+        // Same pattern as `list_meetings_unavailable_when_port_closed`
+        // but for the end endpoint — proves a transport-level error
+        // collapses to `Unavailable` rather than panicking through.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let base = format!("http://{addr}/v1");
+
+        let id = MeetingId::now_v7();
+        let outcome = end_meeting_at(&base, "test", &id).await;
+        assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
     }
 }
