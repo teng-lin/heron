@@ -4,7 +4,7 @@
 
 /*
  * Self-hosted fonts. Files live under apps/desktop/public/fonts/ and are
- * SIL OFL — see the OFL-*.txt next to each TTF for redistribution terms.
+ * SIL OFL — see the OFL-*.txt next to each WOFF2 for redistribution terms.
  * The app must work offline, so we do not load from a CDN.
  *
  * Inter Tight and JetBrains Mono ship as variable fonts; one file per family
@@ -12,35 +12,35 @@
  */
 @font-face {
   font-family: "Spectral";
-  src: url("/fonts/Spectral-Regular.ttf") format("truetype");
+  src: url("/fonts/Spectral-Regular.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "Spectral";
-  src: url("/fonts/Spectral-Medium.ttf") format("truetype");
+  src: url("/fonts/Spectral-Medium.woff2") format("woff2");
   font-weight: 500;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "Inter Tight";
-  src: url("/fonts/InterTight.ttf") format("truetype-variations");
+  src: url("/fonts/InterTight.woff2") format("woff2");
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "Inter Tight";
-  src: url("/fonts/InterTight-Italic.ttf") format("truetype-variations");
+  src: url("/fonts/InterTight-Italic.woff2") format("woff2");
   font-weight: 100 900;
   font-style: italic;
   font-display: swap;
 }
 @font-face {
   font-family: "JetBrains Mono";
-  src: url("/fonts/JetBrainsMono.ttf") format("truetype-variations");
+  src: url("/fonts/JetBrainsMono.woff2") format("woff2");
   font-weight: 100 800;
   font-style: normal;
   font-display: swap;
