@@ -504,6 +504,16 @@ function AppearanceTab() {
   const [theme, setTheme] = useState<ThemePref>(readThemePref);
   const [accent, setAccent] = useState<AccentPref>(readAccentPref);
 
+  // Keep the DOM in sync with OS theme changes while "system" is selected.
+  useEffect(() => {
+    if (theme !== "system") return;
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mq) return;
+    const handler = () => applyTheme("system");
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, [theme]);
+
   function handleThemeChange(value: ThemePref) {
     setTheme(value);
     applyTheme(value);
