@@ -583,6 +583,7 @@ fn sample_envelope() -> Envelope<EventPayload> {
         participants: vec![],
         transcript_status: heron_session::TranscriptLifecycle::Pending,
         summary_status: heron_session::SummaryLifecycle::Pending,
+        tags: vec![],
     };
     Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
         .with_meeting(meeting.id.to_string())

@@ -992,6 +992,7 @@ mod tests {
             }],
             transcript_status: TranscriptLifecycle::Complete,
             summary_status: SummaryLifecycle::Ready,
+            tags: vec![],
         }
     }
 

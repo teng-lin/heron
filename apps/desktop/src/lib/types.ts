@@ -64,6 +64,17 @@ export interface Meeting {
   participants: Participant[];
   transcript_status: TranscriptLifecycle;
   summary_status: SummaryLifecycle;
+  /**
+   * LLM-inferred topic tags lifted from the note's
+   * `Frontmatter.tags`. Empty for active captures (no summary yet)
+   * and for any meeting whose summarizer omitted them. Optional on
+   * the wire so a payload from an older daemon (no `tags` field
+   * emitted, since the Rust side uses `#[serde(default)]`) still
+   * deserializes — callers should treat a missing `tags` as `[]`,
+   * typically via `meeting.tags ?? []` at the consumption site.
+   * Mirrors `crates/heron-session/src/lib.rs:Meeting.tags`.
+   */
+  tags?: string[];
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:482`. */
