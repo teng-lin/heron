@@ -1008,14 +1008,18 @@ mod prefix_tests {
         assert_eq!(processing["model"].as_str(), Some("claude-sonnet-4-6"));
 
         let back: Meeting = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(
-            back.processing,
-            Some(MeetingProcessing {
-                summary_usd: 0.04,
-                tokens_in: 14_231,
-                tokens_out: 612,
-                model: "claude-sonnet-4-6".into(),
-            }),
+        let restored = back.processing.expect("processing round-trips as Some");
+        // Field-by-field instead of `assert_eq!` because
+        // `MeetingProcessing` deliberately does not derive `PartialEq`
+        // (the `f64` field would compare bitwise — flaky under any
+        // future rounding/format change). Compare with an epsilon.
+        assert!(
+            (restored.summary_usd - 0.04).abs() < 1e-9,
+            "summary_usd drifted: {}",
+            restored.summary_usd,
         );
+        assert_eq!(restored.tokens_in, 14_231);
+        assert_eq!(restored.tokens_out, 612);
+        assert_eq!(restored.model, "claude-sonnet-4-6");
     }
 }

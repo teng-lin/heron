@@ -631,6 +631,16 @@ impl Fixture {
     /// the "unpopulated" sentinel the orchestrator collapses to
     /// `Meeting.processing = None`; this helper opts out of that so
     /// tests can assert the populated wire shape.
+    ///
+    /// Unlike the other `write_note_with_*` helpers in this fixture,
+    /// this one builds the `Frontmatter` directly and finalizes once
+    /// rather than going through the `write_note_inner`
+    /// → `read_note` → mutate → `atomic_write` round-trip — `cost` is
+    /// the only thing diverging from the baseline, so a one-shot write
+    /// is both shorter and avoids the read/parse churn the others
+    /// inherit. The other helpers' read-modify-write shape is harder
+    /// to migrate (they each diverge a different field) and out of
+    /// scope here.
     fn write_note_with_cost(
         &self,
         slug: &str,
@@ -639,13 +649,45 @@ impl Fixture {
         company: &str,
         cost: Cost,
     ) {
-        self.write_note_inner(slug, date, start, company, "Body.\n", &[], None, &[]);
-        let path = note_filename(date, start, slug);
-        let abs = self.vault_root().join("meetings").join(&path);
-        let (mut fm, body) = heron_vault::read_note(&abs).unwrap();
-        fm.cost = cost;
-        let rendered = heron_vault::render_note(&fm, &body).unwrap();
-        std::fs::write(&abs, rendered).unwrap();
+        let writer = VaultWriter::new(self.vault_root().to_path_buf());
+        let frontmatter = Frontmatter {
+            date,
+            start: start.to_owned(),
+            duration_min: 30,
+            company: Some(company.to_owned()),
+            attendees: Vec::new(),
+            meeting_type: MeetingType::Internal,
+            source_app: "zoom.us".to_owned(),
+            recording: PathBuf::from(format!(
+                "audio/{}-{} {slug}.m4a",
+                date,
+                start.replace(':', ""),
+            )),
+            transcript: PathBuf::from(format!(
+                "transcripts/{}-{} {slug}.jsonl",
+                date,
+                start.replace(':', ""),
+            )),
+            diarize_source: DiarizeSource::Ax,
+            disclosed: Disclosure {
+                stated: true,
+                when: None,
+                how: DisclosureHow::Verbal,
+            },
+            cost,
+            action_items: Vec::new(),
+            tags: Vec::new(),
+            extra: Mapping::new(),
+        };
+        writer
+            .finalize_session(
+                &date.to_string(),
+                &start.replace(':', ""),
+                slug,
+                &frontmatter,
+                "Body.\n",
+            )
+            .expect("finalize");
     }
 
     fn write_note_with_transcript(
