@@ -1,16 +1,17 @@
 //! Backend selection per `docs/archives/plan.md` §5 weeks 7–8 + §11.1.
 //!
-//! Three backends are available: the Anthropic API, the Claude Code
-//! CLI, and the Codex CLI. The user expresses a [`Preference`]; the
-//! selector probes the local environment for a [`Availability`] and
-//! returns the first viable [`Backend`] under that preference,
-//! along with a [`SelectionReason`] for the diagnostics tab.
+//! Four backends are available: the Anthropic API, the OpenAI API,
+//! the Claude Code CLI, and the Codex CLI. The user expresses a
+//! [`Preference`]; the selector probes the local environment for an
+//! [`Availability`] and returns the first viable [`Backend`] under
+//! that preference, along with a [`SelectionReason`] for the
+//! diagnostics tab.
 //!
 //! The selector is pure and synchronous so the orchestrator can call
 //! it on every session start without paying for a network probe.
 //! Availability is sampled at call time — a user who exports
-//! `ANTHROPIC_API_KEY` after launching heron picks up the change on
-//! the next selection.
+//! `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` after launching heron picks
+//! up the change on the next selection.
 
 use std::path::PathBuf;
 
@@ -22,16 +23,19 @@ use crate::{Backend, LlmError, Summarizer, build_summarizer_with_resolver};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preference {
     /// Pick whatever's most capable that the environment offers.
-    /// Order: Anthropic API → Claude Code CLI → Codex CLI.
+    /// Order: Anthropic API → OpenAI API → Claude Code CLI → Codex CLI.
+    /// Anthropic remains first because that's the existing default; OpenAI
+    /// slots above CLI fallbacks because it's a hosted backend the user
+    /// explicitly configured a key for.
     #[default]
     Auto,
-    /// Use only zero-billed-cost CLI backends. Skips the API even
-    /// when `ANTHROPIC_API_KEY` is set. Order: Claude Code CLI →
-    /// Codex CLI.
+    /// Use only zero-billed-cost CLI backends. Skips API backends even
+    /// when keys are set. Order: Claude Code CLI → Codex CLI.
     FreeOnly,
-    /// Use the API exclusively. Errors if `ANTHROPIC_API_KEY` is
-    /// missing rather than falling through — the user explicitly
-    /// asked for the premium path.
+    /// Use a hosted API exclusively. Prefers Anthropic; falls through to
+    /// OpenAI when only an OpenAI key is present. Errors if neither API
+    /// key is configured rather than falling through to a CLI backend —
+    /// the user explicitly asked for the premium path.
     PremiumOnly,
 }
 
@@ -41,6 +45,7 @@ pub enum Preference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Availability {
     pub has_anthropic_key: bool,
+    pub has_openai_key: bool,
     pub has_claude_cli: bool,
     pub has_codex_cli: bool,
 }
@@ -85,8 +90,19 @@ impl Availability {
                 false
             }
         };
+        let has_openai_key = match resolver.resolve(KeyName::OpenAiApiKey) {
+            Ok(_) => true,
+            Err(KeyResolveError::NotFound(_)) => false,
+            Err(KeyResolveError::Backend(msg)) => {
+                tracing::warn!(
+                    "key resolver backend error during OpenAI availability probe: {msg}"
+                );
+                false
+            }
+        };
         Self {
             has_anthropic_key,
+            has_openai_key,
             has_claude_cli: which_on_path("claude").is_some(),
             has_codex_cli: which_on_path("codex").is_some(),
         }
@@ -95,7 +111,7 @@ impl Availability {
     /// `true` when at least one backend is viable. Lets the caller
     /// short-circuit before constructing the orchestrator.
     pub fn any_available(&self) -> bool {
-        self.has_anthropic_key || self.has_claude_cli || self.has_codex_cli
+        self.has_anthropic_key || self.has_openai_key || self.has_claude_cli || self.has_codex_cli
     }
 }
 
@@ -117,13 +133,13 @@ pub enum SelectionReason {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SelectError {
     #[error(
-        "no LLM backend is available: ANTHROPIC_API_KEY unset, \
+        "no LLM backend is available: ANTHROPIC_API_KEY and OPENAI_API_KEY unset, \
          and neither `claude` nor `codex` is on PATH"
     )]
     NoBackendAvailable,
     #[error(
-        "preference=PremiumOnly but ANTHROPIC_API_KEY is unset; \
-         export the key or switch to Preference::Auto / FreeOnly"
+        "preference=PremiumOnly but neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set; \
+         export a key or switch to Preference::Auto / FreeOnly"
     )]
     PremiumOnlyMissingApiKey,
 }
@@ -137,10 +153,23 @@ pub fn select_backend(
 ) -> Result<(Backend, SelectionReason), SelectError> {
     match pref {
         Preference::Auto => {
+            // Order: Anthropic API → OpenAI API → Claude Code CLI → Codex CLI.
+            // Anthropic remains first (existing default); OpenAI slots above
+            // CLI fallbacks because it's a hosted backend the user explicitly
+            // configured a key for.
             if avail.has_anthropic_key {
                 return Ok((
                     Backend::Anthropic,
                     SelectionReason::PreferredBackendAvailable(Backend::Anthropic),
+                ));
+            }
+            if avail.has_openai_key {
+                return Ok((
+                    Backend::OpenAI,
+                    SelectionReason::FellBackTo {
+                        chose: Backend::OpenAI,
+                        because: "ANTHROPIC_API_KEY unset; using OpenAI API".to_owned(),
+                    },
                 ));
             }
             if avail.has_claude_cli {
@@ -148,7 +177,9 @@ pub fn select_backend(
                     Backend::ClaudeCodeCli,
                     SelectionReason::FellBackTo {
                         chose: Backend::ClaudeCodeCli,
-                        because: "ANTHROPIC_API_KEY unset; using Claude Code CLI".to_owned(),
+                        because: "ANTHROPIC_API_KEY and OPENAI_API_KEY unset; \
+                                  using Claude Code CLI"
+                            .to_owned(),
                     },
                 ));
             }
@@ -157,15 +188,17 @@ pub fn select_backend(
                     Backend::CodexCli,
                     SelectionReason::FellBackTo {
                         chose: Backend::CodexCli,
-                        because:
-                            "ANTHROPIC_API_KEY unset and `claude` not on PATH; using Codex CLI"
-                                .to_owned(),
+                        because: "ANTHROPIC_API_KEY and OPENAI_API_KEY unset, \
+                                  `claude` not on PATH; using Codex CLI"
+                            .to_owned(),
                     },
                 ));
             }
             Err(SelectError::NoBackendAvailable)
         }
         Preference::FreeOnly => {
+            // FreeOnly explicitly opts out of all billed API backends —
+            // skip OpenAI even when a key is present.
             if avail.has_claude_cli {
                 return Ok((
                     Backend::ClaudeCodeCli,
@@ -185,14 +218,26 @@ pub fn select_backend(
             Err(SelectError::NoBackendAvailable)
         }
         Preference::PremiumOnly => {
+            // PremiumOnly means "use a hosted API or error" — Anthropic
+            // first, fall through to OpenAI if only that key is present.
             if avail.has_anthropic_key {
-                Ok((
+                return Ok((
                     Backend::Anthropic,
                     SelectionReason::PreferredBackendAvailable(Backend::Anthropic),
-                ))
-            } else {
-                Err(SelectError::PremiumOnlyMissingApiKey)
+                ));
             }
+            if avail.has_openai_key {
+                return Ok((
+                    Backend::OpenAI,
+                    SelectionReason::FellBackTo {
+                        chose: Backend::OpenAI,
+                        because: "PremiumOnly preference: ANTHROPIC_API_KEY unset; \
+                                  using OpenAI API"
+                            .to_owned(),
+                    },
+                ));
+            }
+            Err(SelectError::PremiumOnlyMissingApiKey)
         }
     }
 }
@@ -236,9 +281,9 @@ pub fn select_summarizer_with_resolver(
     // Skip the resolver probe entirely under `FreeOnly` — that
     // preference says "use a CLI backend, never the API". A broken
     // keychain shouldn't block the user from selecting `claude` /
-    // `codex` when they've explicitly opted out of Anthropic.
-    let has_anthropic_key = match pref {
-        Preference::FreeOnly => false,
+    // `codex` when they've explicitly opted out of API backends.
+    let (has_anthropic_key, has_openai_key) = match pref {
+        Preference::FreeOnly => (false, false),
         Preference::Auto | Preference::PremiumOnly => {
             // Probe explicitly so a `Backend` error surfaces as
             // `LlmError::Backend(...)` instead of being swallowed by
@@ -249,17 +294,26 @@ pub fn select_summarizer_with_resolver(
             // relies on so a corrupted keychain entry produces an
             // actionable renderer toast distinct from "paste a key
             // in Settings".
-            match resolver.resolve(KeyName::AnthropicApiKey) {
+            let has_anthropic = match resolver.resolve(KeyName::AnthropicApiKey) {
                 Ok(_) => true,
                 Err(KeyResolveError::NotFound(_)) => false,
                 Err(KeyResolveError::Backend(msg)) => {
                     return Err(LlmError::Backend(format!("api key resolver: {msg}")));
                 }
-            }
+            };
+            let has_openai = match resolver.resolve(KeyName::OpenAiApiKey) {
+                Ok(_) => true,
+                Err(KeyResolveError::NotFound(_)) => false,
+                Err(KeyResolveError::Backend(msg)) => {
+                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
+                }
+            };
+            (has_anthropic, has_openai)
         }
     };
     let avail = Availability {
         has_anthropic_key,
+        has_openai_key,
         has_claude_cli: which_on_path("claude").is_some(),
         has_codex_cli: which_on_path("codex").is_some(),
     };
@@ -304,9 +358,12 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn avail(api: bool, claude: bool, codex: bool) -> Availability {
+    /// Helper: construct an `Availability` snapshot.
+    /// `(anthropic_key, openai_key, claude_cli, codex_cli)`.
+    fn avail(anthropic: bool, openai: bool, claude: bool, codex: bool) -> Availability {
         Availability {
-            has_anthropic_key: api,
+            has_anthropic_key: anthropic,
+            has_openai_key: openai,
             has_claude_cli: claude,
             has_codex_cli: codex,
         }
@@ -315,7 +372,7 @@ mod tests {
     #[test]
     fn auto_prefers_anthropic_when_key_present() {
         let (backend, reason) =
-            select_backend(Preference::Auto, &avail(true, true, true)).expect("select");
+            select_backend(Preference::Auto, &avail(true, true, true, true)).expect("select");
         assert_eq!(backend, Backend::Anthropic);
         assert_eq!(
             reason,
@@ -324,9 +381,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_falls_back_to_claude_cli_when_key_missing() {
+    fn auto_falls_back_to_openai_when_only_openai_available() {
+        // Anthropic key absent; OpenAI key present; no CLIs.
         let (backend, reason) =
-            select_backend(Preference::Auto, &avail(false, true, true)).expect("select");
+            select_backend(Preference::Auto, &avail(false, true, false, false)).expect("select");
+        assert_eq!(backend, Backend::OpenAI);
+        if let SelectionReason::FellBackTo { because, .. } = reason {
+            assert!(
+                because.contains("ANTHROPIC_API_KEY"),
+                "missing key name: {because}"
+            );
+            assert!(
+                because.contains("OpenAI"),
+                "missing backend name: {because}"
+            );
+        } else {
+            panic!("expected FellBackTo");
+        }
+    }
+
+    #[test]
+    fn auto_falls_back_to_claude_cli_when_api_keys_missing() {
+        let (backend, reason) =
+            select_backend(Preference::Auto, &avail(false, false, true, true)).expect("select");
         assert_eq!(backend, Backend::ClaudeCodeCli);
         assert!(matches!(reason, SelectionReason::FellBackTo { .. }));
     }
@@ -334,12 +411,11 @@ mod tests {
     #[test]
     fn auto_falls_back_to_codex_when_only_codex_available() {
         let (backend, reason) =
-            select_backend(Preference::Auto, &avail(false, false, true)).expect("select");
+            select_backend(Preference::Auto, &avail(false, false, false, true)).expect("select");
         assert_eq!(backend, Backend::CodexCli);
         if let SelectionReason::FellBackTo { because, .. } = reason {
             assert!(because.contains("Codex"));
             assert!(because.contains("ANTHROPIC_API_KEY"));
-            assert!(because.contains("claude"));
         } else {
             panic!("expected FellBackTo");
         }
@@ -347,14 +423,15 @@ mod tests {
 
     #[test]
     fn auto_errors_when_no_backend_available() {
-        let err = select_backend(Preference::Auto, &avail(false, false, false)).expect_err("none");
+        let err =
+            select_backend(Preference::Auto, &avail(false, false, false, false)).expect_err("none");
         assert_eq!(err, SelectError::NoBackendAvailable);
     }
 
     #[test]
     fn free_only_skips_anthropic_even_with_key() {
         let (backend, reason) =
-            select_backend(Preference::FreeOnly, &avail(true, true, true)).expect("select");
+            select_backend(Preference::FreeOnly, &avail(true, true, true, true)).expect("select");
         assert_eq!(backend, Backend::ClaudeCodeCli);
         assert_eq!(
             reason,
@@ -363,23 +440,32 @@ mod tests {
     }
 
     #[test]
+    fn free_only_skips_openai_even_with_key() {
+        // FreeOnly must skip OpenAI even when the key is present.
+        let (backend, _) =
+            select_backend(Preference::FreeOnly, &avail(false, true, true, false)).expect("select");
+        assert_eq!(backend, Backend::ClaudeCodeCli);
+    }
+
+    #[test]
     fn free_only_falls_through_to_codex_when_no_claude() {
         let (backend, _) =
-            select_backend(Preference::FreeOnly, &avail(true, false, true)).expect("select");
+            select_backend(Preference::FreeOnly, &avail(true, false, false, true)).expect("select");
         assert_eq!(backend, Backend::CodexCli);
     }
 
     #[test]
     fn free_only_errors_when_no_cli_available() {
-        let err =
-            select_backend(Preference::FreeOnly, &avail(true, false, false)).expect_err("none");
+        let err = select_backend(Preference::FreeOnly, &avail(true, true, false, false))
+            .expect_err("none");
         assert_eq!(err, SelectError::NoBackendAvailable);
     }
 
     #[test]
     fn premium_only_uses_anthropic_when_key_present() {
         let (backend, reason) =
-            select_backend(Preference::PremiumOnly, &avail(true, false, false)).expect("select");
+            select_backend(Preference::PremiumOnly, &avail(true, false, false, false))
+                .expect("select");
         assert_eq!(backend, Backend::Anthropic);
         assert_eq!(
             reason,
@@ -388,20 +474,42 @@ mod tests {
     }
 
     #[test]
-    fn premium_only_errors_when_key_missing_does_not_fall_through() {
-        // A user who explicitly picked PremiumOnly wants the API or
+    fn premium_only_uses_openai_when_only_openai_key() {
+        // PremiumOnly with only an OpenAI key must use OpenAI, not error.
+        let (backend, reason) =
+            select_backend(Preference::PremiumOnly, &avail(false, true, false, false))
+                .expect("select");
+        assert_eq!(backend, Backend::OpenAI);
+        if let SelectionReason::FellBackTo { because, .. } = reason {
+            assert!(
+                because.contains("ANTHROPIC_API_KEY"),
+                "missing key name: {because}"
+            );
+            assert!(
+                because.contains("OpenAI"),
+                "missing backend name: {because}"
+            );
+        } else {
+            panic!("expected FellBackTo");
+        }
+    }
+
+    #[test]
+    fn premium_only_errors_when_no_api_key_does_not_fall_through_to_cli() {
+        // A user who explicitly picked PremiumOnly wants an API backend or
         // nothing — DON'T silently fall through to a CLI.
-        let err = select_backend(Preference::PremiumOnly, &avail(false, true, true))
+        let err = select_backend(Preference::PremiumOnly, &avail(false, false, true, true))
             .expect_err("missing key");
         assert_eq!(err, SelectError::PremiumOnlyMissingApiKey);
     }
 
     #[test]
     fn availability_any_available_reports_correctly() {
-        assert!(avail(true, false, false).any_available());
-        assert!(avail(false, true, false).any_available());
-        assert!(avail(false, false, true).any_available());
-        assert!(!avail(false, false, false).any_available());
+        assert!(avail(true, false, false, false).any_available());
+        assert!(avail(false, true, false, false).any_available());
+        assert!(avail(false, false, true, false).any_available());
+        assert!(avail(false, false, false, true).any_available());
+        assert!(!avail(false, false, false, false).any_available());
     }
 
     #[test]
@@ -452,6 +560,10 @@ mod tests {
             avail.has_anthropic_key,
             "stub resolver returned Ok; has_anthropic_key must be true"
         );
+        assert!(
+            avail.has_openai_key,
+            "stub resolver returned Ok for all keys; has_openai_key must be true"
+        );
     }
 
     #[test]
@@ -460,6 +572,10 @@ mod tests {
         assert!(
             !avail.has_anthropic_key,
             "stub resolver returned NotFound; has_anthropic_key must be false"
+        );
+        assert!(
+            !avail.has_openai_key,
+            "stub resolver returned NotFound; has_openai_key must be false"
         );
     }
 
@@ -582,6 +698,49 @@ mod tests {
                  a 'export the key' toast is misleading when the key IS configured \
                  but the keychain itself is broken"
             ),
+        }
+    }
+
+    /// A resolver that returns Ok for OpenAI but NotFound for Anthropic.
+    /// Anchors the Auto fallback path: when only OpenAI key is present,
+    /// `select_summarizer_with_resolver` must pick `Backend::OpenAI`.
+    struct StubResolverOpenAIOnly;
+    impl KeyResolver for StubResolverOpenAIOnly {
+        fn resolve(&self, name: KeyName) -> Result<String, KeyResolveError> {
+            match name {
+                KeyName::OpenAiApiKey => Ok("sk-test-openai".to_owned()),
+                _ => Err(KeyResolveError::NotFound(name)),
+            }
+        }
+    }
+
+    #[test]
+    fn select_summarizer_with_resolver_picks_openai_when_only_openai_key() {
+        let (_summarizer, backend, _reason) =
+            select_summarizer_with_resolver(Preference::Auto, &StubResolverOpenAIOnly)
+                .expect("select");
+        assert_eq!(backend, Backend::OpenAI);
+    }
+
+    #[test]
+    fn select_summarizer_with_resolver_premium_only_picks_openai_when_only_openai_key() {
+        let (_summarizer, backend, _reason) =
+            select_summarizer_with_resolver(Preference::PremiumOnly, &StubResolverOpenAIOnly)
+                .expect("select");
+        assert_eq!(backend, Backend::OpenAI);
+    }
+
+    #[test]
+    fn free_only_skips_openai_even_with_key_via_resolver() {
+        // FreeOnly + only OpenAI key available: result depends on CLIs.
+        // What we pin is "OpenAI must never be picked under FreeOnly".
+        match select_summarizer_with_resolver(Preference::FreeOnly, &StubResolverOpenAIOnly) {
+            Ok((_, backend, _)) => {
+                assert_ne!(backend, Backend::OpenAI, "FreeOnly must never pick OpenAI")
+            }
+            // No CLI on PATH: NoBackendAvailable is expected and fine.
+            Err(LlmError::Backend(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
 }

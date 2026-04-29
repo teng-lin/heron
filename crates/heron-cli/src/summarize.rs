@@ -61,6 +61,7 @@ pub enum SummarizeError {
 pub fn parse_backend_flag(s: &str) -> Result<Backend, ParseBackendError> {
     match s {
         "anthropic" => Ok(Backend::Anthropic),
+        "openai" => Ok(Backend::OpenAI),
         "claude-code" => Ok(Backend::ClaudeCodeCli),
         "codex" => Ok(Backend::CodexCli),
         other => Err(ParseBackendError(other.to_owned())),
@@ -68,7 +69,7 @@ pub fn parse_backend_flag(s: &str) -> Result<Backend, ParseBackendError> {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-#[error("unknown --backend {0:?}; expected one of `anthropic`, `claude-code`, `codex`")]
+#[error("unknown --backend {0:?}; expected one of `anthropic`, `openai`, `claude-code`, `codex`")]
 pub struct ParseBackendError(String);
 
 /// Re-summarize the note at `note_path`, writing the merged output
@@ -168,6 +169,7 @@ mod tests {
             parse_backend_flag("anthropic").expect("ok"),
             Backend::Anthropic
         );
+        assert_eq!(parse_backend_flag("openai").expect("ok"), Backend::OpenAI);
         assert_eq!(
             parse_backend_flag("claude-code").expect("ok"),
             Backend::ClaudeCodeCli
@@ -184,6 +186,11 @@ mod tests {
         assert!(
             msg.contains("gpt-99") && msg.contains("anthropic"),
             "error message must name the bad input and the valid set, got: {msg}"
+        );
+        // OpenAI backend must also appear in the error hint.
+        assert!(
+            msg.contains("openai"),
+            "error message must mention openai as a valid option, got: {msg}"
         );
     }
 

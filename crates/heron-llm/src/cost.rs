@@ -34,6 +34,11 @@ pub struct ModelRate {
 /// Published rates as of writing (USD per million tokens). The §11.4
 /// calibration loop tightens these against real invoices in week 9 and
 /// updates this table; `compute_cost` always reads from this list.
+///
+/// OpenAI rates (early 2026 published pricing):
+///   gpt-4o-mini: $0.15/M input, $0.60/M output
+///   gpt-4o:      $2.50/M input, $10.00/M output
+/// Anthropic rates sourced from the public pricing page at time of writing.
 pub const RATE_TABLE: &[ModelRate] = &[
     ModelRate {
         model: "claude-opus-4-7",
@@ -54,6 +59,21 @@ pub const RATE_TABLE: &[ModelRate] = &[
         pricing: ModelPricing {
             input_per_million: 1.0,
             output_per_million: 5.0,
+        },
+    },
+    // OpenAI models (early 2026 public pricing).
+    ModelRate {
+        model: "gpt-4o-mini",
+        pricing: ModelPricing {
+            input_per_million: 0.15,
+            output_per_million: 0.60,
+        },
+    },
+    ModelRate {
+        model: "gpt-4o",
+        pricing: ModelPricing {
+            input_per_million: 2.50,
+            output_per_million: 10.00,
         },
     },
 ];
@@ -142,6 +162,24 @@ mod tests {
     fn zero_tokens_costs_zero() {
         let cost = compute_cost("claude-sonnet-4-6", 0, 0).expect("zero");
         assert_eq!(cost.summary_usd, 0.0);
+    }
+
+    #[test]
+    fn cost_table_includes_openai_models() {
+        // Pins the table so a future model rename silently zeros cost.
+        let mini = compute_cost("gpt-4o-mini", 1_000_000, 1_000_000).expect("gpt-4o-mini");
+        assert_eq!(mini.summary_usd, 0.15 + 0.60);
+        assert_eq!(mini.model, "gpt-4o-mini");
+
+        let full = compute_cost("gpt-4o", 1_000_000, 1_000_000).expect("gpt-4o");
+        assert_eq!(full.summary_usd, 2.50 + 10.00);
+        assert_eq!(full.model, "gpt-4o");
+
+        // gpt-4o must be more expensive than gpt-4o-mini
+        assert!(
+            full.summary_usd > mini.summary_usd,
+            "gpt-4o must cost more than gpt-4o-mini"
+        );
     }
 
     #[test]
