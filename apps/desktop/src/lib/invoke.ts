@@ -528,6 +528,16 @@ export interface HeronCommands {
     returns: void;
   };
   /**
+   * Reveal the user's vault folder in Finder. The Rust side reads
+   * `vault_root` from the settings file at `settingsPath` rather than
+   * trusting a renderer-supplied path, then validates it exists and is
+   * a directory. macOS-only in v1; non-mac builds reject.
+   */
+  heron_open_vault_folder: {
+    args: { settingsPath: string };
+    returns: void;
+  };
+  /**
    * Phase 70 (PR-θ): store an API-key secret in the macOS login
    * Keychain. The Rust side never logs `secret`, never echoes it
    * back, and never returns it across the IPC bridge. Replaces an

@@ -27,6 +27,7 @@ import { invoke } from "../lib/invoke";
 import type { Meeting, TranscriptSegment } from "../lib/types";
 import { useMeetingsStore } from "../store/meetings";
 import { formatElapsed, useRecordingStore } from "../store/recording";
+import { useSettingsStore } from "../store/settings";
 import { useTranscriptStore } from "../store/transcript";
 
 // Stable empty-segments sentinel. See the selector in Recording for
@@ -40,6 +41,7 @@ export default function Recording() {
   const paused = useRecordingStore((s) => s.paused);
   const togglePause = useRecordingStore((s) => s.togglePause);
   const stop = useRecordingStore((s) => s.stop);
+  const settingsPath = useSettingsStore((s) => s.settingsPath);
   const [stopping, setStopping] = useState(false);
 
   const meetings = useMeetingsStore((s) => s.items);
@@ -128,8 +130,29 @@ export default function Recording() {
     } finally {
       setStopping(false);
     }
+    // Capture before `stop()` resets the recording-store state.
+    const savedTitle = activeMeeting?.title ?? null;
+    const savedId = stopTargetId;
     stop();
-    navigate("/home");
+    toast.success("Recording saved", {
+      description: savedTitle ?? undefined,
+      action: settingsPath
+        ? {
+            label: "Reveal vault in Finder",
+            onClick: () => {
+              void invoke("heron_open_vault_folder", { settingsPath }).catch(
+                (err: unknown) => {
+                  const message =
+                    err instanceof Error ? err.message : String(err);
+                  toast.error(`Could not open vault folder: ${message}`);
+                },
+              );
+            },
+          }
+        : undefined,
+      duration: 8_000,
+    });
+    navigate(`/review/${encodeURIComponent(savedId)}`);
   };
 
   if (!isLive) {
@@ -250,6 +273,8 @@ export default function Recording() {
 
 function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {
   if (segments.length === 0) {
+    // TODO: replace with real dBFS waveform once the daemon emits
+    // an `AudioLevel` SSE event (Tier 3 #15 in the backend prereq doc).
     return (
       <div
         className="rounded border px-6 py-12 text-center"
@@ -258,16 +283,34 @@ function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {
           borderColor: "var(--color-rule)",
           color: "var(--color-ink-3)",
         }}
+        role="status"
+        aria-live="polite"
       >
         <p
-          className="font-serif text-lg"
+          className="inline-flex items-center justify-center gap-2 font-mono text-[11px] uppercase tracking-[0.12em]"
+          style={{ color: "var(--color-rec)" }}
+        >
+          <span
+            aria-hidden="true"
+            className="inline-block animate-[pulse-rec_1.4s_ease-in-out_infinite]"
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: "var(--color-rec)",
+            }}
+          />
+          Capturing audio
+        </p>
+        <p
+          className="mt-3 font-serif text-base"
           style={{ color: "var(--color-ink-2)" }}
         >
-          Listening…
+          Listening for the first words…
         </p>
-        <p className="mt-1 text-xs">
-          Live captions appear here once the daemon emits transcript
-          segments.
+        <p className="mt-1 text-xs" style={{ color: "var(--color-ink-4)" }}>
+          Live captions appear here once WhisperKit emits the first
+          transcript segment — typically 5–10 seconds in.
         </p>
       </div>
     );
