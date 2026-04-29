@@ -48,15 +48,18 @@
 //!   the parse error in `detail`. Drift between the TS shape mirror
 //!   in `lib/types.ts` and the Rust serde shape lands here.
 
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use heron_session::{
     CalendarEvent, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus,
-    Platform, PreMeetingContextRequest, Summary,
+    Platform, PreMeetingContextRequest, Summary, Transcript,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use tokio::io::AsyncWriteExt;
 
 use crate::daemon::DaemonHandle;
 
@@ -67,6 +70,8 @@ const BASE_URL: &str = "http://127.0.0.1:7384/v1";
 
 /// Per-request timeout. See module docs for the choice of 5 s.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const AUDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DAEMON_AUDIO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Outcome of a daemon-talking command. Mirrors the TS
 /// `DaemonResult<T>` discriminated union in
@@ -81,6 +86,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum DaemonOutcome<T: Serialize> {
     Ok { data: T },
     Unavailable { detail: String },
+}
+
+fn parse_meeting_id<T: Serialize>(meeting_id: &str) -> Result<MeetingId, DaemonOutcome<T>> {
+    MeetingId::from_str(meeting_id).map_err(|e| DaemonOutcome::Unavailable {
+        detail: format!("invalid meeting_id: {e}"),
+    })
 }
 
 /// Tauri command: list meetings. Proxies `GET /v1/meetings`.
@@ -103,6 +114,26 @@ pub async fn heron_list_meetings(
     Ok(list_meetings_at(BASE_URL, &bearer, parsed).await)
 }
 
+/// Tauri command: fetch a single meeting. Proxies
+/// `GET /v1/meetings/{id}`.
+///
+/// Review uses this to resolve canonical metadata (title, status,
+/// participants) from the daemon instead of treating the route param
+/// as the whole meeting model. Same ID validation / URL-space defence
+/// as [`heron_meeting_summary`].
+#[tauri::command]
+pub async fn heron_get_meeting(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<Meeting>, String> {
+    let parsed = match parse_meeting_id(&meeting_id) {
+        Ok(id) => id,
+        Err(outcome) => return Ok(outcome),
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(get_meeting_at(BASE_URL, &bearer, &parsed.to_string()).await)
+}
+
 /// Tauri command: fetch the summary for a meeting. Proxies
 /// `GET /v1/meetings/{id}/summary`.
 ///
@@ -120,16 +151,57 @@ pub async fn heron_meeting_summary(
     state: State<'_, DaemonHandle>,
     meeting_id: String,
 ) -> Result<DaemonOutcome<Summary>, String> {
-    let parsed = match MeetingId::from_str(&meeting_id) {
+    let parsed = match parse_meeting_id(&meeting_id) {
         Ok(id) => id,
-        Err(e) => {
-            return Ok(DaemonOutcome::Unavailable {
-                detail: format!("invalid meeting_id: {e}"),
-            });
-        }
+        Err(outcome) => return Ok(outcome),
     };
     let bearer = state.auth.bearer.clone();
     Ok(get_summary_at(BASE_URL, &bearer, &parsed.to_string()).await)
+}
+
+/// Tauri command: fetch the finalized transcript. Proxies
+/// `GET /v1/meetings/{id}/transcript`.
+///
+/// Live partials still flow over SSE; this command is for Review's
+/// read-only Transcript tab after the daemon has a finalized sidecar.
+#[tauri::command]
+pub async fn heron_meeting_transcript(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<Transcript>, String> {
+    let parsed = match parse_meeting_id(&meeting_id) {
+        Ok(id) => id,
+        Err(outcome) => return Ok(outcome),
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(get_transcript_at(BASE_URL, &bearer, &parsed.to_string()).await)
+}
+
+/// Tauri command: fetch daemon-streamed audio into the app cache and
+/// return a local file path playable via `convertFileSrc`.
+///
+/// We deliberately do not return the m4a bytes over Tauri IPC: long
+/// meetings can be hundreds of MB. The daemon streams the response;
+/// this proxy preserves that memory profile by writing chunks to
+/// `<cache>/daemon-audio/<meeting_id>.m4a.tmp` and atomically renaming
+/// once the body completes.
+#[tauri::command]
+pub async fn heron_meeting_audio(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<DaemonAudioSource>, String> {
+    let parsed = match parse_meeting_id(&meeting_id) {
+        Ok(id) => id,
+        Err(outcome) => return Ok(outcome),
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(fetch_audio_at(
+        BASE_URL,
+        &bearer,
+        &parsed.to_string(),
+        &crate::default_cache_root(),
+    )
+    .await)
 }
 
 /// Tauri command: start a manual capture. Proxies `POST /v1/meetings`.
@@ -260,6 +332,13 @@ struct StartCaptureBody<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EndMeetingAck {
     pub meeting_id: MeetingId,
+}
+
+/// Local-file source returned by [`heron_meeting_audio`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonAudioSource {
+    pub path: String,
+    pub content_type: Option<String>,
 }
 
 /// Synthetic ack for a successful `PUT /v1/context`.
@@ -446,6 +525,38 @@ pub async fn get_summary_at(
     bearer: &str,
     meeting_id: &str,
 ) -> DaemonOutcome<Summary> {
+    get_json_at(base_url, bearer, &format!("/meetings/{meeting_id}/summary")).await
+}
+
+/// Parameterized get-meeting fetch. Same split-out rationale as
+/// [`get_summary_at`].
+pub async fn get_meeting_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &str,
+) -> DaemonOutcome<Meeting> {
+    get_json_at(base_url, bearer, &format!("/meetings/{meeting_id}")).await
+}
+
+/// Parameterized transcript fetch. Same split-out rationale as
+/// [`get_summary_at`].
+pub async fn get_transcript_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &str,
+) -> DaemonOutcome<Transcript> {
+    get_json_at(
+        base_url,
+        bearer,
+        &format!("/meetings/{meeting_id}/transcript"),
+    )
+    .await
+}
+
+async fn get_json_at<T>(base_url: &str, bearer: &str, path: &str) -> DaemonOutcome<T>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
     let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
@@ -454,13 +565,154 @@ pub async fn get_summary_at(
             };
         }
     };
-    let url = format!("{base_url}/meetings/{meeting_id}/summary");
+    let url = format!("{base_url}{path}");
     match client.get(url).bearer_auth(bearer).send().await {
         Ok(resp) => parse_response(resp).await,
         Err(e) => DaemonOutcome::Unavailable {
             detail: e.to_string(),
         },
     }
+}
+
+/// Parameterized audio fetch. Streams the daemon's `audio/mp4` body to
+/// a local cache file so the WebView can play it via Tauri's asset
+/// protocol without IPC-ing the whole recording.
+pub async fn fetch_audio_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &str,
+    cache_root: &Path,
+) -> DaemonOutcome<DaemonAudioSource> {
+    let client = match reqwest::Client::builder()
+        // Audio may be large; keep connect/read errors bounded by the
+        // daemon and OS rather than the metadata endpoint's 5s budget.
+        .connect_timeout(REQUEST_TIMEOUT)
+        .read_timeout(AUDIO_READ_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/meetings/{meeting_id}/audio");
+    let resp = match client.get(url).bearer_auth(bearer).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_DAEMON_AUDIO_BYTES
+    {
+        return DaemonOutcome::Unavailable {
+            detail: format!("audio response too large: {len} bytes"),
+        };
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if !is_supported_audio_content_type(content_type.as_deref()) {
+        return DaemonOutcome::Unavailable {
+            detail: format!(
+                "unsupported audio content type: {}",
+                content_type.as_deref().unwrap_or("<missing>")
+            ),
+        };
+    }
+    let dir = cache_root.join("daemon-audio");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return DaemonOutcome::Unavailable {
+            detail: format!("audio cache mkdir: {e}"),
+        };
+    }
+    let final_path = dir.join(format!("{meeting_id}.m4a"));
+    let tmp_path = dir.join(format!("{meeting_id}.{}.m4a.tmp", uuid::Uuid::now_v7()));
+    let mut file = match tokio::fs::File::create(&tmp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("audio cache create: {e}"),
+            };
+        }
+    };
+    let mut stream = resp.bytes_stream();
+    let mut total = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return DaemonOutcome::Unavailable {
+                    detail: format!("audio stream: {e}"),
+                };
+            }
+        };
+        total = match total.checked_add(chunk.len() as u64) {
+            Some(n) if n <= MAX_DAEMON_AUDIO_BYTES => n,
+            _ => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return DaemonOutcome::Unavailable {
+                    detail: format!(
+                        "audio response too large: over {MAX_DAEMON_AUDIO_BYTES} bytes"
+                    ),
+                };
+            }
+        };
+        if let Err(e) = file.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return DaemonOutcome::Unavailable {
+                detail: format!("audio cache write: {e}"),
+            };
+        }
+    }
+    if total == 0 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return DaemonOutcome::Unavailable {
+            detail: "audio response was empty".to_owned(),
+        };
+    }
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return DaemonOutcome::Unavailable {
+            detail: format!("audio cache flush: {e}"),
+        };
+    }
+    drop(file);
+    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return DaemonOutcome::Unavailable {
+            detail: format!("audio cache rename: {e}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: DaemonAudioSource {
+            path: final_path.to_string_lossy().into_owned(),
+            content_type,
+        },
+    }
+}
+
+fn is_supported_audio_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    matches!(
+        content_type.split(';').next().map(str::trim),
+        Some("audio/mp4" | "audio/mpeg" | "audio/x-m4a")
+    )
 }
 
 /// Parameterized start — same split-out rationale as
@@ -676,6 +928,7 @@ mod tests {
     use chrono::Utc;
     use heron_session::{
         IdentifierKind, Meeting, Participant, SummaryLifecycle, TranscriptLifecycle,
+        TranscriptSegment,
     };
     use heron_types::MeetingId;
     use std::collections::HashMap;
@@ -714,6 +967,26 @@ mod tests {
         }
     }
 
+    fn sample_transcript(id: MeetingId) -> Transcript {
+        Transcript {
+            meeting_id: id,
+            status: TranscriptLifecycle::Complete,
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptSegment {
+                speaker: Participant {
+                    display_name: "Alex Chen".to_owned(),
+                    identifier_kind: IdentifierKind::AxTree,
+                    is_user: false,
+                },
+                text: "Let's ship the daemon wiring.".to_owned(),
+                start_secs: 12.0,
+                end_secs: 15.5,
+                confidence: heron_session::Confidence::High,
+                is_final: true,
+            }],
+        }
+    }
+
     /// Bare-minimum auth middleware mirroring herond's: requires
     /// `Authorization: Bearer test` on every protected route. Just
     /// the bearer check — we want to exercise the proxy's
@@ -745,6 +1018,7 @@ mod tests {
 
     async fn spawn(meeting: Arc<Meeting>) -> (SocketAddr, oneshot::Sender<()>, LastQuery) {
         let summary = Arc::new(sample_summary(meeting.id));
+        let transcript = Arc::new(sample_transcript(meeting.id));
         let last_query: LastQuery = Arc::new(Mutex::new(None));
 
         let m = Arc::clone(&meeting);
@@ -769,9 +1043,31 @@ mod tests {
             async move { Json((*s).clone()) }
         };
 
+        let gm = Arc::clone(&meeting);
+        let get_meeting_handler = move |Path(_id): Path<String>| {
+            let gm = Arc::clone(&gm);
+            async move { Json((*gm).clone()) }
+        };
+
+        let t = Arc::clone(&transcript);
+        let transcript_handler = move |Path(_id): Path<String>| {
+            let t = Arc::clone(&t);
+            async move { Json((*t).clone()) }
+        };
+
+        let audio_handler = move |Path(_id): Path<String>| async move {
+            (
+                [(axum::http::header::CONTENT_TYPE, "audio/mp4")],
+                vec![0_u8, 1, 2, 3],
+            )
+        };
+
         let app = Router::new()
             .route("/v1/meetings", get(list_handler))
+            .route("/v1/meetings/{id}", get(get_meeting_handler))
             .route("/v1/meetings/{id}/summary", get(summary_handler))
+            .route("/v1/meetings/{id}/transcript", get(transcript_handler))
+            .route("/v1/meetings/{id}/audio", get(audio_handler))
             .layer(middleware::from_fn(require_bearer));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -854,6 +1150,67 @@ mod tests {
             DaemonOutcome::Ok { data } => {
                 assert!(data.text.contains("Summary"));
                 assert_eq!(data.llm_provider.as_deref(), Some("anthropic"));
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_meeting_happy_path() {
+        let m = Arc::new(sample_meeting());
+        let id = m.id;
+        let (addr, _tx, _q) = spawn(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = get_meeting_at(&base, "test", &id.to_string()).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.id, id);
+                assert_eq!(data.title.as_deref(), Some("Weekly product sync"));
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_transcript_happy_path() {
+        let m = Arc::new(sample_meeting());
+        let id = m.id;
+        let (addr, _tx, _q) = spawn(m).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = get_transcript_at(&base, "test", &id.to_string()).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.meeting_id, id);
+                assert_eq!(data.segments.len(), 1);
+                assert_eq!(data.segments[0].text, "Let's ship the daemon wiring.");
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_audio_happy_path_writes_cache_file() {
+        let m = Arc::new(sample_meeting());
+        let id = m.id;
+        let (addr, _tx, _q) = spawn(m).await;
+        let base = format!("http://{addr}/v1");
+        let tmp = tempfile::TempDir::new().expect("tmp");
+
+        let outcome = fetch_audio_at(&base, "test", &id.to_string(), tmp.path()).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.content_type.as_deref(), Some("audio/mp4"));
+                let bytes = std::fs::read(&data.path).expect("audio cache readable");
+                assert_eq!(bytes, vec![0_u8, 1, 2, 3]);
+                assert!(!std::path::Path::new(&format!("{}.tmp", data.path)).exists());
             }
             DaemonOutcome::Unavailable { detail } => {
                 panic!("expected Ok, got Unavailable: {detail}")

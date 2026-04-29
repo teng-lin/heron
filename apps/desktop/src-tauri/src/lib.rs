@@ -843,7 +843,10 @@ pub fn run() {
             // through Rust because the daemon's bearer auth + Origin
             // policy + the Tauri CSP all block direct webview access.
             meetings::heron_list_meetings,
+            meetings::heron_get_meeting,
             meetings::heron_meeting_summary,
+            meetings::heron_meeting_transcript,
+            meetings::heron_meeting_audio,
             // Gap #7 recording-capture wiring: Start / Stop in the
             // desktop UI now actually drive the daemon's
             // `POST /v1/meetings` and `POST /v1/meetings/{id}/end`

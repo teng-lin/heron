@@ -38,7 +38,11 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { Pause, Play } from "lucide-react";
 
 import { Button } from "./ui/button";
-import { invoke, type AssetSource } from "../lib/invoke";
+import {
+  invoke,
+  type AssetSource,
+} from "../lib/invoke";
+import type { DaemonAudioSource } from "../lib/types";
 
 export interface PlaybackBarHandle {
   /** Move the audio playhead to `seconds`. No-op when no recording is
@@ -139,38 +143,67 @@ export function PlaybackBar({
     setCurrentTime(0);
     setDuration(NaN);
 
-    invoke("heron_resolve_recording", {
-      sessionId,
-      m4aCandidate: m4aCandidatePath(vaultRoot, sessionId),
-      cacheRoot,
-    })
-      .then((source: AssetSource) => {
-        if (cancelled) return;
-        if (source.kind === "m4a") {
-          // `convertFileSrc` produces the `https://asset.localhost/...`
-          // URL the webview's CSP `media-src` allows. Tauri 2 routes
-          // requests for that origin back to the disk path through the
-          // built-in asset protocol.
-          setResolved({
-            kind: "ready",
-            src: convertFileSrc(source.path),
-            sourceLabel: "Archival m4a",
-          });
-        } else {
-          // Salvage-from-cache: the raw mic/tap files are not yet
-          // mixed into a playable WAV. The wave-mixer wires up in
-          // week 13; today we surface the empty state so the user
-          // knows the recording exists but isn't yet ready to play.
-          setResolved({
-            kind: "partial",
-            sourceLabel: "Audio not yet encoded",
-          });
+    async function resolveLocal() {
+      const source: AssetSource = await invoke("heron_resolve_recording", {
+        sessionId,
+        m4aCandidate: m4aCandidatePath(vaultRoot, sessionId),
+        cacheRoot,
+      });
+      if (source.kind === "m4a") {
+        return {
+          kind: "ready" as const,
+          src: convertFileSrc(source.path),
+          sourceLabel: "Archival m4a",
+        };
+      }
+      return {
+        kind: "partial" as const,
+        sourceLabel: "Audio not yet encoded",
+      };
+    }
+
+    async function resolveDaemon() {
+      const daemon = await invoke("heron_meeting_audio", {
+        meetingId: sessionId,
+      });
+      if (daemon.kind !== "ok") {
+        throw new Error(daemon.detail);
+      }
+      const source: DaemonAudioSource = daemon.data;
+      return {
+        kind: "ready" as const,
+        src: convertFileSrc(source.path),
+        sourceLabel: "Daemon audio",
+      };
+    }
+
+    async function resolve() {
+      try {
+        const local = await resolveLocal();
+        if (local.kind === "ready") return local;
+        try {
+          return await resolveDaemon();
+        } catch {
+          return local;
         }
+      } catch (localErr) {
+        try {
+          return await resolveDaemon();
+        } catch {
+          throw localErr;
+        }
+      }
+    }
+
+    resolve()
+      .then((next) => {
+        if (!cancelled) setResolved(next);
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
-        const message = err instanceof Error ? err.message : String(err);
-        setResolved({ kind: "missing", message });
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setResolved({ kind: "missing", message });
+        }
       });
     return () => {
       cancelled = true;
