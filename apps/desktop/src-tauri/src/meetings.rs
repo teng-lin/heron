@@ -52,7 +52,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use heron_session::{
-    ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus, Platform, Summary,
+    CalendarEvent, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus,
+    Platform, PreMeetingContextRequest, Summary,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -185,6 +186,54 @@ pub async fn heron_end_meeting(
     Ok(end_meeting_at(BASE_URL, &bearer, &parsed).await)
 }
 
+/// Tauri command: list upcoming calendar events. Proxies
+/// `GET /v1/calendar/upcoming`.
+///
+/// Powers the Home page's upcoming-meetings rail. The daemon's
+/// `LocalSessionOrchestrator::list_upcoming_calendar` reads from
+/// EventKit via `heron_vault::CalendarReader`, so this proxy is the
+/// only way the webview can see the user's week without granting it
+/// raw EventKit access (which the privacy posture explicitly forbids).
+///
+/// `from` / `to` arrive as RFC3339 strings from the JS side and are
+/// parsed via [`TsCalendarQuery::try_from`]. A malformed value
+/// surfaces as `Unavailable` with a parse error in `detail` rather
+/// than silently widening the request to "everything" — same
+/// rationale as the `since` field in [`heron_list_meetings`].
+#[tauri::command]
+pub async fn heron_list_calendar_upcoming(
+    state: State<'_, DaemonHandle>,
+    query: TsCalendarQuery,
+) -> Result<DaemonOutcome<CalendarPage>, String> {
+    let bearer = state.auth.bearer.clone();
+    let parsed = match CalendarQuery::try_from(query) {
+        Ok(q) => q,
+        Err(detail) => return Ok(DaemonOutcome::Unavailable { detail }),
+    };
+    Ok(list_upcoming_calendar_at(BASE_URL, &bearer, parsed).await)
+}
+
+/// Tauri command: attach pre-meeting context to a calendar event.
+/// Proxies `PUT /v1/context`.
+///
+/// Pre-staged from the upcoming-meetings rail: clicking "Start with
+/// context" attaches the calendar event's title / attendees / agenda
+/// before the matching `start_capture` fires, so the orchestrator
+/// finds the context already in `pending_contexts` (keyed by
+/// `calendar_event_id`) when the meeting starts. The daemon emits
+/// `204 No Content` on success; we synthesize an [`AttachContextAck`]
+/// echoing the validated `calendar_event_id` so the JS side has a
+/// typed handle without parsing an empty body — same pattern as
+/// [`heron_end_meeting`].
+#[tauri::command]
+pub async fn heron_attach_context(
+    state: State<'_, DaemonHandle>,
+    request: PreMeetingContextRequest,
+) -> Result<DaemonOutcome<AttachContextAck>, String> {
+    let bearer = state.auth.bearer.clone();
+    Ok(attach_context_at(BASE_URL, &bearer, &request).await)
+}
+
 /// Body shape for `POST /v1/meetings`. Mirrors
 /// [`herond::routes::meetings::StartCaptureBody`] (and
 /// `heron_cli::daemon::StartCaptureBody`); we don't share the cli
@@ -211,6 +260,66 @@ struct StartCaptureBody<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EndMeetingAck {
     pub meeting_id: MeetingId,
+}
+
+/// Synthetic ack for a successful `PUT /v1/context`.
+///
+/// Same rationale as [`EndMeetingAck`]: the daemon emits
+/// `204 No Content`, but the JS side wants confirmation of which
+/// `calendar_event_id` the context was stored under so it can clear
+/// any optimistic UI state without re-deriving from the request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachContextAck {
+    pub calendar_event_id: String,
+}
+
+/// Wire shape for `GET /v1/calendar/upcoming`. Mirrors the daemon's
+/// internal `CalendarPage` (defined as serialize-only inside herond);
+/// we redefine it here with `Deserialize` so the proxy can decode the
+/// response without pulling herond into the desktop crate just for
+/// one type alias.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CalendarPage {
+    pub items: Vec<CalendarEvent>,
+}
+
+/// Strongly-typed calendar query. Mirrors herond's `CalendarParams`
+/// shape so the proxy can serialize the same `from` / `to` / `limit`
+/// query string the daemon expects.
+#[derive(Debug, Default)]
+pub struct CalendarQuery {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+    pub limit: Option<u32>,
+}
+
+/// TS-side mirror for the calendar query. Same `TsListMeetingsQuery`
+/// rationale: the JS layer hands us strings, we parse them once at
+/// the boundary and surface a typed `Unavailable` on malformed input
+/// rather than silently widening the request to the daemon's default
+/// window.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct TsCalendarQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<u32>,
+}
+
+impl TryFrom<TsCalendarQuery> for CalendarQuery {
+    type Error = String;
+
+    fn try_from(q: TsCalendarQuery) -> Result<Self, Self::Error> {
+        let parse = |s: String, name: &str| -> Result<chrono::DateTime<chrono::Utc>, String> {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("invalid `{name}` (RFC3339 expected): {e}"))
+        };
+        Ok(CalendarQuery {
+            from: q.from.map(|s| parse(s, "from")).transpose()?,
+            to: q.to.map(|s| parse(s, "to")).transpose()?,
+            limit: q.limit,
+        })
+    }
 }
 
 /// TS-side query mirror. Tauri's serde plumbing renames camelCase
@@ -431,6 +540,101 @@ pub async fn end_meeting_at(
     DaemonOutcome::Ok {
         data: EndMeetingAck {
             meeting_id: *meeting_id,
+        },
+    }
+}
+
+/// Parameterized calendar fetch — same split-out rationale as
+/// [`list_meetings_at`]. Only attaches query params that are actually
+/// set so the daemon falls back to its own defaults
+/// (now → +7d, limit ≤ 100) for any field the renderer omitted.
+pub async fn list_upcoming_calendar_at(
+    base_url: &str,
+    bearer: &str,
+    query: CalendarQuery,
+) -> DaemonOutcome<CalendarPage> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let mut request = client
+        .get(format!("{base_url}/calendar/upcoming"))
+        .bearer_auth(bearer);
+    let mut params: Vec<(&str, String)> = Vec::new();
+    if let Some(f) = query.from {
+        params.push(("from", f.to_rfc3339()));
+    }
+    if let Some(t) = query.to {
+        params.push(("to", t.to_rfc3339()));
+    }
+    if let Some(l) = query.limit {
+        params.push(("limit", l.to_string()));
+    }
+    if !params.is_empty() {
+        request = request.query(&params);
+    }
+    match request.send().await {
+        Ok(resp) => parse_response(resp).await,
+        Err(e) => DaemonOutcome::Unavailable {
+            detail: e.to_string(),
+        },
+    }
+}
+
+/// Parameterized context attach — same split-out rationale as
+/// [`end_meeting_at`]. PUTs the [`PreMeetingContextRequest`] body and
+/// synthesizes the [`AttachContextAck`] from the request itself on a
+/// 2xx, since the daemon's 204 carries no body. The daemon validates
+/// `calendar_event_id` (non-empty, ≤ MAX_CALENDAR_EVENT_ID_BYTES) and
+/// the serialized context size; both surface here as non-2xx and
+/// collapse to `Unavailable` with the status code in `detail`.
+pub async fn attach_context_at(
+    base_url: &str,
+    bearer: &str,
+    request: &PreMeetingContextRequest,
+) -> DaemonOutcome<AttachContextAck> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/context");
+    let resp = match client
+        .put(url)
+        .bearer_auth(bearer)
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: AttachContextAck {
+            // Echo the same `calendar_event_id` the orchestrator
+            // stores. The daemon's `normalize_calendar_event_id`
+            // trims surrounding whitespace before keying
+            // `pending_contexts`; if we echoed the un-trimmed
+            // request value, a caller comparing the ack to its own
+            // record would think they disagreed. Trim here to match.
+            calendar_event_id: request.calendar_event_id.trim().to_owned(),
         },
     }
 }
@@ -895,6 +1099,278 @@ mod tests {
 
         let id = MeetingId::now_v7();
         let outcome = end_meeting_at(&base, "test", &id).await;
+        assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
+    }
+
+    // ---- Gap #8 calendar / context / transcript tests ------------------
+    //
+    // Spawn a fresh server per group rather than overloading the read /
+    // capture fixtures. The endpoints under test have distinct shapes
+    // (PUT, query-string fan-out, large JSON body) and folding them
+    // into the existing handlers would muddy the captured-state
+    // assertions the older tests already rely on.
+
+    use heron_session::{AttendeeContext, PreMeetingContext};
+
+    fn sample_calendar_event() -> CalendarEvent {
+        CalendarEvent {
+            id: "EVT-week-12".to_owned(),
+            title: "Quarterly review".to_owned(),
+            start: Utc::now(),
+            end: Utc::now() + chrono::Duration::hours(1),
+            attendees: vec![AttendeeContext {
+                name: "Alex Chen".to_owned(),
+                email: Some("alex@example.com".to_owned()),
+                last_seen_in: None,
+                relationship: None,
+                notes: None,
+            }],
+            meeting_url: Some("https://zoom.us/j/123".to_owned()),
+            related_meetings: Vec::new(),
+        }
+    }
+
+    type LastCalendarQuery = Arc<Mutex<Option<HashMap<String, String>>>>;
+    type LastAttachBody = Arc<Mutex<Option<serde_json::Value>>>;
+
+    async fn spawn_gap8(
+        event: CalendarEvent,
+    ) -> (
+        SocketAddr,
+        oneshot::Sender<()>,
+        LastCalendarQuery,
+        LastAttachBody,
+    ) {
+        let last_query: LastCalendarQuery = Arc::new(Mutex::new(None));
+        let last_body: LastAttachBody = Arc::new(Mutex::new(None));
+
+        let event = Arc::new(event);
+        let evc = Arc::clone(&event);
+        let lqc = Arc::clone(&last_query);
+        let calendar_handler = move |Query(params): Query<HashMap<String, String>>| {
+            let evc = Arc::clone(&evc);
+            let lqc = Arc::clone(&lqc);
+            async move {
+                if let Ok(mut slot) = lqc.lock() {
+                    *slot = Some(params);
+                }
+                Json(CalendarPage {
+                    items: vec![(*evc).clone()],
+                })
+            }
+        };
+
+        let lbc = Arc::clone(&last_body);
+        let attach_handler = move |Json(body): Json<serde_json::Value>| {
+            let lbc = Arc::clone(&lbc);
+            async move {
+                if let Ok(mut slot) = lbc.lock() {
+                    *slot = Some(body);
+                }
+                StatusCode::NO_CONTENT
+            }
+        };
+
+        let app = Router::new()
+            .route("/v1/calendar/upcoming", get(calendar_handler))
+            .route("/v1/context", axum::routing::put(attach_handler))
+            .layer(middleware::from_fn(require_bearer));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (addr, tx, last_query, last_body)
+    }
+
+    #[tokio::test]
+    async fn list_upcoming_calendar_happy_path_returns_events() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, _b) = spawn_gap8(evt.clone()).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome = list_upcoming_calendar_at(&base, "test", CalendarQuery::default()).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.items.len(), 1);
+                assert_eq!(data.items[0].id, evt.id);
+                assert_eq!(data.items[0].title, evt.title);
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_upcoming_calendar_propagates_query_params() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, last_query, _b) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let from = chrono::DateTime::parse_from_rfc3339("2026-04-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let to = chrono::DateTime::parse_from_rfc3339("2026-05-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let q = CalendarQuery {
+            from: Some(from),
+            to: Some(to),
+            limit: Some(25),
+        };
+        let outcome = list_upcoming_calendar_at(&base, "test", q).await;
+        assert!(matches!(outcome, DaemonOutcome::Ok { .. }));
+
+        let params = last_query
+            .lock()
+            .expect("last_query mutex")
+            .clone()
+            .expect("calendar handler should have observed a request");
+        // Round-trip through `to_rfc3339` so the assertion matches what
+        // chrono actually emits (e.g. `+00:00` vs `Z`) — we only care
+        // that the parsed datetimes ride the wire faithfully.
+        assert_eq!(
+            params.get("from").map(String::as_str),
+            Some(from.to_rfc3339().as_str())
+        );
+        assert_eq!(
+            params.get("to").map(String::as_str),
+            Some(to.to_rfc3339().as_str())
+        );
+        assert_eq!(params.get("limit").map(String::as_str), Some("25"));
+    }
+
+    #[tokio::test]
+    async fn list_upcoming_calendar_omits_none_params() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, last_query, _b) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let _ = list_upcoming_calendar_at(&base, "test", CalendarQuery::default()).await;
+
+        let params = last_query
+            .lock()
+            .expect("last_query mutex")
+            .clone()
+            .expect("calendar handler should have observed a request");
+        assert!(!params.contains_key("from"));
+        assert!(!params.contains_key("to"));
+        assert!(!params.contains_key("limit"));
+    }
+
+    #[tokio::test]
+    async fn try_from_ts_calendar_query_rejects_malformed_from() {
+        let bad = TsCalendarQuery {
+            from: Some("not-a-date".to_owned()),
+            ..TsCalendarQuery::default()
+        };
+        assert!(CalendarQuery::try_from(bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_upcoming_calendar_unauthorized_when_bearer_wrong() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, _b) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let outcome =
+            list_upcoming_calendar_at(&base, "wrong-token", CalendarQuery::default()).await;
+        match outcome {
+            DaemonOutcome::Unavailable { detail } => {
+                assert!(
+                    detail.contains("401"),
+                    "expected 401 in detail, got: {detail}"
+                );
+            }
+            DaemonOutcome::Ok { .. } => panic!("expected Unavailable on bad bearer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_context_happy_path_echoes_calendar_event_id() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, last_body) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let req = PreMeetingContextRequest {
+            calendar_event_id: "EVT-attach-1".to_owned(),
+            context: PreMeetingContext {
+                agenda: Some("Quarterly review".to_owned()),
+                attendees_known: Vec::new(),
+                related_notes: Vec::new(),
+                prior_decisions: Vec::new(),
+                user_briefing: Some("Focus on Q3 retro".to_owned()),
+            },
+        };
+        let outcome = attach_context_at(&base, "test", &req).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.calendar_event_id, "EVT-attach-1");
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+
+        let body = last_body
+            .lock()
+            .expect("body mutex")
+            .clone()
+            .expect("attach handler should have observed a body");
+        assert_eq!(body["calendar_event_id"], "EVT-attach-1");
+        assert_eq!(body["context"]["agenda"], "Quarterly review");
+        assert_eq!(body["context"]["user_briefing"], "Focus on Q3 retro");
+    }
+
+    #[tokio::test]
+    async fn attach_context_ack_echoes_trimmed_calendar_event_id() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, _last_body) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        // Daemon-side `normalize_calendar_event_id` trims surrounding
+        // whitespace before keying `pending_contexts`. The proxy's
+        // ack must reflect the trimmed form so a caller comparing
+        // the ack to its own record sees the same key the
+        // orchestrator stored.
+        let req = PreMeetingContextRequest {
+            calendar_event_id: "  EVT-padded  ".to_owned(),
+            context: PreMeetingContext::default(),
+        };
+        let outcome = attach_context_at(&base, "test", &req).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.calendar_event_id, "EVT-padded");
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_context_unavailable_when_port_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let base = format!("http://{addr}/v1");
+
+        let req = PreMeetingContextRequest {
+            calendar_event_id: "EVT-x".to_owned(),
+            context: PreMeetingContext::default(),
+        };
+        let outcome = attach_context_at(&base, "test", &req).await;
         assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
     }
 }

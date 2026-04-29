@@ -13,7 +13,7 @@
  * working even when the meetings table is unreachable.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Search } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -21,6 +21,7 @@ import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
 import { MeetingsTable, type StatusFilter } from "../components/home/meetings-table";
+import { UpcomingMeetings } from "../components/home/upcoming-meetings";
 import { Button } from "../components/ui/button";
 import {
   DialogContent,
@@ -29,6 +30,7 @@ import {
 } from "../components/ui/dialog";
 import { invoke } from "../lib/invoke";
 import { cn } from "../lib/cn";
+import type { CalendarEvent, Platform } from "../lib/types";
 import { useConsentStore } from "../store/consent";
 import { useMeetingsStore } from "../store/meetings";
 import { useRecordingStore } from "../store/recording";
@@ -47,6 +49,21 @@ export default function Home() {
   const navigate = useNavigate();
 
   const [diskWarning, setDiskWarning] = useState<DiskWarning | null>(null);
+  const [pendingCalendarEvent, setPendingCalendarEvent] =
+    useState<CalendarEvent | null>(null);
+  // Re-entrancy guard for the recording-start flow. Two pieces:
+  //
+  // - `startingRef` is the AUTHORITATIVE synchronous lock. A `useState`
+  //   guard wouldn't be safe — two clicks fired in the same React tick
+  //   both read the pre-update state and both pass. A ref is mutated
+  //   in place, so the second click sees the lock immediately.
+  // - `starting` (state) drives the render so buttons get a `disabled`
+  //   attribute. State is fine HERE because the render only needs to
+  //   reflect the lock, not enforce it.
+  //
+  // Both are set/cleared in lockstep at every entry/exit point.
+  const startingRef = useRef(false);
+  const [starting, setStarting] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
 
@@ -54,21 +71,55 @@ export default function Home() {
     void loadMeetings();
   }, [loadMeetings]);
 
-  async function proceedToConsent() {
+  async function proceedToConsent(calendarEvent: CalendarEvent | null) {
     const decision = await requestConsent();
     if (decision !== "confirmed") {
       return;
     }
+    // Gap #8: when the user clicked "Start with context" on a calendar
+    // row, pre-stage the briefing before `start_capture`. The daemon
+    // keys `pending_contexts` by `calendar_event_id`, so attaching
+    // first means the orchestrator finds the context already in place
+    // when the matching meeting arms. A failure here is non-fatal —
+    // we surface the detail and continue starting the capture without
+    // context, because losing the briefing is strictly better than
+    // losing the recording.
+    if (calendarEvent !== null) {
+      try {
+        const ack = await invoke("heron_attach_context", {
+          request: {
+            calendar_event_id: calendarEvent.id,
+            context: {
+              agenda: calendarEvent.title || null,
+              attendees_known: calendarEvent.attendees,
+              related_notes: [],
+              prior_decisions: [],
+              user_briefing: null,
+            },
+          },
+        });
+        if (ack.kind !== "ok") {
+          toast.warning(`Context not attached: ${ack.detail}`);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        toast.warning(`Context not attached: ${message}`);
+      }
+    }
     // Gap #7: ask the daemon to actually start a capture before we
     // navigate. Pre-PR the button only flipped local recording-store
     // state; now Start = `POST /v1/meetings`. The platform default is
-    // Zoom — same escape-hatch behaviour as `heron-cli`. A future
-    // patch can preselect from the most recent `meeting.detected`
-    // event or surface a picker; for v1 the most common case (a
-    // running Zoom call) is the right default.
+    // Zoom — same escape-hatch behaviour as `heron-cli`. When the
+    // start was triggered from a calendar row, infer the platform
+    // from `meeting_url` and pass `calendar_event_id` so the
+    // orchestrator pairs the capture with the context attached above.
+    const platform = inferPlatform(calendarEvent?.meeting_url ?? null) ?? "zoom";
     let outcome;
     try {
-      outcome = await invoke("heron_start_capture", { platform: "zoom" });
+      outcome = await invoke("heron_start_capture", {
+        platform,
+        calendarEventId: calendarEvent?.id ?? null,
+      });
     } catch (err) {
       // Reaching here means the Tauri IPC bridge itself failed — the
       // daemon never even saw the request. Surface and stay; the
@@ -90,30 +141,88 @@ export default function Home() {
     navigate("/recording");
   }
 
-  async function onStart() {
+  // Both the disk-warning Cancel button and the dialog's outer
+  // dismiss must clear the disk warning, the pending calendar event,
+  // AND the in-flight `starting` guard so the next click starts from
+  // a clean slate.
+  function dismissDiskWarning() {
+    setDiskWarning(null);
+    setPendingCalendarEvent(null);
+    startingRef.current = false;
+    setStarting(false);
+  }
+
+  async function onStart(event: CalendarEvent | null = null) {
+    // Synchronous re-entrancy gate. The ref read-and-set happens in a
+    // single tick; a second click in the same tick sees `true` and
+    // exits before any IPC fires.
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    let openedDiskWarning = false;
+    // The calendar event is threaded through as a parameter rather
+    // than read back from `pendingCalendarEvent` here. React state
+    // updates scheduled inside an async event handler don't surface
+    // until the next render, so the call site that just did
+    // `setPendingCalendarEvent(evt)` would still see the stale
+    // closure (`null`) when this function reads state. Pending state
+    // is reserved for the disk-warning dialog branch below: the
+    // dialog opens, the user later clicks Continue Anyway in a fresh
+    // render, and `continueAnyway` reads the up-to-date state from
+    // its own (newer) closure.
     try {
-      const settingsPath = await invoke("heron_default_settings_path");
-      const outcome = await invoke("heron_check_disk_for_recording", {
-        settingsPath,
-      });
-      if (outcome.kind === "below_threshold") {
-        setDiskWarning({
-          freeMib: outcome.free_mib,
-          thresholdMib: outcome.threshold_mib,
+      try {
+        const settingsPath = await invoke("heron_default_settings_path");
+        const outcome = await invoke("heron_check_disk_for_recording", {
+          settingsPath,
         });
-        return;
+        if (outcome.kind === "below_threshold") {
+          setPendingCalendarEvent(event);
+          setDiskWarning({
+            freeMib: outcome.free_mib,
+            thresholdMib: outcome.threshold_mib,
+          });
+          openedDiskWarning = true;
+          return;
+        }
+      } catch (err) {
+        // Pre-flight check is non-blocking on IPC failure.
+        // eslint-disable-next-line no-console
+        console.warn("[heron] disk pre-flight failed at start:", err);
       }
-    } catch (err) {
-      // Pre-flight check is non-blocking on IPC failure.
-      // eslint-disable-next-line no-console
-      console.warn("[heron] disk pre-flight failed at start:", err);
+      await proceedToConsent(event);
+    } finally {
+      // Hand off to the dialog when the disk-warning branch fired —
+      // `continueAnyway` / `dismissDiskWarning` clear the lock once
+      // the user resolves the dialog.
+      if (!openedDiskWarning) {
+        startingRef.current = false;
+        setStarting(false);
+      }
     }
-    await proceedToConsent();
   }
 
   async function continueAnyway() {
     setDiskWarning(null);
-    await proceedToConsent();
+    // `pendingCalendarEvent` was set by the prior `onStart(event)`
+    // call before the dialog opened. By the time the user clicks
+    // Continue Anyway, React has rendered the dialog and this
+    // closure captures the up-to-date state — no staleness.
+    const evt = pendingCalendarEvent;
+    setPendingCalendarEvent(null);
+    try {
+      await proceedToConsent(evt);
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
+    }
+  }
+
+  async function onStartWithContext(event: CalendarEvent) {
+    // Thread the event through `onStart` as a parameter so the
+    // no-disk-warning happy path doesn't depend on a state update
+    // that won't surface until the next render.
+    await onStart(event);
   }
 
   async function openVaultFolder() {
@@ -159,9 +268,16 @@ export default function Home() {
             meetings show up here once the daemon finishes summarizing.
           </p>
           <div className="mt-4 flex items-center gap-2">
-            <Button onClick={() => void onStart()}>Start recording</Button>
+            <Button onClick={() => void onStart()} disabled={starting}>
+              Start recording
+            </Button>
           </div>
         </header>
+
+        <UpcomingMeetings
+          onStartWithContext={(evt) => void onStartWithContext(evt)}
+          disabled={starting}
+        />
 
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <label
@@ -197,7 +313,7 @@ export default function Home() {
       <Dialog.Root
         open={diskWarning !== null}
         onOpenChange={(next) => {
-          if (!next) setDiskWarning(null);
+          if (!next) dismissDiskWarning();
         }}
       >
         <DialogContent>
@@ -212,7 +328,7 @@ export default function Home() {
             </p>
           )}
           <div className="mt-2 flex flex-wrap justify-end gap-2">
-            <Button variant="ghost" onClick={() => setDiskWarning(null)}>
+            <Button variant="ghost" onClick={dismissDiskWarning}>
               Cancel
             </Button>
             <Button variant="outline" onClick={() => void openVaultFolder()}>
@@ -226,6 +342,38 @@ export default function Home() {
       </Dialog.Root>
     </>
   );
+}
+
+/**
+ * Best-guess Platform from a calendar event's `meeting_url`. Returns
+ * `null` when the URL is missing or unrecognised — caller falls back
+ * to Zoom (the same default the manual Start button uses). Hostname
+ * matching only; we don't try to parse meeting IDs.
+ *
+ * Each branch matches `host === root || host.endsWith("." + root)` so
+ * a look-alike domain like `evilzoom.us` does NOT register as Zoom —
+ * `endsWith` alone admits any suffix-collision string. Only the
+ * scheme-validated `http:` / `https:` URLs flow through; `javascript:`
+ * and other non-web schemes parse to an empty hostname and bail out.
+ */
+function inferPlatform(meetingUrl: string | null): Platform | null {
+  if (!meetingUrl) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(meetingUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  const host = parsed.hostname.toLowerCase();
+  const isHost = (root: string) => host === root || host.endsWith(`.${root}`);
+  if (isHost("zoom.us") || isHost("zoomgov.com")) return "zoom";
+  if (isHost("meet.google.com")) return "google_meet";
+  if (isHost("teams.microsoft.com") || isHost("teams.live.com")) {
+    return "microsoft_teams";
+  }
+  if (isHost("webex.com")) return "webex";
+  return null;
 }
 
 function FilterChips({

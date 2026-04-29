@@ -21,12 +21,16 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import type {
+  AttachContextAck,
+  CalendarPage,
+  CalendarQuery,
   DaemonResult,
   ListMeetingsPage,
   ListMeetingsQuery,
   Meeting,
   MeetingId,
   Platform,
+  PreMeetingContextRequest,
   Summary,
 } from "./types";
 
@@ -692,6 +696,33 @@ export interface HeronCommands {
   heron_end_meeting: {
     args: { meetingId: MeetingId };
     returns: DaemonResult<EndMeetingAck>;
+  };
+  /**
+   * Gap #8: proxy `GET /v1/calendar/upcoming`. Powers the Home page's
+   * upcoming-meetings rail. The daemon's orchestrator reads from
+   * EventKit via `heron_vault::CalendarReader`; this proxy is the
+   * only way the webview can reach that data without the renderer
+   * being granted raw EventKit access.
+   *
+   * `from` / `to` are optional RFC 3339 strings — the daemon defaults
+   * to `now` → `now + 7 days` when omitted. `limit` is capped at 100
+   * server-side.
+   */
+  heron_list_calendar_upcoming: {
+    args: { query: CalendarQuery };
+    returns: DaemonResult<CalendarPage>;
+  };
+  /**
+   * Gap #8: proxy `PUT /v1/context`. Pre-stages agenda + attendees +
+   * briefing so the orchestrator finds them in `pending_contexts`
+   * (keyed by `calendar_event_id`) when the matching `start_capture`
+   * fires. The daemon emits `204 No Content`; this proxy synthesizes
+   * an `AttachContextAck { calendar_event_id }` so the JS side has a
+   * typed handle without parsing an empty body.
+   */
+  heron_attach_context: {
+    args: { request: PreMeetingContextRequest };
+    returns: DaemonResult<AttachContextAck>;
   };
   /**
    * UI revamp PR 4: ensure the Tauri-side SSE bridge is running.
