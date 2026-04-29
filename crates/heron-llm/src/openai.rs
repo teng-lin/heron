@@ -36,6 +36,11 @@ pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 /// message. Mirrors [`crate::anthropic::ERROR_BODY_SNIPPET_BYTES`].
 pub const ERROR_BODY_SNIPPET_BYTES: usize = 2 * 1024;
 
+/// Hard cap on a successful response body. At 4_096 output tokens and
+/// ~4 bytes/token the completion JSON is ~64 KB; 2 MB gives 30× head-
+/// room while bounding runaway-response OOM risk.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// Default `max_tokens` requested from the API per call.
 pub const DEFAULT_MAX_TOKENS: u32 = 4_096;
 
@@ -189,9 +194,16 @@ impl Summarizer for OpenAIClient {
             )));
         }
 
-        let response: ChatCompletionsResponse = resp
-            .json()
+        // Stream the body up to MAX_RESPONSE_BODY_BYTES so a runaway or
+        // malicious response cannot OOM the process (mirrors the error-
+        // path's `read_capped_body_snippet`). Returns an error if the
+        // body exceeds the cap rather than silently truncating, so the
+        // caller gets a clear message instead of a partial-JSON parse
+        // failure.
+        let body_bytes = read_capped_response_bytes(resp, MAX_RESPONSE_BODY_BYTES)
             .await
+            .map_err(|e| LlmError::Backend(format!("reading response: {e}")))?;
+        let response: ChatCompletionsResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LlmError::Backend(format!("response JSON parse: {e}")))?;
 
         parse_chat_completions_response(response, input.meeting_type)
@@ -232,15 +244,42 @@ async fn read_capped_body_snippet(mut resp: reqwest::Response) -> String {
     if buf.is_empty() && total_observed == 0 {
         return "<no body>".to_owned();
     }
-    let body_str = match std::str::from_utf8(&buf) {
-        Ok(s) => s,
-        Err(_) => return "<non-utf8 body>".to_owned(),
-    };
+    // `String::from_utf8_lossy` replaces any incomplete multi-byte
+    // sequence introduced by the byte-boundary truncation with U+FFFD
+    // rather than discarding the whole snippet. The replacement char
+    // is visually obvious so the user still gets the useful ASCII
+    // portion of the error message.
+    let body_str = String::from_utf8_lossy(&buf);
     if total_observed > buf.len() {
         format!("{body_str} ...[truncated, observed at least {total_observed} bytes]",)
     } else {
-        body_str.to_owned()
+        body_str.into_owned()
     }
+}
+
+/// Stream `resp.bytes_stream()` into a `Vec<u8>`, returning an error if
+/// the body exceeds `limit`. Used for 2xx success responses so that a
+/// runaway or malicious response cannot OOM the process.
+async fn read_capped_response_bytes(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > limit {
+                    return Err(format!(
+                        "response body exceeded {limit} bytes — possible runaway response"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("reading response body: {e}")),
+        }
+    }
+    Ok(buf)
 }
 
 /// Pure parser: takes a `ChatCompletionsResponse` and produces a
