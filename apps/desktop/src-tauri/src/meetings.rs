@@ -1210,7 +1210,20 @@ mod tests {
                 assert_eq!(data.content_type.as_deref(), Some("audio/mp4"));
                 let bytes = std::fs::read(&data.path).expect("audio cache readable");
                 assert_eq!(bytes, vec![0_u8, 1, 2, 3]);
-                assert!(!std::path::Path::new(&format!("{}.tmp", data.path)).exists());
+                let cache_dir = std::path::Path::new(&data.path)
+                    .parent()
+                    .expect("audio cache dir");
+                let leaked_tmp = std::fs::read_dir(cache_dir)
+                    .expect("read audio cache dir")
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .any(|path| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with(&id.to_string()) && n.ends_with(".m4a.tmp"))
+                            .unwrap_or(false)
+                    });
+                assert!(!leaked_tmp, "leaked temp audio file for meeting");
             }
             DaemonOutcome::Unavailable { detail } => {
                 panic!("expected Ok, got Unavailable: {detail}")
