@@ -107,6 +107,22 @@ export interface Meeting {
    * here, not `null`.
    */
   processing?: MeetingProcessing;
+  /**
+   * Tier 0 #3: structured action-item rows lifted from the vault
+   * note's `Frontmatter.action_items`. Empty during the live
+   * recording lifecycle (`detected` / `armed` / `recording` /
+   * `ended`); populated once the note finalizes. Optional on the
+   * wire because pre-Tier-0-#3 daemons (and any cached responses
+   * from a previous build) don't emit the field — Review.tsx falls
+   * back to a regex bullet extractor over the markdown body in that
+   * case.
+   *
+   * **Read path only.** Edits made in the desktop UI flow through
+   * `NoteEditor` → `heron_write_note_atomic` (markdown), not back
+   * through this field. See
+   * `docs/ux-redesign-backend-prerequisites.md` Tier 0 #3.
+   */
+  action_items?: ActionItem[];
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:482`. */
@@ -127,6 +143,19 @@ export interface ListMeetingsPage {
 
 /** Mirrors `crates/heron-session/src/lib.rs:216`. */
 export interface ActionItem {
+  /**
+   * Stable `ItemId` minted by the vault writer (UUIDv7). Survives
+   * merge-on-write so React lists / future checkbox state can key on
+   * it across re-summarize cycles. Optional on the wire because
+   * pre-Tier-0-#3 daemons used `#[serde(default)]` to fill it with
+   * the nil UUID — Tier 0 #3 added the field on the Rust side; this
+   * mirror takes it as `string | undefined` so callers can detect
+   * the legacy shape and fall back to a regex extractor.
+   *
+   * Carried as an opaque string on the JS side; the Rust side serializes
+   * `uuid::Uuid` as a hyphenated lowercase string.
+   */
+  id?: string;
   text: string;
   owner: string | null;
   /** ISO date (`YYYY-MM-DD`); `null` when no due date. */

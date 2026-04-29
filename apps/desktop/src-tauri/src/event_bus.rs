@@ -239,6 +239,7 @@ mod tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let id = meeting.id;
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())

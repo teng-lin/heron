@@ -44,7 +44,7 @@ import { ResummarizeDiffModal } from "../components/ResummarizeDiffModal";
 import { Button } from "../components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { invoke, type BackupInfo } from "../lib/invoke";
-import type { Meeting, Transcript } from "../lib/types";
+import type { ActionItem, Meeting, Transcript } from "../lib/types";
 import { useSettingsStore } from "../store/settings";
 
 type LoadState =
@@ -83,8 +83,17 @@ function formatBackupTime(iso: string): string {
  * Pull the bullet list under `## Action Items` (or `## Actions`)
  * out of the markdown. Pragmatic regex — the v1 LLM template emits
  * the heading verbatim. Returns `[]` when no section exists.
+ *
+ * Tier 0 #3 of the UX redesign moves the canonical source for action
+ * items off the markdown body and onto the `Meeting.action_items`
+ * wire field. This regex extractor stays as a fallback for vault
+ * notes that pre-date the structured emission (or for daemons that
+ * haven't been upgraded yet) — see `selectActionItems`.
+ *
+ * Exported for unit-test consumption; not part of the public app
+ * surface.
  */
-function extractActionItems(markdown: string): string[] {
+export function extractActionItems(markdown: string): string[] {
   const re = /^##\s+(?:Action items|Actions)\s*$/im;
   const match = markdown.match(re);
   if (!match || match.index === undefined) return [];
@@ -101,6 +110,64 @@ function extractActionItems(markdown: string): string[] {
     .filter((m): m is RegExpMatchArray => m !== null)
     .map((m) => m[1].trim())
     .filter((s) => s.length > 0);
+}
+
+/**
+ * Uniform shape the Actions tab renders. `id` is stable for typed
+ * rows (Tier 0 #3) and synthesized (`fallback:<index>`) for
+ * regex-extracted bullets so React keys stay distinct.
+ */
+export interface ActionItemRow {
+  id: string;
+  text: string;
+  owner: string | null;
+  due: string | null;
+  /**
+   * `true` when this row came from the structured
+   * `Meeting.action_items` wire field (Tier 0 #3); `false` when it
+   * was reconstructed from the markdown body via the legacy regex
+   * extractor. The Actions tab uses this to gate the assignee / due
+   * pill rendering — the regex path can't recover those.
+   */
+  structured: boolean;
+}
+
+/**
+ * Tier 0 #3: prefer the structured `Meeting.action_items` wire
+ * field, fall back to regex-extracted bullets when the field is
+ * absent or empty. Empty / absent structured field on a finalized
+ * note is the legacy-vault signal: pre-Tier-0-#3 frontmatter wrote
+ * action items only into the markdown body, so the wire field stays
+ * empty and we have to recover them from prose.
+ *
+ * Exported for testability — the precedence rule is the load-bearing
+ * piece of this PR.
+ */
+export function selectActionItems(
+  meeting: Meeting | null,
+  markdown: string,
+): ActionItemRow[] {
+  const structured = meeting?.action_items ?? [];
+  if (structured.length > 0) {
+    return structured.map((item: ActionItem, idx: number) => ({
+      // `id` is optional on the wire (back-compat with pre-Tier-0
+      // daemons), so we synthesize a stable React key from the index
+      // when it's missing rather than collapsing all rows onto the
+      // same key.
+      id: item.id ?? `legacy:${idx}`,
+      text: item.text,
+      owner: item.owner,
+      due: item.due,
+      structured: true,
+    }));
+  }
+  return extractActionItems(markdown).map((text, idx) => ({
+    id: `fallback:${idx}`,
+    text,
+    owner: null,
+    due: null,
+    structured: false,
+  }));
 }
 
 export default function Review() {
@@ -431,11 +498,11 @@ export default function Review() {
     [vaultRoot, sessionId, editorContentKey],
   );
 
-  const actionItems = useMemo(
-    () => extractActionItems(liveMarkdown),
-    [liveMarkdown],
-  );
   const meeting = meetingLoad.kind === "ready" ? meetingLoad.data : null;
+  const actionItems = useMemo(
+    () => selectActionItems(meeting, liveMarkdown),
+    [meeting, liveMarkdown],
+  );
   const title = meeting?.title ?? sessionId ?? "(no session)";
   const subtitle = meeting
     ? `${meeting.platform.replace(/_/g, " ")} · ${meeting.status}`
@@ -631,8 +698,36 @@ export default function Review() {
                     </p>
                   ) : (
                     <ul className="list-disc space-y-2 pl-5 text-sm">
-                      {actionItems.map((item, i) => (
-                        <li key={i}>{item}</li>
+                      {actionItems.map((item) => (
+                        <li key={item.id}>
+                          <span>{item.text}</span>
+                          {item.owner && (
+                            <span
+                              className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
+                              style={{
+                                background: "var(--color-paper-2)",
+                                borderColor: "var(--color-rule)",
+                                color: "var(--color-ink-2)",
+                              }}
+                              title="Owner"
+                            >
+                              {item.owner}
+                            </span>
+                          )}
+                          {item.due && (
+                            <span
+                              className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
+                              style={{
+                                background: "var(--color-paper-2)",
+                                borderColor: "var(--color-rule)",
+                                color: "var(--color-ink-2)",
+                              }}
+                              title="Due"
+                            >
+                              due {item.due}
+                            </span>
+                          )}
+                        </li>
                       ))}
                     </ul>
                   )}

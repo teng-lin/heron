@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use heron_event::{EventId, ReplayCache, ReplayError};
+pub use heron_types::ItemId;
 pub use heron_types::prefixed_id::IdParseError;
 
 // ── identity ──────────────────────────────────────────────────────────
@@ -186,6 +187,20 @@ pub struct Meeting {
     /// $`). UI for the panel is a separate PR; this is bridge-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing: Option<MeetingProcessing>,
+    /// Structured action items lifted from `Frontmatter.action_items`
+    /// when the meeting note is on disk. Empty during the live
+    /// recording lifecycle (`Detected` / `Armed` / `Recording` /
+    /// `Ended`); populated from the vault frontmatter once the note
+    /// finalizes. `#[serde(default)]` so pre-Tier-0 #3 wire shapes
+    /// keep parsing — the desktop falls back to a regex extractor
+    /// over the markdown body in that case.
+    ///
+    /// **Read path only.** Edits made in the desktop UI do not flow
+    /// back through this field today; the desktop's writeback path
+    /// is markdown-only. See
+    /// `docs/ux-redesign-backend-prerequisites.md` Tier 0 #3.
+    #[serde(default)]
+    pub action_items: Vec<ActionItem>,
 }
 
 /// Per-meeting LLM cost telemetry projected onto the wire.
@@ -262,6 +277,20 @@ pub struct Transcript {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionItem {
+    /// Stable `ItemId` minted by the vault writer (UUIDv7 — see
+    /// `heron_types::ItemId`). Survives merge-on-write per
+    /// `heron_vault::merge_action_items`, so the desktop can key
+    /// React lists / checkbox state on it across re-summarize cycles
+    /// without that state aliasing onto a different bullet.
+    ///
+    /// `#[serde(default)]` for back-compat: pre-Tier-0 #3 daemon
+    /// payloads (and any cached responses sitting on disk from a
+    /// previous build) omitted this field. Falling back to the nil
+    /// UUID lets old wire shapes still parse; clients that want the
+    /// stable-id contract should re-read the meeting from a daemon
+    /// new enough to populate it.
+    #[serde(default)]
+    pub id: ItemId,
     pub text: String,
     /// Display name of the person the item is assigned to, when the
     /// LLM extracted one. Free text — heron does not resolve this
@@ -860,6 +889,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let envelope = Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
             .with_meeting(meeting.id.to_string());
@@ -961,6 +991,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Ready,
             tags: vec!["acme".into(), "pricing".into()],
             processing: None,
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         // Pin the wire-key explicitly so a `#[serde(rename)]` typo
@@ -1066,6 +1097,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         let obj = json.as_object().expect("object");
@@ -1101,6 +1133,7 @@ mod prefix_tests {
                 tokens_out: 612,
                 model: "claude-sonnet-4-6".into(),
             }),
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         let processing = json
