@@ -451,6 +451,50 @@ fn heron_open_window(app: tauri::AppHandle, target: String) -> Result<(), String
     app.emit(event, ()).map_err(|e| e.to_string())
 }
 
+/// Tauri command: reveal the user's vault folder in Finder.
+///
+/// Reads `vault_root` from the on-disk settings file rather than
+/// trusting the renderer — a compromised webview cannot redirect
+/// `open(1)` at an arbitrary directory. The path is canonicalized
+/// before launch so option-shaped names cannot be parsed as flags.
+#[tauri::command]
+async fn heron_open_vault_folder(settings_path: String) -> Result<(), String> {
+    let settings = read_settings(Path::new(&settings_path)).map_err(|e| e.to_string())?;
+    let vault_root = settings.vault_root.trim();
+    if vault_root.is_empty() {
+        return Err("vault folder is not configured".to_string());
+    }
+    let path = Path::new(vault_root);
+    if !path.exists() {
+        return Err(format!("vault folder not found: {vault_root}"));
+    }
+    if !path.is_dir() {
+        return Err(format!("vault path is not a directory: {vault_root}"));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("failed to canonicalize vault folder: {e}"))?;
+    open_vault_in_finder(&canonical).await
+}
+
+#[cfg(target_os = "macos")]
+async fn open_vault_in_finder(path: &Path) -> Result<(), String> {
+    let status = tokio::process::Command::new("open")
+        .arg("--")
+        .arg(path)
+        .status()
+        .await
+        .map_err(|e| format!("failed to open vault folder: {e}"))?;
+    if !status.success() {
+        return Err(format!("`open` exited with status {status}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn open_vault_in_finder(_path: &Path) -> Result<(), String> {
+    Err("opening the vault folder is only supported on macOS in v1".to_string())
+}
+
 // ---- Keychain commands (PR-θ / phase 70) --------------------------
 //
 // Surface for the Settings pane's API-key field. `set` and `delete`
@@ -812,6 +856,7 @@ pub fn run() {
             heron_daemon_status,
             heron_mark_onboarded,
             heron_open_window,
+            heron_open_vault_folder,
             heron_keychain_set,
             heron_keychain_has,
             heron_keychain_delete,
@@ -1058,5 +1103,62 @@ mod tests {
         assert!(res.is_err());
         let res2 = heron_keychain_set("anthropic_api_key".into(), "   ".into());
         assert!(res2.is_err(), "whitespace-only secret must reject too");
+    }
+
+    /// `heron_open_vault_folder` reads `vault_root` from the on-disk
+    /// settings file, validates it, and only then launches `open(1)`.
+    /// These tests cover the rejection branches; the success path would
+    /// actually spawn Finder, which is undesirable in a unit test.
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    mod open_vault_folder {
+        use super::*;
+        use tempfile::NamedTempFile;
+
+        fn write_settings_file(vault_root: &str) -> NamedTempFile {
+            let s = Settings {
+                vault_root: vault_root.to_owned(),
+                ..Settings::default()
+            };
+            let file = NamedTempFile::new().expect("temp settings file");
+            write_settings(file.path(), &s).expect("write settings");
+            file
+        }
+
+        #[tokio::test]
+        async fn rejects_empty_vault_root() {
+            let f = write_settings_file("");
+            let err = heron_open_vault_folder(f.path().to_string_lossy().into_owned())
+                .await
+                .unwrap_err();
+            assert!(err.contains("not configured"), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn rejects_whitespace_vault_root() {
+            let f = write_settings_file("   ");
+            let err = heron_open_vault_folder(f.path().to_string_lossy().into_owned())
+                .await
+                .unwrap_err();
+            assert!(err.contains("not configured"), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn rejects_missing_vault_path() {
+            let f = write_settings_file("/nonexistent/heron/vault/cannot-exist-7c3a91d2");
+            let err = heron_open_vault_folder(f.path().to_string_lossy().into_owned())
+                .await
+                .unwrap_err();
+            assert!(err.contains("not found"), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn rejects_file_vault_path() {
+            let leaf = NamedTempFile::new().expect("temp leaf");
+            let f = write_settings_file(&leaf.path().to_string_lossy());
+            let err = heron_open_vault_folder(f.path().to_string_lossy().into_owned())
+                .await
+                .unwrap_err();
+            assert!(err.contains("not a directory"), "got: {err}");
+        }
     }
 }
