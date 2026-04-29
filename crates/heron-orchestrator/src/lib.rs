@@ -1334,6 +1334,13 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     stt_backend_name: self.stt_backend_name.clone(),
                     llm_preference: self.llm_preference,
                     pre_meeting_briefing,
+                    // Tier 0b #4: bridge `SpeakerEvent` from the AX
+                    // observer onto the canonical event bus so SSE
+                    // / Tauri / MCP transports can render a "now
+                    // speaking" indicator without subscribing to a
+                    // private channel. Cheap clone — the bus is
+                    // `Arc`-backed inside.
+                    event_bus: Some((self.bus.clone(), id)),
                 };
                 let handle = tokio::task::spawn_blocking(move || {
                     // CoreAudio/cpal handles in the capture path are

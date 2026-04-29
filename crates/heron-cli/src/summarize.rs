@@ -121,6 +121,9 @@ pub async fn re_summarize_in_vault(
         // CLI re-summarize never carries pre-meeting context — that
         // surface only flows through the daemon's `attach_context`.
         pre_meeting_briefing: None,
+        // Re-summarize doesn't run a live capture, so there are no AX
+        // events to bridge.
+        event_bus: None,
     };
     let orch = session::Orchestrator::new(cfg);
     let output = orch

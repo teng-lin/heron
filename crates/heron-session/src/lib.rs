@@ -379,6 +379,9 @@ pub enum EventPayload {
     #[serde(rename = "action_items.ready")]
     ActionItemsReady(ActionItemsReadyData),
 
+    #[serde(rename = "speaker.changed")]
+    SpeakerChanged(SpeakerChangedData),
+
     #[serde(rename = "doctor.warning")]
     DoctorWarning(DoctorWarningData),
     #[serde(rename = "daemon.error")]
@@ -406,6 +409,7 @@ impl EventPayload {
             Self::TranscriptFinal(_) => "transcript.final",
             Self::SummaryReady(_) => "summary.ready",
             Self::ActionItemsReady(_) => "action_items.ready",
+            Self::SpeakerChanged(_) => "speaker.changed",
             Self::DoctorWarning(_) => "doctor.warning",
             Self::DaemonError(_) => "daemon.error",
         }
@@ -442,6 +446,49 @@ pub enum MeetingOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionItemsReadyData {
     pub items: Vec<ActionItem>,
+}
+
+/// Body of a `speaker.changed` event. Bridges
+/// [`heron_types::SpeakerEvent`] from the AX observer onto the canonical
+/// bus so SSE / Tauri / MCP transports can project the AX-derived
+/// speaker signal without subscribing to a private channel.
+///
+/// **Important semantic caveat.** Zoom's AX tree does not expose the
+/// active-speaker frame (the colored border around the speaking tile);
+/// that signal is Metal-rendered outside Accessibility. What the AX
+/// bridge actually publishes is **mute-state transitions**: `started`
+/// flips to `true` when a participant unmutes, `false` when they mute.
+/// In the dominant 1:1 client-meeting case exactly one remote
+/// participant is unmuted, so this is a perfect proxy for
+/// "now speaking". In free-for-all 3+ calls multiple participants are
+/// often simultaneously unmuted; consumers MUST treat this signal as
+/// "this participant is potentially speaking" rather than "this
+/// participant is the active speaker." See `swift/zoomax-helper`'s
+/// module header for the full §3.3 spike rationale.
+///
+/// Per the OpenAPI `EventEnvelope` projection convention every payload
+/// is a struct (not a re-export) so this crate stays the single source
+/// of truth on event-wire shape — even when the underlying detector
+/// type evolves. `t` is session-secs (relative to
+/// [`heron_types::SessionClock::started_at`]).
+///
+/// On meeting end consumers should clear any per-meeting "now
+/// speaking" state on the matching `meeting.ended` (or
+/// `meeting.completed`) envelope; the AX bridge stops emitting once
+/// the recording phase ends and any unflushed `started=true` would
+/// otherwise leak into the post-meeting review view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeakerChangedData {
+    /// Session-secs since meeting start (mirrors
+    /// [`heron_types::SpeakerEvent::t`]).
+    pub t: f64,
+    /// Display name from Zoom's AX tree, or `"them"` when AX could not
+    /// attribute the turn.
+    pub name: String,
+    /// `true` when the participant transitioned to UNMUTED (per the
+    /// caveat in the struct doc, "potentially speaking"), `false`
+    /// when they transitioned to MUTED (definitely not speaking).
+    pub started: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -776,6 +823,62 @@ mod prefix_tests {
         assert!(obj.contains_key("data"), "missing data field: {json}");
         let back: EventEnvelope = serde_json::from_value(json).expect("deserialize");
         assert!(matches!(back.payload, EventPayload::MeetingDetected(_)));
+    }
+
+    #[test]
+    fn speaker_changed_round_trips_through_envelope() {
+        // Bridge guard: every other transport (SSE, Tauri IPC, MCP,
+        // webhook) projects from `EventEnvelope`, so a malformed
+        // serde tag/content for `speaker.changed` would silently
+        // corrupt the wire shape on every projection at once. Pin
+        // the discriminator + data shape here.
+        let payload = EventPayload::SpeakerChanged(SpeakerChangedData {
+            t: 12.5,
+            name: "Alice".into(),
+            started: true,
+        });
+        let envelope = Envelope::new(payload).with_meeting("mtg_test");
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.get("event_type").and_then(|v| v.as_str()),
+            Some("speaker.changed"),
+            "speaker.changed must be the wire discriminator: {json}",
+        );
+        let data = obj.get("data").and_then(|v| v.as_object()).expect("data");
+        assert!(
+            (data.get("t").and_then(|v| v.as_f64()).unwrap_or(0.0) - 12.5).abs() < f64::EPSILON
+        );
+        assert_eq!(data.get("name").and_then(|v| v.as_str()), Some("Alice"));
+        assert_eq!(data.get("started").and_then(|v| v.as_bool()), Some(true));
+        let back: EventEnvelope = serde_json::from_value(json).expect("deserialize");
+        match back.payload {
+            EventPayload::SpeakerChanged(d) => {
+                assert_eq!(d.name, "Alice");
+                assert!(d.started);
+            }
+            other => panic!("expected SpeakerChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speaker_changed_event_type_string_matches_serde_tag() {
+        // `event_type()` is the canonical projection used by every
+        // transport for their discriminator string; if the
+        // hand-written match diverges from the `#[serde(rename)]`
+        // tag, replay/topic-filter consumers would silently
+        // mis-route. Pin them in lockstep.
+        let payload = EventPayload::SpeakerChanged(SpeakerChangedData {
+            t: 0.0,
+            name: String::new(),
+            started: false,
+        });
+        assert_eq!(payload.event_type(), "speaker.changed");
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            json.get("event_type").and_then(|v| v.as_str()),
+            Some("speaker.changed"),
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use heron_llm::{Summarizer, SummarizerInput, SummarizerOutput};
+use heron_session::{MeetingId, SessionEventBus};
 use heron_types::{
     IdleReason, MeetingType, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
 };
@@ -85,6 +86,22 @@ pub struct SessionConfig {
     /// the call. `None` for ad-hoc captures or for `heron record` runs
     /// from the CLI which never stage context.
     pub pre_meeting_briefing: Option<String>,
+    /// Optional event-bus handle + meeting id used to bridge
+    /// per-tick AX [`SpeakerEvent`]s onto the canonical
+    /// [`heron_session::EventEnvelope`] stream as `speaker.changed`
+    /// envelopes. `None` for `heron record` CLI runs (no SSE consumer
+    /// listening); set by the daemon orchestrator at `start_capture`
+    /// time. Per Invariant 12 every event flows through
+    /// [`heron_event::EventBus`]; without this hand-off the AX signal
+    /// would die in the offline-aligner Vec.
+    ///
+    /// Both fields are paired: the bus alone has no meeting context to
+    /// stamp on `Envelope::meeting_id`, and a meeting id without a bus
+    /// has nowhere to publish. Carrying them together as a single
+    /// `Option<(...)>` means a forgetful caller can't half-wire it.
+    ///
+    /// [`SpeakerEvent`]: heron_types::SpeakerEvent
+    pub event_bus: Option<(SessionEventBus, MeetingId)>,
 }
 
 /// Outcome of `run_no_op` and `run`.
@@ -350,6 +367,7 @@ mod tests {
             // environment determines which path runs.
             llm_preference: heron_llm::Preference::Auto,
             pre_meeting_briefing: None,
+            event_bus: None,
         }
     }
 

@@ -26,6 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use heron_event::Envelope;
+use heron_session::{EventPayload, MeetingId, SessionEventBus, SpeakerChangedData};
 use heron_types::{
     Attendee, Channel, Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, ItemId,
     MeetingType, RecordingFsm, SessionId, SessionPhase, SessionStateRecord, SpeakerEvent,
@@ -117,6 +119,7 @@ pub async fn run_pipeline(
             &mic_clean_wav,
             &tap_wav,
             ax.as_ref(),
+            config.event_bus.clone(),
             stop_rx,
         )
         .await
@@ -413,6 +416,7 @@ async fn run_capture_phase(
     mic_clean_wav: &Path,
     tap_wav: &Path,
     ax: &dyn heron_zoom::AxBackend,
+    event_bus: Option<(SessionEventBus, MeetingId)>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<Vec<SpeakerEvent>, SessionError> {
     let session_dir = session_cache_dir(config);
@@ -450,7 +454,7 @@ async fn run_capture_phase(
             None
         }
     };
-    let ax_collector = spawn_ax_collector(ax_rx);
+    let ax_collector = spawn_ax_collector(ax_rx, event_bus);
 
     let _ = stop_rx.await;
 
@@ -557,14 +561,43 @@ fn spawn_wav_writer(
     })
 }
 
-/// Drain the AX mpsc into a Vec. Returns when the sender side is
+/// Drain the AX mpsc into a Vec, optionally fanning out each event
+/// onto the canonical [`heron_session::EventEnvelope`] bus as a
+/// `speaker.changed` envelope. Returns when the sender side is
 /// dropped (the AX backend exited). Buffer size is bounded by the
 /// channel cap upstream so a runaway emitter can't OOM the
 /// orchestrator.
-fn spawn_ax_collector(mut rx: mpsc::Receiver<SpeakerEvent>) -> JoinHandle<Vec<SpeakerEvent>> {
+///
+/// The Vec return is the offline-aligner feed (consumed by
+/// `run_pipeline` to compute speaker attribution post-stop). The
+/// bus publish is the live SSE feed (consumed by the desktop UI's
+/// "now speaking" indicator). Both are best-effort — a publish
+/// failure (no receivers) does NOT drop the event from the Vec, so
+/// alignment never silently degrades when SSE consumers come and go.
+fn spawn_ax_collector(
+    mut rx: mpsc::Receiver<SpeakerEvent>,
+    event_bus: Option<(SessionEventBus, MeetingId)>,
+) -> JoinHandle<Vec<SpeakerEvent>> {
+    // Pre-stringify the meeting id once: it's constant for the lifetime
+    // of the task, and `Envelope::with_meeting` would otherwise allocate
+    // a fresh `String` on every `SpeakerEvent` (4 Hz × meeting length).
+    let publish_target = event_bus.map(|(bus, mid)| (bus, mid.to_string()));
     tokio::spawn(async move {
         let mut events = Vec::new();
         while let Some(evt) = rx.recv().await {
+            if let Some((bus, meeting_id)) = publish_target.as_ref() {
+                let payload = EventPayload::SpeakerChanged(SpeakerChangedData {
+                    t: evt.t,
+                    name: evt.name.clone(),
+                    started: evt.started,
+                });
+                let envelope = Envelope::new(payload).with_meeting(meeting_id.clone());
+                // `publish` returns 0 when no subscribers are
+                // attached; that's expected for `heron record` CLI
+                // runs and on the daemon path before the SSE
+                // bridge connects. Fire-and-forget per Invariant 12.
+                bus.publish(envelope);
+            }
             events.push(evt);
         }
         events
@@ -882,6 +915,100 @@ mod tests {
         let body = fallback_body(&turns);
         assert!(body.contains("Transcript (no summary)"));
         assert_eq!(body.lines().filter(|l| l.starts_with("- ")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_ax_collector_publishes_to_bus_and_collects_into_vec() {
+        // Tier 0b #4 contract pin: every `SpeakerEvent` arriving on
+        // the AX mpsc must (a) reach the offline aligner via the
+        // returned Vec AND (b) be projected onto the
+        // `SessionEventBus` as a `speaker.changed` envelope.
+        // The two paths are deliberately independent — bus failure
+        // (no subscribers) must not lose events from the alignment
+        // feed, and vice versa.
+        use heron_event::EventBus;
+        use heron_session::{EventPayload, MeetingId};
+        use heron_types::{SpeakerEvent, ViewMode};
+
+        let bus: SessionEventBus = EventBus::new(16);
+        let meeting_id = MeetingId::now_v7();
+        let mut sub = bus.subscribe();
+
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_ax_collector(rx, Some((bus.clone(), meeting_id)));
+
+        tx.send(SpeakerEvent {
+            t: 1.0,
+            name: "Alice".into(),
+            started: true,
+            view_mode: ViewMode::ActiveSpeaker,
+            own_tile: false,
+        })
+        .await
+        .expect("send");
+        tx.send(SpeakerEvent {
+            t: 2.0,
+            name: "Alice".into(),
+            started: false,
+            view_mode: ViewMode::ActiveSpeaker,
+            own_tile: false,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+
+        // Collect the bus envelopes the publish path emitted before
+        // joining the task — joining first would race against the
+        // broadcast channel close and we'd lose the assertion.
+        let env_a = sub.recv().await.expect("first envelope");
+        let env_b = sub.recv().await.expect("second envelope");
+
+        let collected = handle.await.expect("join");
+        assert_eq!(collected.len(), 2, "alignment feed must keep all events");
+
+        match env_a.payload {
+            EventPayload::SpeakerChanged(d) => {
+                assert_eq!(d.name, "Alice");
+                assert!(d.started);
+                assert!((d.t - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected SpeakerChanged, got {other:?}"),
+        }
+        match env_b.payload {
+            EventPayload::SpeakerChanged(d) => assert!(!d.started),
+            other => panic!("expected SpeakerChanged, got {other:?}"),
+        }
+        // Envelope-meeting tagging contract: publishers MUST set
+        // `meeting_id` to match the payload's meeting (Invariant 12
+        // consistency clause).
+        assert_eq!(
+            env_a.meeting_id.as_deref(),
+            Some(meeting_id.to_string().as_str()),
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_ax_collector_without_bus_still_collects() {
+        // CLI captures pass `None` for the bus. The collector must
+        // still drain the channel into a Vec — regression guard
+        // against a future change that conditionally skips the Vec
+        // push when the bus is absent.
+        use heron_types::{SpeakerEvent, ViewMode};
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_ax_collector(rx, None);
+        tx.send(SpeakerEvent {
+            t: 0.5,
+            name: "them".into(),
+            started: true,
+            view_mode: ViewMode::Gallery,
+            own_tile: false,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        let collected = handle.await.expect("join");
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].name, "them");
     }
 
     #[test]

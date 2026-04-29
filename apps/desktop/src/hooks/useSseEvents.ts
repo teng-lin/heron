@@ -17,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/invoke";
 import type { EventEnvelope } from "../lib/types";
 import { useMeetingsStore } from "../store/meetings";
+import { useSpeakerStore } from "../store/speaker";
 import { useTranscriptStore } from "../store/transcript";
 
 const FRONTEND_EVENT = "heron://event";
@@ -129,7 +130,6 @@ export function dispatch(envelope: EventEnvelope) {
     }
     case "meeting.started":
     case "meeting.armed":
-    case "meeting.ended":
     case "meeting.detected": {
       // Refresh the meetings list so the Home table picks up the
       // new state. Cheap because the store coalesces in-flight
@@ -137,8 +137,26 @@ export function dispatch(envelope: EventEnvelope) {
       void useMeetingsStore.getState().load();
       return;
     }
+    case "meeting.ended":
     case "meeting.completed": {
+      // The AX bridge stops emitting once the recording phase ends,
+      // so any unflushed `speaker.changed { started: true }` would
+      // leak into the post-meeting review view as a stale badge.
+      // Clear on BOTH ended (recording stopped, transcribe still
+      // running) and completed (terminal) so the gap between those
+      // two states never displays a phantom active speaker.
+      const meetingId = envelope.meeting_id;
+      if (meetingId) {
+        useSpeakerStore.getState().clear(meetingId);
+      }
       void useMeetingsStore.getState().load();
+      return;
+    }
+    case "speaker.changed": {
+      const meetingId = envelope.meeting_id;
+      if (meetingId) {
+        useSpeakerStore.getState().apply(meetingId, envelope.data);
+      }
       return;
     }
     case "summary.ready": {
