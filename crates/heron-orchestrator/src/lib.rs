@@ -1263,6 +1263,11 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             participants: Vec::new(),
             transcript_status: TranscriptLifecycle::Pending,
             summary_status: SummaryLifecycle::Pending,
+            // Tags are LLM-inferred from the summary; an active capture
+            // has no summary yet, so start empty and let
+            // `meeting_from_note` fill them in once the note is
+            // finalized on disk.
+            tags: Vec::new(),
         };
         let mut fsm = RecordingFsm::new();
 
@@ -2003,6 +2008,9 @@ fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionE
         participants,
         transcript_status,
         summary_status,
+        // Surface LLM-inferred tags so the frontend can render chips
+        // without a second read into the note's frontmatter.
+        tags: fm.tags.clone(),
     })
 }
 
@@ -2189,6 +2197,7 @@ mod tests {
             participants: vec![],
             transcript_status: TranscriptLifecycle::Pending,
             summary_status: SummaryLifecycle::Pending,
+            tags: vec![],
         };
         let id = meeting.id;
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())

@@ -673,6 +673,17 @@ components:
         summary_status:
           type: string
           enum: [pending, ready, failed]
+        tags:
+          type: array
+          items: { type: string }
+          default: []
+          description: |
+            LLM-inferred topic tags lifted from the note's
+            `Frontmatter.tags`. Empty for active captures (no summary
+            yet) and for any meeting whose summarizer omitted them.
+            Order is the writer's order so a frontend can render a
+            stable chip list. Older daemon builds may omit the field
+            entirely; clients SHOULD treat a missing `tags` as `[]`.
 
     TranscriptSegment:
       type: object

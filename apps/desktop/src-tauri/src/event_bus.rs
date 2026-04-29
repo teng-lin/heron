@@ -237,6 +237,7 @@ mod tests {
             participants: vec![],
             transcript_status: TranscriptLifecycle::Pending,
             summary_status: SummaryLifecycle::Pending,
+            tags: vec![],
         };
         let id = meeting.id;
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())

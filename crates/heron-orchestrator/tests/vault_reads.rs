@@ -154,6 +154,65 @@ async fn get_meeting_resolves_id_to_note() {
 }
 
 #[tokio::test]
+async fn list_and_get_meeting_surface_frontmatter_tags() {
+    // Pin the bridge end-to-end:
+    //   * `list_meetings` returns the tags in writer order
+    //   * `get_meeting` returns the same tags (separate code path
+    //     through `meeting_from_note`)
+    //   * a note WITHOUT tags surfaces an empty list (the
+    //     `#[serde(default)]` contract).
+    let fix = Fixture::new();
+    let with_tags_date = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
+    fix.write_note_with_tags(
+        "alpha",
+        with_tags_date,
+        "09:00",
+        "alpha-co",
+        &["acme", "pricing"],
+    );
+    fix.write_note(
+        "no-tags",
+        NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+        "09:00",
+        "beta-co",
+    );
+
+    let orch = fix.orch();
+    let listed = orch
+        .list_meetings(ListMeetingsQuery::default())
+        .await
+        .unwrap();
+    let tagged = listed
+        .items
+        .iter()
+        .find(|m| m.title.as_deref() == Some("alpha-co"))
+        .expect("tagged note must appear in list");
+    assert_eq!(
+        tagged.tags,
+        vec!["acme".to_owned(), "pricing".to_owned()],
+        "tags must flow through list_meetings in writer order",
+    );
+
+    let untagged = listed
+        .items
+        .iter()
+        .find(|m| m.title.as_deref() == Some("beta-co"))
+        .expect("untagged note must appear in list");
+    assert!(
+        untagged.tags.is_empty(),
+        "note with no tags should surface as empty (not missing): {:?}",
+        untagged.tags,
+    );
+
+    // Same contract via `get_meeting`, which goes through a distinct
+    // code path (`meeting_from_note` from `find_note_path_by_id`
+    // rather than the listing scan). Pin both so a future refactor
+    // that diverges them gets caught.
+    let by_id = orch.get_meeting(&tagged.id).await.unwrap();
+    assert_eq!(by_id.tags, tagged.tags);
+}
+
+#[tokio::test]
 async fn get_meeting_unknown_id_returns_not_found() {
     let fix = Fixture::new();
     let unknown = heron_session::MeetingId::now_v7();
@@ -607,6 +666,28 @@ impl Fixture {
         let abs = self.vault_root().join("meetings").join(&path);
         let (mut fm, body) = heron_vault::read_note(&abs).unwrap();
         fm.source_app = source_app.to_owned();
+        let rendered = heron_vault::render_note(&fm, &body).unwrap();
+        std::fs::write(&abs, rendered).unwrap();
+    }
+
+    /// Write a default note, then patch in `tags`. Mirrors the
+    /// edit-and-rewrite pattern of [`Self::write_note_with_recording`]
+    /// so the test fixture stays additive — tags are llm-inferred,
+    /// so a happy-path note ships them via the same path the real
+    /// summarizer→merge pipeline writes them through.
+    fn write_note_with_tags(
+        &self,
+        slug: &str,
+        date: NaiveDate,
+        start: &str,
+        company: &str,
+        tags: &[&str],
+    ) {
+        self.write_note_inner(slug, date, start, company, "Body.\n", &[], None, &[]);
+        let path = note_filename(date, start, slug);
+        let abs = self.vault_root().join("meetings").join(&path);
+        let (mut fm, body) = heron_vault::read_note(&abs).unwrap();
+        fm.tags = tags.iter().map(|s| (*s).to_owned()).collect();
         let rendered = heron_vault::render_note(&fm, &body).unwrap();
         std::fs::write(&abs, rendered).unwrap();
     }

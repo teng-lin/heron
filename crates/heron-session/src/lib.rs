@@ -167,6 +167,13 @@ pub struct Meeting {
     pub participants: Vec<Participant>,
     pub transcript_status: TranscriptLifecycle,
     pub summary_status: SummaryLifecycle,
+    /// LLM-inferred topic tags lifted from the note's
+    /// `Frontmatter.tags`. Empty for active captures (no summary yet)
+    /// and for any meeting whose summarizer omitted them. `#[serde(default)]`
+    /// so older daemon builds / serialized fixtures that predate this
+    /// field still deserialize cleanly into the wider type.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +770,7 @@ mod prefix_tests {
             participants: vec![],
             transcript_status: TranscriptLifecycle::Partial,
             summary_status: SummaryLifecycle::Pending,
+            tags: vec![],
         };
         let envelope = Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
             .with_meeting(meeting.id.to_string());
@@ -784,6 +792,65 @@ mod prefix_tests {
         assert!(MeetingStatus::Failed.is_terminal());
         assert!(!MeetingStatus::Recording.is_terminal());
         assert!(!MeetingStatus::Detected.is_terminal());
+    }
+
+    #[test]
+    fn meeting_tags_round_trip_and_default_when_omitted() {
+        // Pin two contracts:
+        //   (a) tags survive serialize -> deserialize in writer
+        //       order (stable chip list on the frontend).
+        //   (b) a payload without the `tags` key deserializes
+        //       cleanly with an empty default — the
+        //       `#[serde(default)]` mixed-version contract.
+        let meeting = Meeting {
+            id: MeetingId::now_v7(),
+            status: MeetingStatus::Done,
+            platform: Platform::Zoom,
+            title: Some("Acme weekly".into()),
+            calendar_event_id: None,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            duration_secs: Some(1800),
+            participants: vec![],
+            transcript_status: TranscriptLifecycle::Complete,
+            summary_status: SummaryLifecycle::Ready,
+            tags: vec!["acme".into(), "pricing".into()],
+        };
+        let json = serde_json::to_value(&meeting).expect("serialize");
+        // Pin the wire-key explicitly so a `#[serde(rename)]` typo
+        // can't ship a mismatched key without breaking the test —
+        // the deserialize step alone would still pass via the
+        // `#[serde(default)]` fallback.
+        assert!(
+            json.get("tags").is_some_and(|v| v.is_array()),
+            "tags absent or wrong shape on wire: {json}",
+        );
+        let back: Meeting = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.tags, vec!["acme".to_owned(), "pricing".to_owned()]);
+
+        // Backward compat: a wire payload with no `tags` field at all
+        // (older daemon, or a fixture frozen pre-Tier-0) must still
+        // deserialize, and tags must default to empty.
+        let legacy = serde_json::json!({
+            "id": MeetingId::now_v7(),
+            "status": "done",
+            "platform": "zoom",
+            "title": null,
+            "calendar_event_id": null,
+            "started_at": Utc::now(),
+            "ended_at": null,
+            "duration_secs": null,
+            "participants": [],
+            "transcript_status": "complete",
+            "summary_status": "ready",
+        });
+        let legacy_meeting: Meeting =
+            serde_json::from_value(legacy).expect("legacy payload deserialize");
+        assert!(
+            legacy_meeting.tags.is_empty(),
+            "missing tags should default to empty, got {:?}",
+            legacy_meeting.tags,
+        );
     }
 
     #[test]
