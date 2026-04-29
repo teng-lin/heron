@@ -134,9 +134,53 @@ export interface Settings {
    * Pinned by `active_mode_serializes_lowercase` Rust-side.
    */
   active_mode: ActiveMode;
+  /** Tier 1 (Schema only). Vocabulary boost terms for the STT backend. */
+  hotwords: string[];
+  /** Tier 1. User self-context for the summarizer prompt template. */
+  persona: Persona;
+  /**
+   * Tier 1. Vault writer slug strategy. Mirrors the Rust
+   * `FileNamingPattern` enum's `#[serde(rename_all = "snake_case")]`
+   * variants.
+   */
+  file_naming_pattern: FileNamingPattern;
+  /** Tier 1. `null` means "keep all" — same semantics as `audio_retention_days`. */
+  summary_retention_days: number | null;
+  /** Tier 1. Replace participant names with `Speaker A/B/C` before LLM. */
+  strip_names_before_summarization: boolean;
+  /** Tier 1. Show menu-bar REC pill while recording. */
+  show_tray_indicator: boolean;
+  /** Tier 1. Auto-detect meeting apps launching and prime recording. */
+  auto_detect_meeting_app: boolean;
+  /** Tier 1. OpenAI model id; takes effect when Tier 2's OpenAI summarizer ships. */
+  openai_model: string;
+  /**
+   * Tier 1. Custom global-shortcut bindings keyed by action id. Tier 4
+   * wiring iterates this map at startup and registers each binding.
+   */
+  shortcuts: Record<string, string>;
 }
 
 export type ActiveMode = "clio" | "athena" | "pollux";
+
+/**
+ * Tier 1. User self-context for the summarizer prompt template. Mirrors
+ * the Rust `Persona` struct. The Settings UI binds its three inputs
+ * ("Your name" / "Your role" / "What you're working on") to these fields.
+ */
+export interface Persona {
+  name: string;
+  role: string;
+  working_on: string;
+}
+
+/**
+ * Tier 1. Vault writer slug strategy. Mirrors the Rust
+ * `FileNamingPattern` enum's `#[serde(rename_all = "snake_case")]`
+ * variants. Default `"id"` preserves the pre-Tier-1 `<uuid>.md`
+ * convention for backward compat.
+ */
+export type FileNamingPattern = "id" | "date_slug" | "slug";
 
 /**
  * Discriminated union mirroring the Rust `DiskCheckOutcome`
