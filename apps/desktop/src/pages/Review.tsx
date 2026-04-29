@@ -44,6 +44,7 @@ import { ResummarizeDiffModal } from "../components/ResummarizeDiffModal";
 import { Button } from "../components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { invoke, type BackupInfo } from "../lib/invoke";
+import type { Meeting, Transcript } from "../lib/types";
 import { useSettingsStore } from "../store/settings";
 
 type LoadState =
@@ -51,6 +52,21 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "ready"; markdown: string }
   | { kind: "error"; message: string };
+
+type DaemonLoadState<T> =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready"; data: T }
+  | { kind: "unavailable"; message: string };
+
+const REVIEW_TABS = new Set([
+  "summary",
+  "notes",
+  "transcript",
+  "actions",
+  "raw",
+  "diagnostics",
+]);
 
 type EditorKey = string;
 
@@ -94,8 +110,9 @@ export default function Review() {
   // /review/{id} and the tray's "View diagnostics" toast pushes
   // ?tab=diagnostics, the route doesn't remount, so a defaultValue
   // would leave the visible tab stuck on "summary".
+  const tabParam = searchParams.get("tab");
   const activeTab =
-    searchParams.get("tab") === "diagnostics" ? "diagnostics" : "summary";
+    tabParam !== null && REVIEW_TABS.has(tabParam) ? tabParam : "summary";
   const onTabChange = useCallback(
     (next: string) => {
       const params = new URLSearchParams(searchParams);
@@ -114,6 +131,11 @@ export default function Review() {
   const settingsError = useSettingsStore((s) => s.error);
 
   const [load, setLoad] = useState<LoadState>({ kind: "idle" });
+  const [meetingLoad, setMeetingLoad] = useState<DaemonLoadState<Meeting>>({
+    kind: "idle",
+  });
+  const [transcriptLoad, setTranscriptLoad] =
+    useState<DaemonLoadState<Transcript>>({ kind: "idle" });
   const [liveMarkdown, setLiveMarkdown] = useState<string>("");
   const [savedKey, setSavedKey] = useState(0);
   const editorRef = useRef<NoteEditorHandle | null>(null);
@@ -161,6 +183,53 @@ export default function Review() {
 
   const settingsReady = settings !== null;
   const vaultRoot = settings?.vault_root ?? "";
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!sessionId) {
+      setMeetingLoad({ kind: "idle" });
+      setTranscriptLoad({ kind: "idle" });
+      return () => {
+        cancelled = true;
+      };
+    }
+    setMeetingLoad({ kind: "loading" });
+    setTranscriptLoad({ kind: "loading" });
+
+    invoke("heron_get_meeting", { meetingId: sessionId })
+      .then((result) => {
+        if (cancelled) return;
+        if (result.kind === "ok") {
+          setMeetingLoad({ kind: "ready", data: result.data });
+        } else {
+          setMeetingLoad({ kind: "unavailable", message: result.detail });
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : String(err);
+        setMeetingLoad({ kind: "unavailable", message });
+      });
+
+    invoke("heron_meeting_transcript", { meetingId: sessionId })
+      .then((result) => {
+        if (cancelled) return;
+        if (result.kind === "ok") {
+          setTranscriptLoad({ kind: "ready", data: result.data });
+        } else {
+          setTranscriptLoad({ kind: "unavailable", message: result.detail });
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : String(err);
+        setTranscriptLoad({ kind: "unavailable", message });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
 
   const refreshBackup = useCallback(async () => {
     if (!vaultRoot || !sessionId) {
@@ -366,6 +435,11 @@ export default function Review() {
     () => extractActionItems(liveMarkdown),
     [liveMarkdown],
   );
+  const meeting = meetingLoad.kind === "ready" ? meetingLoad.data : null;
+  const title = meeting?.title ?? sessionId ?? "(no session)";
+  const subtitle = meeting
+    ? `${meeting.platform.replace(/_/g, " ")} · ${meeting.status}`
+    : "Meeting";
 
   return (
     <>
@@ -379,7 +453,7 @@ export default function Review() {
                   className="font-mono text-xs uppercase tracking-[0.12em]"
                   style={{ color: "var(--color-ink-3)" }}
                 >
-                  Meeting
+                  {subtitle}
                 </p>
                 <h1
                   className="mt-1 truncate font-serif text-[24px] leading-tight"
@@ -387,10 +461,15 @@ export default function Review() {
                     color: "var(--color-ink)",
                     letterSpacing: "-0.01em",
                   }}
-                  title={sessionId}
+                  title={title}
                 >
-                  {sessionId ?? "(no session)"}
+                  {title}
                 </h1>
+                {meetingLoad.kind === "unavailable" && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Metadata unavailable: {meetingLoad.message}
+                  </p>
+                )}
               </div>
               <nav className="flex items-center gap-2 text-xs">
                 <Button
@@ -518,10 +597,31 @@ export default function Review() {
                 </TabsContent>
 
                 <TabsContent value="transcript" className="mt-4">
-                  <TranscriptView
-                    markdown={liveMarkdown}
-                    onSeek={onTranscriptSeek}
-                  />
+                  {transcriptLoad.kind === "loading" ? (
+                    <div className="text-sm text-muted-foreground">
+                      Loading transcript…
+                    </div>
+                  ) : transcriptLoad.kind === "ready" &&
+                    transcriptLoad.data.segments.length > 0 ? (
+                    <TranscriptView
+                      segments={transcriptLoad.data.segments}
+                      onSeek={onTranscriptSeek}
+                    />
+                  ) : (
+                    <>
+                      {transcriptLoad.kind === "unavailable" && (
+                        <p className="mb-3 text-xs text-muted-foreground">
+                          Daemon transcript unavailable:{" "}
+                          {transcriptLoad.message}. Showing transcript
+                          parsed from the note.
+                        </p>
+                      )}
+                      <TranscriptView
+                        markdown={liveMarkdown}
+                        onSeek={onTranscriptSeek}
+                      />
+                    </>
+                  )}
                 </TabsContent>
 
                 <TabsContent value="actions" className="mt-4">

@@ -18,6 +18,7 @@
  */
 
 import { cn } from "../lib/cn";
+import type { TranscriptSegment as DaemonTranscriptSegment } from "../lib/types";
 import {
   groupBySpeaker,
   parseClockToSeconds,
@@ -29,7 +30,10 @@ import {
 interface TranscriptViewProps {
   /** Raw markdown body. We re-parse on every change rather than
    * caching — the document is small (~hundreds of lines max). */
-  markdown: string;
+  markdown?: string;
+  /** Finalized daemon transcript segments from `GET /v1/meetings/{id}/transcript`.
+   * When present, these are preferred over parsing markdown. */
+  segments?: DaemonTranscriptSegment[];
   /**
    * Optional click-to-seek callback. When omitted (PR-γ behavior),
    * the clock renders as plain text. When provided (PR-ε), the clock
@@ -44,8 +48,38 @@ interface TranscriptViewProps {
   onSeek?: (seconds: number) => void;
 }
 
-export function TranscriptView({ markdown, onSeek }: TranscriptViewProps) {
-  const segments = parseTranscriptLines(markdown);
+function formatSecondsClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  }
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function fromDaemonSegments(segments: DaemonTranscriptSegment[]) {
+  return segments
+    .filter((seg) => seg.text.trim().length > 0)
+    .map((seg) => ({
+      time: formatSecondsClock(seg.start_secs),
+      speaker: seg.speaker.display_name,
+      text: seg.text.trim(),
+      is_low_confidence: seg.confidence === "low",
+    }));
+}
+
+export function TranscriptView({
+  markdown = "",
+  segments: daemonSegments,
+  onSeek,
+}: TranscriptViewProps) {
+  const segments =
+    daemonSegments === undefined
+      ? parseTranscriptLines(markdown)
+      : fromDaemonSegments(daemonSegments);
   if (segments.length === 0) {
     return (
       <div className="text-sm text-muted-foreground italic">

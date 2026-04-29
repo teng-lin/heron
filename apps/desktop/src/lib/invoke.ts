@@ -24,6 +24,7 @@ import type {
   AttachContextAck,
   CalendarPage,
   CalendarQuery,
+  DaemonAudioSource,
   DaemonResult,
   ListMeetingsPage,
   ListMeetingsQuery,
@@ -32,6 +33,7 @@ import type {
   Platform,
   PreMeetingContextRequest,
   Summary,
+  Transcript,
 } from "./types";
 
 // ---- Domain types --------------------------------------------------
@@ -655,6 +657,15 @@ export interface HeronCommands {
     returns: DaemonResult<ListMeetingsPage>;
   };
   /**
+   * Gap #8 follow-up: proxy `GET /v1/meetings/{id}` so Review can
+   * render canonical daemon metadata instead of treating the route
+   * param as the whole meeting model.
+   */
+  heron_get_meeting: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<Meeting>;
+  };
+  /**
    * UI revamp PR 3: proxy `GET /v1/meetings/{id}/summary`. Used by
    * the Home page's lazy-preview hover to render the first ~120
    * chars of the meeting summary.
@@ -662,6 +673,24 @@ export interface HeronCommands {
   heron_meeting_summary: {
     args: { meetingId: string };
     returns: DaemonResult<Summary>;
+  };
+  /**
+   * Gap #8 follow-up: proxy `GET /v1/meetings/{id}/transcript`.
+   * Review uses this for finalized daemon transcripts; live partials
+   * still arrive over SSE.
+   */
+  heron_meeting_transcript: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<Transcript>;
+  };
+  /**
+   * Gap #8 follow-up: proxy `GET /v1/meetings/{id}/audio`. The Rust
+   * command streams the daemon response into the app cache and returns
+   * a local file path so the WebView can play it via `convertFileSrc`.
+   */
+  heron_meeting_audio: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<DaemonAudioSource>;
   };
   /**
    * Gap #7 recording-capture wiring: proxy `POST /v1/meetings`. The

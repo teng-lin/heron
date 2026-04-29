@@ -102,6 +102,14 @@ export interface Summary {
   llm_model: string | null;
 }
 
+/** Mirrors `crates/heron-session/src/lib.rs:205`. */
+export interface Transcript {
+  meeting_id: MeetingId;
+  status: TranscriptLifecycle;
+  language: string | null;
+  segments: TranscriptSegment[];
+}
+
 /**
  * Daemon-side outcome for `heron_list_meetings` /
  * `heron_meeting_summary`. The Tauri command returns one of these so
@@ -121,6 +129,12 @@ export interface TranscriptSegment {
   confidence: Confidence;
   /** `false` segments are subject to revision in a later partial. */
   is_final: boolean;
+}
+
+/** Local file source returned by `heron_meeting_audio`. */
+export interface DaemonAudioSource {
+  path: string;
+  content_type: string | null;
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:263`. */
