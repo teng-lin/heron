@@ -22,8 +22,8 @@ use chrono::{DateTime, Utc};
 use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
     CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator, StartCaptureArgs,
-    Summary, Transcript,
+    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator,
+    SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
 use herond::{AppState, AuthConfig, build_app};
@@ -249,6 +249,101 @@ async fn events_emits_published_envelope_in_sse_framing() {
     assert!(
         body.contains("\"event_type\":\"meeting.detected\""),
         "missing payload event_type field in: {body}"
+    );
+}
+
+#[tokio::test]
+async fn events_emits_speaker_changed_in_sse_framing() {
+    // Tier 0b #4 bridge guard: a `speaker.changed` envelope pushed
+    // through the bus must reach the SSE stream with the documented
+    // wire shape (`event: speaker.changed`, `data: {…t,name,started}`).
+    // The AX observer in `heron-zoom` has emitted these events for
+    // months but they died inside the offline aligner; this is the
+    // assertion that the bridge through `heron-cli::pipeline` →
+    // `SessionEventBus` → `herond::routes::events` is wired.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let meeting_id = MeetingId::now_v7();
+    let envelope = Envelope::new(EventPayload::SpeakerChanged(SpeakerChangedData {
+        t: 12.5,
+        name: "Alice".to_owned(),
+        started: true,
+    }))
+    .with_meeting(meeting_id.to_string());
+    let delivered = bus.publish(envelope.clone());
+    assert_eq!(delivered, 1, "subscriber not registered before publish");
+
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+
+    assert!(
+        body.contains(&format!("id: {}", envelope.event_id)),
+        "missing id frame in: {body}",
+    );
+    assert!(
+        body.contains("event: speaker.changed"),
+        "missing speaker.changed event-type frame in: {body}",
+    );
+    assert!(
+        body.contains("\"event_type\":\"speaker.changed\""),
+        "missing event_type field in payload: {body}",
+    );
+    assert!(
+        body.contains("\"name\":\"Alice\""),
+        "speaker name missing from payload: {body}",
+    );
+    assert!(
+        body.contains("\"started\":true"),
+        "started flag missing from payload: {body}",
+    );
+}
+
+#[tokio::test]
+async fn events_topics_filter_passes_speaker_changed() {
+    // Pair to the test above: a client subscribing with
+    // `?topics=speaker.*` should still receive `speaker.changed`
+    // envelopes — regression guard against a future glob refactor
+    // that accidentally narrows the wildcard match.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events?topics=speaker.*")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let envelope = Envelope::new(EventPayload::SpeakerChanged(SpeakerChangedData {
+        t: 1.0,
+        name: "them".to_owned(),
+        started: false,
+    }))
+    .with_meeting(MeetingId::now_v7().to_string());
+    bus.publish(envelope);
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+    assert!(
+        body.contains("event: speaker.changed"),
+        "speaker.changed filtered out by speaker.* glob: {body}",
     );
 }
 

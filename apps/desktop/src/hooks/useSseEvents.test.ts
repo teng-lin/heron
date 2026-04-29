@@ -11,11 +11,29 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { dispatchBridgeStatus } from "./useSseEvents";
+import { dispatch, dispatchBridgeStatus } from "./useSseEvents";
 import { useMeetingsStore } from "../store/meetings";
+import { useSpeakerStore } from "../store/speaker";
+
+const SAMPLE_MID = "mtg_01902a8e-7c4f-7000-8000-000000000001";
+
+function envelope<E>(meeting_id: string | null, ev: E): E & {
+  event_id: string;
+  api_version: string;
+  created_at: string;
+  meeting_id: string | null;
+} {
+  return {
+    event_id: "evt_test",
+    api_version: "2026-04-25",
+    created_at: "2026-04-29T00:00:00Z",
+    meeting_id,
+    ...ev,
+  };
+}
 
 afterEach(() => {
-  // Reset store between tests so state doesn't leak across cases.
+  // Reset stores between tests so state doesn't leak across cases.
   useMeetingsStore.setState({
     items: [],
     nextCursor: null,
@@ -24,6 +42,7 @@ afterEach(() => {
     error: null,
     summaries: {},
   });
+  useSpeakerStore.setState({ activeByMeeting: {} });
 });
 
 describe("dispatchBridgeStatus", () => {
@@ -81,6 +100,81 @@ describe("dispatchBridgeStatus", () => {
     return Promise.resolve().then(() => {
       expect(loadCalled).toBe(true);
     });
+  });
+
+  test("speaker.changed routes the data into useSpeakerStore", () => {
+    expect(useSpeakerStore.getState().activeByMeeting[SAMPLE_MID]).toBeUndefined();
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "speaker.changed",
+        data: { t: 1.5, name: "Alice", started: true },
+      } as const),
+    );
+
+    expect(useSpeakerStore.getState().activeByMeeting[SAMPLE_MID]).toBe(
+      "Alice",
+    );
+  });
+
+  test("speaker.changed without meeting_id is dropped", () => {
+    // Defensive: the daemon stamps `meeting_id` per Invariant 12 but a
+    // future bus replay path could in principle deliver an envelope
+    // with `meeting_id: null`. The dispatcher must not key off an
+    // empty meeting id.
+    dispatch(
+      envelope(null, {
+        event_type: "speaker.changed",
+        data: { t: 1.5, name: "Alice", started: true },
+      } as const),
+    );
+
+    expect(useSpeakerStore.getState().activeByMeeting).toEqual({});
+  });
+
+  test("meeting.completed clears active speaker for that meeting", () => {
+    useSpeakerStore.setState({ activeByMeeting: { [SAMPLE_MID]: "Alice" } });
+
+    // Stub load so the test doesn't reach into Tauri IPC.
+    useMeetingsStore.setState({
+      load: async () => {},
+    });
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "meeting.completed",
+        data: {
+          meeting: { id: SAMPLE_MID } as never,
+          outcome: "success",
+          failure_reason: null,
+        },
+      } as const),
+    );
+
+    expect(
+      useSpeakerStore.getState().activeByMeeting[SAMPLE_MID],
+    ).toBeUndefined();
+  });
+
+  test("meeting.ended also clears active speaker (AX bridge stops mid-finalize)", () => {
+    // Regression guard for the gap between `meeting.ended` (recording
+    // stopped) and `meeting.completed` (transcribe + summarize done):
+    // the AX bridge stops emitting on `ended`, so any unflushed
+    // `started=true` would leak as a phantom badge during the
+    // transcribe phase. Both events must clear the store.
+    useSpeakerStore.setState({ activeByMeeting: { [SAMPLE_MID]: "Alice" } });
+    useMeetingsStore.setState({ load: async () => {} });
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "meeting.ended",
+        data: { id: SAMPLE_MID } as never,
+      } as const),
+    );
+
+    expect(
+      useSpeakerStore.getState().activeByMeeting[SAMPLE_MID],
+    ).toBeUndefined();
   });
 
   test("down does not trigger a load()", () => {

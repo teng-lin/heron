@@ -232,6 +232,31 @@ export interface ActionItemsReadyData {
   items: ActionItem[];
 }
 
+/**
+ * Mirrors the `SpeakerChangedData` struct in `crates/heron-session/src/lib.rs`.
+ * Bridges the AX-observer `SpeakerEvent` onto the wire as a
+ * `speaker.changed` envelope.
+ *
+ * **Semantic caveat.** Zoom's AX tree does not expose the active-
+ * speaker frame; this signal is mute-state transitions. `started=true`
+ * means the participant unmuted (potentially speaking), `started=false`
+ * means they muted (definitely not speaking). In 1:1 calls this is a
+ * near-perfect proxy for "now speaking"; in 3+ calls treat it as
+ * "potentially speaking" rather than truth. See the Rust struct doc
+ * (and `swift/zoomax-helper` module header) for the full §3.3 spike
+ * rationale.
+ *
+ * - `t`: session-secs since meeting start.
+ * - `name`: display name from the AX tree, or `"them"` when AX could
+ *   not attribute the turn.
+ * - `started`: `true` on unmute, `false` on mute.
+ */
+export interface SpeakerChangedData {
+  t: number;
+  name: string;
+  started: boolean;
+}
+
 /** Mirrors `crates/heron-session/src/lib.rs:448`. */
 export interface DoctorWarningData {
   component: string;
@@ -263,6 +288,7 @@ export type EventPayload =
   | { event_type: "transcript.final"; data: TranscriptSegment }
   | { event_type: "summary.ready"; data: Summary }
   | { event_type: "action_items.ready"; data: ActionItemsReadyData }
+  | { event_type: "speaker.changed"; data: SpeakerChangedData }
   | { event_type: "doctor.warning"; data: DoctorWarningData }
   | { event_type: "daemon.error"; data: DaemonErrorData };
 

@@ -985,6 +985,49 @@ components:
                   type: array
                   items: { $ref: "#/components/schemas/ActionItem" }
 
+    SpeakerChangedEvent:
+      description: |
+        Bridges Zoom's AX-tree mute-state signal onto the canonical bus
+        so SSE / Tauri / MCP transports can render a "now speaking"
+        indicator without subscribing to a private channel.
+
+        **Semantic caveat.** Zoom's AX tree does not expose the
+        active-speaker frame; what this event carries is mute-state
+        transitions. `started=true` means the participant unmuted
+        (potentially speaking); `started=false` means they muted
+        (definitely not speaking). In a 1:1 call this is a near-perfect
+        proxy for "now speaking" because only one remote is unmuted; in
+        3+ calls consumers should treat this as "potentially speaking"
+        rather than active-speaker truth.
+
+        Clients tracking a "now speaking" badge should clear any
+        per-meeting state on `meeting.ended` or `meeting.completed`;
+        the AX bridge stops emitting once recording ends.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: speaker.changed }
+            data:
+              type: object
+              required: [t, name, started]
+              properties:
+                t:
+                  type: number
+                  format: double
+                  description: Session-secs since meeting start.
+                name:
+                  type: string
+                  description: |
+                    Display name from the AX tree, or `"them"` when AX
+                    could not attribute the turn.
+                started:
+                  type: boolean
+                  description: |
+                    `true` on unmute (potentially speaking),
+                    `false` on mute (definitely not speaking).
+
     DoctorWarningEvent:
       description: |
         Soft warning surfaced from `heron-doctor` checks. Indicates
@@ -1042,6 +1085,7 @@ components:
         - $ref: "#/components/schemas/TranscriptFinalEvent"
         - $ref: "#/components/schemas/SummaryReadyEvent"
         - $ref: "#/components/schemas/ActionItemsReadyEvent"
+        - $ref: "#/components/schemas/SpeakerChangedEvent"
         - $ref: "#/components/schemas/DoctorWarningEvent"
         - $ref: "#/components/schemas/DaemonErrorEvent"
       discriminator:
@@ -1057,6 +1101,7 @@ components:
           transcript.final: "#/components/schemas/TranscriptFinalEvent"
           summary.ready: "#/components/schemas/SummaryReadyEvent"
           action_items.ready: "#/components/schemas/ActionItemsReadyEvent"
+          speaker.changed: "#/components/schemas/SpeakerChangedEvent"
           doctor.warning: "#/components/schemas/DoctorWarningEvent"
           daemon.error: "#/components/schemas/DaemonErrorEvent"
 

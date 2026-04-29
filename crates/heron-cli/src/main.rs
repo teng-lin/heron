@@ -678,6 +678,9 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         // CLI captures never stage pre-meeting context — that path is
         // a daemon-only concern (`attach_context` -> `start_capture`).
         pre_meeting_briefing: None,
+        // CLI captures have no SSE consumer listening, so the AX
+        // bridge stays an offline-aligner-only feed.
+        event_bus: None,
     };
 
     if args.no_op {
