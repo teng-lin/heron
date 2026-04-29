@@ -45,6 +45,40 @@ pub enum ActiveMode {
     Pollux,
 }
 
+/// User self-context the summarizer can inject into the LLM prompt
+/// (Tier 4 wiring). Three discrete inputs so the Settings UI's
+/// "Your name" / "Your role" / "What you're working on" fields can
+/// bind to named struct members rather than parsing a free-form string.
+///
+/// The container-level `#[serde(default)]` makes each field optional on
+/// read so a partially hand-edited `settings.json` (e.g. only `name`
+/// present) deserializes cleanly rather than hard-erroring on the missing
+/// sibling fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Persona {
+    pub name: String,
+    pub role: String,
+    pub working_on: String,
+}
+
+/// Vault writer slug strategy (Tier 4 wiring). Controls how the
+/// `.md` filename is derived for each session.
+///
+/// Default: [`FileNamingPattern::Id`] — preserves the pre-Tier-1
+/// `<uuid>.md` convention so existing vaults are unaffected on upgrade.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileNamingPattern {
+    /// `<uuid>.md` — the original naming convention (backward compat).
+    #[default]
+    Id,
+    /// `<YYYY-MM-DD>-<slug>.md` — date-prefixed human-readable slug.
+    DateSlug,
+    /// `<slug>.md` — human-readable slug only.
+    Slug,
+}
+
 /// User-facing settings persisted by the Settings pane.
 ///
 /// Defaults match the §16.1 v1 starting values: STT runs WhisperKit
@@ -140,6 +174,42 @@ pub struct Settings {
     /// shipping today. Pinned by
     /// `read_pre_revamp_settings_fills_active_mode_default`.
     pub active_mode: ActiveMode,
+    /// Vocabulary boost terms for the STT backend. WhisperKit's prompt
+    /// hook (Tier 4 wiring; this PR only persists the field). Empty vec
+    /// means "no hotwords supplied".
+    pub hotwords: Vec<String>,
+    /// User self-context the summarizer can inject into the LLM prompt
+    /// (Tier 4 wiring). Persona is a struct so the Settings UI's three
+    /// inputs ("Your name" / "Your role" / "What you're working on") can
+    /// bind to discrete fields.
+    pub persona: Persona,
+    /// Vault writer slug strategy (Tier 4 wiring). Defaults to `Id` for
+    /// backward compat with the current `<uuid>.md` convention.
+    pub file_naming_pattern: FileNamingPattern,
+    /// How long to keep summary `.md` files. `None` means "keep all"
+    /// (matches the existing `audio_retention_days` semantics). Tier 4
+    /// adds the sweeper that consumes this.
+    pub summary_retention_days: Option<u32>,
+    /// Strip participant names from the transcript before sending to the
+    /// LLM. Privacy toggle. Tier 4 wiring replaces `participant.display_name`
+    /// with `Speaker A/B/C` in the summarizer input pipeline.
+    pub strip_names_before_summarization: bool,
+    /// Show the menu-bar / dock REC pill while recording. Tier 4 wiring
+    /// gates `tray.rs` rendering on this.
+    pub show_tray_indicator: bool,
+    /// Auto-detect a meeting app launching and prime recording. Tier 4
+    /// wiring gates the detector loop in `heron-orchestrator` /
+    /// `heron-zoom`.
+    pub auto_detect_meeting_app: bool,
+    /// OpenAI model id. Field exists pre-emptively for the OpenAI
+    /// summarizer backend (Tier 2). Default mirrors the docs:
+    /// `"gpt-4o-mini"`.
+    pub openai_model: String,
+    /// Custom global-shortcut bindings keyed by action id. Tier 4 wiring
+    /// iterates the map at startup and registers each via
+    /// `tauri-plugin-global-shortcut`. Use `BTreeMap<String, String>` so
+    /// serde output is order-stable across writes.
+    pub shortcuts: std::collections::BTreeMap<String, String>,
 }
 
 /// PR-λ default for [`Settings::target_bundle_ids`]: a one-item vec
@@ -168,6 +238,15 @@ impl Default for Settings {
             onboarded: false,
             target_bundle_ids: default_target_bundle_ids(),
             active_mode: ActiveMode::default(),
+            hotwords: Vec::new(),
+            persona: Persona::default(),
+            file_naming_pattern: FileNamingPattern::Id,
+            summary_retention_days: None,
+            strip_names_before_summarization: false,
+            show_tray_indicator: true,
+            auto_detect_meeting_app: true,
+            openai_model: "gpt-4o-mini".to_owned(),
+            shortcuts: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -628,5 +707,136 @@ mod tests {
 
         let parsed = read_settings(&path).expect("read");
         assert_eq!(parsed.record_hotkey, "F12");
+    }
+
+    /// Pre-Tier-1 settings.json files have none of the Tier-1 schema
+    /// fields (hotwords, persona, file_naming_pattern,
+    /// summary_retention_days, strip_names_before_summarization,
+    /// show_tray_indicator, auto_detect_meeting_app, openai_model,
+    /// shortcuts). The container-level `#[serde(default)]` must let those
+    /// deserialize cleanly with `Settings::default()` filling each missing
+    /// field — otherwise existing users' Settings panes break on upgrade.
+    /// Sister test to `read_pre_revamp_settings_fills_active_mode_default`.
+    #[test]
+    fn read_pre_tier1_settings_fills_new_field_defaults() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // Verbatim field-set heron-desktop wrote between the UI revamp PR
+        // (added `active_mode`) and Tier 1. Note the absence of every new
+        // field this PR adds.
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
+                "vault_root":"/tmp/vault","record_hotkey":"CmdOrCtrl+Shift+R",
+                "remind_interval_secs":30,"recover_on_launch":true,
+                "min_free_disk_mib":2048,"session_logging":true,"crash_telemetry":false,
+                "audio_retention_days":null,"onboarded":true,
+                "target_bundle_ids":["us.zoom.xos"],"active_mode":"clio"}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        let defaults = Settings::default();
+        assert_eq!(s.hotwords, defaults.hotwords);
+        assert_eq!(s.persona, defaults.persona);
+        assert_eq!(s.file_naming_pattern, defaults.file_naming_pattern);
+        assert_eq!(s.summary_retention_days, defaults.summary_retention_days);
+        assert_eq!(
+            s.strip_names_before_summarization,
+            defaults.strip_names_before_summarization
+        );
+        assert_eq!(s.show_tray_indicator, defaults.show_tray_indicator);
+        assert_eq!(s.auto_detect_meeting_app, defaults.auto_detect_meeting_app);
+        assert_eq!(s.openai_model, defaults.openai_model);
+        assert_eq!(s.shortcuts, defaults.shortcuts);
+        // Belt-and-suspenders: pre-Tier-1 fields the file carried must
+        // survive untouched.
+        assert_eq!(s.vault_root, "/tmp/vault");
+        assert!(s.onboarded);
+        assert_eq!(s.active_mode, ActiveMode::Clio);
+    }
+
+    /// `FileNamingPattern` variants must serialize to the exact
+    /// `snake_case` string the TS type union declares (`"id"`,
+    /// `"date_slug"`, `"slug"`). The Tauri IPC bridge forwards the
+    /// raw JSON to the renderer, so any drift in variant wire names
+    /// silently breaks the Settings UI's pattern picker.
+    #[test]
+    fn file_naming_pattern_serializes_to_snake_case_strings() {
+        assert_eq!(
+            serde_json::to_value(FileNamingPattern::Id).expect("ser"),
+            "id"
+        );
+        assert_eq!(
+            serde_json::to_value(FileNamingPattern::DateSlug).expect("ser"),
+            "date_slug"
+        );
+        assert_eq!(
+            serde_json::to_value(FileNamingPattern::Slug).expect("ser"),
+            "slug"
+        );
+        // Round-trip all three through serde_json::from_value.
+        for pat in [
+            FileNamingPattern::Id,
+            FileNamingPattern::DateSlug,
+            FileNamingPattern::Slug,
+        ] {
+            let v = serde_json::to_value(pat).expect("ser");
+            let back: FileNamingPattern = serde_json::from_value(v).expect("deser");
+            assert_eq!(back, pat);
+        }
+    }
+
+    /// A `persona` object with only some fields present (e.g. from a
+    /// hand-edited `settings.json`) must deserialize cleanly — the
+    /// `#[serde(default)]` on `Persona` fills the missing siblings with
+    /// empty strings rather than hard-erroring.
+    #[test]
+    fn partial_persona_object_fills_defaults() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        // Only `name` present; `role` and `working_on` absent.
+        std::fs::write(
+            &path,
+            r#"{"stt_backend":"whisperkit","llm_backend":"anthropic","auto_summarize":true,
+                "vault_root":"","record_hotkey":"CmdOrCtrl+Shift+R","remind_interval_secs":30,
+                "recover_on_launch":true,"min_free_disk_mib":2048,"session_logging":true,
+                "crash_telemetry":false,"audio_retention_days":null,"onboarded":false,
+                "target_bundle_ids":["us.zoom.xos"],"active_mode":"clio",
+                "persona":{"name":"Alice"}}"#,
+        )
+        .expect("seed");
+        let s = read_settings(&path).expect("read");
+        assert_eq!(s.persona.name, "Alice");
+        assert_eq!(s.persona.role, "");
+        assert_eq!(s.persona.working_on, "");
+    }
+
+    /// Tier-1 fields must survive a full write→read round-trip with
+    /// non-default values — exercises every new field path through the
+    /// serde serializer and the atomic rename.
+    #[test]
+    fn tier1_fields_round_trip_non_default_values() {
+        use std::collections::BTreeMap;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        let s_in = Settings {
+            hotwords: vec!["heron".into()],
+            persona: Persona {
+                name: "Alice".into(),
+                role: "PM".into(),
+                working_on: "Q2 plan".into(),
+            },
+            file_naming_pattern: FileNamingPattern::Slug,
+            summary_retention_days: Some(90),
+            strip_names_before_summarization: true,
+            show_tray_indicator: false,
+            auto_detect_meeting_app: false,
+            openai_model: "gpt-4o".into(),
+            shortcuts: BTreeMap::from([("toggle_recording".into(), "F12".into())]),
+            ..Default::default()
+        };
+        write_settings(&path, &s_in).expect("write");
+        let s_out = read_settings(&path).expect("read");
+        assert_eq!(s_out, s_in);
     }
 }
