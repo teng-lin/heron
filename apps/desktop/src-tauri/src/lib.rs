@@ -852,6 +852,15 @@ pub fn run() {
             // as the read proxies above.
             meetings::heron_start_capture,
             meetings::heron_end_meeting,
+            // Gap #8: backend-ready endpoints the desktop UI never
+            // wired. `list_calendar_upcoming` powers the Home page's
+            // upcoming-meetings rail; `attach_context` lets a click on
+            // a calendar row pre-stage agenda + attendees before
+            // start_capture so the orchestrator finds the briefing in
+            // `pending_contexts` when the matching meeting arms. Same
+            // auth/Origin/CSP rationale as the read proxies above.
+            meetings::heron_list_calendar_upcoming,
+            meetings::heron_attach_context,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

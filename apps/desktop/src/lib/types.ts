@@ -123,6 +123,71 @@ export interface TranscriptSegment {
   is_final: boolean;
 }
 
+/** Mirrors `crates/heron-session/src/lib.rs:263`. */
+export interface AttendeeContext {
+  name: string;
+  email: string | null;
+  last_seen_in: MeetingId | null;
+  relationship: string | null;
+  notes: string | null;
+}
+
+/** Mirrors `crates/heron-session/src/lib.rs:245`. */
+export interface CalendarEvent {
+  /** EventKit identifier — passed back to `attach_context`. */
+  id: string;
+  title: string;
+  /** RFC 3339 UTC. */
+  start: string;
+  /** RFC 3339 UTC. */
+  end: string;
+  attendees: AttendeeContext[];
+  meeting_url: string | null;
+  related_meetings: MeetingId[];
+}
+
+/** Mirrors herond's `CalendarPage` wire shape (serialize-only daemon-side). */
+export interface CalendarPage {
+  items: CalendarEvent[];
+}
+
+/** Mirrors `crates/heron-session/src/lib.rs:285`. */
+export interface PriorDecision {
+  text: string;
+  source_meeting_id: MeetingId;
+}
+
+/** Mirrors `crates/heron-session/src/lib.rs:271`. */
+export interface PreMeetingContext {
+  agenda: string | null;
+  attendees_known: AttendeeContext[];
+  /** Vault-relative paths. */
+  related_notes: string[];
+  prior_decisions: PriorDecision[];
+  user_briefing: string | null;
+}
+
+/** Mirrors `crates/heron-session/src/lib.rs:294`. */
+export interface PreMeetingContextRequest {
+  calendar_event_id: string;
+  context: PreMeetingContext;
+}
+
+/** Synthetic ack for a successful `PUT /v1/context` (daemon emits 204). */
+export interface AttachContextAck {
+  calendar_event_id: string;
+}
+
+/** Query params for `heron_list_calendar_upcoming`. All RFC 3339 / numeric. */
+export interface CalendarQuery {
+  /** RFC 3339 UTC. Default: now. */
+  from?: string;
+  /** RFC 3339 UTC. Default: from + 7 days. */
+  to?: string;
+  /** Capped at 100 by the daemon. */
+  limit?: number;
+}
+
 /** Mirrors `crates/heron-session/src/lib.rs:434`. */
 export type MeetingOutcome =
   | "success"
