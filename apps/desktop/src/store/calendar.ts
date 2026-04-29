@@ -22,7 +22,7 @@ import type { CalendarEvent, CalendarPage, CalendarQuery } from "../lib/types";
 /** Cache lifetime in ms before `ensureFresh()` triggers a re-fetch. */
 export const CALENDAR_TTL_MS = 60_000;
 
-interface CalendarState {
+export interface CalendarStoreState {
   items: CalendarEvent[];
   loading: boolean;
   daemonDown: boolean;
@@ -37,7 +37,7 @@ interface CalendarState {
 
 let inFlightLoad: Promise<void> | null = null;
 
-export const useCalendarStore = create<CalendarState>((set, get) => ({
+export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
   items: [],
   loading: false,
   daemonDown: false,

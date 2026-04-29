@@ -13,7 +13,7 @@
  * working even when the meetings table is unreachable.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Search } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -51,13 +51,18 @@ export default function Home() {
   const [diskWarning, setDiskWarning] = useState<DiskWarning | null>(null);
   const [pendingCalendarEvent, setPendingCalendarEvent] =
     useState<CalendarEvent | null>(null);
-  // Single-shot re-entrancy guard for the recording-start flow. Any
-  // concurrent click (manual Start + a calendar row, or two calendar
-  // rows in quick succession) would otherwise overwrite
-  // `pendingCalendarEvent` mid-flight or fire two `start_capture`
-  // calls that the daemon rejects with 409. Set true at the top of
-  // `onStart`, cleared in a `finally` when the flow exits or hands
-  // off to the disk-warning dialog.
+  // Re-entrancy guard for the recording-start flow. Two pieces:
+  //
+  // - `startingRef` is the AUTHORITATIVE synchronous lock. A `useState`
+  //   guard wouldn't be safe — two clicks fired in the same React tick
+  //   both read the pre-update state and both pass. A ref is mutated
+  //   in place, so the second click sees the lock immediately.
+  // - `starting` (state) drives the render so buttons get a `disabled`
+  //   attribute. State is fine HERE because the render only needs to
+  //   reflect the lock, not enforce it.
+  //
+  // Both are set/cleared in lockstep at every entry/exit point.
+  const startingRef = useRef(false);
   const [starting, setStarting] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
@@ -143,15 +148,16 @@ export default function Home() {
   function dismissDiskWarning() {
     setDiskWarning(null);
     setPendingCalendarEvent(null);
+    startingRef.current = false;
     setStarting(false);
   }
 
   async function onStart(event: CalendarEvent | null = null) {
-    // Re-entrancy guard: drop subsequent clicks while a start is in
-    // flight. Buttons are also disabled in render, but that depends
-    // on React having flushed the previous click's state — this
-    // synchronous gate is the authoritative check.
-    if (starting) return;
+    // Synchronous re-entrancy gate. The ref read-and-set happens in a
+    // single tick; a second click in the same tick sees `true` and
+    // exits before any IPC fires.
+    if (startingRef.current) return;
+    startingRef.current = true;
     setStarting(true);
     let openedDiskWarning = false;
     // The calendar event is threaded through as a parameter rather
@@ -187,9 +193,12 @@ export default function Home() {
       await proceedToConsent(event);
     } finally {
       // Hand off to the dialog when the disk-warning branch fired —
-      // `continueAnyway` / `dismissDiskWarning` clear `starting` once
+      // `continueAnyway` / `dismissDiskWarning` clear the lock once
       // the user resolves the dialog.
-      if (!openedDiskWarning) setStarting(false);
+      if (!openedDiskWarning) {
+        startingRef.current = false;
+        setStarting(false);
+      }
     }
   }
 
@@ -204,6 +213,7 @@ export default function Home() {
     try {
       await proceedToConsent(evt);
     } finally {
+      startingRef.current = false;
       setStarting(false);
     }
   }

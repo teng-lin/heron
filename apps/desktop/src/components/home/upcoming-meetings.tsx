@@ -194,6 +194,18 @@ function filterImminent(items: CalendarEvent[]): CalendarEvent[] {
     .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
 }
 
+// Hoisted to module scope so the rail doesn't allocate a fresh
+// `Intl.DateTimeFormat` for every row on every render — formatter
+// construction reads ICU locale data and is the expensive part. The
+// instance is locale-stable for the app's lifetime; if we ever expose
+// per-user locale overrides, swap this for a `useMemo` keyed on the
+// chosen locale.
+const TIME_RANGE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  weekday: "short",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
 /**
  * Render the time range as either a short relative form ("in 12 min")
  * for upcoming events within the next hour, or a weekday + clock time
@@ -208,16 +220,11 @@ function formatTimeRange(startIso: string, endIso: string): string {
   if (minutesUntil >= 0 && minutesUntil < 60) {
     return minutesUntil <= 1 ? "starting now" : `in ${minutesUntil} min`;
   }
-  const fmt = new Intl.DateTimeFormat(undefined, {
-    weekday: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
   const dur =
     Number.isNaN(end.getTime()) || end <= start
       ? ""
       : ` · ${Math.round((end.getTime() - start.getTime()) / 60_000)} min`;
-  return `${fmt.format(start)}${dur}`;
+  return `${TIME_RANGE_FORMATTER.format(start)}${dur}`;
 }
 
 function summarizeAttendees(attendees: AttendeeContext[]): string {

@@ -11,9 +11,23 @@
  * stale or untouched.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { CALENDAR_TTL_MS, useCalendarStore } from "./calendar";
+import {
+  CALENDAR_TTL_MS,
+  useCalendarStore,
+  type CalendarStoreState,
+} from "./calendar";
+
+// Capture the real `load` action once per test so the afterEach reset
+// can restore it even if the test threw before reaching its own
+// restore line. Without this, a failing test that swapped in a mock
+// `load` would leak that mock into every subsequent test.
+let originalLoad: CalendarStoreState["load"];
+
+beforeEach(() => {
+  originalLoad = useCalendarStore.getState().load;
+});
 
 afterEach(() => {
   useCalendarStore.setState({
@@ -22,13 +36,13 @@ afterEach(() => {
     daemonDown: false,
     error: null,
     lastFetchedAt: null,
+    load: originalLoad,
   });
 });
 
 describe("useCalendarStore — TTL guard", () => {
   test("ensureFresh skips when cache is younger than TTL", async () => {
     let loadCalls = 0;
-    const originalLoad = useCalendarStore.getState().load;
     useCalendarStore.setState({
       lastFetchedAt: Date.now() - (CALENDAR_TTL_MS - 5_000),
       load: async () => {
@@ -39,14 +53,10 @@ describe("useCalendarStore — TTL guard", () => {
     await useCalendarStore.getState().ensureFresh();
 
     expect(loadCalls).toBe(0);
-
-    // Restore so the afterEach reset doesn't leak the spy.
-    useCalendarStore.setState({ load: originalLoad });
   });
 
   test("ensureFresh falls through when cache is older than TTL", async () => {
     let loadCalls = 0;
-    const originalLoad = useCalendarStore.getState().load;
     useCalendarStore.setState({
       lastFetchedAt: Date.now() - (CALENDAR_TTL_MS + 1_000),
       load: async () => {
@@ -57,12 +67,10 @@ describe("useCalendarStore — TTL guard", () => {
     await useCalendarStore.getState().ensureFresh();
 
     expect(loadCalls).toBe(1);
-    useCalendarStore.setState({ load: originalLoad });
   });
 
   test("ensureFresh falls through when never fetched", async () => {
     let loadCalls = 0;
-    const originalLoad = useCalendarStore.getState().load;
     useCalendarStore.setState({
       lastFetchedAt: null,
       load: async () => {
@@ -73,7 +81,6 @@ describe("useCalendarStore — TTL guard", () => {
     await useCalendarStore.getState().ensureFresh();
 
     expect(loadCalls).toBe(1);
-    useCalendarStore.setState({ load: originalLoad });
   });
 });
 
