@@ -857,6 +857,7 @@ mod prefix_tests {
             transcript_status: TranscriptLifecycle::Complete,
             summary_status: SummaryLifecycle::Ready,
             tags: vec!["acme".into(), "pricing".into()],
+            processing: None,
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         // Pin the wire-key explicitly so a `#[serde(rename)]` typo
