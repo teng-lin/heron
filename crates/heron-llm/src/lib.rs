@@ -21,6 +21,7 @@ pub mod codex;
 mod content;
 pub mod cost;
 pub mod key_resolver;
+pub mod openai;
 pub mod select;
 pub mod transcript;
 
@@ -45,6 +46,7 @@ pub use claude_code::{ClaudeCodeClient, ClaudeCodeClientConfig};
 pub use codex::{CodexClient, CodexClientConfig};
 pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, lookup_pricing};
 pub use key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
+pub use openai::{OpenAIClient, OpenAIClientConfig};
 pub use select::{
     Availability, Preference, SelectError, SelectionReason, select_backend, select_summarizer,
     select_summarizer_with_resolver,
@@ -101,7 +103,10 @@ pub enum LlmError {
     Parse(String),
     #[error("ID preservation rate {observed:.0}% < required {required:.0}%; week-8 §10.5")]
     IdPreservationTooLow { observed: f32, required: f32 },
-    #[error("ANTHROPIC_API_KEY is unset or empty; export it before running summarize")]
+    #[error(
+        "API key is unset or empty; export ANTHROPIC_API_KEY or OPENAI_API_KEY \
+         before running summarize"
+    )]
     MissingApiKey,
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -114,6 +119,8 @@ pub enum LlmError {
 pub enum Backend {
     /// Bare-`reqwest` Anthropic API client (primary).
     Anthropic,
+    /// Bare-`reqwest` OpenAI Chat Completions client (hosted API fallback).
+    OpenAI,
     /// Spawn `claude -p` and parse its output.
     ClaudeCodeCli,
     /// Spawn `codex exec` and parse its output.
@@ -184,6 +191,22 @@ pub fn build_summarizer_with_resolver(
                      summarize calls will return NotYetImplemented"
                 );
                 Box::new(stub::AnthropicStub)
+            }
+        },
+        Backend::OpenAI => match OpenAIClientConfig::from_resolver(resolver) {
+            Ok(cfg) => match OpenAIClient::new(cfg) {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    tracing::warn!("OpenAIClient construction failed; falling back to stub: {e}");
+                    Box::new(stub::OpenAIStub)
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "OpenAI backend selected but {e}; \
+                     summarize calls will return NotYetImplemented"
+                );
+                Box::new(stub::OpenAIStub)
             }
         },
         Backend::ClaudeCodeCli => {
@@ -285,6 +308,21 @@ mod stub {
 
     #[async_trait]
     impl Summarizer for AnthropicStub {
+        async fn summarize(
+            &self,
+            _input: SummarizerInput<'_>,
+        ) -> Result<SummarizerOutput, LlmError> {
+            Err(LlmError::NotYetImplemented)
+        }
+    }
+
+    /// Returned by `build_summarizer(OpenAI)` when `OPENAI_API_KEY`
+    /// is missing — the orchestrator can still build, the failure
+    /// surfaces at first summarize call.
+    pub struct OpenAIStub;
+
+    #[async_trait]
+    impl Summarizer for OpenAIStub {
         async fn summarize(
             &self,
             _input: SummarizerInput<'_>,
