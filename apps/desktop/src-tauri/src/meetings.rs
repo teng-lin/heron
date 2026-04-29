@@ -583,6 +583,26 @@ pub async fn fetch_audio_at(
     meeting_id: &str,
     cache_root: &Path,
 ) -> DaemonOutcome<DaemonAudioSource> {
+    let dir = cache_root.join("daemon-audio");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return DaemonOutcome::Unavailable {
+            detail: format!("audio cache mkdir: {e}"),
+        };
+    }
+    let final_path = dir.join(format!("{meeting_id}.m4a"));
+    if let Ok(meta) = tokio::fs::metadata(&final_path).await
+        && meta.is_file()
+        && meta.len() > 0
+    {
+        return DaemonOutcome::Ok {
+            data: DaemonAudioSource {
+                path: final_path.to_string_lossy().into_owned(),
+                content_type: Some("audio/mp4".to_owned()),
+            },
+        };
+    }
+    cleanup_stale_audio_temps(&dir).await;
+
     let client = match reqwest::Client::builder()
         // Audio may be large; keep connect/read errors bounded by the
         // daemon and OS rather than the metadata endpoint's 5s budget.
@@ -632,13 +652,6 @@ pub async fn fetch_audio_at(
             ),
         };
     }
-    let dir = cache_root.join("daemon-audio");
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        return DaemonOutcome::Unavailable {
-            detail: format!("audio cache mkdir: {e}"),
-        };
-    }
-    let final_path = dir.join(format!("{meeting_id}.m4a"));
     let tmp_path = dir.join(format!("{meeting_id}.{}.m4a.tmp", uuid::Uuid::now_v7()));
     let mut file = match tokio::fs::File::create(&tmp_path).await {
         Ok(f) => f,
@@ -713,6 +726,32 @@ fn is_supported_audio_content_type(content_type: Option<&str>) -> bool {
         content_type.split(';').next().map(str::trim),
         Some("audio/mp4" | "audio/mpeg" | "audio/x-m4a")
     )
+}
+
+async fn cleanup_stale_audio_temps(dir: &Path) {
+    let cutoff = Duration::from_secs(24 * 60 * 60);
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let is_tmp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".m4a.tmp"));
+        if !is_tmp {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified.elapsed().is_ok_and(|age| age >= cutoff) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
 }
 
 /// Parameterized start — same split-out rationale as
