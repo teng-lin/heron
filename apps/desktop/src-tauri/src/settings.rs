@@ -108,8 +108,13 @@ impl From<FileNamingPattern> for heron_vault::FileNamingPattern {
 pub struct Settings {
     /// `"whisperkit"` or `"sherpa"`. STT backend selection per §8.6.
     pub stt_backend: String,
-    /// `"anthropic"`, `"claude_code_cli"`, `"codex_cli"`. LLM backend
-    /// selection per §11.1.
+    /// `"anthropic"`, `"openai"`, `"claude_code_cli"`, `"codex_cli"`.
+    /// LLM backend selection per §11.1. The wire-format strings here
+    /// are the snake-cased Rust enum names; map to a typed
+    /// [`heron_llm::Backend`] via [`heron_llm::parse_settings_backend`].
+    /// Unknown values route to `Preference::Auto` rather than hard-
+    /// erroring at startup so a stale on-disk value (typo, hand-edit,
+    /// pre-Tier-2 default) keeps the user's session bootable.
     pub llm_backend: String,
     /// Auto-summarize on stop, or wait for an explicit request from
     /// the review UI?

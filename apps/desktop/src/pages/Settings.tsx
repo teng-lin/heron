@@ -88,13 +88,21 @@ const AUTOSAVE_DEBOUNCE_MS = 500;
 
 /**
  * Wire-format strings for `Settings.llm_backend`. Mirrors the
- * `"anthropic" | "claude_code_cli" | "codex_cli"` values the Rust side
- * accepts (see `settings.rs`).
+ * `"anthropic" | "openai" | "claude_code_cli" | "codex_cli"` values the
+ * Rust side accepts (see `settings.rs`). The desktop side honors the
+ * user's choice via `heron_llm::parse_settings_backend` →
+ * `select_summarizer_with_user_choice`; an unrecognized string routes
+ * to `Preference::Auto`.
+ *
+ * Grouped visually by hosted-API vs local-CLI per the IA note in the
+ * UX-redesign brief: the user reads "API providers" as one billing
+ * model and "local CLI" as another.
  */
 const LLM_BACKENDS = [
-  { value: "anthropic", label: "Anthropic API" },
-  { value: "claude_code_cli", label: "Claude Code CLI" },
-  { value: "codex_cli", label: "Codex CLI" },
+  { value: "anthropic", label: "Anthropic API", group: "api" },
+  { value: "openai", label: "OpenAI API", group: "api" },
+  { value: "claude_code_cli", label: "Claude Code CLI", group: "cli" },
+  { value: "codex_cli", label: "Codex CLI", group: "cli" },
 ] as const;
 
 /**
@@ -1469,26 +1477,46 @@ function SummarizerTab() {
     <section className="space-y-6">
       <h2 className="text-lg font-medium">Summarizer</h2>
 
-      <fieldset className="space-y-2">
+      <fieldset className="space-y-3">
         <legend className="text-sm font-medium">LLM backend</legend>
-        <div className="space-y-2">
-          {LLM_BACKENDS.map((opt) => (
-            <label
-              key={opt.value}
-              className="flex items-center gap-2 text-sm cursor-pointer"
-            >
-              <input
-                type="radio"
-                name="llm-backend"
-                value={opt.value}
-                checked={settings.llm_backend === opt.value}
-                onChange={() => update({ llm_backend: opt.value })}
-                className="h-4 w-4 accent-primary"
-              />
-              {opt.label}
-            </label>
-          ))}
-        </div>
+        {/*
+          Visual grouping per the UX-redesign IA note: hosted "API
+          providers" (billed per-token) and local "CLI" (zero-billed,
+          spawn the user's installed binary) are read as different
+          billing models. Rendered as two stacked subgroups with a
+          subheading each. The data lives on the `LLM_BACKENDS.group`
+          discriminator so the order is the array order within each
+          group.
+        */}
+        {(["api", "cli"] as const).map((group) => {
+          const heading = group === "api" ? "API providers" : "Local CLI";
+          const opts = LLM_BACKENDS.filter((o) => o.group === group);
+          return (
+            <div key={group} className="space-y-1">
+              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {heading}
+              </div>
+              <div className="space-y-2">
+                {opts.map((opt) => (
+                  <label
+                    key={opt.value}
+                    className="flex items-center gap-2 text-sm cursor-pointer"
+                  >
+                    <input
+                      type="radio"
+                      name="llm-backend"
+                      value={opt.value}
+                      checked={settings.llm_backend === opt.value}
+                      onChange={() => update({ llm_backend: opt.value })}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    {opt.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </fieldset>
 
       {showAnthropicModelPicker && (
