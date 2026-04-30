@@ -14,11 +14,12 @@
 //! map, we treat `record_hotkey` as the default for the canonical
 //! [`ACTION_TOGGLE_RECORDING`] action id and let an explicit
 //! `shortcuts.toggle_recording` entry override it. The legacy
-//! `hotkey:fired` event continues to fire alongside the new
-//! `shortcut:toggle_recording` event because the plugin's global
-//! `with_handler` (set up in `lib::run`) emits `hotkey:fired` for
-//! every chord this app owns — independent of how the chord was
-//! registered. Pre–Tier-4 frontend listeners keep working unchanged.
+//! `hotkey:fired` event is emitted alongside the new
+//! `shortcut:toggle_recording` event from [`emit_for_action`], but
+//! *only* when the firing action id is [`ACTION_TOGGLE_RECORDING`] —
+//! pre–Tier-4 listeners that toggle recording on `hotkey:fired` keep
+//! working without falsely toggling on every other registered chord
+//! (e.g. `summarize_now`).
 //!
 //! ## Conflict + invalid-accelerator handling
 //!
@@ -36,9 +37,45 @@
 //! of every other shortcut.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Mutex;
 
-use tauri::{Emitter, Runtime};
+use tauri::{Emitter, Manager, Runtime};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+/// Tauri-managed buffer of conflicts detected during startup
+/// registration. The webview is typically not yet listening when
+/// `register_startup_hotkey` runs from the Tauri `setup` hook, so a
+/// fire-and-forget `app.emit(EVENT_CONFLICT, …)` would be silently
+/// dropped. We additionally stash each conflict here and expose a
+/// Tauri command (`heron_take_pending_shortcut_conflicts`) the
+/// frontend drains on mount, guaranteeing the user-edited
+/// `settings.json` mistake surfaces in the UI even on cold-start.
+#[derive(Default)]
+pub struct PendingConflicts {
+    buf: Mutex<Vec<ConflictNotice>>,
+}
+
+impl PendingConflicts {
+    /// Append `notice` to the buffer. A poisoned lock (theoretically
+    /// only reachable if a panic interrupted a previous push) is
+    /// silently recovered — losing one conflict notice is preferable
+    /// to crashing the app at startup.
+    fn push(&self, notice: ConflictNotice) {
+        if let Ok(mut g) = self.buf.lock() {
+            g.push(notice);
+        }
+    }
+
+    /// Drain and return every notice queued so far. Subsequent calls
+    /// return empty until more conflicts are added (e.g. via a future
+    /// hot-reload of `settings.json`).
+    pub fn drain(&self) -> Vec<ConflictNotice> {
+        match self.buf.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => Vec::new(),
+        }
+    }
+}
 
 /// Canonical action id for the Start/Stop Recording chord.
 ///
@@ -229,16 +266,21 @@ where
             );
             // One toast per losing entry, fired best-effort. A
             // missing main window during shutdown silently drops the
-            // event rather than panicking.
+            // event rather than panicking. We additionally stash the
+            // notice in the [`PendingConflicts`] managed state so the
+            // frontend can drain it on mount even if it wasn't
+            // listening when this fired (the typical case during
+            // startup).
             if conflict_emitted.insert(action_id.clone()) {
-                let _ = app.emit(
-                    EVENT_CONFLICT,
-                    ConflictNotice {
-                        accelerator: accel.clone(),
-                        kept: kept.clone(),
-                        skipped: action_id.clone(),
-                    },
-                );
+                let notice = ConflictNotice {
+                    accelerator: accel.clone(),
+                    kept: kept.clone(),
+                    skipped: action_id.clone(),
+                };
+                if let Some(state) = app.try_state::<PendingConflicts>() {
+                    state.push(notice.clone());
+                }
+                let _ = app.emit(EVENT_CONFLICT, notice);
             }
             outcomes.push((
                 action_id.clone(),
@@ -274,15 +316,28 @@ where
 
 /// Emit the `shortcut:<action_id>` event for `action_id`.
 ///
-/// Backward-compat for the legacy `hotkey:fired` event is handled by
-/// the plugin's global `with_handler` registered in `lib::run` — that
-/// fires for *every* chord regardless of how it was registered, so
-/// pre–Tier-4 listeners on `hotkey:fired` keep working without code
-/// changes here.
+/// Backward-compat: when `action_id` is [`ACTION_TOGGLE_RECORDING`] we
+/// also emit the legacy [`crate::EVENT_HOTKEY_FIRED`] event so pre–
+/// Tier-4 frontend listeners (which toggle recording on
+/// `hotkey:fired`) keep working unchanged. We deliberately do *not*
+/// emit `hotkey:fired` for any other action id — otherwise a new
+/// shortcut like `summarize_now` would falsely toggle recording on
+/// pre–Tier-4 frontends.
 fn emit_for_action<R: Runtime>(app: &tauri::AppHandle<R>, action_id: &str) {
     tracing::info!(action_id = %action_id, "shortcut fired");
     let event_name = format!("{EVENT_PREFIX}{action_id}");
     let _ = app.emit(&event_name, ());
+    if action_id == ACTION_TOGGLE_RECORDING {
+        let _ = app.emit(crate::EVENT_HOTKEY_FIRED, ());
+    }
+}
+
+/// Public wrapper around [`emit_for_action`] so Tauri commands defined
+/// in [`crate`] can re-use the same emit-pair contract (per-action
+/// `shortcut:<id>` event + legacy `hotkey:fired` for the toggle case).
+/// Keeps the legacy/new event coupling in one place.
+pub fn emit_for_action_public<R: Runtime>(app: &tauri::AppHandle<R>, action_id: &str) {
+    emit_for_action(app, action_id);
 }
 
 #[cfg(test)]
@@ -562,5 +617,72 @@ mod tests {
                 RegistrationOutcome::Registered
             )]
         );
+    }
+
+    // ---------- PendingConflicts buffer ----------
+
+    #[test]
+    fn pending_conflicts_drain_returns_pushed_notices_then_empties() {
+        let buf = PendingConflicts::default();
+        buf.push(ConflictNotice {
+            accelerator: "Cmd+Shift+R".into(),
+            kept: ACTION_TOGGLE_RECORDING.into(),
+            skipped: "pause_resume".into(),
+        });
+        buf.push(ConflictNotice {
+            accelerator: "Cmd+Alt+P".into(),
+            kept: "pause_resume".into(),
+            skipped: "summarize_now".into(),
+        });
+        let drained = buf.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].skipped, "pause_resume");
+        assert_eq!(drained[1].skipped, "summarize_now");
+        // Second drain is empty — semantics of "take pending" not "peek".
+        assert!(buf.drain().is_empty());
+    }
+
+    #[test]
+    fn register_with_routes_conflicts_into_pending_buffer_when_state_present() {
+        // Mirror of `second_action_with_same_accelerator_is_skipped_first_wins`
+        // but asserts the PendingConflicts state captures the notice
+        // even when the webview wouldn't be listening (the typical
+        // cold-start case).
+        let app = tauri::test::mock_app();
+        app.handle().manage(PendingConflicts::default());
+        let entries = vec![
+            (
+                "toggle_recording".to_owned(),
+                "CmdOrCtrl+Shift+R".to_owned(),
+            ),
+            ("pause_resume".to_owned(), "CmdOrCtrl+Shift+R".to_owned()),
+        ];
+        let _ = register_with(app.handle(), &entries, |_, _, _| Ok(()));
+        let queued = app.handle().state::<PendingConflicts>().drain();
+        assert_eq!(queued.len(), 1, "exactly one losing entry queues a notice");
+        assert_eq!(queued[0].kept, "toggle_recording");
+        assert_eq!(queued[0].skipped, "pause_resume");
+        assert_eq!(queued[0].accelerator, "CmdOrCtrl+Shift+R");
+    }
+
+    #[test]
+    fn register_with_no_managed_state_still_records_outcome() {
+        // The PendingConflicts buffer is optional — `register_with`
+        // must not panic when the caller never installed it (early-
+        // boot tests, future call sites that don't care about the
+        // toast surface).
+        let app = tauri::test::mock_app();
+        let entries = vec![
+            (
+                "toggle_recording".to_owned(),
+                "CmdOrCtrl+Shift+R".to_owned(),
+            ),
+            ("pause_resume".to_owned(), "CmdOrCtrl+Shift+R".to_owned()),
+        ];
+        let outcomes = register_with(app.handle(), &entries, |_, _, _| Ok(()));
+        assert!(matches!(
+            outcomes[1].1,
+            RegistrationOutcome::SkippedConflict { .. }
+        ));
     }
 }
