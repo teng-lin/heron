@@ -20,7 +20,11 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
-import { MeetingsTable, type StatusFilter } from "../components/home/meetings-table";
+import {
+  MeetingsTable,
+  type StatusFilter,
+  type TagFilter,
+} from "../components/home/meetings-table";
 import { UpcomingMeetings } from "../components/home/upcoming-meetings";
 import { Button } from "../components/ui/button";
 import {
@@ -66,6 +70,20 @@ export default function Home() {
   const [starting, setStarting] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
+  // Tag filter is independent of `filter` (status). They compose AND
+  // inside `MeetingsTable`. Discriminated union (see `TagFilter`):
+  //
+  //   - `{ kind: "all" }`        — no tag constraint (default).
+  //   - `{ kind: "untagged" }`   — show only meetings with empty `tags`.
+  //   - `{ kind: "tag"; value }` — show only meetings whose `tags` has it.
+  //
+  // The discriminator avoids the `"untagged"` magic-string collision
+  // with an LLM-emitted tag literally named `"untagged"`.
+  //
+  // Single-select so the chip strip stays a flat segmented-control UX —
+  // a multi-tag picker would need a popover, which is more weight than
+  // this surface needs.
+  const [tagFilter, setTagFilter] = useState<TagFilter>({ kind: "all" });
 
   useEffect(() => {
     void loadMeetings();
@@ -305,9 +323,15 @@ export default function Home() {
             />
           </label>
           <FilterChips value={filter} onChange={setFilter} />
+          <TagFilterChips value={tagFilter} onChange={setTagFilter} />
         </div>
 
-        <MeetingsTable query={search} filter={filter} />
+        <MeetingsTable
+          query={search}
+          filter={filter}
+          tagFilter={tagFilter}
+          onTagClick={(tag) => setTagFilter({ kind: "tag", value: tag })}
+        />
       </main>
 
       <Dialog.Root
@@ -414,6 +438,93 @@ function FilterChips({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * Tag-axis filter strip. Sits next to the status `FilterChips` and
+ * applies orthogonally — selecting `Untagged` doesn't reset the
+ * status filter, just constrains the tag axis.
+ *
+ * Two affordances:
+ *
+ *   1. The `All` / `Untagged` segmented pair toggles between "no tag
+ *      constraint" and "only meetings with empty `tags`". Clicking
+ *      `All` from any specific-tag state also clears down to `null`.
+ *   2. A trailing pill appears when the user has filtered to a
+ *      specific tag (via clicking a row chip — Home doesn't surface
+ *      the full tag enumeration, since the LLM emits a long-tail
+ *      vocabulary and a faceted picker would need product work). The
+ *      pill shows `#tag ×` and clearing it returns to `All`.
+ *
+ * Same segmented-control geometry as `FilterChips` so the two strips
+ * read as a unified filter bar.
+ */
+function TagFilterChips({
+  value,
+  onChange,
+}: {
+  value: TagFilter;
+  onChange: (next: TagFilter) => void;
+}) {
+  const options: { id: "all" | "untagged"; label: string }[] = [
+    { id: "all", label: "All tags" },
+    { id: "untagged", label: "Untagged" },
+  ];
+  // The "active" state for the segmented pair: a specific-tag value
+  // doesn't light either button — only the trailing pill below.
+  const segmentValue: "all" | "untagged" | null =
+    value.kind === "tag" ? null : value.kind;
+  return (
+    <div className="inline-flex items-center gap-2">
+      <div
+        className="inline-flex overflow-hidden rounded border"
+        style={{ borderColor: "var(--color-rule)" }}
+      >
+        {options.map((opt) => {
+          const active = opt.id === segmentValue;
+          return (
+            <button
+              type="button"
+              key={opt.id}
+              onClick={() =>
+                onChange(
+                  opt.id === "all" ? { kind: "all" } : { kind: "untagged" },
+                )
+              }
+              className={cn(
+                "px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] transition-colors",
+              )}
+              style={{
+                background: active
+                  ? "var(--color-accent)"
+                  : "var(--color-paper)",
+                color: active ? "var(--color-paper)" : "var(--color-ink-3)",
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+      {value.kind === "tag" && (
+        <button
+          type="button"
+          onClick={() => onChange({ kind: "all" })}
+          className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] tracking-[0.04em] transition-colors"
+          style={{
+            background: "var(--color-accent)",
+            color: "var(--color-paper)",
+            borderColor: "var(--color-accent)",
+          }}
+          title="Clear tag filter"
+        >
+          <span>#{value.value}</span>
+          <span aria-hidden="true">×</span>
+          <span className="sr-only">Clear tag filter</span>
+        </button>
+      )}
     </div>
   );
 }

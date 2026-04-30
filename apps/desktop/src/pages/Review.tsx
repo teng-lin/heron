@@ -35,6 +35,7 @@ import { RotateCcw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
+import { TagChip } from "../components/home/meetings-table";
 import { NoteEditor, type NoteEditorHandle } from "../components/NoteEditor";
 import { TranscriptView } from "../components/TranscriptView";
 import { PlaybackBar, type PlaybackBarHandle } from "../components/PlaybackBar";
@@ -532,6 +533,27 @@ export default function Review() {
                 >
                   {title}
                 </h1>
+                {/*
+                  LLM-emitted topic tags from the note's frontmatter
+                  (Tier 0 #1). Read-only here — Home owns the
+                  tag-as-filter UX; on Review they're decorative
+                  metadata next to the title. Coalesce optional
+                  `tags` (back-compat with pre-Tier-0-#1 daemons).
+                */}
+                {meeting && (meeting.tags ?? []).length > 0 && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {/*
+                      `${tag}-${index}` (rather than `tag` alone) so a
+                      duplicate tag emitted by the LLM summarizer
+                      doesn't collide on React's reconciliation key —
+                      same shape used by the Home meetings-table chip
+                      strip.
+                    */}
+                    {(meeting.tags ?? []).map((tag, index) => (
+                      <TagChip key={`${tag}-${index}`} tag={tag} />
+                    ))}
+                  </div>
+                )}
                 {meetingLoad.kind === "unavailable" && (
                   <p className="mt-1 text-xs text-muted-foreground">
                     Metadata unavailable: {meetingLoad.message}
