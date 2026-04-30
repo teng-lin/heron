@@ -1527,19 +1527,136 @@ fn validate_context_size(context: &PreMeetingContext) -> Result<usize, SessionEr
     Ok(serialized.len())
 }
 
-/// `Down` plus a "not yet wired" message — the honest answer for a
-/// substrate-only orchestrator. Deliberately not `PermissionMissing`
-/// (which would suggest a TCC permission gap and route consumers
-/// down a debugging dead end). When a subsystem actually wires in,
-/// its branch flips to a real probe; until then this is the cleanest
-/// signal that the daemon is up but the subsystem is not.
-fn not_yet_wired(subsystem: &str) -> HealthComponent {
+fn health_component(state: ComponentState, message: impl Into<String>) -> HealthComponent {
     HealthComponent {
-        state: ComponentState::Down,
-        message: Some(format!(
-            "{subsystem} not yet wired into LocalSessionOrchestrator",
-        )),
-        last_check: None,
+        state,
+        message: Some(message.into()),
+        last_check: Some(Utc::now()),
+    }
+}
+
+fn aggregate_health_status(components: &HealthComponents) -> HealthStatus {
+    // Destructure so the compiler errors on a new `HealthComponents`
+    // field that this aggregator forgets — otherwise a broken new
+    // component could silently never flip `/health` to `Down`
+    // (`aggregate_health_status_truth_table` only pins the components
+    // currently listed).
+    let HealthComponents {
+        capture,
+        whisperkit,
+        vault,
+        eventkit,
+        llm,
+    } = components;
+    let mut degraded = false;
+    for component in [capture, whisperkit, vault, eventkit, llm] {
+        match component.state {
+            ComponentState::Down | ComponentState::PermissionMissing => return HealthStatus::Down,
+            ComponentState::Degraded => degraded = true,
+            ComponentState::Ok => {}
+        }
+    }
+    if degraded {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Ok
+    }
+}
+
+fn stt_health_component(backend_name: &str) -> HealthComponent {
+    match heron_speech::build_backend(backend_name, &[]) {
+        Ok(backend) if backend.is_available() => health_component(
+            ComponentState::Ok,
+            format!("STT backend configured: {}", backend.name()),
+        ),
+        Ok(backend) => health_component(
+            ComponentState::Down,
+            format!("STT backend configured but unavailable: {}", backend.name()),
+        ),
+        Err(err) => health_component(
+            ComponentState::Down,
+            format!("STT backend configuration failed for {backend_name}: {err}"),
+        ),
+    }
+}
+
+fn llm_health_component(preference: heron_llm::Preference) -> HealthComponent {
+    let availability = heron_llm::Availability::detect();
+    match heron_llm::select_backend(preference, &availability) {
+        Ok((backend, reason)) => {
+            let reason_msg = match &reason {
+                heron_llm::SelectionReason::PreferredBackendAvailable(_) => "preferred".to_owned(),
+                heron_llm::SelectionReason::FellBackTo { because, .. } => {
+                    format!("fell back: {because}")
+                }
+            };
+            health_component(
+                ComponentState::Ok,
+                format!("LLM backend selected: {backend:?} ({reason_msg})"),
+            )
+        }
+        Err(err) => health_component(
+            ComponentState::Down,
+            format!("no LLM backend available for {preference:?}: {err}"),
+        ),
+    }
+}
+
+fn eventkit_health_component() -> HealthComponent {
+    // Avoid calling EventKit from /health: on a fresh macOS install
+    // the permission prompt blocks the caller. The read endpoint
+    // reports PermissionMissing/Timeout with the real TCC result.
+    health_component(
+        ComponentState::Ok,
+        "calendar reader configured; EventKit permission is checked on read",
+    )
+}
+
+fn capture_health_component(vault_root: Option<&Path>) -> HealthComponent {
+    match vault_root {
+        Some(root) if root.exists() => health_component(
+            ComponentState::Ok,
+            format!(
+                "capture pipeline configured with vault root: {}",
+                root.display()
+            ),
+        ),
+        Some(root) => health_component(
+            ComponentState::Degraded,
+            format!(
+                "capture pipeline configured, but vault root does not exist yet: {}",
+                root.display(),
+            ),
+        ),
+        None => health_component(
+            ComponentState::Degraded,
+            "synthetic capture available; configure a vault for persisted audio/transcript/summary",
+        ),
+    }
+}
+
+fn vault_health_component(vault_root: Option<&Path>) -> HealthComponent {
+    match vault_root {
+        Some(root) if root.exists() => health_component(
+            ComponentState::Ok,
+            format!("vault root: {}", root.display()),
+        ),
+        Some(root) => health_component(
+            ComponentState::Down,
+            format!(
+                "configured vault root does not exist on disk: {}",
+                root.display(),
+            ),
+        ),
+        // Unconfigured vault keeps the daemon usable via synthetic
+        // capture (see `capture_health_component`); reporting `Down`
+        // here would flip `/health` to `Down` for what is really a
+        // soft, recoverable misconfig — operators expect `Down` to
+        // mean "broken", not "not yet pointed at a directory".
+        None => health_component(
+            ComponentState::Degraded,
+            "vault root is not configured; persistence is disabled until one is set",
+        ),
     }
 }
 
@@ -2326,42 +2443,54 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     }
 
     async fn health(&self) -> Health {
-        // Substrate-only baseline (every component `Down + "not yet
-        // wired"`). When a `vault_root` is configured, flip the
-        // `vault` component to a real path-existence probe; the
-        // rest stay honest until their FSM-merge wires them.
-        // EventKit access is NOT probed here — `calendar_has_access`
-        // delegates to a Swift FFI that on a CI runner without
-        // pre-granted TCC blocks waiting for the system permission
-        // prompt. Real EventKit access surfaces on
-        // `/v1/calendar/upcoming`, which already returns 503 on
-        // `Denied`; that's the right contract for liveness to defer
-        // to.
-        let vault = match self.vault_root.as_deref() {
-            Some(root) if root.exists() => HealthComponent {
-                state: ComponentState::Ok,
-                message: Some(format!("vault root: {}", root.display())),
-                last_check: Some(Utc::now()),
-            },
-            Some(root) => HealthComponent {
-                state: ComponentState::Down,
-                message: Some(format!(
-                    "configured vault root does not exist on disk: {}",
-                    root.display(),
-                )),
-                last_check: Some(Utc::now()),
-            },
-            None => not_yet_wired("vault writer"),
-        };
-        Health {
-            status: HealthStatus::Degraded,
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-            components: HealthComponents {
-                capture: not_yet_wired("audio capture"),
-                whisperkit: not_yet_wired("speech recognition"),
-                vault,
-                eventkit: not_yet_wired("EventKit calendar reads"),
-                llm: not_yet_wired("LLM summarizer"),
+        // Keep /health side-effect-free: no EventKit permission prompt,
+        // no model download, no hosted-LLM network request. The
+        // endpoint reports local orchestrator wiring and cheap backend
+        // availability; operation-specific failures still surface from
+        // the corresponding read/capture/summarize paths.
+        //
+        // The probes do touch the filesystem (`Path::exists`) and
+        // PATH (`which` inside `heron_llm::Availability::detect`),
+        // both blocking syscalls — run them on the blocking pool so
+        // an unlucky disk stall can't park the async runtime.
+        let vault_root = self.vault_root.clone();
+        let stt_backend_name = self.stt_backend_name.clone();
+        let llm_preference = self.llm_preference;
+        let probe = tokio::task::spawn_blocking(move || {
+            let components = HealthComponents {
+                capture: capture_health_component(vault_root.as_deref()),
+                whisperkit: stt_health_component(&stt_backend_name),
+                vault: vault_health_component(vault_root.as_deref()),
+                eventkit: eventkit_health_component(),
+                llm: llm_health_component(llm_preference),
+            };
+            let status = aggregate_health_status(&components);
+            Health {
+                status,
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                components,
+            }
+        })
+        .await;
+        match probe {
+            Ok(health) => health,
+            // Probe functions don't panic and the runtime doesn't
+            // cancel us, so a `JoinError` here means a real bug —
+            // surface it as `Down` rather than panic, so a single
+            // bad health probe can't take the daemon down with it.
+            Err(err) => Health {
+                status: HealthStatus::Down,
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                components: HealthComponents {
+                    capture: health_component(
+                        ComponentState::Down,
+                        format!("health probe task failed: {err}"),
+                    ),
+                    whisperkit: health_component(ComponentState::Down, "health probe task failed"),
+                    vault: health_component(ComponentState::Down, "health probe task failed"),
+                    eventkit: health_component(ComponentState::Down, "health probe task failed"),
+                    llm: health_component(ComponentState::Down, "health probe task failed"),
+                },
             },
         }
     }
@@ -3093,32 +3222,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_degraded_with_down_components() {
-        // Pin the "Down + reason" contract per-component. Reviewers
-        // flagged that `PermissionMissing` would mislead `/health`
-        // consumers into thinking a TCC permission is missing —
-        // `Down` is the honest state for "subsystem not yet wired".
+    async fn health_reports_configured_orchestrator_capabilities() {
+        // /health reports the local orchestrator's configured
+        // capabilities without triggering side effects such as
+        // EventKit TCC prompts, model downloads, or hosted LLM calls.
         let orch = LocalSessionOrchestrator::new();
         let h = orch.health().await;
-        assert!(matches!(h.status, HealthStatus::Degraded));
-        for component in [
-            &h.components.capture,
-            &h.components.whisperkit,
-            &h.components.vault,
-            &h.components.eventkit,
-            &h.components.llm,
-        ] {
-            assert!(
-                matches!(component.state, ComponentState::Down),
-                "expected Down for not-yet-wired subsystem, got {:?}",
-                component.state,
-            );
-            let msg = component.message.as_deref().unwrap_or_default();
-            assert!(
-                msg.contains("not yet wired"),
-                "expected 'not yet wired' in message, got {msg:?}",
-            );
+        // Aggregate isn't pinned here: capture and vault are both
+        // `Degraded` (no configured root → synthetic-only), but the
+        // `llm` probe depends on env keys / `claude` / `codex` on
+        // PATH and may be `Down`, which would dominate. The truth-
+        // table test pins the aggregation contract directly.
+        assert!(matches!(
+            h.components.capture.state,
+            ComponentState::Degraded
+        ));
+        assert!(matches!(h.components.vault.state, ComponentState::Degraded));
+        assert!(matches!(h.components.eventkit.state, ComponentState::Ok));
+        // The default `sherpa` STT backend reports available
+        // unconditionally, so whisperkit pins to `Ok` regardless of
+        // the host machine — pin it to guard against silent regressions
+        // if the default flips to a backend with environment-dependent
+        // availability. `llm` is intentionally not asserted: its state
+        // depends on env keys / `claude` / `codex` on PATH.
+        assert!(matches!(h.components.whisperkit.state, ComponentState::Ok));
+        assert!(
+            !h.components
+                .capture
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not yet wired"),
+            "capture health should no longer report placeholder wiring"
+        );
+        assert!(
+            !h.components
+                .eventkit
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not yet wired"),
+            "EventKit health should no longer report placeholder wiring"
+        );
+    }
+
+    #[test]
+    fn aggregate_health_status_truth_table() {
+        // Pin the contract directly — the end-to-end /health tests
+        // only exercise paths through the live orchestrator, so
+        // `Degraded`-stickiness and `PermissionMissing`-short-circuit
+        // can regress silently without a focused test.
+        fn component(state: ComponentState) -> HealthComponent {
+            HealthComponent {
+                state,
+                message: None,
+                last_check: None,
+            }
         }
+        fn components(states: [ComponentState; 5]) -> HealthComponents {
+            HealthComponents {
+                capture: component(states[0]),
+                whisperkit: component(states[1]),
+                vault: component(states[2]),
+                eventkit: component(states[3]),
+                llm: component(states[4]),
+            }
+        }
+        use ComponentState::{Degraded, Down, Ok as Up, PermissionMissing};
+
+        assert!(matches!(
+            aggregate_health_status(&components([Up, Up, Up, Up, Up])),
+            HealthStatus::Ok
+        ));
+        assert!(matches!(
+            aggregate_health_status(&components([Up, Degraded, Up, Up, Up])),
+            HealthStatus::Degraded
+        ));
+        assert!(matches!(
+            aggregate_health_status(&components([Up, Up, Up, Up, Down])),
+            HealthStatus::Down
+        ));
+        // PermissionMissing must collapse to Down, not Degraded —
+        // otherwise a denied TCC permission masquerades as a soft
+        // degradation and consumers stop alerting.
+        assert!(matches!(
+            aggregate_health_status(&components([Up, Up, Up, PermissionMissing, Up])),
+            HealthStatus::Down
+        ));
+        // Down dominates Degraded.
+        assert!(matches!(
+            aggregate_health_status(&components([Degraded, Up, Down, Up, Up])),
+            HealthStatus::Down
+        ));
     }
 
     #[tokio::test]
@@ -3132,6 +3327,7 @@ mod tests {
         assert!(!missing.exists());
         let orch = Builder::default().vault_root(missing.clone()).build();
         let h = orch.health().await;
+        assert!(matches!(h.status, HealthStatus::Down));
         let vault = &h.components.vault;
         assert!(
             matches!(vault.state, ComponentState::Down),

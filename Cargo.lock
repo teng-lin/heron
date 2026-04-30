@@ -2361,6 +2361,7 @@ dependencies = [
  "heron-policy",
  "heron-realtime",
  "heron-session",
+ "heron-speech",
  "heron-types",
  "heron-vault",
  "serde",

@@ -699,9 +699,8 @@ pub fn default_settings_path() -> PathBuf {
 /// Pulled out of the setup hook so the same precedence rule is one
 /// well-tested call rather than reimplemented inline. We deliberately
 /// don't `mkdir -p` the path here: the vault writer creates it at
-/// first capture, and an absent vault is reported as
-/// `permission_missing` on `/health` — the right signal to a
-/// freshly-installed daemon's first liveness probe.
+/// first capture, and an absent vault is reported as a down vault
+/// component on `/health`.
 fn resolve_vault_root() -> Option<PathBuf> {
     if let Ok(s) = std::env::var("HERON_VAULT_ROOT") {
         let trimmed = s.trim();

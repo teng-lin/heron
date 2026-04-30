@@ -1,15 +1,14 @@
-//! Stub [`SessionOrchestrator`] used by the production binary until
-//! the `LocalSessionOrchestrator` consolidation lands.
+//! Stub [`SessionOrchestrator`] used by router/auth tests.
 //!
 //! Hardcodes a degraded `Health` (every component reports
 //! `permission_missing`, since no real subsystem is wired), owns a
 //! [`heron_event::EventBus`] that nothing publishes to, and returns
 //! [`SessionError::NotYetImplemented`] for every actual operation.
 //!
-//! The point isn't usefulness — the point is shape: a real
-//! orchestrator drops in by replacing `Arc<dyn …>` in
-//! [`crate::AppState`], no router rewiring. That's the trait surface
-//! validating itself.
+//! The production daemon no longer uses this. It exists so tests that
+//! only care about HTTP middleware, routing, and wire error mapping do
+//! not need to construct a vault-backed
+//! [`heron_orchestrator::LocalSessionOrchestrator`].
 
 use std::path::PathBuf;
 

@@ -825,11 +825,12 @@ async fn health_reports_vault_ok_when_root_exists() {
         h.components.vault.state,
         heron_session::ComponentState::Ok
     ));
-    // Capture / whisperkit / eventkit / llm are honestly stubbed
-    // (`Down + "not yet wired"`).
+    // Capture is wired when a vault root exists; remaining component
+    // states depend on local platform/tool availability and are covered
+    // by unit tests in `src/lib.rs`.
     assert!(matches!(
         h.components.capture.state,
-        heron_session::ComponentState::Down
+        heron_session::ComponentState::Ok
     ));
 }
 

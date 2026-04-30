@@ -1,22 +1,18 @@
 //! `herond` daemon binary entry point.
 //!
 //! Loads (or mints) the bearer token, builds an [`AppState`] backed
-//! by [`heron_orchestrator::LocalSessionOrchestrator`] (read-side
-//! fully wired against the user's vault on disk; capture-lifecycle
-//! endpoints still 501 until the FSM-merge PR lands), binds the
+//! by [`heron_orchestrator::LocalSessionOrchestrator`], binds the
 //! OpenAPI-pinned `127.0.0.1:7384`, and serves until SIGINT.
 //!
 //! The orchestrator brings a real bus + replay cache (from
-//! `heron-event-http`) — the SSE `Last-Event-ID` resume contract is
-//! live end-to-end as soon as any future publisher exists. The
-//! capture-lifecycle methods (`start_capture`, `end_meeting`,
-//! `attach_context`) still return `NotYetImplemented` until the
-//! FSM-merge wires the heron-cli session driver into this trait.
+//! `heron-event-http`) and implements manual capture, pre-meeting
+//! context staging, calendar reads, and vault-backed meeting reads
+//! when a vault root is configured. The `/events` SSE
+//! `Last-Event-ID` resume contract is live end-to-end for every
+//! event the orchestrator publishes.
 //!
 //! Vault root resolution: the `HERON_VAULT_ROOT` env var wins;
-//! falls back to `~/heron-vault`. The directory is created lazily
-//! by the vault writer when the FSM-merge PR adds capture; this
-//! binary just reads.
+//! falls back to `~/heron-vault`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +43,7 @@ async fn main() -> Result<()> {
     let vault_root = resolve_vault_root().context("resolving vault root")?;
     tracing::info!(
         vault_root = %vault_root.display(),
-        "wiring LocalSessionOrchestrator (read-side; capture-lifecycle still 501 until FSM-merge)"
+        "wiring LocalSessionOrchestrator"
     );
     let orchestrator = Arc::new(LocalSessionOrchestrator::with_vault(vault_root));
     std::mem::drop(orchestrator.spawn_auto_record_scheduler());
@@ -67,10 +63,9 @@ async fn main() -> Result<()> {
 }
 
 /// Vault root precedence: `HERON_VAULT_ROOT` env var > `~/heron-vault`
-/// default. We don't `mkdir` here; an absent vault is reported as
-/// `permission_missing` on `/health` and `list_meetings` returns an
-/// empty page, which is the right signal to a freshly-installed
-/// daemon's first liveness probe.
+/// default. We don't `mkdir` here; an absent vault is reported as a
+/// down vault component on `/health`, and `list_meetings` returns an
+/// empty page.
 fn resolve_vault_root() -> Result<PathBuf> {
     // Treat an empty / whitespace-only `HERON_VAULT_ROOT` as unset.
     // The naïve `PathBuf::from("")` resolves to the current working
