@@ -429,6 +429,8 @@ pub enum EventPayload {
 
     #[serde(rename = "speaker.changed")]
     SpeakerChanged(SpeakerChangedData),
+    #[serde(rename = "audio.level")]
+    AudioLevel(AudioLevelData),
 
     #[serde(rename = "doctor.warning")]
     DoctorWarning(DoctorWarningData),
@@ -458,6 +460,7 @@ impl EventPayload {
             Self::SummaryReady(_) => "summary.ready",
             Self::ActionItemsReady(_) => "action_items.ready",
             Self::SpeakerChanged(_) => "speaker.changed",
+            Self::AudioLevel(_) => "audio.level",
             Self::DoctorWarning(_) => "doctor.warning",
             Self::DaemonError(_) => "daemon.error",
         }
@@ -537,6 +540,50 @@ pub struct SpeakerChangedData {
     /// caveat in the struct doc, "potentially speaking"), `false`
     /// when they transitioned to MUTED (definitely not speaking).
     pub started: bool,
+}
+
+/// Channels that carry an `audio.level` reading. A wire-local subset
+/// of [`heron_types::Channel`] that omits the raw `Mic` variant —
+/// pre-AEC mic carries echo bleed of the remote audio and is never
+/// metered (see [`AudioLevelData`] doc). Encoding the filter at the
+/// type level means the collector can't accidentally publish a `Mic`
+/// envelope, and SSE consumers see a tighter enum on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioLevelChannel {
+    /// Post-AEC user voice. STT consumes this stream; the
+    /// "your voice" meter renders it.
+    MicClean,
+    /// Remote audio captured via the per-app process tap. The
+    /// "their voice" meter renders it; in 3+ calls it remains a
+    /// single mixed channel (per-participant equalizers need
+    /// speaker diarization on top).
+    Tap,
+}
+
+/// Body of an `audio.level` event. Coalesced from raw 100 Hz capture
+/// frames down to ~10 Hz before publishing; see Tier 3 #15 in
+/// `docs/ux-redesign-backend-prerequisites.md` for the rationale.
+///
+/// **Not persisted.** Volume-high and uninteresting after the fact —
+/// the orchestrator skips writing this event to any session log.
+/// `Last-Event-ID` resume on `/events` still returns recent envelopes
+/// from the in-memory replay window; consumers reconnecting after a
+/// drop may want to skip replayed `audio.level` envelopes (filter via
+/// `?topics=` to exclude this stream) since stale level readings are
+/// not useful — the frontend's last-value-sticks contract handles the
+/// gap as well as a flood of replayed values would.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AudioLevelData {
+    /// Session-secs of the newest frame folded into this coalesced
+    /// window.
+    pub t: f64,
+    pub channel: AudioLevelChannel,
+    /// Floored at -100 dBFS so consumers never have to handle `-inf`.
+    pub peak_dbfs: f32,
+    /// Floored at -100 dBFS. Tracks perceived loudness; pair with
+    /// `peak_dbfs` for a twin-needle meter.
+    pub rms_dbfs: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -909,6 +956,66 @@ mod prefix_tests {
             }
             other => panic!("expected SpeakerChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn audio_level_round_trips_through_envelope() {
+        // Same bridge guard as `speaker_changed_round_trips_through_envelope`:
+        // every transport projects from `EventEnvelope`, so a
+        // mistyped serde rename for `audio.level` would silently
+        // corrupt the wire shape on every projection at once. Pin
+        // the discriminator + data shape explicitly.
+        let payload = EventPayload::AudioLevel(AudioLevelData {
+            t: 4.25,
+            channel: AudioLevelChannel::MicClean,
+            peak_dbfs: -3.5,
+            rms_dbfs: -18.0,
+        });
+        let envelope = Envelope::new(payload).with_meeting("mtg_test");
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.get("event_type").and_then(|v| v.as_str()),
+            Some("audio.level"),
+            "audio.level must be the wire discriminator: {json}",
+        );
+        let data = obj.get("data").and_then(|v| v.as_object()).expect("data");
+        assert_eq!(
+            data.get("channel").and_then(|v| v.as_str()),
+            Some("mic_clean")
+        );
+        assert!(
+            (data.get("t").and_then(|v| v.as_f64()).unwrap_or(0.0) - 4.25).abs() < f64::EPSILON,
+        );
+        let back: EventEnvelope = serde_json::from_value(json).expect("deserialize");
+        match back.payload {
+            EventPayload::AudioLevel(d) => {
+                assert_eq!(d.channel, AudioLevelChannel::MicClean);
+                assert!((d.peak_dbfs - -3.5).abs() < 1e-3);
+                assert!((d.rms_dbfs - -18.0).abs() < 1e-3);
+            }
+            other => panic!("expected AudioLevel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_level_event_type_string_matches_serde_tag() {
+        // Same drift guard as the speaker.changed pair: hand-written
+        // `event_type()` match must not diverge from the
+        // `#[serde(rename)]` tag; transports route on this string and
+        // a mismatch silently mis-routes consumers.
+        let payload = EventPayload::AudioLevel(AudioLevelData {
+            t: 0.0,
+            channel: AudioLevelChannel::Tap,
+            peak_dbfs: -100.0,
+            rms_dbfs: -100.0,
+        });
+        assert_eq!(payload.event_type(), "audio.level");
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            json.get("event_type").and_then(|v| v.as_str()),
+            Some("audio.level"),
+        );
     }
 
     #[test]

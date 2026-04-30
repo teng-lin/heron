@@ -12,6 +12,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { dispatch, dispatchBridgeStatus } from "./useSseEvents";
+import { useAudioLevelStore } from "../store/audioLevel";
 import { useMeetingsStore } from "../store/meetings";
 import { useSpeakerStore } from "../store/speaker";
 
@@ -43,6 +44,7 @@ afterEach(() => {
     summaries: {},
   });
   useSpeakerStore.setState({ activeByMeeting: {} });
+  useAudioLevelStore.setState({ latestByMeeting: {} });
 });
 
 describe("dispatchBridgeStatus", () => {
@@ -153,6 +155,120 @@ describe("dispatchBridgeStatus", () => {
 
     expect(
       useSpeakerStore.getState().activeByMeeting[SAMPLE_MID],
+    ).toBeUndefined();
+  });
+
+  test("audio.level routes the data into useAudioLevelStore", () => {
+    expect(
+      useAudioLevelStore.getState().latestByMeeting[SAMPLE_MID],
+    ).toBeUndefined();
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "audio.level",
+        data: { t: 1.5, channel: "mic_clean", peak_dbfs: -6.0, rms_dbfs: -18.0 },
+      } as const),
+    );
+
+    const slot = useAudioLevelStore.getState().latestByMeeting[SAMPLE_MID];
+    expect(slot?.mic_clean).toEqual({
+      t: 1.5,
+      channel: "mic_clean",
+      peak_dbfs: -6.0,
+      rms_dbfs: -18.0,
+    });
+    // Tap remains null — channels are independent.
+    expect(slot?.tap).toBeNull();
+  });
+
+  test("audio.level latest envelope wins per channel without folding", () => {
+    // The daemon-side coalescer already takes max over the tick window,
+    // so the frontend is pure latest-wins — a follow-up envelope on the
+    // same channel must replace the prior reading even when the new
+    // peak is quieter. Pin so a future "smooth the meter on the JS side"
+    // refactor can't ship a fold here without a deliberate review.
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "audio.level",
+        data: { t: 1.0, channel: "mic_clean", peak_dbfs: -3.0, rms_dbfs: -12.0 },
+      } as const),
+    );
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "audio.level",
+        data: { t: 1.1, channel: "mic_clean", peak_dbfs: -20.0, rms_dbfs: -40.0 },
+      } as const),
+    );
+
+    expect(
+      useAudioLevelStore.getState().latestByMeeting[SAMPLE_MID]?.mic_clean
+        ?.peak_dbfs,
+    ).toBe(-20.0);
+  });
+
+  test("audio.level without meeting_id is dropped", () => {
+    // Same defensive guard as the speaker.changed counterpart — Invariant
+    // 12 stamps the meeting id but a replay path could deliver null.
+    dispatch(
+      envelope(null, {
+        event_type: "audio.level",
+        data: { t: 1.5, channel: "tap", peak_dbfs: -6.0, rms_dbfs: -18.0 },
+      } as const),
+    );
+
+    expect(useAudioLevelStore.getState().latestByMeeting).toEqual({});
+  });
+
+  test("meeting.completed clears audio levels for that meeting", () => {
+    // Capture broadcast closes on `ended`/`completed`; without this
+    // clear the meter would freeze a stale dBFS bar onto the post-
+    // meeting review screen indefinitely.
+    useAudioLevelStore.setState({
+      latestByMeeting: {
+        [SAMPLE_MID]: {
+          mic_clean: { t: 1.0, channel: "mic_clean", peak_dbfs: -6, rms_dbfs: -18 },
+          tap: null,
+        },
+      },
+    });
+    useMeetingsStore.setState({ load: async () => {} });
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "meeting.completed",
+        data: {
+          meeting: { id: SAMPLE_MID } as never,
+          outcome: "success",
+          failure_reason: null,
+        },
+      } as const),
+    );
+
+    expect(
+      useAudioLevelStore.getState().latestByMeeting[SAMPLE_MID],
+    ).toBeUndefined();
+  });
+
+  test("meeting.ended also clears audio levels (capture broadcast closes)", () => {
+    useAudioLevelStore.setState({
+      latestByMeeting: {
+        [SAMPLE_MID]: {
+          mic_clean: { t: 1.0, channel: "mic_clean", peak_dbfs: -6, rms_dbfs: -18 },
+          tap: null,
+        },
+      },
+    });
+    useMeetingsStore.setState({ load: async () => {} });
+
+    dispatch(
+      envelope(SAMPLE_MID, {
+        event_type: "meeting.ended",
+        data: { id: SAMPLE_MID } as never,
+      } as const),
+    );
+
+    expect(
+      useAudioLevelStore.getState().latestByMeeting[SAMPLE_MID],
     ).toBeUndefined();
   });
 

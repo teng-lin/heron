@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use heron_event::Envelope;
-use heron_session::{EventPayload, MeetingId, SessionEventBus, SpeakerChangedData};
+use heron_session::{
+    AudioLevelChannel, AudioLevelData, EventPayload, MeetingId, SessionEventBus, SpeakerChangedData,
+};
 use heron_types::{
     Attendee, Channel, Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, ItemId,
     MeetingType, RecordingFsm, SessionId, SessionPhase, SessionStateRecord, SpeakerEvent,
@@ -65,6 +67,22 @@ const SAMPLE_RATE_HZ: u32 = 48_000;
 /// Channel size for the AX → aligner mpsc. 256 events is ~1 minute of
 /// active-speaker churn at the upper bound observed in the §4 spike.
 const AX_EVENT_CHANNEL_SIZE: usize = 256;
+
+/// Tick period for the audio-level coalescer (Tier 3 #15). 100 ms is
+/// 10 Hz, the rate the dBFS meter / waveform / equalizer-bar renderer
+/// in `apps/desktop` actually consumes; the raw capture rate is closer
+/// to 100 Hz (10 ms frames at 48 kHz mono) and forwarding every frame
+/// would saturate the SSE channel and burn CPU on the renderer for no
+/// visible benefit. The coalescer collapses one window into a single
+/// per-channel envelope carrying max-peak + max-rms across the window.
+const AUDIO_LEVEL_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Lower clamp on dBFS values published on `audio.level`. `20*log10(0)`
+/// is `-inf`; the SSE wire and the renderer's needle math both dislike
+/// non-finite floats, and a window of pure silence below ~-100 dBFS is
+/// already inaudible after dithering. Floor here so consumers never
+/// have to special-case `-inf`.
+const AUDIO_LEVEL_DBFS_FLOOR: f32 = -100.0;
 
 /// Run the full pipeline. Drives the FSM and threads outputs from each
 /// backend into the next per the module preamble.
@@ -454,6 +472,13 @@ async fn run_capture_phase(
             None
         }
     };
+    // Audio-level meter (Tier 3 #15). Spawned only when a bus is
+    // present — the `heron record` CLI path has no live-level
+    // consumer. Cloned ahead of `event_bus` being moved into
+    // `spawn_ax_collector` below.
+    let audio_level_handle = event_bus.as_ref().map(|(bus, mid)| {
+        spawn_audio_level_collector(capture.frames.resubscribe(), bus.clone(), *mid)
+    });
     let ax_collector = spawn_ax_collector(ax_rx, event_bus);
 
     let _ = stop_rx.await;
@@ -469,6 +494,11 @@ async fn run_capture_phase(
     }
     if let Err(e) = tap_handle.await {
         tracing::warn!(error = %e, "tap WAV writer panicked");
+    }
+    if let Some(h) = audio_level_handle
+        && let Err(e) = h.await
+    {
+        tracing::warn!(error = %e, "audio-level collector panicked");
     }
 
     if let Some(h) = ax_handle
@@ -602,6 +632,151 @@ fn spawn_ax_collector(
         }
         events
     })
+}
+
+/// Peak + RMS for a 48 kHz f32 mono frame in one pass. Returns dBFS
+/// for both, floored at [`AUDIO_LEVEL_DBFS_FLOOR`] so a window of pure
+/// silence does not produce `-inf` (which the SSE encoder + the
+/// renderer's needle math would have to special-case).
+fn frame_levels_dbfs(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (AUDIO_LEVEL_DBFS_FLOOR, AUDIO_LEVEL_DBFS_FLOOR);
+    }
+    let mut peak: f32 = 0.0;
+    let mut sum_sq: f32 = 0.0;
+    for &s in samples {
+        let abs = s.abs();
+        if abs > peak {
+            peak = abs;
+        }
+        sum_sq += s * s;
+    }
+    let rms = (sum_sq / (samples.len() as f32)).sqrt();
+    (linear_to_dbfs(peak), linear_to_dbfs(rms))
+}
+
+fn linear_to_dbfs(linear: f32) -> f32 {
+    if linear <= 0.0 {
+        AUDIO_LEVEL_DBFS_FLOOR
+    } else {
+        (20.0 * linear.log10()).max(AUDIO_LEVEL_DBFS_FLOOR)
+    }
+}
+
+/// Map a capture-pipeline [`Channel`] to the wire-side
+/// [`AudioLevelChannel`]. Returns `None` for raw `Mic` — that channel
+/// is intentionally not metered (see [`AudioLevelChannel`] doc on
+/// echo-bleed).
+fn audio_level_channel(channel: Channel) -> Option<AudioLevelChannel> {
+    match channel {
+        Channel::MicClean => Some(AudioLevelChannel::MicClean),
+        Channel::Tap => Some(AudioLevelChannel::Tap),
+        Channel::Mic => None,
+    }
+}
+
+/// Subscribe to the capture broadcast and forward coalesced per-channel
+/// `audio.level` envelopes onto the bus. Implements Tier 3 #15.
+///
+/// Coalesces ~100 Hz raw frames into ~10 Hz envelopes (max-peak +
+/// max-rms per tick window). A window with no frames publishes nothing
+/// for that channel — consumers rely on last-value-sticks.
+fn spawn_audio_level_collector(
+    frames_rx: broadcast::Receiver<heron_audio::CaptureFrame>,
+    bus: SessionEventBus,
+    meeting_id: MeetingId,
+) -> JoinHandle<()> {
+    spawn_audio_level_collector_with_period(frames_rx, bus, meeting_id, AUDIO_LEVEL_TICK)
+}
+
+/// Test seam exposing the tick period. Pinned with the `_with_period`
+/// suffix so production callers can't accidentally pick a custom rate
+/// — the SSE channel + renderer calibrate against
+/// [`AUDIO_LEVEL_TICK`].
+fn spawn_audio_level_collector_with_period(
+    mut frames_rx: broadcast::Receiver<heron_audio::CaptureFrame>,
+    bus: SessionEventBus,
+    meeting_id: MeetingId,
+    tick: std::time::Duration,
+) -> JoinHandle<()> {
+    // Stringify once outside the tick loop: `MeetingId::to_string`
+    // formats a UUID (heap alloc + format work), and we'd otherwise pay
+    // it per envelope. Inside the loop we still clone the resulting
+    // `String` per envelope because `Envelope::with_meeting` takes
+    // ownership; that's a single short-buffer alloc instead of a UUID
+    // formatter pass.
+    let meeting_id = meeting_id.to_string();
+    tokio::spawn(async move {
+        let mut mic_clean: Option<AudioLevelData> = None;
+        let mut tap: Option<AudioLevelData> = None;
+
+        // `interval_at(now + tick, tick)` skips the immediate first
+        // fire that plain `interval(tick)` would issue at t=0 — at
+        // t=0 we'd publish nothing useful (no frames yet) and the
+        // renderer would see one empty cycle on every reconnect.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
+        // Skip catch-up bursts on missed ticks: the meter is a
+        // "current loudness" reading, not a history we owe in full.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                msg = frames_rx.recv() => match msg {
+                    Ok(frame) => fold_frame_into_slot(frame, &mut mic_clean, &mut tap),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(lagged = n, "audio-level collector dropped frames");
+                        continue;
+                    }
+                },
+                _ = ticker.tick() => {
+                    publish_slot(&bus, &meeting_id, mic_clean.take());
+                    publish_slot(&bus, &meeting_id, tap.take());
+                }
+            }
+        }
+    })
+}
+
+fn publish_slot(bus: &SessionEventBus, meeting_id: &str, slot: Option<AudioLevelData>) {
+    if let Some(data) = slot {
+        let env = Envelope::new(EventPayload::AudioLevel(data)).with_meeting(meeting_id);
+        bus.publish(env);
+    }
+}
+
+fn fold_frame_into_slot(
+    frame: heron_audio::CaptureFrame,
+    mic_clean: &mut Option<AudioLevelData>,
+    tap: &mut Option<AudioLevelData>,
+) {
+    let Some(channel) = audio_level_channel(frame.channel) else {
+        return;
+    };
+    let slot = match channel {
+        AudioLevelChannel::MicClean => mic_clean,
+        AudioLevelChannel::Tap => tap,
+    };
+    let (peak, rms) = frame_levels_dbfs(&frame.samples);
+    match slot {
+        Some(data) => {
+            data.t = frame.session_secs;
+            if peak > data.peak_dbfs {
+                data.peak_dbfs = peak;
+            }
+            if rms > data.rms_dbfs {
+                data.rms_dbfs = rms;
+            }
+        }
+        None => {
+            *slot = Some(AudioLevelData {
+                t: frame.session_secs,
+                channel,
+                peak_dbfs: peak,
+                rms_dbfs: rms,
+            });
+        }
+    }
 }
 
 /// Thin wrapper around `SttBackend::transcribe`. Reads the partial
@@ -985,6 +1160,245 @@ mod tests {
             env_a.meeting_id.as_deref(),
             Some(meeting_id.to_string().as_str()),
         );
+    }
+
+    // ----- audio-level collector (Tier 3 #15) -----
+
+    fn capture_frame(channel: Channel, samples: Vec<f32>, t: f64) -> heron_audio::CaptureFrame {
+        heron_audio::CaptureFrame {
+            channel,
+            host_time: 0,
+            session_secs: t,
+            samples,
+        }
+    }
+
+    #[test]
+    fn frame_levels_dbfs_floors_at_silence() {
+        // `20*log10(0)` would return -inf; the floor protects every
+        // downstream consumer (renderer, SSE encode, log) from
+        // having to special-case non-finite floats.
+        let (peak, rms) = frame_levels_dbfs(&[0.0; 480]);
+        assert!((peak - AUDIO_LEVEL_DBFS_FLOOR).abs() < 1e-3);
+        assert!((rms - AUDIO_LEVEL_DBFS_FLOOR).abs() < 1e-3);
+        let (peak_empty, rms_empty) = frame_levels_dbfs(&[]);
+        assert!((peak_empty - AUDIO_LEVEL_DBFS_FLOOR).abs() < 1e-3);
+        assert!((rms_empty - AUDIO_LEVEL_DBFS_FLOOR).abs() < 1e-3);
+    }
+
+    #[test]
+    fn frame_levels_dbfs_full_scale_is_zero() {
+        // A single sample at ±1.0 = 0 dBFS by definition. Pin so a
+        // refactor that swaps log base or off-by-one'd the conversion
+        // breaks loudly.
+        let (peak, rms) = frame_levels_dbfs(&[1.0]);
+        assert!(peak.abs() < 1e-3 && rms.abs() < 1e-3);
+        let (peak_neg, _) = frame_levels_dbfs(&[-1.0]);
+        assert!(peak_neg.abs() < 1e-3);
+        // Half scale ≈ -6.02 dBFS.
+        let (peak_half, _) = frame_levels_dbfs(&[0.5]);
+        assert!((peak_half - (-6.0206)).abs() < 1e-2);
+    }
+
+    #[test]
+    fn frame_levels_dbfs_dc_signal_peak_equals_rms() {
+        // A constant ±1.0 signal: peak == rms == 1.0 → both 0 dBFS.
+        let (peak, rms) = frame_levels_dbfs(&[1.0; 16]);
+        assert!(peak.abs() < 1e-3 && rms.abs() < 1e-3);
+    }
+
+    #[test]
+    fn frame_levels_dbfs_nan_samples_floor_instead_of_propagating() {
+        // The capture pipeline promises finite samples, but a future
+        // SIMD-vectorized fold could reorder ops and end up
+        // propagating NaN through the dBFS conversion. Pin that the
+        // function ALWAYS returns finite values floored at the
+        // declared minimum — SSE-encoded `NaN` would silently break
+        // every downstream renderer.
+        let samples = [0.5, f32::NAN, -0.25, 0.1];
+        let (peak, rms) = frame_levels_dbfs(&samples);
+        assert!(peak.is_finite(), "peak must be finite, got {peak}");
+        assert!(rms.is_finite(), "rms must be finite, got {rms}");
+        assert!(peak >= AUDIO_LEVEL_DBFS_FLOOR);
+        assert!(rms >= AUDIO_LEVEL_DBFS_FLOOR);
+    }
+
+    #[test]
+    fn fold_frame_takes_max_peak_and_max_rms_per_channel() {
+        // The coalescer holds one slot per channel; multiple frames
+        // arriving within a tick window must collapse into a single
+        // envelope carrying max(peak) and max(rms). Pin the math so a
+        // refactor that switches to "latest" or "average" can't ship
+        // silently — the renderer sizes its meter against the peak.
+        let mut mic_clean = None;
+        let mut tap = None;
+        for (samples, t) in [
+            (vec![0.1f32; 16], 0.5),
+            (vec![0.5; 16], 0.6),
+            (vec![0.05; 16], 0.7),
+        ] {
+            fold_frame_into_slot(
+                capture_frame(Channel::MicClean, samples, t),
+                &mut mic_clean,
+                &mut tap,
+            );
+        }
+        let data = mic_clean.expect("mic_clean populated");
+        assert_eq!(data.channel, AudioLevelChannel::MicClean);
+        assert!((data.t - 0.7).abs() < f64::EPSILON);
+        assert!((data.peak_dbfs - -6.0206).abs() < 1e-2);
+        assert!((data.rms_dbfs - -6.0206).abs() < 1e-2);
+        assert!(tap.is_none(), "tap slot must not see mic_clean frames");
+    }
+
+    #[test]
+    fn fold_frame_drops_raw_mic_channel() {
+        // Raw `Mic` is intentionally not metered — pre-AEC carries
+        // echo bleed of the remote audio. Pin so a refactor of the
+        // capture pipeline can't accidentally expose it.
+        let mut mic_clean = None;
+        let mut tap = None;
+        fold_frame_into_slot(
+            capture_frame(Channel::Mic, vec![1.0; 16], 0.5),
+            &mut mic_clean,
+            &mut tap,
+        );
+        assert!(mic_clean.is_none() && tap.is_none());
+    }
+
+    #[test]
+    fn fold_frame_splits_mic_clean_and_tap() {
+        let mut mic_clean = None;
+        let mut tap = None;
+        fold_frame_into_slot(
+            capture_frame(Channel::MicClean, vec![0.5; 16], 1.0),
+            &mut mic_clean,
+            &mut tap,
+        );
+        fold_frame_into_slot(
+            capture_frame(Channel::Tap, vec![0.25; 16], 1.1),
+            &mut mic_clean,
+            &mut tap,
+        );
+        let mc = mic_clean.expect("mic_clean populated");
+        let tp = tap.expect("tap populated");
+        assert_eq!(mc.channel, AudioLevelChannel::MicClean);
+        assert_eq!(tp.channel, AudioLevelChannel::Tap);
+        assert!(mc.peak_dbfs > tp.peak_dbfs);
+    }
+
+    #[tokio::test]
+    async fn spawn_audio_level_collector_publishes_one_envelope_per_channel_per_tick() {
+        // End-to-end pin: a window of frames coalesces into exactly
+        // two bus envelopes (one per active channel) regardless of
+        // how many frames land in the window. Coalescer rate matters
+        // for SSE backpressure; without this guard a refactor could
+        // accidentally publish at the raw 100 Hz frame rate.
+        use heron_event::EventBus;
+        use heron_session::{EventPayload, MeetingId};
+
+        let bus: SessionEventBus = EventBus::new(64);
+        let meeting_id = MeetingId::now_v7();
+        let mut sub = bus.subscribe();
+        let (tx, rx) = broadcast::channel::<heron_audio::CaptureFrame>(64);
+
+        // Use a 50 ms tick so the test wakes the publish path within
+        // a comfortable wall-clock budget; production is 100 ms.
+        let handle = spawn_audio_level_collector_with_period(
+            rx,
+            bus.clone(),
+            meeting_id,
+            std::time::Duration::from_millis(50),
+        );
+
+        // Send 4 frames into one tick window: 2 mic_clean, 1 tap, and
+        // 1 raw mic that must be ignored.
+        tx.send(capture_frame(Channel::MicClean, vec![0.25; 480], 0.10))
+            .expect("send");
+        tx.send(capture_frame(Channel::MicClean, vec![0.5; 480], 0.11))
+            .expect("send");
+        tx.send(capture_frame(Channel::Tap, vec![0.1; 480], 0.12))
+            .expect("send");
+        tx.send(capture_frame(Channel::Mic, vec![1.0; 480], 0.13))
+            .expect("send");
+
+        // Wait for the tick to publish.
+        let env_a = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
+            .await
+            .expect("first envelope timeout")
+            .expect("first envelope");
+        let env_b = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
+            .await
+            .expect("second envelope timeout")
+            .expect("second envelope");
+
+        let mut got_mic_clean = false;
+        let mut got_tap = false;
+        for env in [env_a, env_b] {
+            assert_eq!(
+                env.meeting_id.as_deref(),
+                Some(meeting_id.to_string().as_str()),
+                "audio.level publishers must tag the envelope with the meeting id",
+            );
+            match env.payload {
+                EventPayload::AudioLevel(data) => match data.channel {
+                    AudioLevelChannel::MicClean => {
+                        got_mic_clean = true;
+                        // Coalesced peak should match the louder of
+                        // the two mic_clean frames (0.5 → ≈ -6 dBFS).
+                        assert!(
+                            (data.peak_dbfs - -6.0206).abs() < 1e-2,
+                            "mic_clean peak {} did not max-fold",
+                            data.peak_dbfs,
+                        );
+                    }
+                    AudioLevelChannel::Tap => {
+                        got_tap = true;
+                        assert!(data.peak_dbfs < -6.0); // 0.1 ≈ -20 dBFS
+                    }
+                },
+                other => panic!("expected AudioLevel, got {other:?}"),
+            }
+        }
+        assert!(got_mic_clean && got_tap, "both channels must publish");
+
+        // Close the broadcast so the collector exits cleanly. The
+        // join must NOT hang — regression guard for a future select
+        // arm that doesn't honour `RecvError::Closed`.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("collector did not exit on broadcast close")
+            .expect("collector panicked");
+    }
+
+    #[tokio::test]
+    async fn spawn_audio_level_collector_publishes_nothing_when_silent() {
+        // No frames in a window → no envelope. The renderer's
+        // last-value-sticks contract relies on this; a zero-data
+        // envelope per tick would override the meter to silence even
+        // when the previous window was loud.
+        use heron_event::EventBus;
+        use heron_session::MeetingId;
+
+        let bus: SessionEventBus = EventBus::new(8);
+        let meeting_id = MeetingId::now_v7();
+        let mut sub = bus.subscribe();
+        let (tx, rx) = broadcast::channel::<heron_audio::CaptureFrame>(8);
+
+        let handle = spawn_audio_level_collector_with_period(
+            rx,
+            bus.clone(),
+            meeting_id,
+            std::time::Duration::from_millis(20),
+        );
+
+        // Let several ticks pass with no frames sent.
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(120), sub.recv()).await;
+        assert!(recv.is_err(), "no envelope expected on silent window");
+
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
     #[tokio::test]

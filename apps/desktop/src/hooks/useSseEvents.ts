@@ -16,6 +16,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import { invoke } from "../lib/invoke";
 import type { EventEnvelope } from "../lib/types";
+import { useAudioLevelStore } from "../store/audioLevel";
 import { useMeetingsStore } from "../store/meetings";
 import { useSpeakerStore } from "../store/speaker";
 import { useTranscriptStore } from "../store/transcript";
@@ -144,10 +145,14 @@ export function dispatch(envelope: EventEnvelope) {
       // leak into the post-meeting review view as a stale badge.
       // Clear on BOTH ended (recording stopped, transcribe still
       // running) and completed (terminal) so the gap between those
-      // two states never displays a phantom active speaker.
+      // two states never displays a phantom active speaker. Same
+      // reasoning for the audio-level meter: the capture broadcast
+      // closes on `ended`, so any latent reading would freeze a
+      // stale dBFS bar onto the post-meeting review screen.
       const meetingId = envelope.meeting_id;
       if (meetingId) {
         useSpeakerStore.getState().clear(meetingId);
+        useAudioLevelStore.getState().clear(meetingId);
       }
       void useMeetingsStore.getState().load();
       return;
@@ -156,6 +161,13 @@ export function dispatch(envelope: EventEnvelope) {
       const meetingId = envelope.meeting_id;
       if (meetingId) {
         useSpeakerStore.getState().apply(meetingId, envelope.data);
+      }
+      return;
+    }
+    case "audio.level": {
+      const meetingId = envelope.meeting_id;
+      if (meetingId) {
+        useAudioLevelStore.getState().apply(meetingId, envelope.data);
       }
       return;
     }
