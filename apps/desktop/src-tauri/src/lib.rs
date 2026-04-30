@@ -43,7 +43,9 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use daemon::{DaemonHandle, DaemonStatus};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
-pub use disk::{DiskError, DiskUsage, disk_usage, purge_audio_older_than};
+pub use disk::{
+    DiskError, DiskUsage, disk_usage, purge_audio_older_than, purge_summaries_older_than,
+};
 pub use onboarding::{
     TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
     test_audio_tap_async, test_calendar, test_calendar_async, test_daemon, test_daemon_async,
@@ -329,6 +331,16 @@ fn heron_disk_usage(vault_path: String) -> Result<DiskUsage, String> {
 #[tauri::command]
 fn heron_purge_audio_older_than(vault_path: String, days: u32) -> Result<u32, String> {
     purge_audio_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
+}
+
+/// Tauri command: Tier 4 sibling of [`heron_purge_audio_older_than`].
+/// Purges `.md` summary files at the vault root whose mtime is older
+/// than `days` days. Returns the count actually deleted. Driven by
+/// `Settings.summary_retention_days`; the audio sidecars are never
+/// candidates (see `purge_summaries_keeps_audio_deletes_old_md`).
+#[tauri::command]
+fn heron_purge_summaries_older_than(vault_path: String, days: u32) -> Result<u32, String> {
+    purge_summaries_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
 }
 
 /// Tauri command: persist the "wizard finished" flag (§13.3 / PR-ι).
@@ -874,6 +886,9 @@ pub fn run() {
             heron_unregister_hotkey,
             heron_disk_usage,
             heron_purge_audio_older_than,
+            // Tier 4 #20 — summary retention sweeper. Sibling of the
+            // audio sweeper above; consumes `Settings.summary_retention_days`.
+            heron_purge_summaries_older_than,
             // Phase 73 (PR-λ) — pre-flight checks.
             heron_check_disk_for_recording,
             tray::heron_emit_capture_degraded,
