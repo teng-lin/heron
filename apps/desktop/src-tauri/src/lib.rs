@@ -13,6 +13,7 @@
 //!   §16.1 settings persistence backends so the review UI and
 //!   Settings pane can land in week 13/14 against stable Rust.
 
+pub mod action_items;
 pub mod asset_protocol;
 pub mod daemon;
 pub mod diagnostics;
@@ -204,6 +205,31 @@ async fn heron_resummarize_preview(
     session_id: String,
 ) -> Result<String, String> {
     resummarize::resummarize_preview(Path::new(&vault_path), &session_id).await
+}
+
+/// Tauri command (Day 8-10 #19): apply a per-row patch against a single
+/// action item in `<vault>/<session_id>.md`'s frontmatter. Returns the
+/// post-merge row so the renderer can drop optimistic UI without a
+/// follow-up `heron_get_meeting`.
+///
+/// `meetingId` is the vault's `<session_id>.md` basename — same ID
+/// `heron_resummarize` consumes — and is named `meetingId` on the
+/// JS-side wire to align with the daemon's `MeetingId` semantics
+/// (today the desktop's read path uses these as interchangeable
+/// pointers to the same meeting note). `itemId` is the
+/// `Frontmatter.action_items[].id` UUID minted by the vault writer.
+///
+/// Patch semantics follow JSON Merge Patch (RFC 7396). See
+/// [`action_items::update_action_item`] for the per-field rules and
+/// [`heron_vault::ActionItemPatch`] for the wire shape.
+#[tauri::command]
+async fn heron_update_action_item(
+    vault_path: String,
+    meeting_id: String,
+    item_id: String,
+    patch: heron_vault::ActionItemPatch,
+) -> Result<action_items::ActionItemView, String> {
+    action_items::update_action_item(Path::new(&vault_path), &meeting_id, &item_id, patch).await
 }
 
 /// Tauri command: report whether a `<id>.md.bak` exists. `Ok(None)` when
@@ -893,6 +919,7 @@ pub fn run() {
             heron_list_sessions,
             heron_resummarize,
             heron_resummarize_preview,
+            heron_update_action_item,
             heron_check_backup,
             heron_restore_backup,
             heron_test_microphone,

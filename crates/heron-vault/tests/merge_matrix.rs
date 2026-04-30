@@ -288,6 +288,7 @@ fn full_action_items_round_trip_uses_theirs_order_then_user_appended() {
             owner: "me".into(),
             text: "A".into(),
             due: None,
+            done: false,
         });
         fm
     };
@@ -297,6 +298,7 @@ fn full_action_items_round_trip_uses_theirs_order_then_user_appended() {
         owner: "me".into(),
         text: "C user-added".into(),
         due: None,
+        done: false,
     });
     let mut theirs = base.clone();
     theirs.action_items.insert(
@@ -306,6 +308,7 @@ fn full_action_items_round_trip_uses_theirs_order_then_user_appended() {
             owner: "alice".into(),
             text: "B llm-new".into(),
             due: None,
+            done: false,
         },
     );
 

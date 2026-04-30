@@ -387,6 +387,7 @@ mod tests {
             owner: "me".into(),
             text: "Send pricing deck".into(),
             due: None,
+            done: false,
         }];
         let path = PathBuf::from("/tmp/x.jsonl");
         let prompt = render_meeting_prompt(&SummarizerInput {

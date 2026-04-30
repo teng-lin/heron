@@ -135,6 +135,7 @@ fn alice_action(id: u128) -> ActionItem {
         owner: "alice".into(),
         text: "Send pricing deck to Acme".into(),
         due: None,
+        done: false,
     }
 }
 
@@ -169,6 +170,7 @@ async fn re_summarize_threads_prior_items_and_writes_merged_frontmatter() {
             owner: "alice".into(),
             text: "Send the pricing deck to Acme".into(),
             due: None,
+            done: false,
         }],
         attendees: vec![prior_attendee.clone()],
         cost: Cost {

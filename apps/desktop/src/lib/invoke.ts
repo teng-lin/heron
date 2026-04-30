@@ -345,6 +345,56 @@ export interface UnfinalizedSession {
   has_partial_transcript: boolean;
 }
 
+/**
+ * Day 8-10 write-back: per-row patch shape for
+ * `heron_update_action_item`. Mirrors `heron_vault::ActionItemPatch`
+ * (RFC 7396 JSON Merge Patch).
+ *
+ * Per-field semantics on the wire:
+ * - **omit the key** to leave the field unchanged
+ * - **set to `null`** (only valid for nullable fields `owner` / `due`)
+ *   to clear the field
+ * - **set to a value** to overwrite
+ *
+ * The Rust side uses a custom `Option<Option<T>>` deserializer to
+ * distinguish missing-from-JSON from explicit `null`; serde's default
+ * collapses both to `None` and would lose the "clear" signal. Stick
+ * to literal omission for "no change" — `undefined` works in JSON
+ * because `JSON.stringify` drops `undefined` keys, but mixing the two
+ * forms across the renderer is a footgun.
+ *
+ * `text` and `done` are never nullable on the wire — `null` would be
+ * meaningless for either. Pass a string / boolean to set, omit to
+ * leave alone.
+ */
+export interface ActionItemPatch {
+  /** New text body. Trim renderer-side; the writer rejects empty / whitespace-only. */
+  text?: string;
+  /** `null` to clear, string to set, omit to leave unchanged. */
+  owner?: string | null;
+  /** ISO `YYYY-MM-DD`. `null` to clear, omit to leave unchanged. */
+  due?: string | null;
+  /** New `done` flag. Only path that flips a user checkbox on disk. */
+  done?: boolean;
+}
+
+/**
+ * Day 8-10 write-back: post-merge action-item row returned from
+ * `heron_update_action_item`. Mirrors
+ * `apps/desktop/src-tauri/src/action_items.rs::ActionItemView`.
+ *
+ * `owner` / `due` are nullable (matching the existing `lib/types.ts::ActionItem`
+ * shape — `null` means "no value"); `done` is always emitted because
+ * the Rust side has a definite post-merge value to return.
+ */
+export interface ActionItemView {
+  id: string;
+  text: string;
+  owner: string | null;
+  due: string | null;
+  done: boolean;
+}
+
 // ---- Command surface ----------------------------------------------
 
 /**
@@ -443,6 +493,33 @@ export interface HeronCommands {
   heron_resummarize_preview: {
     args: { vaultPath: string; sessionId: string };
     returns: string;
+  };
+  /**
+   * Day 8-10 write-back: apply a per-row [`ActionItemPatch`] against
+   * `<vault>/<meetingId>.md`'s `Frontmatter.action_items` and atomically
+   * rewrite the note. Returns the post-merge row so the renderer can
+   * drop optimistic UI without a follow-up `heron_get_meeting`.
+   *
+   * `meetingId` is the vault note's `<session_id>.md` basename — the
+   * same id `heron_resummarize` consumes; named `meetingId` on the
+   * wire to align with the daemon's `MeetingId` semantics.
+   * `itemId` is the `Frontmatter.action_items[].id` UUID minted by
+   * the vault writer (Tier 0 #3).
+   *
+   * Errors come back through the standard `Promise.reject(string)`
+   * envelope with a stable prefix the renderer can pattern-match:
+   * - `not_found: action item <id> not found in note frontmatter`
+   * - `validation: ...` (bad UUID, non-ISO due, empty text)
+   * - `vault_locked: ...` (atomic write failed — iCloud eviction, etc.)
+   */
+  heron_update_action_item: {
+    args: {
+      vaultPath: string;
+      meetingId: string;
+      itemId: string;
+      patch: ActionItemPatch;
+    };
+    returns: ActionItemView;
   };
   /**
    * Phase 67 (PR-ε): report whether a `<id>.md.bak` is present. `null`
@@ -920,4 +997,25 @@ export async function invoke<C extends HeronCommand>(
     cmd,
     args as Record<string, unknown> | undefined,
   );
+}
+
+/**
+ * Day 8-10 write-back: thin wrapper around the typed `invoke` so the
+ * Review tab's optimistic-UI handlers don't have to spell out the
+ * command name. Returns the post-merge action-item row; rejects with
+ * the `not_found:` / `validation:` / `vault_locked:` envelope strings
+ * the renderer pattern-matches on.
+ *
+ * Pass `patch` fields with the JSON Merge Patch (RFC 7396) convention:
+ * omit a key for "no change", set to `null` (only on `owner` / `due`)
+ * for "clear", set to a value for "set". See [`ActionItemPatch`] for
+ * the per-field rules.
+ */
+export async function updateActionItem(args: {
+  vaultPath: string;
+  meetingId: string;
+  itemId: string;
+  patch: ActionItemPatch;
+}): Promise<ActionItemView> {
+  return invoke("heron_update_action_item", args);
 }

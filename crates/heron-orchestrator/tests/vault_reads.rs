@@ -979,6 +979,7 @@ impl Fixture {
                 owner: (*owner).to_owned(),
                 text: (*text).to_owned(),
                 due: due.map(str::to_owned),
+                done: false,
             })
             .collect();
         self.write_note_inner(slug, date, start, company, body, &items, None, &[]);
@@ -1000,6 +1001,7 @@ impl Fixture {
                 owner: (*owner).to_owned(),
                 text: (*text).to_owned(),
                 due: due.map(str::to_owned),
+                done: false,
             })
             .collect();
         self.write_note_inner(slug, date, start, company, body, &items, None, &[]);

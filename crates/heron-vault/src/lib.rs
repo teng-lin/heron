@@ -27,6 +27,6 @@ pub use merge::{MergeInputs, MergeOutcome, merge, merge_action_items, merge_atte
 pub use purge::{PurgeOutcome, purge_after_verify};
 pub use validate::{Issue, validate_vault};
 pub use writer::{
-    FileNamingPattern, PriorItems, VaultError, VaultWriter, atomic_write, read_note,
-    read_prior_items, render_note, slugify,
+    ActionItemPatch, FileNamingPattern, PriorItems, VaultError, VaultWriter, atomic_write,
+    read_note, read_prior_items, render_note, slugify,
 };
