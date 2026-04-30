@@ -467,78 +467,71 @@ fn set_mode_0600(_path: &Path) -> std::io::Result<()> {
 /// reserved-char-only title, or transliteration that produces only
 /// whitespace all return `None`.
 pub fn slugify(title: &str) -> Option<String> {
-    // Step 1: transliterate to ASCII.
+    // Step 1: transliterate to ASCII. `deunicode` guarantees the output
+    // contains only ASCII bytes, which lets the rest of this function
+    // run as a byte-oriented single pass without UTF-8 boundary fuss.
     let ascii = deunicode::deunicode(title);
 
-    // Step 2 + 3: byte-walk; map reserved bytes / non-alnum to a marker
-    // ('-'). Lowercasing happens here too so a single linear pass
-    // produces the final character set.
+    // Steps 2–4 fused: lowercase, replace non-alphanumeric with `-`,
+    // collapse `-` runs, and trim a leading dash (we trim the trailing
+    // dash via `trim_end_matches` after the loop). Starting `prev_dash`
+    // at `true` makes the first non-alnum char drop into the "skip
+    // consecutive dash" branch, doubling as the leading-dash trim.
+    //
+    // Single allocation, single linear pass. Per the gemini PR-168
+    // review note, the previous two-pass + `Vec<char>` shape was both
+    // slower and allocated more than needed.
     let mut buf = String::with_capacity(ascii.len());
-    for ch in ascii.chars() {
-        // ASCII control codes (incl. NUL, BEL, BS, TAB, LF, CR, etc.)
-        // never belong in a filename. Reserved chars (`/\:*?"<>|`) get
-        // the same treatment. Stray ASCII bytes outside `[A-Za-z0-9]`
-        // also collapse to '-' — punctuation, dots, and spaces all
-        // produce the same separator.
-        if ch.is_ascii_alphanumeric() {
-            buf.push(ch.to_ascii_lowercase());
-        } else {
-            buf.push('-');
-        }
-    }
-
-    // Collapse runs of `-` and trim. Single linear pass: skip
-    // consecutive `-` so `"a---b"` → `"a-b"`. Leading / trailing `-`
-    // dropped at the end via `trim_matches`.
-    let mut collapsed = String::with_capacity(buf.len());
-    let mut prev_dash = false;
-    for ch in buf.chars() {
-        if ch == '-' {
-            if !prev_dash {
-                collapsed.push('-');
-                prev_dash = true;
-            }
-        } else {
-            collapsed.push(ch);
+    let mut prev_dash = true;
+    for b in ascii.bytes() {
+        if b.is_ascii_alphanumeric() {
+            buf.push(b.to_ascii_lowercase() as char);
             prev_dash = false;
+        } else if !prev_dash {
+            buf.push('-');
+            prev_dash = true;
         }
     }
-    let trimmed = collapsed.trim_matches('-');
-    if trimmed.is_empty() {
+    // Trim trailing `-` (the loop only suppresses leading + interior
+    // duplicates; one trailing `-` can survive the final iteration).
+    let trimmed_len = buf.trim_end_matches('-').len();
+    buf.truncate(trimmed_len);
+    if buf.is_empty() {
         return None;
     }
 
-    // Step 5: length cap. Budget is in chars; transliteration
-    // produces ASCII so chars == bytes here.
-    if trimmed.chars().count() <= MAX_SLUG_CHARS {
-        return Some(trimmed.to_owned());
+    // Step 5: length cap. `deunicode` produces ASCII so `len()` is the
+    // byte count and equals the char count — no `chars().count()` walk
+    // needed.
+    if buf.len() > MAX_SLUG_CHARS {
+        // Word-boundary trim. Walk back from the cap to the last `-`
+        // so we don't slice a word; falls back to a hard cut at the
+        // cap when no boundary lands inside the budget.
+        let bytes = buf.as_bytes();
+        let mut cut = MAX_SLUG_CHARS;
+        while cut > 0 && bytes[cut - 1] != b'-' {
+            cut -= 1;
+        }
+        let cut = if cut == 0 {
+            // No `-` inside the budget — keep the first MAX_SLUG_CHARS
+            // chars; the trailing-`-` trim below handles the tail.
+            MAX_SLUG_CHARS
+        } else {
+            // Stop at the `-` (don't include it).
+            cut - 1
+        };
+        buf.truncate(cut);
+        let final_len = buf.trim_end_matches('-').len();
+        buf.truncate(final_len);
     }
 
-    // Word-boundary trim. Walk back from the cap to the last `-` so
-    // we don't slice a word; if no boundary lands inside the budget,
-    // hard-cut at the cap and strip any trailing `-`.
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut cut = MAX_SLUG_CHARS;
-    while cut > 0 && chars[cut - 1] != '-' {
-        cut -= 1;
-    }
-    let cut = if cut == 0 {
-        // No `-` inside the budget — keep the first MAX_SLUG_CHARS
-        // chars, the resulting suffix-trim handles trailing dashes.
-        MAX_SLUG_CHARS
-    } else {
-        // Stop at the `-` (don't include it).
-        cut - 1
-    };
-    let head: String = chars[..cut].iter().collect();
-    let head = head.trim_end_matches('-');
-    if head.is_empty() {
+    if buf.is_empty() {
         // Pathological: cap landed before the first non-`-` char.
-        // Shouldn't be reachable (`trimmed` had no leading `-`), but
-        // be defensive.
+        // Shouldn't be reachable (the leading-trim sets the first
+        // alnum, not a dash), but be defensive.
         return None;
     }
-    Some(head.to_owned())
+    Some(buf)
 }
 
 /// Reserve a collision-free filename inside `meetings_dir` for
