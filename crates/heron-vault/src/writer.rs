@@ -797,6 +797,55 @@ mod tests {
         assert_eq!(body, "v2\n");
     }
 
+    #[test]
+    fn read_note_round_trips_structured_action_items_with_stable_ids() {
+        // Tier 0 #3 of the UX redesign: the desktop wire bridge reads
+        // structured `Frontmatter.action_items` (with stable
+        // [`heron_types::ItemId`]) instead of regex-extracting bullets
+        // from the markdown body. Pin the round-trip here so a future
+        // YAML schema drift (rename, reorder, drop `id`) breaks loudly
+        // on this test rather than silently in the desktop's Actions
+        // tab.
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+
+        let id_a = uuid::Uuid::now_v7();
+        let id_b = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![
+            heron_types::ActionItem {
+                id: id_a,
+                owner: "Teng".into(),
+                text: "Write the doc".into(),
+                due: Some("2026-05-01".into()),
+            },
+            heron_types::ActionItem {
+                id: id_b,
+                owner: "".into(),
+                text: "Pick a reviewer".into(),
+                due: None,
+            },
+        ];
+
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "tier0-3", &fm, "Body.\n")
+            .expect("finalize");
+        let (read_back, body) = read_note(&path).expect("read");
+
+        assert_eq!(body, "Body.\n");
+        assert_eq!(read_back.action_items.len(), 2);
+        assert_eq!(read_back.action_items[0].id, id_a);
+        assert_eq!(read_back.action_items[0].owner, "Teng");
+        assert_eq!(read_back.action_items[0].text, "Write the doc");
+        assert_eq!(read_back.action_items[0].due.as_deref(), Some("2026-05-01"));
+        // Empty owner → still serialized verbatim. The wire-side
+        // bridge in the orchestrator collapses `""` to `None`; the
+        // YAML reader doesn't second-guess what's on disk.
+        assert_eq!(read_back.action_items[1].id, id_b);
+        assert_eq!(read_back.action_items[1].owner, "");
+        assert_eq!(read_back.action_items[1].due, None);
+    }
+
     // ----- Tier 4 #19: file-naming pattern -----
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {

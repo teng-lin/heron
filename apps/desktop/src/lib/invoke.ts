@@ -656,6 +656,17 @@ export interface HeronCommands {
     returns: number;
   };
   /**
+   * Tier 4 #20: purge `.md` summary files whose mtime is older than
+   * `days`. Returns the count actually deleted. Sibling of
+   * `heron_purge_audio_older_than`; consumes
+   * `Settings.summary_retention_days`. The audio sidecars are never
+   * candidates — the two sweepers operate on disjoint extension sets.
+   */
+  heron_purge_summaries_older_than: {
+    args: { vaultPath: string; days: number };
+    returns: number;
+  };
+  /**
    * Phase 73 (PR-λ): pre-flight disk-space gate. Reads
    * `min_free_disk_mib` from the user's settings.json, asks the OS
    * how much free space the cache volume has, and returns the

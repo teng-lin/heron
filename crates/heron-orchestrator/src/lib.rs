@@ -1299,6 +1299,11 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             // populated later by `meeting_from_note` when the
             // finalized vault note is read back.
             processing: None,
+            // No structured action items yet at start-capture time;
+            // populated later by `meeting_from_note` from
+            // `Frontmatter.action_items` once the vault note is on
+            // disk. Tier 0 #3 — read path only.
+            action_items: Vec::new(),
         };
         let mut fsm = RecordingFsm::new();
 
@@ -1666,19 +1671,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         };
         let path = self.note_path_for_read(root, id)?;
         let (frontmatter, body) = read_note(&path).map_err(vault_to_session_err)?;
-        let action_items = frontmatter
-            .action_items
-            .iter()
-            .map(|a| heron_session::ActionItem {
-                text: a.text.clone(),
-                owner: if a.owner.is_empty() {
-                    None
-                } else {
-                    Some(a.owner.clone())
-                },
-                due: a.due.as_deref().and_then(parse_iso_date),
-            })
-            .collect();
+        let action_items = action_items_from_frontmatter(&frontmatter.action_items);
         Ok(Some(Summary {
             meeting_id: *id,
             generated_at: started_at_from_frontmatter(&frontmatter),
@@ -2036,6 +2029,7 @@ fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionE
         SummaryLifecycle::Ready
     };
     let processing = meeting_processing_from_cost(&fm.cost);
+    let action_items = action_items_from_frontmatter(&fm.action_items);
     Ok(Meeting {
         id,
         // Notes are only finalized for completed meetings, so the
@@ -2055,6 +2049,7 @@ fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionE
         // without a second read into the note's frontmatter.
         tags: fm.tags.clone(),
         processing,
+        action_items,
     })
 }
 
@@ -2089,6 +2084,33 @@ fn meeting_processing_from_cost(
             model: cost.model.clone(),
         })
     }
+}
+
+/// Project `Frontmatter.action_items` (typed rows with stable
+/// [`heron_types::ItemId`]) into the wire `heron_session::ActionItem`.
+///
+/// Tier 0 #3 of the UX redesign: surface structured rows on the
+/// `Meeting` and `Summary` IPC types so the desktop's Review tab can
+/// render assignees + due dates without re-parsing the markdown body
+/// with a bullet-extracting regex. Read path only — write-back stays
+/// markdown-flavoured for now (`docs/ux-redesign-backend-prerequisites.md`).
+///
+/// Empty `owner` strings on disk become `None` on the wire — the
+/// vault writer materializes an empty string when the LLM emitted no
+/// owner, but the wire type is "owner is optional," so `""` is the
+/// honest projection of "no owner."
+fn action_items_from_frontmatter(
+    items: &[heron_types::ActionItem],
+) -> Vec<heron_session::ActionItem> {
+    items
+        .iter()
+        .map(|a| heron_session::ActionItem {
+            id: a.id,
+            text: a.text.clone(),
+            owner: (!a.owner.is_empty()).then(|| a.owner.clone()),
+            due: a.due.as_deref().and_then(parse_iso_date),
+        })
+        .collect()
 }
 
 fn platform_from_source_app(source_app: &str) -> Platform {
@@ -2276,6 +2298,7 @@ mod tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let id = meeting.id;
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())

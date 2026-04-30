@@ -999,6 +999,7 @@ mod tests {
                 tokens_out: 612,
                 model: "claude-sonnet-4-6".to_owned(),
             }),
+            action_items: Vec::new(),
         }
     }
 
