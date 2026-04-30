@@ -24,11 +24,34 @@ import { DaemonDownBanner } from "../components/DaemonDownBanner";
 import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
 import { invoke } from "../lib/invoke";
-import type { Meeting, TranscriptSegment } from "../lib/types";
+import type { Meeting, MeetingId, TranscriptSegment } from "../lib/types";
+import { useAudioLevelStore } from "../store/audioLevel";
 import { useMeetingsStore } from "../store/meetings";
 import { formatElapsed, useRecordingStore } from "../store/recording";
 import { useSettingsStore } from "../store/settings";
+import { useSpeakerStore } from "../store/speaker";
 import { useTranscriptStore } from "../store/transcript";
+
+// Channels exposed to the renderer. Raw `Mic` is intentionally
+// not surfaced (Tier 3 #15 — only `mic_clean` after the chain).
+type LiveChannel = "mic_clean" | "tap";
+
+const CHANNEL_LABELS: Record<LiveChannel, string> = {
+  mic_clean: "Microphone",
+  tap: "System audio",
+};
+
+// Depth of the rolling waveform / equaliser history. ~6 seconds at the
+// daemon's ~20 Hz envelope cadence — enough motion to look alive
+// without making the canvas scroll feel slow.
+const HISTORY_DEPTH = 120;
+// Number of equaliser bars rendered. Coarser than the waveform so the
+// bars stay legibly wide at this card width.
+const EQ_BARS = 24;
+// dBFS values are floored at -100 by the daemon; clamp the renderer
+// to the same range so a missing reading doesn't blow up the meter.
+const DBFS_FLOOR = -100;
+const DBFS_CEIL = 0;
 
 // Stable empty-segments sentinel. See the selector in Recording for
 // why we can't `?? []` inline.
@@ -92,6 +115,17 @@ export default function Recording() {
   }, [recordingStart, loadMeetings]);
 
   const isLive = recordingStart !== null || activeMeeting !== null;
+
+  // Resolve the meeting whose live signals (audio levels, active
+  // speaker) we should bind to. Same fallback chain as `stopTargetId`
+  // below — prefer the id we got back from `heron_start_capture`,
+  // then fall back to the meetings store's active meeting (CLI /
+  // detector path).
+  const liveMeetingId: MeetingId | null =
+    recordingMeetingId ?? activeMeeting?.id ?? null;
+  const activeSpeaker = useSpeakerStore((s) =>
+    liveMeetingId ? (s.activeByMeeting[liveMeetingId] ?? null) : null,
+  );
 
   const elapsedMs =
     recordingStart === null ? 0 : Math.max(0, now - recordingStart);
@@ -251,6 +285,9 @@ export default function Recording() {
             >
               {activeMeeting?.title ?? "Untitled meeting"}
             </h1>
+            {activeSpeaker !== null && (
+              <NowSpeakingPill name={activeSpeaker} />
+            )}
           </div>
           <div
             className="font-mono text-3xl tabular-nums"
@@ -288,6 +325,10 @@ export default function Recording() {
           </section>
         )}
 
+        {liveMeetingId !== null && (
+          <LiveMeterPanel meetingId={liveMeetingId} paused={paused} />
+        )}
+
         <TranscriptPane segments={segments} />
 
         <div className="mt-6 flex gap-3">
@@ -322,10 +363,10 @@ export default function Recording() {
 
 function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {
   if (segments.length === 0) {
-    // TODO: replace with the real dBFS waveform now that the daemon
-    // emits `audio.level` envelopes (Tier 3 #15 — the backend ships
-    // the data via `useAudioLevelStore`; the renderer pass is a
-    // pure-UI follow-up).
+    // The live dBFS meter / waveform / equaliser panel renders just
+    // above this pane (see <LiveMeterPanel /> in Recording above), so
+    // the empty-transcript state stays a small typographic pulse —
+    // the audio-presence affordance lives in the meter, not here.
     return (
       <div
         className="rounded border px-6 py-12 text-center"
@@ -421,3 +462,331 @@ function formatStamp(secs: number): string {
   const s = total % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
+
+/**
+ * Compact "Now speaking" badge driven by `useSpeakerStore`. Hidden by
+ * the parent when the store has no active speaker for the meeting —
+ * this component is intentionally unconditional so the AX caveat
+ * (mute-state proxy, not a true speaker frame) is documented in one
+ * place. We label it "speaking" rather than "potentially speaking"
+ * because the daemon-side store already drops `started=false` /
+ * cleared the slot when the active speaker mutes; a labelled name in
+ * the badge means "AX last reported them as the unmuted talker."
+ */
+function NowSpeakingPill({ name }: { name: string }) {
+  return (
+    <div className="mt-2">
+      <span
+        className="inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs"
+        style={{
+          background: "var(--color-paper-2)",
+          borderColor: "var(--color-rule)",
+          color: "var(--color-ink-2)",
+        }}
+        aria-live="polite"
+      >
+        <span
+          aria-hidden="true"
+          className="inline-block animate-[pulse-rec_1.4s_ease-in-out_infinite]"
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: "50%",
+            background: "var(--color-rec)",
+          }}
+        />
+        <span
+          className="font-mono text-[10px] uppercase tracking-[0.12em]"
+          style={{ color: "var(--color-ink-3)" }}
+        >
+          Now speaking
+        </span>
+        <Avatar name={name} size={16} />
+        <span className="font-medium" style={{ color: "var(--color-ink)" }}>
+          {name}
+        </span>
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Per-channel rolling history of `audio.level` envelopes. We sample
+ * only the latest envelope per channel — the daemon already coalesces
+ * to ~20 Hz max-peak / max-rms inside the tick window, so pushing each
+ * fresh value into a fixed-length ring is plenty for a sparkline.
+ *
+ * Returns `peak` (waveform / EQ source) and the latest reading
+ * (numeric meter source). `peak` is a plain array — copies on every
+ * push, ~120 numbers per channel; cheap enough that a ring-buffer
+ * implementation isn't worth the complexity at this depth.
+ */
+function useAudioLevelHistory(meetingId: MeetingId, channel: LiveChannel) {
+  const latest = useAudioLevelStore(
+    (s) => s.latestByMeeting[meetingId]?.[channel] ?? null,
+  );
+  const [history, setHistory] = useState<number[]>(() => []);
+
+  useEffect(() => {
+    // Reset the ring whenever the meeting flips so a stale tail from a
+    // previous session doesn't bleed into the new sparkline.
+    setHistory([]);
+  }, [meetingId, channel]);
+
+  useEffect(() => {
+    if (latest === null) return;
+    setHistory((prev) => {
+      const next = prev.length >= HISTORY_DEPTH ? prev.slice(1) : prev.slice();
+      next.push(clampDbfs(latest.peak_dbfs));
+      return next;
+    });
+  }, [latest]);
+
+  return { latest, history };
+}
+
+function clampDbfs(value: number): number {
+  if (Number.isNaN(value)) return DBFS_FLOOR;
+  if (value < DBFS_FLOOR) return DBFS_FLOOR;
+  if (value > DBFS_CEIL) return DBFS_CEIL;
+  return value;
+}
+
+/** Map a dBFS value into a 0..1 fill ratio. -100 → 0, 0 → 1. */
+function dbfsToRatio(value: number): number {
+  const clamped = clampDbfs(value);
+  return (clamped - DBFS_FLOOR) / (DBFS_CEIL - DBFS_FLOOR);
+}
+
+/**
+ * Pick a colour for a dBFS reading. Loud (>-6 dBFS) is `--color-rec`
+ * (clipping risk), warm signal (>-24 dBFS) is `--color-warn`, normal
+ * speech sits at `--color-ok`, and a near-floor reading (no signal)
+ * fades into `--color-ink-4` so a paused / silent capture doesn't
+ * look identical to a hot one.
+ */
+function dbfsColor(value: number): string {
+  if (value <= -90) return "var(--color-ink-4)";
+  if (value > -6) return "var(--color-rec)";
+  if (value > -24) return "var(--color-warn)";
+  return "var(--color-ok)";
+}
+
+function formatDbfs(value: number | null): string {
+  if (value === null) return "--";
+  return `${clampDbfs(value).toFixed(1)} dB`;
+}
+
+function LiveMeterPanel({
+  meetingId,
+  paused,
+}: {
+  meetingId: MeetingId;
+  paused: boolean;
+}) {
+  return (
+    <section
+      className="mb-6 rounded border"
+      style={{
+        background: "var(--color-paper-2)",
+        borderColor: "var(--color-rule)",
+      }}
+      aria-label="Live audio levels"
+    >
+      <div className="flex items-center justify-between px-4 pt-3">
+        <p
+          className="font-mono text-[10px] uppercase tracking-[0.12em]"
+          style={{ color: "var(--color-ink-3)" }}
+        >
+          Live signal
+        </p>
+        {paused && (
+          <p
+            className="font-mono text-[10px] uppercase tracking-[0.12em]"
+            style={{ color: "var(--color-warn)" }}
+          >
+            Paused — daemon is not writing frames
+          </p>
+        )}
+      </div>
+      <div className="grid gap-4 px-4 py-3 md:grid-cols-2">
+        <ChannelMeter meetingId={meetingId} channel="mic_clean" />
+        <ChannelMeter meetingId={meetingId} channel="tap" />
+      </div>
+    </section>
+  );
+}
+
+function ChannelMeter({
+  meetingId,
+  channel,
+}: {
+  meetingId: MeetingId;
+  channel: LiveChannel;
+}) {
+  const { latest, history } = useAudioLevelHistory(meetingId, channel);
+  const peak = latest?.peak_dbfs ?? null;
+  const rms = latest?.rms_dbfs ?? null;
+  const peakColor = dbfsColor(peak ?? DBFS_FLOOR);
+  const rmsColor = dbfsColor(rms ?? DBFS_FLOOR);
+
+  return (
+    <div
+      className="rounded border p-3"
+      style={{
+        background: "var(--color-paper)",
+        borderColor: "var(--color-rule)",
+      }}
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <p
+          className="font-mono text-[10px] uppercase tracking-[0.12em]"
+          style={{ color: "var(--color-ink-3)" }}
+        >
+          {CHANNEL_LABELS[channel]}
+        </p>
+        <p
+          className="font-mono text-[10px] tabular-nums"
+          style={{ color: "var(--color-ink-3)" }}
+          aria-label={`Peak ${formatDbfs(peak)}, RMS ${formatDbfs(rms)}`}
+        >
+          peak {formatDbfs(peak)} · rms {formatDbfs(rms)}
+        </p>
+      </div>
+      <DbfsBar label="peak" value={peak} color={peakColor} />
+      <div className="h-1" />
+      <DbfsBar label="rms" value={rms} color={rmsColor} />
+      <div className="mt-3">
+        <Equalizer history={history} />
+      </div>
+      <div className="mt-3">
+        <Waveform history={history} />
+      </div>
+    </div>
+  );
+}
+
+function DbfsBar({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number | null;
+  color: string;
+}) {
+  const ratio = value === null ? 0 : dbfsToRatio(value);
+  return (
+    <div
+      className="relative h-2 overflow-hidden rounded"
+      style={{ background: "var(--color-paper-3)" }}
+      role="meter"
+      aria-label={label}
+      aria-valuemin={DBFS_FLOOR}
+      aria-valuemax={DBFS_CEIL}
+      aria-valuenow={value === null ? undefined : clampDbfs(value)}
+    >
+      <div
+        className="h-full transition-[width] duration-75 ease-out"
+        style={{ width: `${ratio * 100}%`, background: color }}
+      />
+    </div>
+  );
+}
+
+/**
+ * Animated bar-graph EQ. We don't have an FFT — the daemon emits a
+ * single coalesced peak per tick — so we synthesise an EQ-feel by
+ * sampling the trailing `EQ_BARS` peaks and rendering each as a
+ * vertical column. Read it as "the recent shape of the signal,"
+ * not as a frequency-domain breakdown.
+ */
+function Equalizer({ history }: { history: number[] }) {
+  const recent = history.slice(-EQ_BARS);
+  // Pad on the left so a fresh meter doesn't render as a single right-
+  // aligned spike — the bars grow in from the right as samples arrive.
+  const padded =
+    recent.length < EQ_BARS
+      ? [...new Array<number>(EQ_BARS - recent.length).fill(DBFS_FLOOR), ...recent]
+      : recent;
+  return (
+    <div
+      className="flex h-8 items-end gap-[2px]"
+      aria-hidden="true"
+    >
+      {padded.map((value, i) => {
+        const ratio = dbfsToRatio(value);
+        return (
+          <div
+            key={i}
+            className="flex-1 rounded-sm transition-[height] duration-75 ease-out"
+            style={{
+              height: `${Math.max(2, ratio * 100)}%`,
+              background: dbfsColor(value),
+              opacity: value <= DBFS_FLOOR + 1 ? 0.2 : 1,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Sparkline-style waveform. Plots the last `HISTORY_DEPTH` peak
+ * readings as an SVG polyline. Not a forensic visualiser — just
+ * enough motion to confirm "audio is flowing on this channel."
+ */
+function Waveform({ history }: { history: number[] }) {
+  const width = 320;
+  const height = 36;
+  if (history.length < 2) {
+    return (
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="block h-9 w-full"
+        aria-hidden="true"
+      >
+        <line
+          x1={0}
+          y1={height / 2}
+          x2={width}
+          y2={height / 2}
+          stroke="var(--color-rule)"
+          strokeWidth={1}
+        />
+      </svg>
+    );
+  }
+  const stepX = width / (HISTORY_DEPTH - 1);
+  // Right-align so the freshest sample is always at the right edge,
+  // matching how meters typically scroll.
+  const offset = HISTORY_DEPTH - history.length;
+  const points = history
+    .map((value, i) => {
+      const x = (i + offset) * stepX;
+      const y = height - dbfsToRatio(value) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const last = history[history.length - 1] ?? DBFS_FLOOR;
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className="block h-9 w-full"
+      aria-hidden="true"
+    >
+      <polyline
+        points={points}
+        fill="none"
+        stroke={dbfsColor(last)}
+        strokeWidth={1.25}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
