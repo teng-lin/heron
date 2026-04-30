@@ -274,6 +274,16 @@ pub struct LocalSessionOrchestrator {
     /// `apps/desktop/src-tauri` and `crates/herond` install at boot
     /// once an `OPENAI_API_KEY` and `RECALL_API_KEY` are available.
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
+    /// Tier 4 #23: gate for any future meeting-app detector loop.
+    /// Read by [`LocalSessionOrchestrator::auto_detect_meeting_app`];
+    /// the detector path (when one lands) must consult that getter
+    /// before invoking `start_capture` on its own initiative. Manual
+    /// capture paths (UI, hotkey, HTTP) do not consult this flag —
+    /// it gates only the *automatic* arm path. `true` (the default)
+    /// preserves the pre-Tier-4 behavior; the desktop shell flips it
+    /// to `false` when the user has unchecked Settings → Recording
+    /// → "Auto-detect meeting apps".
+    auto_detect_meeting_app: bool,
 }
 
 /// Per-meeting state tracked while a capture is in flight. The
@@ -436,6 +446,14 @@ pub struct Builder {
     llm_preference: heron_llm::Preference,
     file_naming_pattern: FileNamingPattern,
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
+    /// Tier 4 #23: gate for any future meeting-app detector loop that
+    /// would auto-arm a recording without an explicit user gesture.
+    /// `true` (the default) preserves the pre-Tier-4 behavior where
+    /// the detector path — once it lands — runs unconditionally; `false`
+    /// suppresses the auto-arm so only the manual hotkey / UI / HTTP
+    /// `POST /v1/meetings` paths can start a capture. The desktop
+    /// shell sets this from `Settings.auto_detect_meeting_app` at boot.
+    auto_detect_meeting_app: bool,
 }
 
 impl std::fmt::Debug for Builder {
@@ -458,6 +476,7 @@ impl std::fmt::Debug for Builder {
                     .as_ref()
                     .map(|_| "<Arc<dyn LiveSessionFactory>>"),
             )
+            .field("auto_detect_meeting_app", &self.auto_detect_meeting_app)
             .finish()
     }
 }
@@ -476,6 +495,12 @@ impl Default for Builder {
             llm_preference: heron_llm::Preference::Auto,
             file_naming_pattern: FileNamingPattern::Id,
             live_session_factory: None,
+            // Default `true` matches the pre-Tier-4 behavior so an
+            // existing detector loop (when one lands) auto-arms by
+            // default. The desktop shell flips this when the user has
+            // unchecked Settings → Recording → "Auto-detect meeting
+            // apps".
+            auto_detect_meeting_app: true,
         }
     }
 }
@@ -586,6 +611,30 @@ impl Builder {
         self
     }
 
+    /// Tier 4 #23: configure whether a future meeting-app detector
+    /// loop is allowed to auto-arm a recording without a user gesture.
+    ///
+    /// `true` (the default) preserves the pre-Tier-4 contract — when
+    /// the detector lands, it auto-arms the moment the configured
+    /// meeting app launches. `false` suppresses the auto-arm path
+    /// entirely; manual capture (hotkey, UI button, `POST
+    /// /v1/meetings`) is unaffected by this flag and continues to
+    /// publish the full `meeting.detected → armed → started` envelope
+    /// trio.
+    ///
+    /// **Gate-point contract.** Any future detector loop landing in
+    /// `heron-orchestrator` (or `heron-zoom`) must read
+    /// [`LocalSessionOrchestrator::auto_detect_meeting_app`] before
+    /// invoking `start_capture` on its own initiative. The flag lives
+    /// on the orchestrator (rather than as a free global) so a single
+    /// daemon process can host two orchestrators with different
+    /// detector policies — useful for multi-account / sandboxed
+    /// futures the v2 pivot leaves open.
+    pub fn auto_detect_meeting_app(mut self, enabled: bool) -> Self {
+        self.auto_detect_meeting_app = enabled;
+        self
+    }
+
     /// Construct the orchestrator and spawn its recorder task.
     ///
     /// # Panics
@@ -635,6 +684,7 @@ impl Builder {
             recorder: Mutex::new(Some(recorder)),
             finalizers: Mutex::new(Vec::new()),
             live_session_factory: self.live_session_factory,
+            auto_detect_meeting_app: self.auto_detect_meeting_app,
         }
     }
 }
@@ -666,6 +716,25 @@ impl LocalSessionOrchestrator {
     /// `replay_since`.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Tier 4 #23: gate-point for a future meeting-app detector loop.
+    ///
+    /// Returns `true` when an auto-detect path is permitted to call
+    /// [`SessionOrchestrator::start_capture`] on its own initiative,
+    /// `false` when the user has disabled Settings → Recording →
+    /// "Auto-detect meeting apps". Default is `true` (matching
+    /// `Settings::default()` and the pre-Tier-4 contract).
+    ///
+    /// **Contract for detector authors.** Any code path that arms a
+    /// recording without an explicit user gesture (hotkey press, UI
+    /// click, HTTP `POST /v1/meetings`) MUST read this getter and
+    /// short-circuit when it returns `false`. Manual paths are not
+    /// gated by this flag — the user clicking Start in the UI is, by
+    /// definition, an explicit gesture and should always work even
+    /// when auto-detect is off.
+    pub fn auto_detect_meeting_app(&self) -> bool {
+        self.auto_detect_meeting_app
     }
 
     fn note_path_for_read(
@@ -2461,6 +2530,99 @@ mod tests {
                 );
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Tier 4 #23: the auto-detect gate defaults to `true` so the
+    /// pre-Tier-4 detector contract is preserved for every existing
+    /// caller that doesn't opt in to the builder method.
+    #[tokio::test]
+    async fn auto_detect_meeting_app_defaults_true() {
+        let orch = LocalSessionOrchestrator::new();
+        assert!(
+            orch.auto_detect_meeting_app(),
+            "default builder must enable auto-detect (preserves pre-Tier-4 behavior)",
+        );
+    }
+
+    /// Tier 4 #23: the builder setter round-trips through the getter,
+    /// covering both branches (the desktop wires `false` from
+    /// `Settings.auto_detect_meeting_app` when the user has unchecked
+    /// the toggle, and re-enables it when they re-check).
+    #[tokio::test]
+    async fn auto_detect_meeting_app_round_trips_through_builder() {
+        for enabled in [true, false] {
+            let orch = Builder::default().auto_detect_meeting_app(enabled).build();
+            assert_eq!(
+                orch.auto_detect_meeting_app(),
+                enabled,
+                "builder setter for {enabled:?} must round-trip through the getter",
+            );
+        }
+    }
+
+    /// Tier 4 #23: the gate must NOT affect manual `start_capture`
+    /// — the user clicking Start in the UI is an explicit gesture and
+    /// the manual path always proceeds, even with auto-detect off.
+    /// This test pins the "manual path is unaffected" contract by
+    /// running `start_capture` against an orchestrator built with
+    /// `auto_detect_meeting_app(false)` and asserting the full
+    /// `MeetingDetected → MeetingArmed → MeetingStarted` envelope
+    /// trio still publishes to the bus.
+    #[tokio::test]
+    async fn manual_start_capture_unaffected_when_auto_detect_disabled() {
+        let orch = Builder::default().auto_detect_meeting_app(false).build();
+        let mut rx = orch.event_bus().subscribe();
+        let result = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: Some("Test".into()),
+                calendar_event_id: None,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "auto_detect_meeting_app(false) must not block manual start_capture; got {result:?}",
+        );
+
+        // Drain the three FSM-walk envelopes the substrate-only path
+        // emits (`MeetingDetected` → `MeetingArmed` → `MeetingStarted`).
+        // Use a generous timeout so a slow test runner doesn't flake;
+        // under normal load this completes within microseconds.
+        let mut kinds = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while kinds.len() < 3 {
+            if Instant::now() > deadline {
+                panic!(
+                    "expected 3 envelopes (detected/armed/started); got {} ({kinds:?})",
+                    kinds.len(),
+                );
+            }
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(env)) => kinds.push(env.payload.event_type().to_owned()),
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                "meeting.detected".to_owned(),
+                "meeting.armed".to_owned(),
+                "meeting.started".to_owned(),
+            ],
+            "manual start_capture must publish the full FSM-walk trio regardless of auto-detect",
+        );
+
+        // Cleanup — terminate the in-flight meeting so the test
+        // shutdown path is deterministic. Same `lock_or_recover`
+        // discipline as production callers (treat a poisoned mutex as
+        // recoverable rather than masking it).
+        let active_id = lock_or_recover(&orch.active_meetings)
+            .keys()
+            .next()
+            .copied();
+        if let Some(id) = active_id {
+            let _ = orch.end_meeting(&id).await;
         }
     }
 

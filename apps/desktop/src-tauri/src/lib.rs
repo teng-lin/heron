@@ -39,9 +39,10 @@ use std::sync::Arc;
 use heron_orchestrator::Builder as OrchestratorBuilder;
 // `LocalSessionOrchestrator` is only referenced from doc-comments in
 // this file (Tier 4 #17 switched the boot path to use `Builder`
-// directly so we can seed `Settings::hotwords` at startup); kept
-// imported under `allow(unused_imports)` so rustdoc's intra-doc
-// links resolve without warnings.
+// directly so we can seed `Settings::hotwords` at startup; Tier 4 #23
+// extends that path to also push `Settings::auto_detect_meeting_app`
+// into the same builder); kept imported under `allow(unused_imports)`
+// so rustdoc's intra-doc links resolve without warnings.
 #[allow(unused_imports)]
 use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
@@ -817,16 +818,18 @@ pub fn run() {
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
-            // Tier 4 #17: read user-configured hotwords once at boot
-            // and seed the orchestrator's `Builder.hotwords` so every
-            // session starts with the latest persisted list. A
-            // corrupt / missing `settings.json` is the first-run
-            // state — we fall back to the empty default rather than
-            // failing setup, mirroring `register_startup_hotkey` and
-            // matching `Settings::default().hotwords`.
-            let hotwords = read_settings(&default_settings_path())
-                .map(|s| s.hotwords)
-                .unwrap_or_default();
+            // Tier 4 #17 + #23: read user-configured hotwords and the
+            // "Auto-detect meeting apps" toggle once at boot and push
+            // both into the orchestrator's builder so every session
+            // starts with the latest persisted state. A corrupt /
+            // missing `settings.json` is the first-run state — we
+            // fall back to defaults rather than failing setup,
+            // mirroring `register_startup_hotkey` and matching
+            // `Settings::default()` (`hotwords = []`,
+            // `auto_detect_meeting_app = true`).
+            let (hotwords, auto_detect_meeting_app) = read_settings(&default_settings_path())
+                .map(|s| (s.hotwords, s.auto_detect_meeting_app))
+                .unwrap_or_else(|_| (Vec::new(), true));
             let app_handle = app.handle().clone();
             // Tier 4 #19: read the saved `file_naming_pattern` once at
             // boot so the in-process orchestrator threads the right
@@ -843,11 +846,13 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let mut builder = OrchestratorBuilder::default()
                     .hotwords(hotwords)
-                    .file_naming_pattern(file_naming_pattern);
+                    .file_naming_pattern(file_naming_pattern)
+                    .auto_detect_meeting_app(auto_detect_meeting_app);
                 if let Some(root) = vault_root {
                     tracing::info!(
                         vault_root = %root.display(),
                         ?file_naming_pattern,
+                        auto_detect_meeting_app,
                         "in-process orchestrator: read-side wired against vault",
                     );
                     builder = builder.vault_root(root);
@@ -857,6 +862,7 @@ pub fn run() {
                     // return NotYetImplemented, which is the
                     // honest answer until a vault is configured.
                     tracing::warn!(
+                        auto_detect_meeting_app,
                         "no vault root resolvable; in-process orchestrator runs substrate-only",
                     );
                 }
