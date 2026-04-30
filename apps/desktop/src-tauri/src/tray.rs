@@ -448,8 +448,16 @@ pub(crate) fn newest_note_basename(
     if vault_root.as_os_str().is_empty() || !vault_root.is_dir() {
         return Ok(None);
     }
+    // Notes live under `<vault>/meetings/<basename>.md` per
+    // `heron_vault::VaultWriter::finalize_with_pattern`. A pre-capture
+    // vault has no `meetings/` subdir yet — match `notes::list_sessions`
+    // and report `None` rather than erroring.
+    let dir = crate::notes::meetings_dir(vault_root);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
     let mut best: Option<(std::time::SystemTime, String)> = None;
-    for entry in std::fs::read_dir(vault_root)? {
+    for entry in std::fs::read_dir(&dir)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
@@ -773,6 +781,16 @@ fn flip_tray_to_error<R: Runtime>(app: &AppHandle<R>, payload: &DegradedPayload)
 mod tests {
     use super::*;
 
+    /// Create + return `<vault>/meetings`. The `newest_note_basename`
+    /// tests need to seed `.md` files where the production reader
+    /// looks (matches `heron_vault::VaultWriter`'s on-disk layout);
+    /// the helper keeps the boilerplate out of the assertions.
+    fn make_meetings_dir(vault: &std::path::Path) -> std::path::PathBuf {
+        let dir = crate::notes::meetings_dir(vault);
+        std::fs::create_dir_all(&dir).expect("mkdir meetings");
+        dir
+    }
+
     #[test]
     fn visual_maps_pre_recording_states_to_idle() {
         // The "armed" + "armed_cooldown" states sit between the
@@ -852,7 +870,18 @@ mod tests {
     #[test]
     fn newest_note_basename_returns_none_when_no_md_files() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        std::fs::write(tmp.path().join("not-a-note.txt"), b"x").expect("write");
+        let dir = make_meetings_dir(tmp.path());
+        std::fs::write(dir.join("not-a-note.txt"), b"x").expect("write");
+        let out = newest_note_basename(tmp.path()).expect("call");
+        assert!(out.is_none());
+    }
+
+    /// Pre-capture state: writer hasn't created `<vault>/meetings`
+    /// yet. The tray's lookup must report `None` (so the no-notes
+    /// notification fires) instead of erroring.
+    #[test]
+    fn newest_note_basename_returns_none_when_meetings_dir_absent() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
         let out = newest_note_basename(tmp.path()).expect("call");
         assert!(out.is_none());
     }
@@ -868,8 +897,9 @@ mod tests {
     #[test]
     fn newest_note_basename_picks_most_recent_md_file() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let older = tmp.path().join("2024-01-01-meeting.md");
-        let newer = tmp.path().join("2026-04-25-meeting.md");
+        let dir = make_meetings_dir(tmp.path());
+        let older = dir.join("2024-01-01-meeting.md");
+        let newer = dir.join("2026-04-25-meeting.md");
         std::fs::write(&older, b"older").expect("older");
         // Sleep long enough to clear typical FS mtime resolution
         // (HFS+ is ~1 s; APFS is sub-second but rounds; ext4 + xfs
@@ -887,9 +917,10 @@ mod tests {
     #[test]
     fn newest_note_basename_skips_dotfile_md_and_extensionless_files() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        std::fs::write(tmp.path().join(".hidden.md"), b"x").expect("hidden");
-        std::fs::write(tmp.path().join("README"), b"x").expect("readme");
-        std::fs::write(tmp.path().join("notes.md"), b"x").expect("notes");
+        let dir = make_meetings_dir(tmp.path());
+        std::fs::write(dir.join(".hidden.md"), b"x").expect("hidden");
+        std::fs::write(dir.join("README"), b"x").expect("readme");
+        std::fs::write(dir.join("notes.md"), b"x").expect("notes");
         let out = newest_note_basename(tmp.path())
             .expect("call")
             .expect("notes.md should win");
@@ -1014,7 +1045,8 @@ mod tests {
         // VaultWriter wrote, hyphens / dots inside it are part of
         // the session id.
         let tmp = tempfile::TempDir::new().expect("tmp");
-        std::fs::write(tmp.path().join("foo.bar.md"), b"x").expect("write");
+        let dir = make_meetings_dir(tmp.path());
+        std::fs::write(dir.join("foo.bar.md"), b"x").expect("write");
         let out = newest_note_basename(tmp.path())
             .expect("call")
             .expect("should pick");

@@ -155,7 +155,9 @@ fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(),
     write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
 }
 
-/// Tauri command: read `<vault>/<session_id>.md`.
+/// Tauri command: read `<vault>/meetings/<basename>.md`, where
+/// `<basename>` is `session_id` with any `mtg_` wire prefix stripped
+/// to match `heron_vault::VaultWriter`'s on-disk shape.
 ///
 /// `vault_path` and `session_id` are passed as separate strings so the
 /// path policy enforced by `notes::read_note` (validate basename,
@@ -166,7 +168,7 @@ async fn heron_read_note(vault_path: String, session_id: String) -> Result<Strin
     notes::read_note(Path::new(&vault_path), &session_id).await
 }
 
-/// Tauri command: atomic-write `<vault>/<session_id>.md` (editor blur / ⌘S).
+/// Tauri command: atomic-write `<vault>/meetings/<basename>.md` (editor blur / ⌘S).
 #[tauri::command]
 async fn heron_write_note_atomic(
     vault_path: String,
@@ -208,11 +210,12 @@ async fn heron_resummarize_preview(
 }
 
 /// Tauri command (Day 8-10 #19): apply a per-row patch against a single
-/// action item in `<vault>/<session_id>.md`'s frontmatter. Returns the
-/// post-merge row so the renderer can drop optimistic UI without a
-/// follow-up `heron_get_meeting`.
+/// action item in `<vault>/meetings/<basename>.md`'s frontmatter
+/// (`<basename>` strips the `mtg_` wire prefix). Returns the post-merge
+/// row so the renderer can drop optimistic UI without a follow-up
+/// `heron_get_meeting`.
 ///
-/// `meetingId` is the vault's `<session_id>.md` basename — same ID
+/// `meetingId` is the wire-form id (or on-disk basename) — same ID
 /// `heron_resummarize` consumes — and is named `meetingId` on the
 /// JS-side wire to align with the daemon's `MeetingId` semantics
 /// (today the desktop's read path uses these as interchangeable
@@ -842,7 +845,6 @@ pub fn run() {
             // daemon's `bind()` is also async and runs in the same
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
-            let vault_root = resolve_vault_root();
             let app_handle = app.handle().clone();
             // Tier 4 #17 / #19 / #23: read boot settings once and seed
             // hotwords, file naming, and auto-detect into the
@@ -850,6 +852,16 @@ pub fn run() {
             // first-run state — fall back to defaults rather than
             // failing setup, mirroring `register_startup_hotkey`.
             let boot_settings = read_settings(&default_settings_path()).unwrap_or_default();
+            // The renderer reads/writes `Settings.vault_root`; if the
+            // in-process orchestrator pointed at the env / `~/heron-vault`
+            // default the daemon would write notes the renderer can never
+            // see. Prefer the configured vault when set (trimmed; empty
+            // = unset, same convention as `HERON_VAULT_ROOT`), else fall
+            // back to `resolve_vault_root`.
+            let vault_root = match boot_settings.vault_root.trim() {
+                "" => resolve_vault_root(),
+                s => Some(PathBuf::from(s)),
+            };
             let hotwords = boot_settings.hotwords;
             let auto_detect_meeting_app = boot_settings.auto_detect_meeting_app;
             let file_naming_pattern: heron_vault::FileNamingPattern =
