@@ -49,10 +49,8 @@ async fn main() -> Result<()> {
         vault_root = %vault_root.display(),
         "wiring LocalSessionOrchestrator (read-side; capture-lifecycle still 501 until FSM-merge)"
     );
-    // `LocalSessionOrchestrator::with_vault` spawns the bus → cache
-    // recorder task; it must run inside the `#[tokio::main]`
-    // runtime, which we're already in here.
     let orchestrator = Arc::new(LocalSessionOrchestrator::with_vault(vault_root));
+    std::mem::drop(orchestrator.spawn_auto_record_scheduler());
 
     let state = AppState {
         orchestrator,

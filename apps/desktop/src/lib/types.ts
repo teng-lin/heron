@@ -241,6 +241,13 @@ export interface CalendarEvent {
    * builds keep deserializing.
    */
   primed: boolean;
+  /**
+   * `true` once this EventKit id is on the daemon's per-event
+   * auto-record list. The orchestrator scheduler will start capture
+   * automatically when the event window opens. Daemon defaults it to
+   * `false` when omitted, so older builds keep deserializing.
+   */
+  auto_record: boolean;
 }
 
 /** Mirrors herond's `CalendarPage` wire shape (serialize-only daemon-side). */
@@ -285,6 +292,18 @@ export interface PrepareContextRequest {
 /** Synthetic ack for a successful `PUT /v1/context` (daemon emits 204). */
 export interface AttachContextAck {
   calendar_event_id: string;
+}
+
+/** Body for `heron_set_event_auto_record` (`POST /v1/auto-record`). */
+export interface SetEventAutoRecordRequest {
+  calendar_event_id: string;
+  enabled: boolean;
+}
+
+/** Synthetic ack for a successful per-event auto-record toggle. */
+export interface AutoRecordAck {
+  calendar_event_id: string;
+  enabled: boolean;
 }
 
 /** Query params for `heron_list_calendar_upcoming`. All RFC 3339 / numeric. */

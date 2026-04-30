@@ -347,6 +347,13 @@ pub struct CalendarEvent {
     /// (which omitted the field) deserialize as un-primed.
     #[serde(default)]
     pub primed: bool,
+    /// `true` when this event is on the auto-record list — the
+    /// orchestrator's scheduler will fire `start_capture` for it when
+    /// the start window opens. Drives the rail's per-row toggle
+    /// state. `#[serde(default)]` for the same daemon/desktop
+    /// version-skew reason as `primed`.
+    #[serde(default)]
+    pub auto_record: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +412,26 @@ pub struct PrepareContextRequest {
     /// entry.
     #[serde(default)]
     pub attendees: Vec<AttendeeContext>,
+}
+
+/// Body shape for `POST /auto-record`. Toggles the per-event
+/// auto-record flag — the orchestrator's scheduler tick fires
+/// `start_capture` for every enabled event when its start window
+/// opens. `enabled: false` removes the entry; the daemon's reply is
+/// always `204 No Content` (success is the same shape regardless of
+/// prior state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetEventAutoRecordRequest {
+    pub calendar_event_id: String,
+    pub enabled: bool,
+}
+
+/// Response shape for `GET /auto-record`. Sorted for byte-stable
+/// payloads across calls so cache layers / equality checks don't
+/// see spurious diffs from `HashSet` iteration order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoRecordList {
+    pub event_ids: Vec<String>,
 }
 
 // ── health ────────────────────────────────────────────────────────────
@@ -940,6 +967,25 @@ pub trait SessionOrchestrator: Send + Sync {
     /// `prepare_context`); returns `Ok(())` either way.
     async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError>;
 
+    // ── per-event auto-record (Tier 5 #26) ────────────────────────────
+
+    /// `POST /auto-record` — enable or disable the auto-record flag
+    /// for `req.calendar_event_id`. The orchestrator persists the
+    /// updated set to disk (when a vault root is configured) and the
+    /// scheduler tick will pick up the change on its next pass.
+    /// Idempotent for already-set / already-clear ids.
+    async fn set_event_auto_record(
+        &self,
+        req: SetEventAutoRecordRequest,
+    ) -> Result<(), SessionError>;
+
+    /// `GET /auto-record` — snapshot of the current auto-record set
+    /// as a sorted list of `calendar_event_id`s. Diagnostic /
+    /// settings-page surface; the rail itself reads the per-event
+    /// `CalendarEvent.auto_record` flag from `list_upcoming_calendar`
+    /// so it doesn't have to join two endpoints.
+    async fn list_auto_record_events(&self) -> Result<AutoRecordList, SessionError>;
+
     // ── ops ───────────────────────────────────────────────────────────
 
     /// `GET /health`. Mirrors what `heron-doctor` reports offline.
@@ -1016,6 +1062,44 @@ mod prefix_tests {
     }
 
     #[test]
+    fn calendar_event_auto_record_defaults_false_when_field_omitted() {
+        // Same backwards-compat rationale as `primed`: an older
+        // daemon build that pre-dates Tier 5 #26 emits `CalendarEvent`
+        // without `auto_record`. Desktop deserialization defaults to
+        // `false` rather than failing.
+        let raw = r#"{
+            "id": "evt_legacy",
+            "title": "Legacy event",
+            "start": "2026-04-29T15:00:00Z",
+            "end": "2026-04-29T15:30:00Z",
+            "attendees": [],
+            "meeting_url": null,
+            "related_meetings": []
+        }"#;
+        let parsed: CalendarEvent = serde_json::from_str(raw).expect("deserialize");
+        assert!(!parsed.auto_record);
+
+        let staged = CalendarEvent {
+            id: "evt_new".into(),
+            title: "New event".into(),
+            start: Utc::now(),
+            end: Utc::now(),
+            attendees: Vec::new(),
+            meeting_url: None,
+            related_meetings: Vec::new(),
+            primed: false,
+            auto_record: true,
+        };
+        let json = serde_json::to_value(&staged).expect("serialize");
+        assert_eq!(
+            json.get("auto_record").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let back: CalendarEvent = serde_json::from_value(json).expect("deserialize");
+        assert!(back.auto_record);
+    }
+
+    #[test]
     fn calendar_event_primed_defaults_false_when_field_omitted() {
         // Backwards-compat pin: an older daemon build that pre-dates
         // Tier 5 #25 emits `CalendarEvent` without the `primed` field.
@@ -1044,6 +1128,7 @@ mod prefix_tests {
             meeting_url: None,
             related_meetings: Vec::new(),
             primed: true,
+            auto_record: false,
         };
         let json = serde_json::to_value(&staged).expect("serialize");
         assert_eq!(json.get("primed").and_then(|v| v.as_bool()), Some(true));

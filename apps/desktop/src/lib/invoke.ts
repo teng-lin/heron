@@ -22,6 +22,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import type {
   AttachContextAck,
+  AutoRecordAck,
   CalendarPage,
   CalendarQuery,
   DaemonAudioSource,
@@ -33,6 +34,7 @@ import type {
   Platform,
   PreMeetingContextRequest,
   PrepareContextRequest,
+  SetEventAutoRecordRequest,
   Summary,
   Transcript,
 } from "./types";
@@ -863,6 +865,15 @@ export interface HeronCommands {
   heron_prepare_context: {
     args: { request: PrepareContextRequest };
     returns: DaemonResult<AttachContextAck>;
+  };
+  /**
+   * Tier 5 #26: proxy `POST /v1/auto-record`. Toggles the daemon's
+   * per-event auto-record registry; future calendar loads mirror the
+   * flag onto `CalendarEvent.auto_record`.
+   */
+  heron_set_event_auto_record: {
+    args: { request: SetEventAutoRecordRequest };
+    returns: DaemonResult<AutoRecordAck>;
   };
   /**
    * UI revamp PR 4: ensure the Tauri-side SSE bridge is running.

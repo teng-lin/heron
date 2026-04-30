@@ -55,7 +55,8 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use heron_session::{
     CalendarEvent, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus,
-    Platform, PreMeetingContextRequest, PrepareContextRequest, Summary, Transcript,
+    Platform, PreMeetingContextRequest, PrepareContextRequest, SetEventAutoRecordRequest, Summary,
+    Transcript,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -366,6 +367,22 @@ pub async fn heron_prepare_context(
     Ok(prepare_context_at(BASE_URL, &bearer, &request).await)
 }
 
+/// Tauri command: toggle the per-event auto-record flag. Proxies
+/// `POST /v1/auto-record`.
+///
+/// The daemon stores a small registry keyed by `calendar_event_id`;
+/// future `heron_list_calendar_upcoming` calls mirror membership onto
+/// `CalendarEvent.auto_record`. This command synthesizes an ack from
+/// the request because the daemon emits `204 No Content`.
+#[tauri::command]
+pub async fn heron_set_event_auto_record(
+    state: State<'_, DaemonHandle>,
+    request: SetEventAutoRecordRequest,
+) -> Result<DaemonOutcome<AutoRecordAck>, String> {
+    let bearer = state.auth.bearer.clone();
+    Ok(set_event_auto_record_at(BASE_URL, &bearer, &request).await)
+}
+
 /// Body shape for `POST /v1/meetings`. Mirrors
 /// [`herond::routes::meetings::StartCaptureBody`] (and
 /// `heron_cli::daemon::StartCaptureBody`); we don't share the cli
@@ -419,6 +436,13 @@ pub struct DaemonAudioSource {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachContextAck {
     pub calendar_event_id: String,
+}
+
+/// Synthetic ack for a successful `POST /v1/auto-record`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AutoRecordAck {
+    pub calendar_event_id: String,
+    pub enabled: bool,
 }
 
 /// Wire shape for `GET /v1/calendar/upcoming`. Mirrors the daemon's
@@ -1108,6 +1132,52 @@ pub async fn prepare_context_at(
     }
 }
 
+/// Parameterized auto-record toggle — same split-out rationale as
+/// [`attach_context_at`]. POSTs the [`SetEventAutoRecordRequest`] body
+/// and synthesizes an [`AutoRecordAck`] from the request itself on a
+/// 2xx, since the daemon's 204 carries no body.
+pub async fn set_event_auto_record_at(
+    base_url: &str,
+    bearer: &str,
+    request: &SetEventAutoRecordRequest,
+) -> DaemonOutcome<AutoRecordAck> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/auto-record");
+    let resp = match client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: AutoRecordAck {
+            calendar_event_id: request.calendar_event_id.trim().to_owned(),
+            enabled: request.enabled,
+        },
+    }
+}
+
 async fn parse_response<T>(resp: reqwest::Response) -> DaemonOutcome<T>
 where
     T: serde::de::DeserializeOwned + Serialize,
@@ -1738,6 +1808,7 @@ mod tests {
             meeting_url: Some("https://zoom.us/j/123".to_owned()),
             related_meetings: Vec::new(),
             primed: false,
+            auto_record: false,
         }
     }
 
