@@ -2076,11 +2076,7 @@ fn action_items_from_frontmatter(
         .map(|a| heron_session::ActionItem {
             id: a.id,
             text: a.text.clone(),
-            owner: if a.owner.is_empty() {
-                None
-            } else {
-                Some(a.owner.clone())
-            },
+            owner: (!a.owner.is_empty()).then(|| a.owner.clone()),
             due: a.due.as_deref().and_then(parse_iso_date),
         })
         .collect()

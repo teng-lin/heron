@@ -149,8 +149,11 @@ export interface ActionItem {
    * it across re-summarize cycles. Optional on the wire because
    * pre-Tier-0-#3 daemons used `#[serde(default)]` to fill it with
    * the nil UUID — Tier 0 #3 added the field on the Rust side; this
-   * mirror takes it as `string | undefined` so callers can detect
-   * the legacy shape and fall back to a regex extractor.
+   * mirror takes it as `string | undefined` so callers can synthesize
+   * a fallback key for React when it's absent on legacy items. (The
+   * regex-extractor fallback in `Review.tsx` is a separate path,
+   * triggered when `meeting.action_items` itself is missing or empty,
+   * not when `id` is absent on a present item.)
    *
    * Carried as an opaque string on the JS side; the Rust side serializes
    * `uuid::Uuid` as a hyphenated lowercase string.
