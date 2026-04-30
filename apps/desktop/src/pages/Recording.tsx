@@ -535,11 +535,9 @@ function useAudioLevelHistory(meetingId: MeetingId, channel: LiveChannel) {
 
   useEffect(() => {
     if (latest === null) return;
-    setHistory((prev) => {
-      const next = prev.length >= HISTORY_DEPTH ? prev.slice(1) : prev.slice();
-      next.push(clampDbfs(latest.peak_dbfs));
-      return next;
-    });
+    setHistory((prev) =>
+      [...prev, clampDbfs(latest.peak_dbfs)].slice(-HISTORY_DEPTH),
+    );
   }, [latest]);
 
   return { latest, history };
