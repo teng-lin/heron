@@ -115,12 +115,14 @@ const ANTHROPIC_MODELS = [
  * Rust `FileNamingPattern` enum's `#[serde(rename_all = "snake_case")]`
  * variants. The vault writer's slug pipeline (Tier 4 #19, PR #168)
  * consumes the chosen pattern.
+ *
+ * `satisfies` pins each `value` to the imported `FileNamingPattern`
+ * union so a typo here is a build error; `as const` keeps the array
+ * immutable + narrows each entry's type to its literal so TS treats
+ * the radio's `value` as the typed union, matching the
+ * `ANTHROPIC_MODELS` / `LLM_BACKENDS` pattern in this file.
  */
-const FILE_NAMING_PATTERNS: {
-  value: FileNamingPattern;
-  label: string;
-  description: string;
-}[] = [
+const FILE_NAMING_PATTERNS = [
   {
     value: "id",
     label: "UUID",
@@ -136,7 +138,11 @@ const FILE_NAMING_PATTERNS: {
     label: "Slug only",
     description: "<slug>.md — readable filename without date prefix.",
   },
-];
+] as const satisfies readonly {
+  value: FileNamingPattern;
+  label: string;
+  description: string;
+}[];
 
 /**
  * Tier 1 — `Settings.shortcuts` action ids the renderer knows about.
@@ -146,12 +152,12 @@ const FILE_NAMING_PATTERNS: {
  * orchestrator action can be bound without a UI change. Listed first
  * here so the "+ Add shortcut" preset surfaces it as a default option.
  */
-const KNOWN_SHORTCUT_ACTIONS: { value: string; label: string }[] = [
+const KNOWN_SHORTCUT_ACTIONS = [
   {
     value: "toggle_recording",
     label: "Toggle recording (overrides Hotkey tab default)",
   },
-];
+] as const;
 
 export default function Settings() {
   const { settings, settingsPath, dirty, loading, saving, error, load, save } =
