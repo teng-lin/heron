@@ -993,6 +993,12 @@ mod tests {
             transcript_status: TranscriptLifecycle::Complete,
             summary_status: SummaryLifecycle::Ready,
             tags: vec![],
+            processing: Some(heron_session::MeetingProcessing {
+                summary_usd: 0.04,
+                tokens_in: 14_231,
+                tokens_out: 612,
+                model: "claude-sonnet-4-6".to_owned(),
+            }),
         }
     }
 
@@ -1209,6 +1215,16 @@ mod tests {
             DaemonOutcome::Ok { data } => {
                 assert_eq!(data.id, id);
                 assert_eq!(data.title.as_deref(), Some("Weekly product sync"));
+                // Tier 0 #2: cost telemetry survives the daemon →
+                // Tauri-proxy → desktop hop. The sample meeting has
+                // a populated `processing` block; pinning the
+                // round-trip here keeps the bridge honest if either
+                // side's serde shape drifts.
+                let processing = data.processing.as_ref().expect("processing populated");
+                assert_eq!(processing.tokens_in, 14_231);
+                assert_eq!(processing.tokens_out, 612);
+                assert_eq!(processing.model, "claude-sonnet-4-6");
+                assert!((processing.summary_usd - 0.04).abs() < f64::EPSILON);
             }
             DaemonOutcome::Unavailable { detail } => {
                 panic!("expected Ok, got Unavailable: {detail}")

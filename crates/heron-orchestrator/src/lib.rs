@@ -1268,6 +1268,10 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             // `meeting_from_note` fill them in once the note is
             // finalized on disk.
             tags: Vec::new(),
+            // No summary has run yet at start-capture time; cost is
+            // populated later by `meeting_from_note` when the
+            // finalized vault note is read back.
+            processing: None,
         };
         let mut fsm = RecordingFsm::new();
 
@@ -2000,6 +2004,7 @@ fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionE
     } else {
         SummaryLifecycle::Ready
     };
+    let processing = meeting_processing_from_cost(&fm.cost);
     Ok(Meeting {
         id,
         // Notes are only finalized for completed meetings, so the
@@ -2018,7 +2023,41 @@ fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionE
         // Surface LLM-inferred tags so the frontend can render chips
         // without a second read into the note's frontmatter.
         tags: fm.tags.clone(),
+        processing,
     })
+}
+
+/// Project `Frontmatter.cost` into the wire `MeetingProcessing`.
+///
+/// Returns `None` when the cost looks unpopulated — the integration
+/// test fixtures and pre-Tier-0-#2 vault notes wrote zero tokens and
+/// an empty model string, which the desktop "Processing" panel can't
+/// render usefully ("Summarized by ", "Tokens in: 0"). Treating that
+/// shape as `None` keeps the panel hidden until a real summarize has
+/// run, rather than rendering a misleading "$0.00 by `<empty>`" row.
+///
+/// All-zero-but-real-model and all-real-but-zero-tokens are
+/// vanishingly unlikely (the summarizer always pays for at least the
+/// system prompt), but we still surface them as `Some` — the
+/// emptiness gate is the conjunction, so a real-but-cheap call is
+/// honestly reported.
+fn meeting_processing_from_cost(
+    cost: &heron_types::Cost,
+) -> Option<heron_session::MeetingProcessing> {
+    if cost.model.is_empty()
+        && cost.tokens_in == 0
+        && cost.tokens_out == 0
+        && cost.summary_usd == 0.0
+    {
+        None
+    } else {
+        Some(heron_session::MeetingProcessing {
+            summary_usd: cost.summary_usd,
+            tokens_in: cost.tokens_in,
+            tokens_out: cost.tokens_out,
+            model: cost.model.clone(),
+        })
+    }
 }
 
 fn platform_from_source_app(source_app: &str) -> Platform {
@@ -2205,6 +2244,7 @@ mod tests {
             transcript_status: TranscriptLifecycle::Pending,
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
+            processing: None,
         };
         let id = meeting.id;
         Envelope::new(EventPayload::MeetingDetected(meeting)).with_meeting(id.to_string())

@@ -213,6 +213,63 @@ async fn list_and_get_meeting_surface_frontmatter_tags() {
 }
 
 #[tokio::test]
+async fn meeting_processing_surfaces_persisted_cost() {
+    // Tier 0 #2: a vault note carrying populated `Frontmatter.cost`
+    // must surface as `Meeting.processing` on the wire. This is the
+    // round-trip that powers the Review right-rail "Processing"
+    // panel — vault YAML → `read_note` → `meeting_from_note` →
+    // `Meeting.processing`.
+    let fix = Fixture::new();
+    fix.write_note_with_cost(
+        "with-cost",
+        NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        "11:00",
+        "Acme",
+        Cost {
+            summary_usd: 0.0421,
+            tokens_in: 14_231,
+            tokens_out: 612,
+            model: "claude-sonnet-4-6".to_owned(),
+        },
+    );
+    let orch = fix.orch();
+    let listed = orch
+        .list_meetings(ListMeetingsQuery::default())
+        .await
+        .unwrap();
+    let id = listed.items[0].id;
+    let got = orch.get_meeting(&id).await.unwrap();
+    let processing = got.processing.as_ref().expect("processing populated");
+    assert_eq!(processing.tokens_in, 14_231);
+    assert_eq!(processing.tokens_out, 612);
+    assert_eq!(processing.model, "claude-sonnet-4-6");
+    assert!((processing.summary_usd - 0.0421).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn meeting_processing_is_none_for_unpopulated_cost() {
+    // Pre-Tier-0-#2 vault notes (and the existing test fixtures'
+    // default `Cost { 0, 0, 0, "" }`) write zero tokens / empty
+    // model. Surfacing those as `Some(MeetingProcessing)` would
+    // render a misleading "$0.00 by `<empty>`" row in the Review
+    // panel; pin the bridge's "treat fully-zero cost as None"
+    // behavior here.
+    let fix = Fixture::new();
+    fix.write_note(
+        "no-cost",
+        NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        "12:00",
+        "Acme",
+    );
+    let orch = fix.orch();
+    let listed = orch
+        .list_meetings(ListMeetingsQuery::default())
+        .await
+        .unwrap();
+    assert!(listed.items[0].processing.is_none());
+}
+
+#[tokio::test]
 async fn get_meeting_unknown_id_returns_not_found() {
     let fix = Fixture::new();
     let unknown = heron_session::MeetingId::now_v7();
@@ -567,6 +624,70 @@ impl Fixture {
 
     fn write_note(&self, slug: &str, date: NaiveDate, start: &str, company: &str) {
         self.write_note_inner(slug, date, start, company, "Body.\n", &[], None, &[]);
+    }
+
+    /// Write a note and stamp a populated `Cost` block onto its
+    /// frontmatter. The default fixture's `Cost { 0, 0, 0, "" }` is
+    /// the "unpopulated" sentinel the orchestrator collapses to
+    /// `Meeting.processing = None`; this helper opts out of that so
+    /// tests can assert the populated wire shape.
+    ///
+    /// Unlike the other `write_note_with_*` helpers in this fixture,
+    /// this one builds the `Frontmatter` directly and finalizes once
+    /// rather than going through the `write_note_inner`
+    /// → `read_note` → mutate → `atomic_write` round-trip — `cost` is
+    /// the only thing diverging from the baseline, so a one-shot write
+    /// is both shorter and avoids the read/parse churn the others
+    /// inherit. The other helpers' read-modify-write shape is harder
+    /// to migrate (they each diverge a different field) and out of
+    /// scope here.
+    fn write_note_with_cost(
+        &self,
+        slug: &str,
+        date: NaiveDate,
+        start: &str,
+        company: &str,
+        cost: Cost,
+    ) {
+        let writer = VaultWriter::new(self.vault_root().to_path_buf());
+        let frontmatter = Frontmatter {
+            date,
+            start: start.to_owned(),
+            duration_min: 30,
+            company: Some(company.to_owned()),
+            attendees: Vec::new(),
+            meeting_type: MeetingType::Internal,
+            source_app: "zoom.us".to_owned(),
+            recording: PathBuf::from(format!(
+                "audio/{}-{} {slug}.m4a",
+                date,
+                start.replace(':', ""),
+            )),
+            transcript: PathBuf::from(format!(
+                "transcripts/{}-{} {slug}.jsonl",
+                date,
+                start.replace(':', ""),
+            )),
+            diarize_source: DiarizeSource::Ax,
+            disclosed: Disclosure {
+                stated: true,
+                when: None,
+                how: DisclosureHow::Verbal,
+            },
+            cost,
+            action_items: Vec::new(),
+            tags: Vec::new(),
+            extra: Mapping::new(),
+        };
+        writer
+            .finalize_session(
+                &date.to_string(),
+                &start.replace(':', ""),
+                slug,
+                &frontmatter,
+                "Body.\n",
+            )
+            .expect("finalize");
     }
 
     fn write_note_with_transcript(

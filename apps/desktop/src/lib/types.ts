@@ -48,6 +48,28 @@ export interface Participant {
   is_user: boolean;
 }
 
+/**
+ * Per-meeting LLM cost telemetry projected from
+ * `heron_types::Cost` (`crates/heron-types/src/lib.rs:155`). Mirrors
+ * `heron_session::MeetingProcessing`.
+ *
+ * Surfaces every field the summarizer wrote into the YAML
+ * frontmatter. STT model is intentionally absent — the frontmatter
+ * does not currently persist it, so adding `stt_model` here would
+ * fabricate a wire field the backend can't fill.
+ *
+ * Tier 0 #2 of the UX redesign — bridge-only; the Review right-rail
+ * "Processing" panel UI ships in a follow-up PR.
+ */
+export interface MeetingProcessing {
+  /** USD cost of the most recent summarize call. */
+  summary_usd: number;
+  tokens_in: number;
+  tokens_out: number;
+  /** LLM model identifier, e.g. `"claude-sonnet-4-6"`. */
+  model: string;
+}
+
 /** Mirrors `crates/heron-session/src/lib.rs:152`. */
 export interface Meeting {
   id: MeetingId;
@@ -75,6 +97,16 @@ export interface Meeting {
    * Mirrors `crates/heron-session/src/lib.rs:Meeting.tags`.
    */
   tags?: string[];
+  /**
+   * Tier 0 #2: per-meeting cost telemetry. `undefined` for meetings
+   * that haven't been summarized yet (still recording, freshly
+   * detected, or pre-Tier-0-#2 vault notes that recorded zero/empty
+   * cost). The Rust side serializes with
+   * `#[serde(skip_serializing_if = "Option::is_none")]`, so the
+   * field is omitted entirely on the wire when absent — `undefined`
+   * here, not `null`.
+   */
+  processing?: MeetingProcessing;
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:482`. */

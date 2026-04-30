@@ -174,6 +174,47 @@ pub struct Meeting {
     /// field still deserialize cleanly into the wider type.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Per-meeting LLM cost telemetry. `Some` once a summary has been
+    /// generated — the orchestrator reads this from the persisted
+    /// `Frontmatter.cost` (`heron-types::Cost`) when projecting a
+    /// vault note into a `Meeting`. `None` for meetings that haven't
+    /// been summarized yet (still recording, freshly detected, or
+    /// pre-Tier-0-#2 vault notes that recorded zero/empty cost).
+    ///
+    /// Tier 0 #2 of the UX redesign: powers the Review right-rail
+    /// "Processing" panel (`Tokens in / Tokens out / Summarized by /
+    /// $`). UI for the panel is a separate PR; this is bridge-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing: Option<MeetingProcessing>,
+}
+
+/// Per-meeting LLM cost telemetry projected onto the wire.
+///
+/// Mirrors `heron_types::Cost` one-for-one: every field corresponds
+/// directly to what the summarizer wrote into the YAML frontmatter on
+/// the last summarize call (`heron-vault::merge` always pulls cost
+/// from `theirs`, so this is the *most recent* summarize, not an
+/// aggregate). No new fields are invented — STT model is not
+/// persisted in the frontmatter today, so it does not appear here.
+///
+/// `Option<Self>` on `Meeting.processing` carries the
+/// "summary not yet run" signal — the inner struct is always
+/// fully populated when present.
+///
+/// `PartialEq` is intentionally NOT derived: the `summary_usd: f64`
+/// field would compare with bitwise equality, which is unreliable
+/// for floats. Tests compare numeric fields with an epsilon
+/// tolerance and pin the model string separately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingProcessing {
+    /// USD cost of the most recent summarize call.
+    pub summary_usd: f64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    /// LLM model identifier (e.g. `claude-sonnet-4-6`). Free string —
+    /// the wire shape does not enumerate a closed set so v1.1+ models
+    /// surface without a wire bump.
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,6 +859,7 @@ mod prefix_tests {
             transcript_status: TranscriptLifecycle::Partial,
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
+            processing: None,
         };
         let envelope = Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
             .with_meeting(meeting.id.to_string());
@@ -918,6 +960,7 @@ mod prefix_tests {
             transcript_status: TranscriptLifecycle::Complete,
             summary_status: SummaryLifecycle::Ready,
             tags: vec!["acme".into(), "pricing".into()],
+            processing: None,
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         // Pin the wire-key explicitly so a `#[serde(rename)]` typo
@@ -999,5 +1042,88 @@ mod prefix_tests {
                 "code {code} has non-conforming characters",
             );
         }
+    }
+
+    #[test]
+    fn meeting_processing_absent_omits_field_on_the_wire() {
+        // Tier 0 #2: `processing` is `Option<MeetingProcessing>` with
+        // `skip_serializing_if = "Option::is_none"`. A `None` must not
+        // emit a `"processing": null` field — pre-existing JSON
+        // consumers (the desktop's older Tauri command surface, the
+        // OpenAPI spec, snapshot tests in herond) would otherwise see
+        // an unexpected key. Pin the omission here.
+        let meeting = Meeting {
+            id: MeetingId::now_v7(),
+            status: MeetingStatus::Recording,
+            platform: Platform::Zoom,
+            title: None,
+            calendar_event_id: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            duration_secs: None,
+            participants: vec![],
+            transcript_status: TranscriptLifecycle::Pending,
+            summary_status: SummaryLifecycle::Pending,
+            tags: vec![],
+            processing: None,
+        };
+        let json = serde_json::to_value(&meeting).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert!(
+            !obj.contains_key("processing"),
+            "expected no `processing` key for None, got: {json}",
+        );
+    }
+
+    #[test]
+    fn meeting_processing_present_round_trips() {
+        // Pin the `Some(MeetingProcessing { .. })` round-trip so the
+        // Tier 0 #2 wire shape is locked. Mirrors `heron_types::Cost`
+        // one-for-one — adding a field there without updating
+        // `MeetingProcessing` would silently drop data from the
+        // bridge; this test keeps the projection honest.
+        let meeting = Meeting {
+            id: MeetingId::now_v7(),
+            status: MeetingStatus::Done,
+            platform: Platform::Zoom,
+            title: Some("Acme".into()),
+            calendar_event_id: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            duration_secs: Some(1_800),
+            participants: vec![],
+            transcript_status: TranscriptLifecycle::Complete,
+            summary_status: SummaryLifecycle::Ready,
+            tags: vec![],
+            processing: Some(MeetingProcessing {
+                summary_usd: 0.04,
+                tokens_in: 14_231,
+                tokens_out: 612,
+                model: "claude-sonnet-4-6".into(),
+            }),
+        };
+        let json = serde_json::to_value(&meeting).expect("serialize");
+        let processing = json
+            .get("processing")
+            .expect("processing present when Some");
+        assert_eq!(processing["summary_usd"].as_f64(), Some(0.04));
+        assert_eq!(processing["tokens_in"].as_u64(), Some(14_231));
+        assert_eq!(processing["tokens_out"].as_u64(), Some(612));
+        assert_eq!(processing["model"].as_str(), Some("claude-sonnet-4-6"));
+
+        let back: Meeting = serde_json::from_value(json).expect("deserialize");
+        let restored = back.processing.expect("processing round-trips as Some");
+        // Field-by-field instead of `assert_eq!` because
+        // `MeetingProcessing` deliberately does not derive `PartialEq`
+        // (the `f64` field would compare bitwise — flaky under any
+        // future rounding/format change). Compare with an epsilon.
+        assert!(
+            (restored.summary_usd - 0.04).abs() < 1e-9,
+            "summary_usd drifted: {}",
+            restored.summary_usd,
+        );
+        assert_eq!(restored.tokens_in, 14_231);
+        assert_eq!(restored.tokens_out, 612);
+        assert_eq!(restored.model, "claude-sonnet-4-6");
     }
 }
