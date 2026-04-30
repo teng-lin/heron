@@ -4,7 +4,7 @@
 //! over the wire format pinned in
 //! [`docs/api-desktop-openapi.yaml`](../../../docs/api-desktop-openapi.yaml).
 //!
-//! Scope of this slice:
+//! Scope of this crate:
 //! - `/health` — full implementation (no auth required, per spec).
 //! - `/events` — SSE projection of the orchestrator's event bus, with
 //!   15s heartbeat keep-alive and `Last-Event-ID` / `?since_event_id`
@@ -12,15 +12,14 @@
 //! - Bearer auth from `~/.heron/cli-token` (skipped for `/health`).
 //! - CORS denial: any request carrying an `Origin` header is rejected
 //!   so the daemon doesn't accidentally answer browser-side `fetch()`.
-//! - Every other endpoint in the OpenAPI returns the
-//!   `HERON_E_NOT_YET_IMPLEMENTED` envelope at `501`. The routing
-//!   surface stays complete; the bodies are honest about what's not
-//!   wired yet.
+//! - Meeting, transcript, summary, audio, calendar, and context routes
+//!   are thin projections over the injected orchestrator.
 //!
 //! The orchestrator is supplied by the caller via [`AppState`]; the
-//! production binary plugs in [`stub::StubOrchestrator`] until the
-//! `LocalSessionOrchestrator` consolidation lands. Tests supply their
-//! own — that's the whole point of the trait-driven design.
+//! production binary plugs in
+//! [`heron_orchestrator::LocalSessionOrchestrator`]. Tests can supply
+//! [`stub::StubOrchestrator`] or narrower fakes when they only need to
+//! exercise router/auth/error mapping.
 
 use std::sync::Arc;
 

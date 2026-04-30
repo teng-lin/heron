@@ -14,6 +14,7 @@ heron-event = { workspace = true }
 heron-event-http = { workspace = true }
 heron-policy = { workspace = true }
 heron-realtime = { workspace = true }
+heron-speech = { workspace = true }
 heron-cli = { workspace = true }
 heron-llm = { workspace = true }
 heron-session = { workspace = true }
