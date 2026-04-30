@@ -19,8 +19,8 @@ use heron_event::EventBus;
 use heron_session::{
     CalendarEvent, ComponentState, EventPayload, Health, HealthComponent, HealthComponents,
     HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator, StartCaptureArgs,
-    Summary, Transcript,
+    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
+    SessionOrchestrator, StartCaptureArgs, Summary, Transcript,
 };
 
 /// Fixed bus capacity for the stub. 1024 covers any vertical-slice
@@ -93,6 +93,10 @@ impl SessionOrchestrator for StubOrchestrator {
     }
 
     async fn attach_context(&self, _req: PreMeetingContextRequest) -> Result<(), SessionError> {
+        Err(SessionError::NotYetImplemented)
+    }
+
+    async fn prepare_context(&self, _req: PrepareContextRequest) -> Result<(), SessionError> {
         Err(SessionError::NotYetImplemented)
     }
 

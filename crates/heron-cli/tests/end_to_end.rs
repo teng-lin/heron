@@ -22,10 +22,13 @@ fn cfg(tmp: &TempDir) -> SessionConfig {
         cache_dir: tmp.path().join("cache"),
         vault_root: tmp.path().join("vault"),
         stt_backend_name: "sherpa".into(),
+        hotwords: Vec::new(),
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
         file_naming_pattern: heron_vault::FileNamingPattern::Id,
+        persona: None,
+        strip_names: false,
     }
 }
 

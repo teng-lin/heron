@@ -334,6 +334,13 @@ pub struct CalendarEvent {
     /// calendar event in one round trip.
     #[serde(default)]
     pub related_meetings: Vec<MeetingId>,
+    /// `true` when a `PreMeetingContext` is already staged for this
+    /// event id (via `prepare_context` or `attach_context`). Lets the
+    /// upcoming-meetings rail render a "primed" indicator without a
+    /// second round trip. `#[serde(default)]` so older daemon builds
+    /// (which omitted the field) deserialize as un-primed.
+    #[serde(default)]
+    pub primed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +380,25 @@ pub struct PreMeetingContextRequest {
     /// to.
     pub calendar_event_id: String,
     pub context: PreMeetingContext,
+}
+
+/// Body shape for `POST /context/prepare`. The daemon synthesizes a
+/// minimal default `PreMeetingContext` from the fields present here —
+/// today just `attendees`, lifted into `attendees_known`. Surfaces as
+/// the rail's auto-prime path: callers don't have to construct the
+/// full `PreMeetingContext` themselves, and as the synthesizer learns
+/// new sources (related-notes lookup, agenda extraction) older clients
+/// pick up the richer context without a wire change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareContextRequest {
+    pub calendar_event_id: String,
+    /// Carried over verbatim from the calendar event; copied into
+    /// `PreMeetingContext::attendees_known`. Empty is fine — priming
+    /// with no attendees still flips the `primed` flag so the UI
+    /// surfaces the indicator and `start_capture` finds the staged
+    /// entry.
+    #[serde(default)]
+    pub attendees: Vec<AttendeeContext>,
 }
 
 // ── health ────────────────────────────────────────────────────────────
@@ -458,6 +484,8 @@ pub enum EventPayload {
 
     #[serde(rename = "speaker.changed")]
     SpeakerChanged(SpeakerChangedData),
+    #[serde(rename = "audio.level")]
+    AudioLevel(AudioLevelData),
 
     #[serde(rename = "doctor.warning")]
     DoctorWarning(DoctorWarningData),
@@ -487,6 +515,7 @@ impl EventPayload {
             Self::SummaryReady(_) => "summary.ready",
             Self::ActionItemsReady(_) => "action_items.ready",
             Self::SpeakerChanged(_) => "speaker.changed",
+            Self::AudioLevel(_) => "audio.level",
             Self::DoctorWarning(_) => "doctor.warning",
             Self::DaemonError(_) => "daemon.error",
         }
@@ -566,6 +595,50 @@ pub struct SpeakerChangedData {
     /// caveat in the struct doc, "potentially speaking"), `false`
     /// when they transitioned to MUTED (definitely not speaking).
     pub started: bool,
+}
+
+/// Channels that carry an `audio.level` reading. A wire-local subset
+/// of [`heron_types::Channel`] that omits the raw `Mic` variant —
+/// pre-AEC mic carries echo bleed of the remote audio and is never
+/// metered (see [`AudioLevelData`] doc). Encoding the filter at the
+/// type level means the collector can't accidentally publish a `Mic`
+/// envelope, and SSE consumers see a tighter enum on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioLevelChannel {
+    /// Post-AEC user voice. STT consumes this stream; the
+    /// "your voice" meter renders it.
+    MicClean,
+    /// Remote audio captured via the per-app process tap. The
+    /// "their voice" meter renders it; in 3+ calls it remains a
+    /// single mixed channel (per-participant equalizers need
+    /// speaker diarization on top).
+    Tap,
+}
+
+/// Body of an `audio.level` event. Coalesced from raw 100 Hz capture
+/// frames down to ~10 Hz before publishing; see Tier 3 #15 in
+/// `docs/ux-redesign-backend-prerequisites.md` for the rationale.
+///
+/// **Not persisted.** Volume-high and uninteresting after the fact —
+/// the orchestrator skips writing this event to any session log.
+/// `Last-Event-ID` resume on `/events` still returns recent envelopes
+/// from the in-memory replay window; consumers reconnecting after a
+/// drop may want to skip replayed `audio.level` envelopes (filter via
+/// `?topics=` to exclude this stream) since stale level readings are
+/// not useful — the frontend's last-value-sticks contract handles the
+/// gap as well as a flood of replayed values would.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AudioLevelData {
+    /// Session-secs of the newest frame folded into this coalesced
+    /// window.
+    pub t: f64,
+    pub channel: AudioLevelChannel,
+    /// Floored at -100 dBFS so consumers never have to handle `-inf`.
+    pub peak_dbfs: f32,
+    /// Floored at -100 dBFS. Tracks perceived loudness; pair with
+    /// `peak_dbfs` for a twin-needle meter.
+    pub rms_dbfs: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -830,6 +903,18 @@ pub trait SessionOrchestrator: Send + Sync {
     /// `calendar_event_id` wins.
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError>;
 
+    /// `POST /context/prepare` — auto-stage a minimal default
+    /// `PreMeetingContext` for `req.calendar_event_id`. The
+    /// orchestrator synthesizes the context from the request fields
+    /// (today: `attendees` → `attendees_known`); future expansions
+    /// (related-notes lookup, agenda extraction) live behind this
+    /// method so the wire shape stays stable.
+    ///
+    /// Idempotent. Skips when an entry already exists for the id (so
+    /// a manual `attach_context` is never clobbered by a later
+    /// `prepare_context`); returns `Ok(())` either way.
+    async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError>;
+
     // ── ops ───────────────────────────────────────────────────────────
 
     /// `GET /health`. Mirrors what `heron-doctor` reports offline.
@@ -906,6 +991,42 @@ mod prefix_tests {
     }
 
     #[test]
+    fn calendar_event_primed_defaults_false_when_field_omitted() {
+        // Backwards-compat pin: an older daemon build that pre-dates
+        // Tier 5 #25 emits `CalendarEvent` without the `primed` field.
+        // The desktop deserialization path must default it to `false`
+        // rather than fail; otherwise rolling out the desktop binary
+        // ahead of the daemon (or vice versa) bricks the rail.
+        let raw = r#"{
+            "id": "evt_legacy",
+            "title": "Legacy event",
+            "start": "2026-04-29T15:00:00Z",
+            "end": "2026-04-29T15:30:00Z",
+            "attendees": [],
+            "meeting_url": null,
+            "related_meetings": []
+        }"#;
+        let parsed: CalendarEvent = serde_json::from_str(raw).expect("deserialize");
+        assert!(!parsed.primed);
+
+        // And the round-trip with `primed: true` preserves the flag.
+        let staged = CalendarEvent {
+            id: "evt_new".into(),
+            title: "New event".into(),
+            start: Utc::now(),
+            end: Utc::now(),
+            attendees: Vec::new(),
+            meeting_url: None,
+            related_meetings: Vec::new(),
+            primed: true,
+        };
+        let json = serde_json::to_value(&staged).expect("serialize");
+        assert_eq!(json.get("primed").and_then(|v| v.as_bool()), Some(true));
+        let back: CalendarEvent = serde_json::from_value(json).expect("deserialize");
+        assert!(back.primed);
+    }
+
+    #[test]
     fn speaker_changed_round_trips_through_envelope() {
         // Bridge guard: every other transport (SSE, Tauri IPC, MCP,
         // webhook) projects from `EventEnvelope`, so a malformed
@@ -939,6 +1060,66 @@ mod prefix_tests {
             }
             other => panic!("expected SpeakerChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn audio_level_round_trips_through_envelope() {
+        // Same bridge guard as `speaker_changed_round_trips_through_envelope`:
+        // every transport projects from `EventEnvelope`, so a
+        // mistyped serde rename for `audio.level` would silently
+        // corrupt the wire shape on every projection at once. Pin
+        // the discriminator + data shape explicitly.
+        let payload = EventPayload::AudioLevel(AudioLevelData {
+            t: 4.25,
+            channel: AudioLevelChannel::MicClean,
+            peak_dbfs: -3.5,
+            rms_dbfs: -18.0,
+        });
+        let envelope = Envelope::new(payload).with_meeting("mtg_test");
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.get("event_type").and_then(|v| v.as_str()),
+            Some("audio.level"),
+            "audio.level must be the wire discriminator: {json}",
+        );
+        let data = obj.get("data").and_then(|v| v.as_object()).expect("data");
+        assert_eq!(
+            data.get("channel").and_then(|v| v.as_str()),
+            Some("mic_clean")
+        );
+        assert!(
+            (data.get("t").and_then(|v| v.as_f64()).unwrap_or(0.0) - 4.25).abs() < f64::EPSILON,
+        );
+        let back: EventEnvelope = serde_json::from_value(json).expect("deserialize");
+        match back.payload {
+            EventPayload::AudioLevel(d) => {
+                assert_eq!(d.channel, AudioLevelChannel::MicClean);
+                assert!((d.peak_dbfs - -3.5).abs() < 1e-3);
+                assert!((d.rms_dbfs - -18.0).abs() < 1e-3);
+            }
+            other => panic!("expected AudioLevel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_level_event_type_string_matches_serde_tag() {
+        // Same drift guard as the speaker.changed pair: hand-written
+        // `event_type()` match must not diverge from the
+        // `#[serde(rename)]` tag; transports route on this string and
+        // a mismatch silently mis-routes consumers.
+        let payload = EventPayload::AudioLevel(AudioLevelData {
+            t: 0.0,
+            channel: AudioLevelChannel::Tap,
+            peak_dbfs: -100.0,
+            rms_dbfs: -100.0,
+        });
+        assert_eq!(payload.event_type(), "audio.level");
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            json.get("event_type").and_then(|v| v.as_str()),
+            Some("audio.level"),
+        );
     }
 
     #[test]

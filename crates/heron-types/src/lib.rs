@@ -109,6 +109,42 @@ pub struct ActionItem {
     pub due: Option<String>,
 }
 
+/// User self-context the summarizer can inject into the LLM system
+/// prompt (Tier 4 wiring, item #18). Three discrete inputs so the
+/// Settings UI's "Your name" / "Your role" / "What you're working on"
+/// fields can bind to named struct members rather than parsing a
+/// free-form string.
+///
+/// Lives in `heron-types` (not `apps/desktop/src-tauri/src/settings.rs`)
+/// so `heron-llm`'s `SummarizerInput` and the desktop crate's
+/// `Settings.persona` field can reference one struct rather than
+/// duplicating the shape across the wire boundary. `apps/desktop`
+/// re-exports this from its `settings` module so existing
+/// `crate::settings::Persona` imports keep working.
+///
+/// The container-level `#[serde(default)]` makes each field optional on
+/// read so a partially hand-edited `settings.json` (e.g. only `name`
+/// present) deserializes cleanly rather than hard-erroring on the missing
+/// sibling fields. An "all empty strings" `Persona` is explicitly the
+/// "no persona configured" sentinel — the summarizer treats it as a
+/// no-op so the rendered prompt is byte-identical to the no-persona path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Persona {
+    pub name: String,
+    pub role: String,
+    pub working_on: String,
+}
+
+impl Persona {
+    /// True when every field is the empty string. The summarizer
+    /// treats an empty `Persona` as equivalent to `None` so the
+    /// rendered prompt does not drift on the no-config path.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty() && self.role.is_empty() && self.working_on.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attendee {
     pub id: ItemId,
@@ -423,6 +459,59 @@ custom_nested:
         assert!(back.contains("duration_min: 47"));
         assert!(back.contains("custom_user_field: hello"));
         assert!(back.contains("custom_nested:"));
+    }
+
+    #[test]
+    fn persona_default_is_all_empty_strings() {
+        let p = Persona::default();
+        assert_eq!(p.name, "");
+        assert_eq!(p.role, "");
+        assert_eq!(p.working_on, "");
+        assert!(p.is_empty(), "default Persona must be is_empty()");
+    }
+
+    #[test]
+    fn persona_is_empty_returns_false_when_any_field_set() {
+        let p = Persona {
+            name: "Alice".into(),
+            ..Persona::default()
+        };
+        assert!(!p.is_empty());
+        let p = Persona {
+            role: "PM".into(),
+            ..Persona::default()
+        };
+        assert!(!p.is_empty());
+        let p = Persona {
+            working_on: "Q3 plan".into(),
+            ..Persona::default()
+        };
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn persona_partial_object_fills_missing_fields_with_empty_strings() {
+        // Mirrors the desktop crate's
+        // `partial_persona_object_fills_defaults` test; pinned here
+        // so a refactor that drops `#[serde(default)]` from the
+        // moved-into-heron-types struct fails loudly.
+        let p: Persona =
+            serde_json::from_str(r#"{"name":"Alice"}"#).expect("partial persona must parse");
+        assert_eq!(p.name, "Alice");
+        assert_eq!(p.role, "");
+        assert_eq!(p.working_on, "");
+    }
+
+    #[test]
+    fn persona_round_trips_through_json() {
+        let p = Persona {
+            name: "Alice".into(),
+            role: "PM".into(),
+            working_on: "Q3 plan".into(),
+        };
+        let s = serde_json::to_string(&p).expect("serialize");
+        let back: Persona = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, p);
     }
 
     #[test]

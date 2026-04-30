@@ -24,6 +24,16 @@ them into a single voice.
 Surface the most important content for someone who didn't attend.
 {{/if}}
 
+{{~#if persona}}
+## About the user
+
+{{#if persona.has_name}}Their name is {{persona.name}}.{{/if}}{{#if persona.has_role}} They work as {{persona.role}}.{{/if}}{{#if persona.has_working_on}} They're currently focused on: {{persona.working_on}}.{{/if}}
+
+Use this self-context to attribute "I" / "we" turns and flag follow-ups
+that land on the user. Do not echo this block back into the summary
+output.
+
+{{/if~}}
 {{#if pre_meeting_briefing}}
 ## Pre-meeting context
 

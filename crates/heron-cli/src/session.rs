@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use heron_llm::{Summarizer, SummarizerInput, SummarizerOutput};
 use heron_session::{MeetingId, SessionEventBus};
 use heron_types::{
-    IdleReason, MeetingType, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
+    IdleReason, MeetingType, Persona, RecordingFsm, RecordingState, SessionId, SummaryOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -71,6 +71,13 @@ pub struct SessionConfig {
     /// `"whisperkit"` or `"sherpa"`; resolves via
     /// [`heron_speech::build_backend`].
     pub stt_backend_name: String,
+    /// Tier 4 #17 vocabulary-boost hotwords. The Settings pane edits
+    /// this list; the daemon orchestrator copies it from
+    /// `Settings::hotwords` at `start_capture` time and forwards it
+    /// here so the WhisperKit backend can compose a tokenized prompt.
+    /// Empty vec → no prompt is set (migration-safe; identical decoder
+    /// output to pre-Tier-4 builds).
+    pub hotwords: Vec<String>,
     /// User-expressed LLM backend preference. Phase 40's selector
     /// picks the first viable backend under this preference at
     /// `backends()` call time; the returned `SelectionReason` is
@@ -108,6 +115,18 @@ pub struct SessionConfig {
     /// `<uuid>.md` convention) so existing callers that don't set the
     /// field keep their current naming behavior.
     pub file_naming_pattern: heron_vault::FileNamingPattern,
+    /// User self-context (Tier 4 #18). Threaded into the LLM
+    /// summarizer's `SummarizerInput::persona` so the prompt can
+    /// reference the user's name / role / current focus. `None` when
+    /// `Settings.persona` is unset; an "all empty strings" persona
+    /// is treated identically to `None` by the prompt renderer so
+    /// the no-config path stays byte-identical to pre-Tier-4.
+    pub persona: Option<Persona>,
+    /// Strip participant names from the transcript before sending to
+    /// the LLM (Tier 4 #21). Maps to
+    /// `SummarizerInput::strip_names`. `false` preserves
+    /// pre-Tier-4 behavior — speaker labels reach the LLM unchanged.
+    pub strip_names: bool,
 }
 
 /// Outcome of `run_no_op` and `run`.
@@ -265,7 +284,8 @@ impl Orchestrator {
     ///   inspecting logs can tell whether the API path was picked or a
     ///   CLI fallback fired.
     pub fn backends(&self) -> Result<Backends, SessionError> {
-        let stt = heron_speech::build_backend(&self.config.stt_backend_name)?;
+        let stt =
+            heron_speech::build_backend(&self.config.stt_backend_name, &self.config.hotwords)?;
         let ax = heron_zoom::select_ax_backend();
         let (llm, backend, reason) = heron_llm::select_summarizer(self.config.llm_preference)?;
         tracing::info!(?backend, ?reason, "LLM backend selected");
@@ -325,6 +345,14 @@ impl Orchestrator {
             // the action-items / attendees preservation block is the
             // only context the LLM needs.
             pre_meeting_briefing: None,
+            // Tier 4 #18 / #21: persona + strip_names come from the
+            // session config the desktop crate populated from
+            // `Settings.persona` / `Settings.strip_names_before_summarization`.
+            // CLI re-summarize callers default both to "off" via
+            // `SessionConfig::default()` semantics so the prompt path
+            // stays byte-identical to pre-Tier-4.
+            persona: self.config.persona.as_ref(),
+            strip_names: self.config.strip_names,
         };
         let mut output = summarizer.summarize(input).await?;
 
@@ -368,6 +396,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/heron-test-cache"),
             vault_root: PathBuf::from("/tmp/heron-test-vault"),
             stt_backend_name: "sherpa".into(),
+            hotwords: Vec::new(),
             // Auto picks Anthropic when ANTHROPIC_API_KEY is set,
             // else falls back to a CLI; the test machine's
             // environment determines which path runs.
@@ -375,6 +404,8 @@ mod tests {
             pre_meeting_briefing: None,
             event_bus: None,
             file_naming_pattern: heron_vault::FileNamingPattern::Id,
+            persona: None,
+            strip_names: false,
         }
     }
 

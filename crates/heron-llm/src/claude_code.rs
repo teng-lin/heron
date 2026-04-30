@@ -30,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::content::parse_content_json;
-use crate::transcript::{build_user_content, read_transcript_capped};
+use crate::transcript::{build_user_content, read_transcript_capped, strip_speaker_names};
 use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
 
 /// Default binary name resolved on `PATH`. The user can override via
@@ -102,7 +102,13 @@ impl Summarizer for ClaudeCodeClient {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
         let prompt = render_meeting_prompt(&input)?;
         let transcript_text = read_transcript_capped(input.transcript)?;
-        let user_content = build_user_content(&prompt, &transcript_text);
+        // Tier 4 #21: pseudonymize speaker names for the LLM input.
+        let transcript_for_llm = if input.strip_names {
+            strip_speaker_names(&transcript_text)
+        } else {
+            transcript_text
+        };
+        let user_content = build_user_content(&prompt, &transcript_for_llm);
         run_cli_summarize(
             &self.config.binary,
             &self.config.args,
@@ -314,6 +320,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect("summarize");
@@ -337,6 +345,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect("ok");
@@ -355,6 +365,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("missing binary");
@@ -378,6 +390,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("non-zero");
@@ -402,6 +416,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("malformed");
@@ -435,6 +451,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("should time out");
@@ -484,6 +502,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect("ok");

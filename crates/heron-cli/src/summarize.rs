@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use heron_llm::{Backend, Summarizer};
-use heron_types::Frontmatter;
+use heron_types::{Frontmatter, Persona};
 use heron_vault::{MergeOutcome, VaultWriter, read_note};
 
 use crate::session;
@@ -90,6 +90,30 @@ pub async fn re_summarize_in_vault(
     vault_root: &Path,
     note_path: &Path,
 ) -> Result<MergeOutcome, SummarizeError> {
+    // Backward-compat shim around the persona-aware path. CLI callers
+    // (`heron summarize`) don't read the desktop's `Settings.persona` /
+    // `Settings.strip_names_before_summarization`, so default both off
+    // here — that's the pre-Tier-4 prompt path, byte-identical.
+    re_summarize_in_vault_with_persona(summarizer, vault_root, note_path, None, false).await
+}
+
+/// Like [`re_summarize_in_vault`], but threads the user's persona and
+/// strip-names flag through to the LLM call (Tier 4 #18 / #21).
+///
+/// Desktop callers (`apps/desktop/src-tauri/src/resummarize.rs`) read
+/// `Settings.persona` / `Settings.strip_names_before_summarization`
+/// and pass them here so a re-summarize uses the same prompt-injection
+/// and name-stripping the live capture would. CLI callers stay on the
+/// thin [`re_summarize_in_vault`] shim above so the no-config path is
+/// pinned byte-identical to pre-Tier-4 by the snapshot test
+/// `template_with_empty_persona_matches_no_persona_baseline`.
+pub async fn re_summarize_in_vault_with_persona(
+    summarizer: &dyn Summarizer,
+    vault_root: &Path,
+    note_path: &Path,
+    persona: Option<&Persona>,
+    strip_names: bool,
+) -> Result<MergeOutcome, SummarizeError> {
     let (fm, _body) = read_note(note_path).map_err(|source| SummarizeError::ReadNote {
         path: note_path.to_path_buf(),
         source,
@@ -109,15 +133,18 @@ pub async fn re_summarize_in_vault(
     // Reuse the orchestrator's re_summarize_note for the §10.5
     // ID-preservation contract (layer 1 prompt-side + layer 2 text
     // matcher). `re_summarize_note` doesn't read any SessionConfig
-    // field today, so leaving `cache_dir` / `session_id` empty is
-    // accurate — fabricating a placeholder path would invite grep
-    // confusion with `cmd_record`'s real cache root.
+    // field today other than `persona` / `strip_names`, so leaving
+    // `cache_dir` / `session_id` empty is accurate — fabricating a
+    // placeholder path would invite grep confusion with `cmd_record`'s
+    // real cache root.
     let cfg = session::SessionConfig {
         session_id: uuid::Uuid::nil(),
         target_bundle_id: fm.source_app.clone(),
         cache_dir: PathBuf::new(),
         vault_root: vault_root.to_path_buf(),
         stt_backend_name: "sherpa".into(),
+        // Re-summarize never invokes STT; hotwords are inert here.
+        hotwords: Vec::new(),
         llm_preference: heron_llm::Preference::Auto,
         // CLI re-summarize never carries pre-meeting context — that
         // surface only flows through the daemon's `attach_context`.
@@ -129,6 +156,8 @@ pub async fn re_summarize_in_vault(
         // existing one through `re_summarize_note`), so the field is
         // unread on this path. Use the `Id` default for shape.
         file_naming_pattern: heron_vault::FileNamingPattern::Id,
+        persona: persona.cloned(),
+        strip_names,
     };
     let orch = session::Orchestrator::new(cfg);
     let output = orch

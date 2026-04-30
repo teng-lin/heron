@@ -1028,6 +1028,61 @@ components:
                     `true` on unmute (potentially speaking),
                     `false` on mute (definitely not speaking).
 
+    AudioLevelEvent:
+      description: |
+        Live capture-loop dBFS readings driving the desktop UI's
+        recording-screen meter / waveform / equalizer bars (Tier 3 #15
+        in `docs/ux-redesign-backend-prerequisites.md`).
+
+        Coalesced server-side from the raw 100 Hz capture rate down to
+        ~10 Hz before publishing — the renderer doesn't need 20+ Hz and
+        forwarding every frame would saturate the SSE channel. Each
+        envelope carries one channel's max-peak + max-rms over the
+        coalescing window. Two channels are emitted: `mic_clean`
+        (post-AEC user voice) and `tap` (remote audio); raw `mic` is
+        intentionally not metered (it carries echo bleed of the remote
+        side until APM cancels it).
+
+        Not persisted to any session log — the renderer's
+        last-value-sticks contract means a new envelope after silence
+        simply replaces the prior reading.
+      allOf:
+        - $ref: "#/components/schemas/EventEnvelopeBase"
+        - type: object
+          required: [event_type, data]
+          properties:
+            event_type: { type: string, const: audio.level }
+            data:
+              type: object
+              required: [t, channel, peak_dbfs, rms_dbfs]
+              properties:
+                t:
+                  type: number
+                  format: double
+                  description: |
+                    Session-secs of the latest sample folded into this
+                    coalesced window.
+                channel:
+                  type: string
+                  enum: [mic_clean, tap]
+                  description: |
+                    Capture stream this reading is for. `mic_clean` =
+                    post-AEC user voice; `tap` = remote audio. Raw
+                    `mic` is never emitted on this event.
+                peak_dbfs:
+                  type: number
+                  format: float
+                  description: |
+                    Loudest single-sample magnitude in the window,
+                    floored at -100 dBFS to avoid `-inf` on silence.
+                rms_dbfs:
+                  type: number
+                  format: float
+                  description: |
+                    Root-mean-square energy in dBFS, floored at -100.
+                    Tracks perceived loudness; pair with `peak_dbfs`
+                    for a twin-needle meter.
+
     DoctorWarningEvent:
       description: |
         Soft warning surfaced from `heron-doctor` checks. Indicates
@@ -1086,6 +1141,7 @@ components:
         - $ref: "#/components/schemas/SummaryReadyEvent"
         - $ref: "#/components/schemas/ActionItemsReadyEvent"
         - $ref: "#/components/schemas/SpeakerChangedEvent"
+        - $ref: "#/components/schemas/AudioLevelEvent"
         - $ref: "#/components/schemas/DoctorWarningEvent"
         - $ref: "#/components/schemas/DaemonErrorEvent"
       discriminator:
@@ -1102,6 +1158,7 @@ components:
           summary.ready: "#/components/schemas/SummaryReadyEvent"
           action_items.ready: "#/components/schemas/ActionItemsReadyEvent"
           speaker.changed: "#/components/schemas/SpeakerChangedEvent"
+          audio.level: "#/components/schemas/AudioLevelEvent"
           doctor.warning: "#/components/schemas/DoctorWarningEvent"
           daemon.error: "#/components/schemas/DaemonErrorEvent"
 

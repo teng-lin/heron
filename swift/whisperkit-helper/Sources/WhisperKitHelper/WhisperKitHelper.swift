@@ -329,6 +329,16 @@ public func wk_fetch_model(
 /// Transcribe `wav_path` and return a JSONL turn array as a malloc'd
 /// NUL-terminated C string in `*out`.
 ///
+/// `prompt` is an optional UTF-8 NUL-terminated C string carrying
+/// vocabulary-boost hotwords (Tier 4 #17). When non-NULL and non-empty,
+/// the bridge tokenizes it via WhisperKit's tokenizer and forwards the
+/// resulting token IDs as `DecodingOptions.promptTokens`. Mirrors the
+/// `WhisperKitCLI/TranscribeCLI.swift` `--prompt` flag handling exactly,
+/// down to the leading-space prepend the Whisper tokenizer expects so
+/// hotwords don't accidentally fuse with the decoder's first emitted
+/// token. NULL or empty → no prompt is set (preserves the pre-Tier-4
+/// decode behavior identically).
+///
 /// Wire shape (matching the Rust side's expectation in
 /// whisperkit_bridge.rs): one JSON object per line, separated by `\n`,
 /// with `{"start": f64, "end": f64, "text": String}`. The Rust side
@@ -342,6 +352,7 @@ public func wk_fetch_model(
 @_cdecl("wk_transcribe")
 public func wk_transcribe(
     _ wav_path: UnsafePointer<CChar>?,
+    _ prompt: UnsafePointer<CChar>?,
     _ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     // Always write *some* value to *out so the Rust side never sees
@@ -363,6 +374,17 @@ public func wk_transcribe(
     }
     let path = String(cString: wav_path)
 
+    // Optional prompt → tokens. NULL pointer or zero-length string both
+    // mean "no prompt"; we only build `DecodingOptions` when there's a
+    // tokenizer AND something to encode. The leading space + special-
+    // token filter mirrors `WhisperKitCLI/TranscribeCLI.swift` exactly
+    // (lines 133-138 in upstream); diverging here would silently change
+    // decode behavior compared to the reference CLI.
+    let promptText: String? = prompt.flatMap { p -> String? in
+        let s = String(cString: p)
+        return s.isEmpty ? nil : s
+    }
+
     box.lock.lock()
     let instance = box.instance
     box.lock.unlock()
@@ -370,6 +392,29 @@ public func wk_transcribe(
     guard let instance = instance else {
         writeEmpty()
         return WK_INTERNAL
+    }
+
+    // Compose `DecodingOptions` only when a non-empty prompt was supplied.
+    // Without a prompt we pass `nil` so WhisperKit picks its own defaults
+    // (matching the pre-Tier-4 path byte-for-byte). With a prompt, we
+    // tokenize via the loaded tokenizer; if the tokenizer isn't ready we
+    // surface `WK_INTERNAL` rather than silently dropping the prompt —
+    // that turns "hotwords requested but unwirable" into a loud failure
+    // the operator can investigate.
+    var decodeOptions: DecodingOptions? = nil
+    if let promptText = promptText {
+        guard let tokenizer = instance.tokenizer else {
+            writeEmpty()
+            return WK_INTERNAL
+        }
+        let trimmed = promptText.trimmingCharacters(in: .whitespaces)
+        let tokens = tokenizer
+            .encode(text: " " + trimmed)
+            .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+        var options = DecodingOptions()
+        options.promptTokens = tokens
+        options.usePrefillPrompt = true
+        decodeOptions = options
     }
 
     // Sync wrapper around WhisperKit's async transcribe call. The
@@ -380,7 +425,15 @@ public func wk_transcribe(
 
     let finished = runWithTimeout(WK_TRANSCRIBE_TIMEOUT) {
         do {
-            let r = try await instance.transcribe(audioPath: path)
+            let r: [TranscriptionResult]
+            if let opts = decodeOptions {
+                r = try await instance.transcribe(
+                    audioPath: path,
+                    decodeOptions: opts
+                )
+            } else {
+                r = try await instance.transcribe(audioPath: path)
+            }
             outcome.set(.success(r))
         } catch {
             outcome.set(.failure(error))

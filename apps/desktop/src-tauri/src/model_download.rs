@@ -78,7 +78,13 @@ pub struct ProgressPayload {
 ///   into a `Skipped`-style outcome, but for now the wizard treats
 ///   any non-Ok as failure.
 pub async fn run_download<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
-    let backend = build_backend("whisperkit").map_err(|e| format!("backend unavailable: {e}"))?;
+    // Hotwords are only consulted at `transcribe`-time, not at
+    // `ensure_model`-time, so the download wizard passes the empty
+    // slice. The session-start path in heron-cli `Orchestrator::backends`
+    // is what threads the user-configured `Settings.hotwords` through
+    // to the backend that actually decodes audio.
+    let backend =
+        build_backend("whisperkit", &[]).map_err(|e| format!("backend unavailable: {e}"))?;
     // Clone for the progress closure so the outer `app` stays available
     // for the post-`ensure_model` terminal-tick emit below.
     let app_for_progress = app.clone();

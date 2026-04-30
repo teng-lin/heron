@@ -27,7 +27,7 @@ use axum::routing::{get, post, put};
 use chrono::{DateTime, Utc};
 use heron_session::{
     CalendarEvent, ListMeetingsQuery, MeetingId, MeetingStatus, Platform, PreMeetingContextRequest,
-    StartCaptureArgs, Summary, Transcript,
+    PrepareContextRequest, StartCaptureArgs, Summary, Transcript,
 };
 use serde::Deserialize;
 
@@ -44,6 +44,7 @@ pub fn router() -> Router<AppState> {
         .route("/meetings/{meeting_id}/audio", get(read_audio))
         .route("/calendar/upcoming", get(list_upcoming_calendar))
         .route("/context", put(attach_context))
+        .route("/context/prepare", post(prepare_context))
 }
 
 // ── meetings ──────────────────────────────────────────────────────────
@@ -234,6 +235,16 @@ async fn attach_context(
     Json(req): Json<PreMeetingContextRequest>,
 ) -> Response {
     match state.orchestrator.attach_context(req).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => WireError::from(e).into_response(),
+    }
+}
+
+async fn prepare_context(
+    State(state): State<AppState>,
+    Json(req): Json<PrepareContextRequest>,
+) -> Response {
+    match state.orchestrator.prepare_context(req).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => WireError::from(e).into_response(),
     }

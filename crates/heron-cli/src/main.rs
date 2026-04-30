@@ -674,6 +674,10 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         cache_dir: cache,
         vault_root,
         stt_backend_name: "sherpa".into(),
+        // The `heron record` CLI doesn't read Tauri Settings; it ships
+        // with no hotwords by default. Daemon callers (Tauri / herond)
+        // populate this from `Settings::hotwords` instead.
+        hotwords: Vec::new(),
         llm_preference: heron_llm::Preference::Auto,
         // CLI captures never stage pre-meeting context — that path is
         // a daemon-only concern (`attach_context` -> `start_capture`).
@@ -685,6 +689,11 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         // template — the daemon path is the surface that flips this
         // via `Settings::file_naming_pattern`.
         file_naming_pattern: heron_vault::FileNamingPattern::Id,
+        // Tier 4: CLI captures don't read the desktop's `Settings.persona`
+        // / `Settings.strip_names_before_summarization` — leave both off
+        // so the prompt path stays byte-identical to pre-Tier-4 here.
+        persona: None,
+        strip_names: false,
     };
 
     if args.no_op {

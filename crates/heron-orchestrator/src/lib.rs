@@ -90,8 +90,8 @@ use heron_session::{
     AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
     HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
     MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Participant, Platform,
-    PreMeetingContext, PreMeetingContextRequest, SessionError, SessionEventBus,
-    SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
+    PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest, SessionError,
+    SessionEventBus, SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
     TranscriptLifecycle, TranscriptSegment,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
@@ -194,6 +194,13 @@ pub struct LocalSessionOrchestrator {
     calendar: Arc<dyn CalendarReader>,
     cache_dir: PathBuf,
     stt_backend_name: String,
+    /// Tier 4 #17 vocabulary-boost hotwords forwarded to the WhisperKit
+    /// backend at `start_capture` time. The desktop / `herond` shell
+    /// populates this from `Settings::hotwords`; the legacy CLI path
+    /// (`heron record`) leaves it empty so the v1 decode is byte-
+    /// identical to pre-Tier-4. Cloned per session so a live-edit in
+    /// the Settings pane doesn't mutate an in-flight session's prompt.
+    hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
     /// Tier 4 #19: vault-writer slug strategy forwarded to every
     /// `CliSessionConfig` this orchestrator hands to the v1 pipeline.
@@ -378,6 +385,36 @@ impl PendingContexts {
     fn get_cloned(&self, key: &str) -> Option<PreMeetingContext> {
         lock_or_recover(&self.inner).map.get(key).cloned()
     }
+
+    /// Whether an entry exists for `key`. Cheaper than `get_cloned`
+    /// (no clone of the context body) — used by
+    /// `list_upcoming_calendar` to mirror the `primed` flag onto each
+    /// returned event without dragging the full context across.
+    fn contains_key(&self, key: &str) -> bool {
+        lock_or_recover(&self.inner).map.contains_key(key)
+    }
+
+    /// Insert only when no entry exists for `key`. Returns `true` when
+    /// the insert happened, `false` when an existing entry preserved
+    /// the staged context. Atomic across the check + insert (single
+    /// lock acquisition) so a concurrent `insert` (manual
+    /// `attach_context`) racing with this call cannot land between a
+    /// `contains_key` probe and the insert and silently get clobbered.
+    /// Same FIFO cap discipline as [`insert`](Self::insert).
+    fn insert_if_absent(&self, key: String, value: PreMeetingContext) -> bool {
+        let mut g = lock_or_recover(&self.inner);
+        if g.map.contains_key(&key) {
+            return false;
+        }
+        g.map.insert(key.clone(), value);
+        g.order.push_back(key);
+        while g.order.len() > MAX_PENDING_CONTEXTS {
+            if let Some(oldest) = g.order.pop_front() {
+                g.map.remove(&oldest);
+            }
+        }
+        true
+    }
 }
 
 /// Builder for [`LocalSessionOrchestrator`] — exposed so the daemon
@@ -392,6 +429,10 @@ pub struct Builder {
     calendar: Option<Arc<dyn CalendarReader>>,
     cache_dir: PathBuf,
     stt_backend_name: String,
+    /// Initial value for [`LocalSessionOrchestrator::hotwords`]. The
+    /// desktop / daemon boot path calls
+    /// [`Builder::hotwords`] to seed this from `Settings::hotwords`.
+    hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
     file_naming_pattern: FileNamingPattern,
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
@@ -407,6 +448,7 @@ impl std::fmt::Debug for Builder {
             .field("calendar", &"<Arc<dyn CalendarReader>>")
             .field("cache_dir", &self.cache_dir)
             .field("stt_backend_name", &self.stt_backend_name)
+            .field("hotwords", &self.hotwords)
             .field("llm_preference", &self.llm_preference)
             .field("file_naming_pattern", &self.file_naming_pattern)
             .field(
@@ -430,6 +472,7 @@ impl Default for Builder {
             calendar: None,
             cache_dir: default_cache_dir(),
             stt_backend_name: "sherpa".to_owned(),
+            hotwords: Vec::new(),
             llm_preference: heron_llm::Preference::Auto,
             file_naming_pattern: FileNamingPattern::Id,
             live_session_factory: None,
@@ -517,6 +560,17 @@ impl Builder {
         self
     }
 
+    /// Tier 4 #17: forward a vocabulary-boost list to the WhisperKit
+    /// backend at `start_capture` time. Mirrors how
+    /// [`stt_backend_name`](Self::stt_backend_name) flows through to
+    /// `CliSessionConfig`. Defaults to the empty vec, which preserves
+    /// pre-Tier-4 decoder behaviour byte-for-byte. The desktop /
+    /// `herond` shell calls this with `Settings::hotwords` at boot.
+    pub fn hotwords(mut self, hotwords: Vec<String>) -> Self {
+        self.hotwords = hotwords;
+        self
+    }
+
     /// Install a [`LiveSessionFactory`] that `start_capture` invokes
     /// to compose the v2 four-layer stack alongside the v1 vault
     /// pipeline. Without this, `start_capture` only runs the v1
@@ -571,6 +625,7 @@ impl Builder {
             calendar,
             cache_dir: self.cache_dir,
             stt_backend_name: self.stt_backend_name,
+            hotwords: self.hotwords,
             llm_preference: self.llm_preference,
             file_naming_pattern: self.file_naming_pattern,
             active_meetings: Mutex::new(HashMap::new()),
@@ -1169,6 +1224,24 @@ fn normalize_calendar_event_id(raw: &str) -> Result<String, SessionError> {
     Ok(trimmed.to_owned())
 }
 
+/// Serialize-then-size-check the context body. Shared by
+/// `attach_context` and `prepare_context` so the on-disk size
+/// contract is enforced uniformly: a future persistence layer (or
+/// HTTP echo) observes the same byte boundary, and a non-serializable
+/// payload bails before mutating any state. Returns the serialized
+/// length so the caller can stamp it on the trace event.
+fn validate_context_size(context: &PreMeetingContext) -> Result<usize, SessionError> {
+    let serialized = serde_json::to_vec(context).map_err(|e| SessionError::Validation {
+        detail: format!("context serialization failed: {e}"),
+    })?;
+    if serialized.len() > MAX_PRE_MEETING_CONTEXT_BYTES {
+        return Err(SessionError::Validation {
+            detail: format!("context payload exceeds {MAX_PRE_MEETING_CONTEXT_BYTES} bytes"),
+        });
+    }
+    Ok(serialized.len())
+}
+
 /// `Down` plus a "not yet wired" message — the honest answer for a
 /// substrate-only orchestrator. Deliberately not `PermissionMissing`
 /// (which would suggest a TCC permission gap and route consumers
@@ -1373,6 +1446,20 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     cache_dir: self.cache_dir.clone(),
                     vault_root,
                     stt_backend_name: self.stt_backend_name.clone(),
+                    // Tier 4 #17: forward the user-configured
+                    // vocabulary-boost list to the WhisperKit backend.
+                    // Cloned per `start_capture` so each session
+                    // captures a *snapshot* of the orchestrator's
+                    // hotwords at start time. The current orchestrator
+                    // is `&self` and the field is plain
+                    // `Vec<String>`, so there's no concurrent-mutation
+                    // hazard today — but if a future PR adds a
+                    // `Settings.hotwords` live-reload setter (with
+                    // interior mutability via `RwLock` / `Mutex`), the
+                    // snapshot is what keeps in-flight sessions
+                    // pointing at a stable prompt instead of swapping
+                    // mid-decode.
+                    hotwords: self.hotwords.clone(),
                     llm_preference: self.llm_preference,
                     pre_meeting_briefing,
                     // Tier 0b #4: bridge `SpeakerEvent` from the AX
@@ -1386,6 +1473,15 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     // strategy so `pipeline.rs` picks the right
                     // `<vault>/meetings/<filename>.md` shape.
                     file_naming_pattern: self.file_naming_pattern,
+                    // Tier 4 #18 / #21: the daemon orchestrator does
+                    // not currently read the desktop's `Settings.persona`
+                    // / `Settings.strip_names_before_summarization`. The
+                    // desktop's `resummarize.rs` threads them in for the
+                    // re-summarize path; live capture inherits the
+                    // pre-Tier-4 prompt path until the daemon grows a
+                    // settings reader.
+                    persona: None,
+                    strip_names: false,
                 };
                 let handle = tokio::task::spawn_blocking(move || {
                     // CoreAudio/cpal handles in the capture path are
@@ -1726,7 +1822,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         let events = raw
             .into_iter()
             .take(cap)
-            .map(|ev| CalendarEvent {
+            .map(|ev| {
                 // EventKit doesn't yet expose a stable per-event id
                 // through the Swift bridge; until it does, synthesize
                 // a deterministic id from `(start, end, title)` so a
@@ -1734,28 +1830,33 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 // titles are SHA-collision-resistant — `format!` of
                 // the raw f64 bits + full title string is enough at
                 // this scope; collision-free across realistic vaults.
-                id: format!(
+                let id = format!(
                     "synth_{}_{}_{}",
                     ev.start.to_bits(),
                     ev.end.to_bits(),
                     ev.title
-                ),
-                title: ev.title,
-                start: epoch_seconds_to_utc(ev.start),
-                end: epoch_seconds_to_utc(ev.end),
-                attendees: ev
-                    .attendees
-                    .into_iter()
-                    .map(|a| AttendeeContext {
-                        name: a.name,
-                        email: Some(a.email).filter(|s| !s.is_empty()),
-                        last_seen_in: None,
-                        relationship: None,
-                        notes: None,
-                    })
-                    .collect(),
-                meeting_url: None,
-                related_meetings: Vec::new(),
+                );
+                let primed = self.pending_contexts.contains_key(&id);
+                CalendarEvent {
+                    id,
+                    title: ev.title,
+                    start: epoch_seconds_to_utc(ev.start),
+                    end: epoch_seconds_to_utc(ev.end),
+                    attendees: ev
+                        .attendees
+                        .into_iter()
+                        .map(|a| AttendeeContext {
+                            name: a.name,
+                            email: Some(a.email).filter(|s| !s.is_empty()),
+                            last_seen_in: None,
+                            relationship: None,
+                            notes: None,
+                        })
+                        .collect(),
+                    meeting_url: None,
+                    related_meetings: Vec::new(),
+                    primed,
+                }
             })
             .collect();
         Ok(events)
@@ -1763,27 +1864,68 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
 
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
         let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        // Serialize-then-size-check so the cap matches what a future
-        // on-disk persistence layer (or HTTP echo) would observe, and
-        // so a non-serializable payload bails before mutating state.
-        let serialized =
-            serde_json::to_vec(&req.context).map_err(|e| SessionError::Validation {
-                detail: format!("context serialization failed: {e}"),
-            })?;
-        if serialized.len() > MAX_PRE_MEETING_CONTEXT_BYTES {
-            return Err(SessionError::Validation {
-                detail: format!("context payload exceeds {MAX_PRE_MEETING_CONTEXT_BYTES} bytes"),
-            });
-        }
+        let bytes = validate_context_size(&req.context)?;
         let overwrote = self
             .pending_contexts
             .insert(calendar_event_id.clone(), req.context);
         tracing::info!(
             calendar_event_id = %calendar_event_id,
             overwrote,
-            bytes = serialized.len(),
+            bytes,
             "pre-meeting context attached",
         );
+        Ok(())
+    }
+
+    async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
+        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
+        // Today's synthesizer is intentionally minimal: lift the
+        // calendar event's attendees into `attendees_known` and leave
+        // the rest at default. Related-notes lookup needs vault
+        // search by attendee/title — that lands with the Ask-bar RAG
+        // infrastructure (Tier 6b in the UX redesign doc); until then
+        // the priming is enough to flip the rail's `primed` flag and
+        // give `start_capture` a non-empty staged entry to consume.
+        //
+        // Known limitation — synth-id drift: when the upstream
+        // calendar reader synthesizes ids from `(start, end, title)`
+        // (today's behavior, see `list_upcoming_calendar`), editing
+        // the event's title or time changes the id. The previously-
+        // staged context becomes orphaned in `pending_contexts` and a
+        // fresh `prepare_context` runs against the new id. The orphan
+        // ages out via the FIFO cap. Worth pruning explicitly once
+        // EventKit exposes a stable id.
+        let context = PreMeetingContext {
+            attendees_known: req.attendees,
+            ..PreMeetingContext::default()
+        };
+        // Re-use the same size guard as `attach_context` even though
+        // today's synthesized context is tiny — keeps the on-disk
+        // contract uniform and means a future synthesizer that grows
+        // the body fails loudly here rather than silently busting the
+        // cap.
+        let bytes = validate_context_size(&context)?;
+        // `insert_if_absent` is a single-mutex-acquisition check +
+        // insert: a concurrent `attach_context` for the same id
+        // racing this prepare cannot land between the existence
+        // probe and the insert (which would silently clobber the
+        // user's manual context). Prepare losers leave the prior
+        // entry untouched.
+        let inserted = self
+            .pending_contexts
+            .insert_if_absent(calendar_event_id.clone(), context);
+        if inserted {
+            tracing::info!(
+                calendar_event_id = %calendar_event_id,
+                bytes,
+                "pre-meeting context auto-prepared",
+            );
+        } else {
+            tracing::debug!(
+                calendar_event_id = %calendar_event_id,
+                "prepare_context: entry already staged, leaving as-is",
+            );
+        }
         Ok(())
     }
 
@@ -3022,6 +3164,164 @@ mod tests {
             matches!(err, SessionError::Validation { .. }),
             "expected Validation, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_context_stages_default_with_attendees_known() {
+        // The auto-prime path lifts the calendar event's attendees
+        // into `attendees_known` and leaves the rest of
+        // `PreMeetingContext` at default. The rail uses this to flip
+        // the `primed` indicator without forcing the user to supply
+        // anything extra.
+        let orch = LocalSessionOrchestrator::new();
+        orch.prepare_context(heron_session::PrepareContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            attendees: vec![heron_session::AttendeeContext {
+                name: "Alex Chen".into(),
+                email: Some("alex@example.com".into()),
+                last_seen_in: None,
+                relationship: None,
+                notes: None,
+            }],
+        })
+        .await
+        .expect("prepare");
+        let staged = orch.pending_context("evt_alpha").expect("staged");
+        assert_eq!(staged.attendees_known.len(), 1);
+        assert_eq!(staged.attendees_known[0].name, "Alex Chen");
+        assert!(staged.agenda.is_none());
+        assert!(staged.related_notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_context_is_idempotent_and_does_not_clobber_attach_context() {
+        // The rail re-fans `prepare_context` on every `ensureFresh`,
+        // so a richer context the user already attached manually MUST
+        // survive subsequent prepare calls. The orchestrator skips
+        // the synthesizer when an entry already exists.
+        let orch = LocalSessionOrchestrator::new();
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("rich agenda from user"),
+        })
+        .await
+        .expect("attach");
+        orch.prepare_context(heron_session::PrepareContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            attendees: vec![heron_session::AttendeeContext {
+                name: "Alex Chen".into(),
+                email: None,
+                last_seen_in: None,
+                relationship: None,
+                notes: None,
+            }],
+        })
+        .await
+        .expect("prepare must succeed but skip");
+        let staged = orch.pending_context("evt_alpha").expect("staged");
+        assert_eq!(staged.agenda.as_deref(), Some("rich agenda from user"));
+        assert!(
+            staged.attendees_known.is_empty(),
+            "manual attach had no attendees_known; prepare must not have overwritten it",
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_context_under_concurrent_attach_does_not_clobber() {
+        // The rail fans `prepare_context` out in parallel after every
+        // calendar load; meanwhile the user can click "Start with
+        // context" and trigger an `attach_context` for the same id.
+        // `PendingContexts::insert_if_absent` must hold the lock
+        // across the existence probe and the insert so prepare losers
+        // never overwrite a manual attach. Spam both calls in
+        // parallel — at least one of the prepares lands either before
+        // attach (legal: attach overwrites) or after (legal: prepare
+        // is no-op). The invariant: when both have settled, the
+        // staged context has the manual-attach agenda.
+        let orch = Arc::new(LocalSessionOrchestrator::new());
+        let attach = {
+            let orch = Arc::clone(&orch);
+            tokio::spawn(async move {
+                orch.attach_context(PreMeetingContextRequest {
+                    calendar_event_id: "evt_race".into(),
+                    context: ctx_with_agenda("manual"),
+                })
+                .await
+            })
+        };
+        let prepares: Vec<_> = (0..16)
+            .map(|_| {
+                let orch = Arc::clone(&orch);
+                tokio::spawn(async move {
+                    orch.prepare_context(heron_session::PrepareContextRequest {
+                        calendar_event_id: "evt_race".into(),
+                        attendees: Vec::new(),
+                    })
+                    .await
+                })
+            })
+            .collect();
+        attach.await.expect("attach join").expect("attach");
+        for j in prepares {
+            j.await.expect("prepare join").expect("prepare");
+        }
+        let staged = orch.pending_context("evt_race").expect("staged");
+        // Manual attach is the always-overwrites caller, so its
+        // agenda must be the final value regardless of interleaving:
+        // - prepare→attach: attach overwrites the synth context.
+        // - attach→prepare: insert_if_absent sees the attach entry
+        //   and skips.
+        assert_eq!(staged.agenda.as_deref(), Some("manual"));
+    }
+
+    #[tokio::test]
+    async fn attach_context_after_prepare_overwrites_with_rich_context() {
+        // Manual attach is always the latest-wins authority — pin
+        // that prepare_context's idempotent skip doesn't accidentally
+        // turn into an attach-context skip too.
+        let orch = LocalSessionOrchestrator::new();
+        orch.prepare_context(heron_session::PrepareContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            attendees: vec![heron_session::AttendeeContext {
+                name: "Alex".into(),
+                email: None,
+                last_seen_in: None,
+                relationship: None,
+                notes: None,
+            }],
+        })
+        .await
+        .expect("prepare");
+        orch.attach_context(PreMeetingContextRequest {
+            calendar_event_id: "evt_alpha".into(),
+            context: ctx_with_agenda("rich"),
+        })
+        .await
+        .expect("attach");
+        let staged = orch.pending_context("evt_alpha").expect("staged");
+        assert_eq!(staged.agenda.as_deref(), Some("rich"));
+        assert!(
+            staged.attendees_known.is_empty(),
+            "rich attach should fully replace the prepare's synth attendees",
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_context_rejects_empty_calendar_event_id() {
+        let orch = LocalSessionOrchestrator::new();
+        for cid in ["", "   "] {
+            let err = orch
+                .prepare_context(heron_session::PrepareContextRequest {
+                    calendar_event_id: cid.into(),
+                    attendees: Vec::new(),
+                })
+                .await
+                .expect_err("empty id must be rejected");
+            assert!(
+                matches!(err, SessionError::Validation { .. }),
+                "expected Validation, got {err:?}",
+            );
+        }
     }
 
     #[tokio::test]

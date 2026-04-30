@@ -21,9 +21,10 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
-    CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, SessionError, SessionEventBus, SessionOrchestrator,
-    SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
+    AudioLevelChannel, AudioLevelData, CalendarEvent, EventPayload, Health, ListMeetingsPage,
+    ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, PrepareContextRequest,
+    SessionError, SessionEventBus, SessionOrchestrator, SpeakerChangedData, StartCaptureArgs,
+    Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
 use herond::{AppState, AuthConfig, build_app};
@@ -180,6 +181,53 @@ async fn stub_orchestrator_endpoints_all_return_501() {
 }
 
 #[tokio::test]
+async fn prepare_context_route_requires_bearer() {
+    // The new `POST /v1/context/prepare` route lives next to
+    // `PUT /v1/context` and inherits the same bearer middleware. Pin
+    // the auth gate so a future router refactor can't accidentally
+    // expose it on the unauthenticated surface.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::post("/v1/context/prepare")
+                .header(header::AUTHORIZATION, "Bearer wrong")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"calendar_event_id":"evt_x","attendees":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn prepare_context_route_reaches_orchestrator() {
+    // Pin the URL/method/auth/extractor wiring end-to-end. The stub
+    // returns `NotYetImplemented` → 501; what we're locking in is
+    // that the route is reachable with valid auth and a valid body
+    // (so the JSON extractor accepts the shape) — not the eventual
+    // 204 success path, which the orchestrator unit tests cover.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::post("/v1/context/prepare")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"calendar_event_id":"evt_route_test","attendees":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = body_json(res).await;
+    assert_eq!(body["code"], "HERON_E_NOT_YET_IMPLEMENTED");
+}
+
+#[tokio::test]
 async fn malformed_meeting_id_in_path_returns_400() {
     // Path<MeetingId> rejects non-`mtg_<uuid>` values with a 400.
     // Pin the rejection so a future change to the path-extractor
@@ -308,6 +356,66 @@ async fn events_emits_speaker_changed_in_sse_framing() {
     assert!(
         body.contains("\"started\":true"),
         "started flag missing from payload: {body}",
+    );
+}
+
+#[tokio::test]
+async fn events_emits_audio_level_in_sse_framing() {
+    // Tier 3 #15 bridge guard: an `audio.level` envelope pushed
+    // through the bus must reach the SSE stream with the documented
+    // wire shape (`event: audio.level`, `data: {…t,channel,peak_dbfs,
+    // rms_dbfs}`). Mirrors `events_emits_speaker_changed_in_sse_framing`
+    // — same projection, different payload — so a future refactor of
+    // the SSE encode that special-cases one variant breaks the other
+    // loudly here.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let meeting_id = MeetingId::now_v7();
+    let envelope = Envelope::new(EventPayload::AudioLevel(AudioLevelData {
+        t: 4.25,
+        channel: AudioLevelChannel::MicClean,
+        peak_dbfs: -3.5,
+        rms_dbfs: -18.0,
+    }))
+    .with_meeting(meeting_id.to_string());
+    let delivered = bus.publish(envelope.clone());
+    assert_eq!(delivered, 1, "subscriber not registered before publish");
+
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+
+    assert!(
+        body.contains(&format!("id: {}", envelope.event_id)),
+        "missing id frame in: {body}",
+    );
+    assert!(
+        body.contains("event: audio.level"),
+        "missing audio.level event-type frame in: {body}",
+    );
+    assert!(
+        body.contains("\"event_type\":\"audio.level\""),
+        "missing event_type field in payload: {body}",
+    );
+    assert!(
+        body.contains("\"channel\":\"mic_clean\""),
+        "channel missing or wrong on wire: {body}",
+    );
+    assert!(
+        body.contains("\"peak_dbfs\":-3.5"),
+        "peak_dbfs missing or wrong on wire: {body}",
     );
 }
 
@@ -762,6 +870,9 @@ impl SessionOrchestrator for WithCache {
     }
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
         self.inner.attach_context(req).await
+    }
+    async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
+        self.inner.prepare_context(req).await
     }
     async fn health(&self) -> Health {
         self.inner.health().await

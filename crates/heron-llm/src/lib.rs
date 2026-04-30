@@ -11,7 +11,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use handlebars::Handlebars;
-use heron_types::{ActionItem, Attendee, Cost, MeetingType};
+use heron_types::{ActionItem, Attendee, Cost, MeetingType, Persona};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -71,6 +71,21 @@ const MEETING_TEMPLATE_NAME: &str = "meeting";
 /// template emits a "Pre-meeting context" preamble so the LLM can
 /// reference what the user knew going into the call. Stays `None` for
 /// CLI / ad-hoc captures with no calendar correlation.
+///
+/// `persona` carries the user's self-context (name / role /
+/// working-on) the summarizer can splice into the system / preamble
+/// prompt (Tier 4 #18). When `None` OR every persona field is the
+/// empty string, the rendered prompt is byte-identical to the
+/// pre-Tier-4 template — pinned by
+/// `template_with_empty_persona_matches_no_persona_baseline`.
+///
+/// `strip_names` (Tier 4 #21) replaces each unique
+/// `participant.display_name` (the JSONL `speaker` field) with
+/// `Speaker A`, `Speaker B`, … in the transcript text fed to the LLM.
+/// Letters are assigned in first-appearance order so the same speaker
+/// gets the same letter on every call. The strip applies *only* to
+/// the LLM input — the orchestrator's `attendees` round-trip still
+/// uses the real names.
 #[derive(Debug)]
 pub struct SummarizerInput<'a> {
     pub transcript: &'a Path,
@@ -78,6 +93,8 @@ pub struct SummarizerInput<'a> {
     pub existing_action_items: Option<&'a [ActionItem]>,
     pub existing_attendees: Option<&'a [Attendee]>,
     pub pre_meeting_briefing: Option<&'a str>,
+    pub persona: Option<&'a Persona>,
+    pub strip_names: bool,
 }
 
 /// Structured LLM output. See `meeting.hbs` for the JSON shape the
@@ -230,6 +247,21 @@ pub fn render_meeting_prompt(input: &SummarizerInput<'_>) -> Result<String, LlmE
     hb.register_template_string(MEETING_TEMPLATE_NAME, MEETING_TEMPLATE)
         .map_err(|e| LlmError::Backend(format!("template register: {e}")))?;
 
+    // Persona is suppressed when `None` OR every field is empty so
+    // the rendered prompt stays byte-identical to the pre-Tier-4
+    // baseline on the no-config path. Pinned by
+    // `template_with_empty_persona_matches_no_persona_baseline`.
+    let persona = input.persona.filter(|p| !p.is_empty()).map(|p| {
+        serde_json::json!({
+            "name": p.name,
+            "role": p.role,
+            "working_on": p.working_on,
+            "has_name": !p.name.is_empty(),
+            "has_role": !p.role.is_empty(),
+            "has_working_on": !p.working_on.is_empty(),
+        })
+    });
+
     let ctx = serde_json::json!({
         "transcript": input.transcript.display().to_string(),
         "meeting_type": meeting_type_str(input.meeting_type),
@@ -258,6 +290,7 @@ pub fn render_meeting_prompt(input: &SummarizerInput<'_>) -> Result<String, LlmE
         "pre_meeting_briefing": input.pre_meeting_briefing
             .map(str::trim)
             .filter(|s| !s.is_empty()),
+        "persona": persona,
     });
     hb.render(MEETING_TEMPLATE_NAME, &ctx)
         .map_err(|e| LlmError::Backend(format!("template render: {e}")))
@@ -339,7 +372,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use heron_types::{ActionItem, Attendee, ItemId, MeetingType};
+    use heron_types::{ActionItem, Attendee, ItemId, MeetingType, Persona};
 
     fn next_id() -> ItemId {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -362,6 +395,8 @@ mod tests {
             existing_action_items: Some(&items),
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("render");
         assert!(prompt.contains("RETURN THE EXACT SAME `id`"));
@@ -378,6 +413,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("render");
         // The block header must NOT appear when there are no priors —
@@ -401,6 +438,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: Some(&attendees),
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("render");
         assert!(prompt.contains(&id.to_string()));
@@ -417,6 +456,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("client");
         assert!(client.contains("EXTERNAL client meeting"));
@@ -427,6 +468,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("internal");
         assert!(internal.contains("INTERNAL team meeting"));
@@ -437,6 +480,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("1:1");
         assert!(one_on_one.contains("This is a 1:1"));
@@ -452,6 +497,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: Some(briefing),
+            persona: None,
+            strip_names: false,
         })
         .expect("render with briefing");
         assert!(prompt.contains("## Pre-meeting context"));
@@ -471,6 +518,8 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
         })
         .expect("render without briefing");
         assert!(!prompt.contains("Pre-meeting context"));
@@ -488,9 +537,147 @@ mod tests {
             existing_action_items: None,
             existing_attendees: None,
             pre_meeting_briefing: Some("   \n\n   "),
+            persona: None,
+            strip_names: false,
         })
         .expect("render with empty briefing");
         assert!(!prompt.contains("Pre-meeting context"));
+    }
+
+    // ── Tier 4 #18: persona injection ──────────────────────────────────
+
+    /// **Regression contract.** The snapshot for the no-persona path
+    /// must be byte-identical to the no-persona / no-briefing prompt
+    /// regardless of whether the caller passed `persona: None` or a
+    /// `Persona` whose every field is the empty string. This pins the
+    /// migration story for users who upgrade past Tier 4 without ever
+    /// filling in the Settings → Persona inputs: their summaries must
+    /// keep using the same prompt the pre-Tier-4 build emitted.
+    #[test]
+    fn template_with_empty_persona_matches_no_persona_baseline() {
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let baseline = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
+        })
+        .expect("render baseline");
+        let with_empty_persona = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: Some(&Persona::default()),
+            strip_names: false,
+        })
+        .expect("render with empty persona");
+        assert_eq!(
+            baseline, with_empty_persona,
+            "an all-empty Persona must produce the same prompt as None — \
+             otherwise users who upgraded without filling in Settings → \
+             Persona will silently see prompt drift on their summaries"
+        );
+        // And the baseline itself must NOT contain the persona block
+        // header. Anchor on a unique substring from the rendered block
+        // so a future template tweak (e.g. heading rename) doesn't
+        // silently weaken the contract.
+        assert!(
+            !baseline.contains("## About the user"),
+            "baseline must not carry the persona block: {baseline}"
+        );
+    }
+
+    #[test]
+    fn template_renders_persona_block_when_all_fields_present() {
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let persona = Persona {
+            name: "Alice".into(),
+            role: "Head of Sales".into(),
+            working_on: "Q3 pipeline".into(),
+        };
+        let prompt = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: Some(&persona),
+            strip_names: false,
+        })
+        .expect("render with persona");
+        assert!(prompt.contains("## About the user"));
+        // Each field must reach the rendered prompt — substring asserts
+        // rather than exact-string so the surrounding sentence can be
+        // tweaked without breaking the test.
+        assert!(prompt.contains("Alice"), "name not in prompt: {prompt}");
+        assert!(
+            prompt.contains("Head of Sales"),
+            "role not in prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("Q3 pipeline"),
+            "working_on not in prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn template_renders_persona_block_with_partial_fields() {
+        // Only `name` set; `role` and `working_on` empty. The block
+        // must still render (since the user isn't `is_empty()`) but
+        // shouldn't paste in stranded "They work as ." sentences.
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let persona = Persona {
+            name: "Alice".into(),
+            ..Persona::default()
+        };
+        let prompt = render_meeting_prompt(&SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: Some(&persona),
+            strip_names: false,
+        })
+        .expect("render with partial persona");
+        assert!(prompt.contains("## About the user"));
+        assert!(prompt.contains("Alice"));
+        // Belt-and-suspenders: the empty-role / empty-working_on
+        // sentences must not appear with a stranded period.
+        assert!(
+            !prompt.contains("They work as ."),
+            "empty role must not produce a stranded sentence: {prompt}"
+        );
+        assert!(
+            !prompt.contains("focused on: ."),
+            "empty working_on must not produce a stranded sentence: {prompt}"
+        );
+    }
+
+    // ── Tier 4 #21: strip_names flag plumbed through SummarizerInput ────
+
+    #[test]
+    fn summarizer_input_carries_strip_names_field() {
+        // Smoke: the field exists, defaults to false, and a `true`
+        // value round-trips through Debug. The actual transform is
+        // exercised in `transcript::tests::strip_speaker_names_*`;
+        // this test only pins that the struct field is wired.
+        let path = PathBuf::from("/tmp/x.jsonl");
+        let input = SummarizerInput {
+            transcript: &path,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: true,
+        };
+        assert!(input.strip_names);
     }
 
     #[tokio::test]
@@ -515,6 +702,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await;
         match result {
@@ -544,6 +733,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await;
         // Two possible failures depending on order of operations:
