@@ -1,31 +1,47 @@
 /**
  * Home / Library — the post-onboarding landing surface.
  *
- * Shows the meetings list pulled from `useMeetingsStore` (which calls
- * `heron_list_meetings` against the in-process daemon). The
- * "Start recording" CTA preserves the existing PR-λ disk-space gate +
- * ConsentGate flow before navigating to /recording.
+ * The redesigned shell renders five bands top-to-bottom:
  *
- * Daemon-down handling: when the meetings list call returns
- * `{ kind: "unavailable" }`, the store flips `daemonDown = true` and
- * the shared `<DaemonDownBanner />` renders the retry UI. Settings
- * and Salvage routes are deliberately layout-mounted so they keep
- * working even when the meetings table is unreachable.
+ *   1. `<HeroBand />` — editorial display copy + activity stats.
+ *   2. `<ComingUpBand />` — featured next event + rest-of-day rows;
+ *      reads `useCalendarStore` and exposes per-row auto-record +
+ *      "Start with context" affordances.
+ *   3. `<SpacesStrip />` — the Spaces tab IA, stub-mocked until the
+ *      sharing backend lands.
+ *   4. Toolbar (search + status filter + tag filter + manual Start
+ *      recording CTA) and the existing `<MeetingsTable />`.
+ *   5. `<HomeFooterNote />` — privacy reminder.
+ *
+ * `<AskBar />` is pinned at the bottom of the route area outside the
+ * scrolling region so it stays visible regardless of how long the
+ * meeting list grows. Cross-vault Ask isn't wired yet — the bar
+ * renders its chrome and toasts a friendly stub on submit.
+ *
+ * The recording-start flow (disk-space gate → ConsentGate →
+ * heron_attach_context → heron_start_capture → navigate) is preserved
+ * verbatim from the previous Home; only the surrounding chrome
+ * changed.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Search } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
+import { AskBar } from "../components/home/ask-bar";
+import { ComingUpBand } from "../components/home/upcoming-meetings";
+import { HeroBand } from "../components/home/hero-band";
+import { HomeFooterNote } from "../components/home/footer-note";
+import { SpacesStrip } from "../components/home/spaces-strip";
 import {
+  filterMeetings,
   MeetingsTable,
   type StatusFilter,
   type TagFilter,
 } from "../components/home/meetings-table";
-import { UpcomingMeetings } from "../components/home/upcoming-meetings";
 import { Button } from "../components/ui/button";
 import {
   DialogContent,
@@ -50,6 +66,7 @@ export default function Home() {
   const startRecording = useRecordingStore((s) => s.start);
   const ensureLoaded = useSettingsStore((s) => s.ensureLoaded);
   const loadMeetings = useMeetingsStore((s) => s.load);
+  const items = useMeetingsStore((s) => s.items);
   const navigate = useNavigate();
 
   const [diskWarning, setDiskWarning] = useState<DiskWarning | null>(null);
@@ -79,29 +96,49 @@ export default function Home() {
   //
   // The discriminator avoids the `"untagged"` magic-string collision
   // with an LLM-emitted tag literally named `"untagged"`.
-  //
-  // Single-select so the chip strip stays a flat segmented-control UX —
-  // a multi-tag picker would need a popover, which is more weight than
-  // this surface needs.
   const [tagFilter, setTagFilter] = useState<TagFilter>({ kind: "all" });
 
   useEffect(() => {
     void loadMeetings();
   }, [loadMeetings]);
 
+  // Calendar-month roll-up for HeroBand stats. Recomputed when the
+  // meetings list changes (or month boundary crosses, but the boundary
+  // case is fine to wait for the next refresh — the user would have
+  // had to leave the app open across midnight on the 1st).
+  const monthStats = useMemo(() => {
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+    const cutoff = startOfMonth.getTime();
+    let count = 0;
+    let secs = 0;
+    for (const m of items) {
+      const ts = Date.parse(m.started_at);
+      if (Number.isFinite(ts) && ts >= cutoff) {
+        count += 1;
+        secs += m.duration_secs ?? 0;
+      }
+    }
+    return { count, hours: secs / 3600 };
+  }, [items]);
+
+  const visibleCount = useMemo(
+    () => filterMeetings(items, search, filter, tagFilter).length,
+    [items, search, filter, tagFilter],
+  );
+
   async function proceedToConsent(calendarEvent: CalendarEvent | null) {
     const decision = await requestConsent();
     if (decision !== "confirmed") {
       return;
     }
-    // Gap #8: when the user clicked "Start with context" on a calendar
-    // row, pre-stage the briefing before `start_capture`. The daemon
-    // keys `pending_contexts` by `calendar_event_id`, so attaching
-    // first means the orchestrator finds the context already in place
-    // when the matching meeting arms. A failure here is non-fatal —
-    // we surface the detail and continue starting the capture without
-    // context, because losing the briefing is strictly better than
-    // losing the recording.
+    // When the user clicked "Start with context" on a calendar row,
+    // pre-stage the briefing before `start_capture`. The daemon keys
+    // `pending_contexts` by `calendar_event_id`, so attaching first
+    // means the orchestrator finds the context already in place when
+    // the matching meeting arms. A failure here is non-fatal — losing
+    // the briefing is strictly better than losing the recording.
     if (calendarEvent !== null) {
       try {
         const ack = await invoke("heron_attach_context", {
@@ -124,12 +161,10 @@ export default function Home() {
         toast.warning(`Context not attached: ${message}`);
       }
     }
-    // Gap #7: ask the daemon to actually start a capture before we
-    // navigate. Pre-PR the button only flipped local recording-store
-    // state; now Start = `POST /v1/meetings`. The platform default is
-    // Zoom — same escape-hatch behaviour as `heron-cli`. When the
-    // start was triggered from a calendar row, infer the platform
-    // from `meeting_url` and pass `calendar_event_id` so the
+    // Ask the daemon to start a capture before navigating. The
+    // platform default is Zoom — same escape-hatch as `heron-cli`.
+    // When the start was triggered from a calendar row, infer the
+    // platform from `meeting_url` and pass `calendar_event_id` so the
     // orchestrator pairs the capture with the context attached above.
     const platform = inferPlatform(calendarEvent?.meeting_url ?? null) ?? "zoom";
     let outcome;
@@ -159,10 +194,6 @@ export default function Home() {
     navigate("/recording");
   }
 
-  // Both the disk-warning Cancel button and the dialog's outer
-  // dismiss must clear the disk warning, the pending calendar event,
-  // AND the in-flight `starting` guard so the next click starts from
-  // a clean slate.
   function dismissDiskWarning() {
     setDiskWarning(null);
     setPendingCalendarEvent(null);
@@ -171,23 +202,10 @@ export default function Home() {
   }
 
   async function onStart(event: CalendarEvent | null = null) {
-    // Synchronous re-entrancy gate. The ref read-and-set happens in a
-    // single tick; a second click in the same tick sees `true` and
-    // exits before any IPC fires.
     if (startingRef.current) return;
     startingRef.current = true;
     setStarting(true);
     let openedDiskWarning = false;
-    // The calendar event is threaded through as a parameter rather
-    // than read back from `pendingCalendarEvent` here. React state
-    // updates scheduled inside an async event handler don't surface
-    // until the next render, so the call site that just did
-    // `setPendingCalendarEvent(evt)` would still see the stale
-    // closure (`null`) when this function reads state. Pending state
-    // is reserved for the disk-warning dialog branch below: the
-    // dialog opens, the user later clicks Continue Anyway in a fresh
-    // render, and `continueAnyway` reads the up-to-date state from
-    // its own (newer) closure.
     try {
       try {
         const settingsPath = await invoke("heron_default_settings_path");
@@ -210,9 +228,6 @@ export default function Home() {
       }
       await proceedToConsent(event);
     } finally {
-      // Hand off to the dialog when the disk-warning branch fired —
-      // `continueAnyway` / `dismissDiskWarning` clear the lock once
-      // the user resolves the dialog.
       if (!openedDiskWarning) {
         startingRef.current = false;
         setStarting(false);
@@ -222,10 +237,6 @@ export default function Home() {
 
   async function continueAnyway() {
     setDiskWarning(null);
-    // `pendingCalendarEvent` was set by the prior `onStart(event)`
-    // call before the dialog opened. By the time the user clicks
-    // Continue Anyway, React has rendered the dialog and this
-    // closure captures the up-to-date state — no staleness.
     const evt = pendingCalendarEvent;
     setPendingCalendarEvent(null);
     try {
@@ -237,9 +248,6 @@ export default function Home() {
   }
 
   async function onStartWithContext(event: CalendarEvent) {
-    // Thread the event through `onStart` as a parameter so the
-    // no-disk-warning happy path doesn't depend on a state update
-    // that won't surface until the next render.
     await onStart(event);
   }
 
@@ -263,76 +271,54 @@ export default function Home() {
 
   return (
     <>
-      <DaemonDownBanner />
-      <main className="mx-auto w-full max-w-5xl px-8 py-10">
-        <header className="mb-8">
-          <p
-            className="font-mono text-xs uppercase tracking-[0.12em]"
-            style={{ color: "var(--color-ink-3)" }}
-          >
-            Library
-          </p>
-          <h1
-            className="mt-1 font-serif text-[32px] leading-tight"
-            style={{ color: "var(--color-ink)", letterSpacing: "-0.02em" }}
-          >
-            Welcome back
-          </h1>
-          <p
-            className="mt-2 max-w-prose text-sm"
-            style={{ color: "var(--color-ink-2)" }}
-          >
-            Start a recording from the tray, ⌘⇧R, or the button below. Past
-            meetings show up here once the daemon finishes summarizing.
-          </p>
-          <div className="mt-4 flex items-center gap-2">
-            <Button onClick={() => void onStart()} disabled={starting}>
-              Start recording
-            </Button>
+      {/*
+        Layout: a full-height flex column whose middle child scrolls
+        and whose AskBar pin sits at the visual bottom. The
+        DaemonDownBanner is a flex sibling rather than a sibling of
+        the column — keeping it outside the column would push the
+        scroll region (and AskBar) below the visible viewport when
+        the banner renders, breaking the pin. `min-h-0` on the
+        scroll region defeats the default `min-height: auto` that
+        flex items inherit; without it the inner content's intrinsic
+        min-height would prevent shrinking and `overflow-auto` would
+        never activate.
+      */}
+      <div className="flex h-full flex-col">
+        <DaemonDownBanner />
+        <div className="min-h-0 flex-1 overflow-auto">
+          <HeroBand
+            meetingsCount={monthStats.count}
+            hoursCaptured={monthStats.hours}
+            audioUploaded={0}
+          />
+          <ComingUpBand
+            onStartWithContext={(evt) => void onStartWithContext(evt)}
+            disabled={starting}
+          />
+          <SpacesStrip />
+          <Toolbar
+            search={search}
+            setSearch={setSearch}
+            filter={filter}
+            setFilter={setFilter}
+            tagFilter={tagFilter}
+            setTagFilter={setTagFilter}
+            visibleCount={visibleCount}
+            starting={starting}
+            onStart={() => void onStart()}
+          />
+          <div className="px-14 pb-6">
+            <MeetingsTable
+              query={search}
+              filter={filter}
+              tagFilter={tagFilter}
+              onTagClick={(tag) => setTagFilter({ kind: "tag", value: tag })}
+            />
           </div>
-        </header>
-
-        <UpcomingMeetings
-          onStartWithContext={(evt) => void onStartWithContext(evt)}
-          disabled={starting}
-        />
-
-        <div className="mb-4 flex flex-wrap items-center gap-3">
-          <label
-            className="relative flex flex-1 min-w-[240px] items-center"
-            style={{ color: "var(--color-ink-3)" }}
-          >
-            <span className="sr-only">Search meetings</span>
-            <Search
-              size={14}
-              aria-hidden="true"
-              className="pointer-events-none absolute left-3"
-            />
-            <input
-              type="text"
-              aria-label="Search meetings"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search title, platform, or attendee"
-              className="w-full rounded border py-2 pl-9 pr-3 text-sm outline-none transition-shadow focus:shadow-[0_0_0_3px_var(--color-accent-soft)]"
-              style={{
-                background: "var(--color-paper)",
-                borderColor: "var(--color-rule-2)",
-                color: "var(--color-ink)",
-              }}
-            />
-          </label>
-          <FilterChips value={filter} onChange={setFilter} />
-          <TagFilterChips value={tagFilter} onChange={setTagFilter} />
+          <HomeFooterNote />
         </div>
-
-        <MeetingsTable
-          query={search}
-          filter={filter}
-          tagFilter={tagFilter}
-          onTagClick={(tag) => setTagFilter({ kind: "tag", value: tag })}
-        />
-      </main>
+        <AskBar />
+      </div>
 
       <Dialog.Root
         open={diskWarning !== null}
@@ -365,6 +351,85 @@ export default function Home() {
         </DialogContent>
       </Dialog.Root>
     </>
+  );
+}
+
+/**
+ * Toolbar row above the meetings table — search input, status filter,
+ * tag filter, row-count meta, and the manual "Start recording" CTA.
+ *
+ * The Start button lives here (rather than the hero) so it's always
+ * adjacent to the meetings list — the empty-state copy in
+ * `MeetingsTable` literally references "the button above," and that
+ * affordance has to remain reachable when the calendar rail is empty
+ * (no `<ComingUpBand />` Record-now button to fall back on).
+ */
+function Toolbar({
+  search,
+  setSearch,
+  filter,
+  setFilter,
+  tagFilter,
+  setTagFilter,
+  visibleCount,
+  starting,
+  onStart,
+}: {
+  search: string;
+  setSearch: (value: string) => void;
+  filter: StatusFilter;
+  setFilter: (value: StatusFilter) => void;
+  tagFilter: TagFilter;
+  setTagFilter: (value: TagFilter) => void;
+  visibleCount: number;
+  starting: boolean;
+  onStart: () => void;
+}) {
+  return (
+    <div
+      className="flex flex-wrap items-center gap-3 border-b px-14 py-3.5"
+      style={{
+        background: "var(--color-paper-2)",
+        borderColor: "var(--color-rule)",
+      }}
+    >
+      <label
+        className="relative flex flex-1 min-w-[240px] items-center"
+        style={{ color: "var(--color-ink-3)" }}
+      >
+        <span className="sr-only">Search meetings</span>
+        <Search
+          size={13}
+          aria-hidden="true"
+          className="pointer-events-none absolute left-3"
+        />
+        <input
+          type="text"
+          aria-label="Search meetings"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search transcripts, summaries, people…"
+          className="w-full rounded border py-1.5 pl-8 pr-3 text-[13px] outline-none transition-shadow focus:shadow-[0_0_0_3px_var(--color-accent-soft)]"
+          style={{
+            background: "var(--color-paper)",
+            borderColor: "var(--color-rule-2)",
+            color: "var(--color-ink)",
+          }}
+        />
+      </label>
+      <FilterChips value={filter} onChange={setFilter} />
+      <TagFilterChips value={tagFilter} onChange={setTagFilter} />
+      <span
+        className="font-mono text-[11px]"
+        style={{ color: "var(--color-ink-3)" }}
+      >
+        {visibleCount} {visibleCount === 1 ? "meeting" : "meetings"} · sorted by
+        date
+      </span>
+      <Button onClick={onStart} disabled={starting} size="sm">
+        Start recording
+      </Button>
+    </div>
   );
 }
 
@@ -450,13 +515,10 @@ function FilterChips({
  * Two affordances:
  *
  *   1. The `All` / `Untagged` segmented pair toggles between "no tag
- *      constraint" and "only meetings with empty `tags`". Clicking
- *      `All` from any specific-tag state also clears down to `null`.
+ *      constraint" and "only meetings with empty `tags`".
  *   2. A trailing pill appears when the user has filtered to a
- *      specific tag (via clicking a row chip — Home doesn't surface
- *      the full tag enumeration, since the LLM emits a long-tail
- *      vocabulary and a faceted picker would need product work). The
- *      pill shows `#tag ×` and clearing it returns to `All`.
+ *      specific tag (via clicking a row chip). The pill shows
+ *      `#tag ×` and clearing it returns to `All`.
  *
  * Same segmented-control geometry as `FilterChips` so the two strips
  * read as a unified filter bar.
@@ -472,8 +534,6 @@ function TagFilterChips({
     { id: "all", label: "All tags" },
     { id: "untagged", label: "Untagged" },
   ];
-  // The "active" state for the segmented pair: a specific-tag value
-  // doesn't light either button — only the trailing pill below.
   const segmentValue: "all" | "untagged" | null =
     value.kind === "tag" ? null : value.kind;
   return (

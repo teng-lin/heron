@@ -7,6 +7,10 @@
 
 import { useState } from "react";
 
+import { AskBar } from "../components/home/ask-bar";
+import { HeroBand } from "../components/home/hero-band";
+import { HomeFooterNote } from "../components/home/footer-note";
+import { SpacesStrip } from "../components/home/spaces-strip";
 import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
 import { HeronMark } from "../components/ui/heron-mark";
@@ -193,6 +197,38 @@ export default function Styleguide() {
           ].map((tok) => (
             <Swatch key={tok} token={tok} />
           ))}
+        </div>
+      </Section>
+
+      <Section title="Home — composition">
+        <p className="mb-4 text-xs" style={{ color: "var(--color-ink-3)" }}>
+          The atoms below stack as the new Home page does. ComingUpBand is
+          omitted here because it reads the live calendar store; preview it
+          on /home with mock data.
+        </p>
+        <div
+          className="overflow-hidden rounded border"
+          style={{ borderColor: "var(--color-rule)" }}
+        >
+          <HeroBand
+            meetingsCount={47}
+            hoursCaptured={38.2}
+            audioUploaded={0}
+          />
+          <SpacesStrip />
+          <div
+            className="px-14 py-10 text-center"
+            style={{
+              background: "var(--color-paper)",
+              color: "var(--color-ink-3)",
+            }}
+          >
+            <p className="font-mono text-[10.5px] uppercase tracking-[0.12em]">
+              [ meetings table renders here on /home ]
+            </p>
+          </div>
+          <HomeFooterNote />
+          <AskBar />
         </div>
       </Section>
     </main>
