@@ -35,7 +35,6 @@ pub mod tray;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -789,27 +788,39 @@ pub fn run() {
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
+            // Tier 4 #23: read the user's Settings → Recording →
+            // "Auto-detect meeting apps" toggle once at boot and push
+            // it into the orchestrator's builder. Runtime toggles from
+            // the Settings pane re-write the same field; future work
+            // adds a settings-change subscriber that re-applies the
+            // value without an app restart. Defaults to `true` on any
+            // settings-read failure so the pre-Tier-4 behavior is
+            // preserved for users without a settings.json yet.
+            let auto_detect_meeting_app = read_settings(&default_settings_path())
+                .map(|s| s.auto_detect_meeting_app)
+                .unwrap_or(true);
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
-                let orchestrator = match vault_root {
-                    Some(root) => {
-                        tracing::info!(
-                            vault_root = %root.display(),
-                            "in-process orchestrator: read-side wired against vault",
-                        );
-                        Arc::new(LocalSessionOrchestrator::with_vault(root))
-                    }
-                    None => {
-                        // Sandboxed test runner / no home dir.
-                        // Substrate-only — every read endpoint will
-                        // return NotYetImplemented, which is the
-                        // honest answer until a vault is configured.
-                        tracing::warn!(
-                            "no vault root resolvable; in-process orchestrator runs substrate-only",
-                        );
-                        Arc::new(LocalSessionOrchestrator::new())
-                    }
-                };
+                let mut builder = heron_orchestrator::Builder::default()
+                    .auto_detect_meeting_app(auto_detect_meeting_app);
+                if let Some(root) = vault_root {
+                    tracing::info!(
+                        vault_root = %root.display(),
+                        auto_detect_meeting_app,
+                        "in-process orchestrator: read-side wired against vault",
+                    );
+                    builder = builder.vault_root(root);
+                } else {
+                    // Sandboxed test runner / no home dir.
+                    // Substrate-only — every read endpoint will
+                    // return NotYetImplemented, which is the
+                    // honest answer until a vault is configured.
+                    tracing::warn!(
+                        auto_detect_meeting_app,
+                        "no vault root resolvable; in-process orchestrator runs substrate-only",
+                    );
+                }
+                let orchestrator = Arc::new(builder.build());
                 event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
                 daemon::install(&app_handle, orchestrator).await?;
                 // UI revamp PR 4: install the SSE bridge state slot.

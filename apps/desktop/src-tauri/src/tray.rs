@@ -294,6 +294,16 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
 /// a shared FSM in Tauri app-state, the body of this loop swaps to a
 /// `State::<RecordingFsm>` lookup with no caller change. Until then
 /// the tray sticks on `Idle` after the initial paint.
+///
+/// **Tier 4 #22 (this PR).** The visual the loop applies is masked by
+/// [`gate_visual_with_indicator`] against the user's
+/// `Settings.show_tray_indicator` toggle. When the user has disabled
+/// the indicator, every non-`Idle` visual collapses to `Idle` so the
+/// menubar pill never lights up — neither during recording nor during
+/// transcribing/summarizing/error. The masked visual still feeds the
+/// `last_visual` diff so a flip back to `true` repaints promptly on
+/// the next tick. Default `true` (set by [`Settings::default`])
+/// preserves the pre-Tier-4 behaviour for every existing user.
 fn spawn_status_poll<R: Runtime>(tray: TrayIcon<R>) {
     tauri::async_runtime::spawn(async move {
         let mut tick = interval(Duration::from_secs(1));
@@ -301,7 +311,17 @@ fn spawn_status_poll<R: Runtime>(tray: TrayIcon<R>) {
         loop {
             tick.tick().await;
             let fsm = heron_types::RecordingFsm::new();
-            let visual = TrayVisual::from_state(fsm.state());
+            let raw = TrayVisual::from_state(fsm.state());
+            // Best-effort read: a missing / corrupt settings.json
+            // collapses to `true` (the default), which preserves the
+            // current behavior. We deliberately re-read on every tick
+            // rather than caching: the user can flip the toggle from
+            // Settings → Recording at any time and the tray must
+            // honour the change without an app restart. The cost is a
+            // single ~hundred-byte JSON parse per second, well below
+            // the 1 s polling cadence's noise floor.
+            let show = read_show_tray_indicator(&crate::default_settings_path());
+            let visual = gate_visual_with_indicator(raw, show);
             if Some(visual) == last_visual {
                 continue;
             }
@@ -309,6 +329,41 @@ fn spawn_status_poll<R: Runtime>(tray: TrayIcon<R>) {
             apply_visual(&tray, visual);
         }
     });
+}
+
+/// Tier 4 #22: read `Settings.show_tray_indicator` from `settings_path`,
+/// defaulting to `true` on any failure (missing file, parse error, IO
+/// error). Returning `true` on error preserves the pre-Tier-4 behaviour
+/// — the tray pill renders unless the user has explicitly opted out.
+///
+/// Pulled out of [`spawn_status_poll`] so the unit test can pin the
+/// "missing file → true" and "explicit false → false" branches without
+/// spinning up a Tauri runtime.
+pub(crate) fn read_show_tray_indicator(settings_path: &std::path::Path) -> bool {
+    crate::read_settings(settings_path)
+        .map(|s| s.show_tray_indicator)
+        .unwrap_or(true)
+}
+
+/// Tier 4 #22: collapse non-idle visuals to `Idle` when the user has
+/// disabled the menubar REC pill. Idle stays Idle in every case — the
+/// tray icon itself remains visible (so the dropdown menu's "Open last
+/// note…" / "Settings…" / "Quit" affordances stay reachable); only the
+/// "we are doing something" colourings are suppressed.
+///
+/// Pulled out as a pure function so the unit tests can exhaustively
+/// pin the truth table without instantiating a `TrayIcon`.
+fn gate_visual_with_indicator(visual: TrayVisual, show_indicator: bool) -> TrayVisual {
+    if show_indicator {
+        return visual;
+    }
+    match visual {
+        TrayVisual::Idle => TrayVisual::Idle,
+        TrayVisual::Recording
+        | TrayVisual::Transcribing
+        | TrayVisual::Summarizing
+        | TrayVisual::Error => TrayVisual::Idle,
+    }
 }
 
 /// Push a `TrayVisual` to the live tray icon. Logs (without panicking)
@@ -682,6 +737,14 @@ fn flip_tray_to_error<R: Runtime>(app: &AppHandle<R>, payload: &DegradedPayload)
         // fires regardless.
         return;
     };
+    // Tier 4 #22: honour the user's `show_tray_indicator` toggle on
+    // the manual-fire degraded path too. The Sonner toast still
+    // surfaces upstream — flipping the menubar to red is the
+    // affordance the user opted out of, not the diagnostics
+    // notification itself.
+    if !read_show_tray_indicator(&crate::default_settings_path()) {
+        return;
+    }
     match Image::from_bytes(TrayVisual::Error.icon_bytes()) {
         Ok(image) => {
             if let Err(err) = tray.set_icon(Some(image)) {
@@ -949,6 +1012,94 @@ mod tests {
             .expect("call")
             .expect("should pick");
         assert_eq!(out, "foo.bar");
+    }
+
+    /// Tier 4 #22: the indicator gate masks every active visual to
+    /// `Idle` when the user has disabled the menubar pill, and is a
+    /// pass-through when the toggle is on (the pre-Tier-4 default).
+    #[test]
+    fn gate_visual_with_indicator_passes_through_when_enabled() {
+        for visual in [
+            TrayVisual::Idle,
+            TrayVisual::Recording,
+            TrayVisual::Transcribing,
+            TrayVisual::Summarizing,
+            TrayVisual::Error,
+        ] {
+            assert_eq!(
+                gate_visual_with_indicator(visual, true),
+                visual,
+                "show=true must be a pass-through for {visual:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn gate_visual_with_indicator_collapses_active_visuals_to_idle_when_disabled() {
+        // Idle stays Idle (the tray icon itself stays visible — only
+        // the recording/transcribing/summarizing/error colourings are
+        // suppressed by the toggle).
+        assert_eq!(
+            gate_visual_with_indicator(TrayVisual::Idle, false),
+            TrayVisual::Idle,
+        );
+        // Every active visual collapses so the tray pill never lights
+        // up while the user has the indicator disabled.
+        for visual in [
+            TrayVisual::Recording,
+            TrayVisual::Transcribing,
+            TrayVisual::Summarizing,
+            TrayVisual::Error,
+        ] {
+            assert_eq!(
+                gate_visual_with_indicator(visual, false),
+                TrayVisual::Idle,
+                "{visual:?} must collapse to Idle when show=false",
+            );
+        }
+    }
+
+    #[test]
+    fn read_show_tray_indicator_defaults_true_when_settings_missing() {
+        // First-run / sandboxed runner: settings.json doesn't exist,
+        // and the gate must collapse to "show". Anything else would
+        // silently hide the menubar pill for every user the moment a
+        // settings read fails.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("never-existed.json");
+        assert!(read_show_tray_indicator(&path));
+    }
+
+    #[test]
+    fn read_show_tray_indicator_returns_persisted_false() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        let custom = crate::Settings {
+            show_tray_indicator: false,
+            ..Default::default()
+        };
+        crate::write_settings(&path, &custom).expect("seed");
+        assert!(!read_show_tray_indicator(&path));
+    }
+
+    #[test]
+    fn read_show_tray_indicator_returns_persisted_true() {
+        // Belt-and-suspenders: a settings.json with the default `true`
+        // still round-trips correctly through the gate.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        crate::write_settings(&path, &crate::Settings::default()).expect("seed");
+        assert!(read_show_tray_indicator(&path));
+    }
+
+    #[test]
+    fn read_show_tray_indicator_defaults_true_on_parse_error() {
+        // A truncated / hand-edited file that fails to parse must not
+        // hide the user's pill silently — collapse to the default.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{not valid json").expect("seed");
+        assert!(read_show_tray_indicator(&path));
     }
 
     #[test]
