@@ -21,9 +21,10 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
-    CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
-    SessionOrchestrator, SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
+    AudioLevelChannel, AudioLevelData, CalendarEvent, EventPayload, Health, ListMeetingsPage,
+    ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, PrepareContextRequest,
+    SessionError, SessionEventBus, SessionOrchestrator, SpeakerChangedData, StartCaptureArgs,
+    Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
 use herond::{AppState, AuthConfig, build_app};
@@ -355,6 +356,66 @@ async fn events_emits_speaker_changed_in_sse_framing() {
     assert!(
         body.contains("\"started\":true"),
         "started flag missing from payload: {body}",
+    );
+}
+
+#[tokio::test]
+async fn events_emits_audio_level_in_sse_framing() {
+    // Tier 3 #15 bridge guard: an `audio.level` envelope pushed
+    // through the bus must reach the SSE stream with the documented
+    // wire shape (`event: audio.level`, `data: {…t,channel,peak_dbfs,
+    // rms_dbfs}`). Mirrors `events_emits_speaker_changed_in_sse_framing`
+    // — same projection, different payload — so a future refactor of
+    // the SSE encode that special-cases one variant breaks the other
+    // loudly here.
+    let stub = Arc::new(StubOrchestrator::new());
+    let bus: SessionEventBus = stub.event_bus();
+    let app = build_app(test_state(stub.clone()));
+
+    let req = Request::get("/v1/events")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+        .body(Body::empty())
+        .unwrap();
+    let response_fut = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    wait_for_subscriber(&bus).await;
+
+    let meeting_id = MeetingId::now_v7();
+    let envelope = Envelope::new(EventPayload::AudioLevel(AudioLevelData {
+        t: 4.25,
+        channel: AudioLevelChannel::MicClean,
+        peak_dbfs: -3.5,
+        rms_dbfs: -18.0,
+    }))
+    .with_meeting(meeting_id.to_string());
+    let delivered = bus.publish(envelope.clone());
+    assert_eq!(delivered, 1, "subscriber not registered before publish");
+
+    drop(bus);
+    drop(stub);
+
+    let response = response_fut.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = collect_body_to_string(response).await;
+
+    assert!(
+        body.contains(&format!("id: {}", envelope.event_id)),
+        "missing id frame in: {body}",
+    );
+    assert!(
+        body.contains("event: audio.level"),
+        "missing audio.level event-type frame in: {body}",
+    );
+    assert!(
+        body.contains("\"event_type\":\"audio.level\""),
+        "missing event_type field in payload: {body}",
+    );
+    assert!(
+        body.contains("\"channel\":\"mic_clean\""),
+        "channel missing or wrong on wire: {body}",
+    );
+    assert!(
+        body.contains("\"peak_dbfs\":-3.5"),
+        "peak_dbfs missing or wrong on wire: {body}",
     );
 }
 

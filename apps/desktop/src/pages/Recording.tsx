@@ -273,8 +273,10 @@ export default function Recording() {
 
 function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {
   if (segments.length === 0) {
-    // TODO: replace with real dBFS waveform once the daemon emits
-    // an `AudioLevel` SSE event (Tier 3 #15 in the backend prereq doc).
+    // TODO: replace with the real dBFS waveform now that the daemon
+    // emits `audio.level` envelopes (Tier 3 #15 — the backend ships
+    // the data via `useAudioLevelStore`; the renderer pass is a
+    // pure-UI follow-up).
     return (
       <div
         className="rounded border px-6 py-12 text-center"

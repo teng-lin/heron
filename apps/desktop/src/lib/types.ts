@@ -341,6 +341,22 @@ export interface SpeakerChangedData {
   started: boolean;
 }
 
+/**
+ * Mirrors `AudioLevelData` in `crates/heron-session/src/lib.rs`
+ * (Tier 3 #15). dBFS values are floored at -100.
+ *
+ * Last-value-sticks: a tick window with no incoming frames publishes
+ * no envelope, so the renderer should keep showing the prior reading
+ * until the next non-silent window. Don't reset the meter on a tick
+ * boundary just because the latest envelope hasn't arrived yet.
+ */
+export interface AudioLevelData {
+  t: number;
+  channel: "mic_clean" | "tap";
+  peak_dbfs: number;
+  rms_dbfs: number;
+}
+
 /** Mirrors `crates/heron-session/src/lib.rs:448`. */
 export interface DoctorWarningData {
   component: string;
@@ -373,6 +389,7 @@ export type EventPayload =
   | { event_type: "summary.ready"; data: Summary }
   | { event_type: "action_items.ready"; data: ActionItemsReadyData }
   | { event_type: "speaker.changed"; data: SpeakerChangedData }
+  | { event_type: "audio.level"; data: AudioLevelData }
   | { event_type: "doctor.warning"; data: DoctorWarningData }
   | { event_type: "daemon.error"; data: DaemonErrorData };
 
