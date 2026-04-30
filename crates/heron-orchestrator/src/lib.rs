@@ -99,7 +99,8 @@ use heron_types::{RecordingFsm, SummaryOutcome};
 
 use crate::live_session::{DynLiveSession, LiveSessionFactory, LiveSessionStartArgs};
 use heron_vault::{
-    CalendarReader, EventKitCalendarReader, VaultError, epoch_seconds_to_utc, read_note,
+    CalendarReader, EventKitCalendarReader, FileNamingPattern, VaultError, epoch_seconds_to_utc,
+    read_note,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
@@ -202,6 +203,16 @@ pub struct LocalSessionOrchestrator {
     /// the Settings pane doesn't mutate an in-flight session's prompt.
     hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
+    /// Tier 4 #19: vault-writer slug strategy forwarded to every
+    /// `CliSessionConfig` this orchestrator hands to the v1 pipeline.
+    /// Read once from `Settings::file_naming_pattern` at orchestrator
+    /// construction, mirroring the existing `stt_backend_name` /
+    /// `llm_preference` cadence — runtime changes via the Settings
+    /// pane only land on the next app launch. Default
+    /// [`FileNamingPattern::Id`] preserves the legacy
+    /// `<date>-<hhmm> <slug>.md` template (heron-cli's pre-Tier-4
+    /// behavior on `Id`).
+    file_naming_pattern: FileNamingPattern,
     /// In-flight captures keyed by `MeetingId`. Each entry pairs the
     /// last-published `Meeting` snapshot with the [`RecordingFsm`]
     /// driving its lifecycle. Held under a sync `Mutex` (no `.await`
@@ -444,6 +455,7 @@ pub struct Builder {
     /// [`Builder::hotwords`] to seed this from `Settings::hotwords`.
     hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
+    file_naming_pattern: FileNamingPattern,
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
     /// Tier 4 #23: gate for any future meeting-app detector loop that
     /// would auto-arm a recording without an explicit user gesture.
@@ -467,6 +479,7 @@ impl std::fmt::Debug for Builder {
             .field("stt_backend_name", &self.stt_backend_name)
             .field("hotwords", &self.hotwords)
             .field("llm_preference", &self.llm_preference)
+            .field("file_naming_pattern", &self.file_naming_pattern)
             .field(
                 "live_session_factory",
                 &self
@@ -491,6 +504,7 @@ impl Default for Builder {
             stt_backend_name: "sherpa".to_owned(),
             hotwords: Vec::new(),
             llm_preference: heron_llm::Preference::Auto,
+            file_naming_pattern: FileNamingPattern::Id,
             live_session_factory: None,
             // Default `true` matches the pre-Tier-4 behavior so an
             // existing detector loop (when one lands) auto-arms by
@@ -567,6 +581,18 @@ impl Builder {
     /// the shared v1 session pipeline. Defaults to `Auto`.
     pub fn llm_preference(mut self, preference: heron_llm::Preference) -> Self {
         self.llm_preference = preference;
+        self
+    }
+
+    /// Tier 4 #19: configure the vault-writer slug strategy forwarded
+    /// to every `CliSessionConfig` this orchestrator builds. Read once
+    /// from `Settings::file_naming_pattern` by the desktop / herond
+    /// boot path. Defaults to [`FileNamingPattern::Id`] — the
+    /// pre-Tier-1 `<date>-<hhmm> <slug>.md` template the CLI produces
+    /// when the field stays at its default — so existing test setups
+    /// that don't call this method see no behavior change.
+    pub fn file_naming_pattern(mut self, pattern: FileNamingPattern) -> Self {
+        self.file_naming_pattern = pattern;
         self
     }
 
@@ -661,6 +687,7 @@ impl Builder {
             stt_backend_name: self.stt_backend_name,
             hotwords: self.hotwords,
             llm_preference: self.llm_preference,
+            file_naming_pattern: self.file_naming_pattern,
             active_meetings: Mutex::new(HashMap::new()),
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
             pending_contexts: PendingContexts::new(),
@@ -1523,6 +1550,10 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     // private channel. Cheap clone — the bus is
                     // `Arc`-backed inside.
                     event_bus: Some((self.bus.clone(), id)),
+                    // Tier 4 #19: forward the orchestrator's slug
+                    // strategy so `pipeline.rs` picks the right
+                    // `<vault>/meetings/<filename>.md` shape.
+                    file_naming_pattern: self.file_naming_pattern,
                     // Tier 4 #18 / #21: the daemon orchestrator does
                     // not currently read the desktop's `Settings.persona`
                     // / `Settings.strip_names_before_summarization`. The
@@ -2112,19 +2143,14 @@ fn list_meetings_impl(
     let mut started_after = after.is_none();
     let mut items = Vec::with_capacity(limit);
     let mut next_cursor: Option<String> = None;
-    let mut last_kept_rel: Option<String> = None;
+    let mut last_kept_cursor: Option<String> = None;
+    let mut listed = Vec::new();
     for path in paths {
         let rel = path
             .strip_prefix(vault_root)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| path.clone());
         let rel_str = rel.to_string_lossy().to_string();
-        if !started_after {
-            if Some(rel_str.as_str()) == after {
-                started_after = true;
-            }
-            continue;
-        }
         let meeting = match meeting_from_note(vault_root, &path) {
             Ok(m) => m,
             Err(e) => {
@@ -2151,14 +2177,37 @@ fn list_meetings_impl(
         {
             continue;
         }
+        listed.push((rel_str, meeting));
+    }
+    // Pattern-based filenames (`slug.md`, `YYYY-MM-DD-slug.md`, or
+    // `<uuid>.md`) are not a reliable chronology. Sort by parsed
+    // frontmatter time first, then by relative path for deterministic
+    // pagination when two notes share the same minute.
+    listed.sort_by(|(a_rel, a), (b_rel, b)| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| b_rel.cmp(a_rel))
+    });
+    for (rel_str, meeting) in listed {
+        let cursor = meeting_list_cursor(&rel_str, &meeting);
+        if !started_after {
+            if Some(cursor.as_str()) == after || Some(rel_str.as_str()) == after {
+                started_after = true;
+            }
+            continue;
+        }
         if items.len() == limit {
-            next_cursor = last_kept_rel.clone();
+            next_cursor = last_kept_cursor.clone();
             break;
         }
         items.push(meeting);
-        last_kept_rel = Some(rel_str);
+        last_kept_cursor = Some(cursor);
     }
     Ok(ListMeetingsPage { items, next_cursor })
+}
+
+fn meeting_list_cursor(rel_path: &str, meeting: &Meeting) -> String {
+    format!("{}|{rel_path}", meeting.started_at.timestamp_millis())
 }
 
 fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionError> {
@@ -2177,8 +2226,8 @@ fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionErr
         })
         .map(|e| e.path())
         .collect();
-    // Note filenames are `YYYY-MM-DD-HHMM <slug>.md` per `docs/archives/plan.md`
-    // §3.2, so a lex-descending sort IS a date-descending sort.
+    // Deterministic input order only. `list_meetings_impl` sorts by
+    // parsed frontmatter time after reading each note.
     entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     Ok(entries)
 }
@@ -2843,6 +2892,25 @@ mod tests {
         // any lingering item before re-asserting.
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(orch.cache_len(), 2, "FIFO eviction should cap at 2");
+    }
+
+    /// Tier 4 #19: `Builder::file_naming_pattern` threads through to
+    /// `LocalSessionOrchestrator::file_naming_pattern`, the field
+    /// `start_capture` reads when assembling each `CliSessionConfig`.
+    /// Without this hand-off the desktop / herond boot path's
+    /// `read_settings(...).file_naming_pattern` value lands nowhere.
+    #[tokio::test]
+    async fn builder_file_naming_pattern_threads_through() {
+        let orch = Builder::default()
+            .file_naming_pattern(FileNamingPattern::DateSlug)
+            .build();
+        assert_eq!(orch.file_naming_pattern, FileNamingPattern::DateSlug);
+
+        // Default stays at `Id` so unrelated tests don't see a behavior
+        // change. Pinned alongside the override path so a later
+        // regression that flips the default falls into this test.
+        let default_orch = LocalSessionOrchestrator::new();
+        assert_eq!(default_orch.file_naming_pattern, FileNamingPattern::Id);
     }
 
     #[tokio::test]

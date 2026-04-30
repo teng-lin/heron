@@ -59,6 +59,37 @@ async fn list_meetings_returns_notes_newest_first() {
 }
 
 #[tokio::test]
+async fn list_meetings_orders_slug_filenames_by_frontmatter_time() {
+    let fix = Fixture::new();
+    let old_date = NaiveDate::from_ymd_opt(2026, 4, 25).unwrap();
+    let new_date = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
+    fix.write_note("z-old", old_date, "10:00", "old");
+    fix.write_note("a-new", new_date, "10:00", "new");
+
+    let meetings_dir = fix.vault_root().join("meetings");
+    std::fs::rename(
+        meetings_dir.join(note_filename(old_date, "10:00", "z-old")),
+        meetings_dir.join("z-old.md"),
+    )
+    .unwrap();
+    std::fs::rename(
+        meetings_dir.join(note_filename(new_date, "10:00", "a-new")),
+        meetings_dir.join("a-new.md"),
+    )
+    .unwrap();
+
+    let page = fix
+        .orch()
+        .list_meetings(ListMeetingsQuery::default())
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].title.as_deref(), Some("new"));
+    assert_eq!(page.items[1].title.as_deref(), Some("old"));
+}
+
+#[tokio::test]
 async fn list_meetings_filters_by_since() {
     let fix = Fixture::new();
     fix.write_note(

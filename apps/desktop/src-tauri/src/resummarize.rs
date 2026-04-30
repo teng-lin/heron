@@ -240,6 +240,8 @@ async fn run_summarize(
         // Re-summarize never starts a live capture, so there are no
         // AX events to bridge onto the bus.
         event_bus: None,
+        // Re-summarize doesn't finalize a fresh note; pattern is unread.
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
         // Tier 4 #18 / #21: forward the user's persona + strip-names
         // toggle into the LLM call so a desktop-driven re-summarize
         // honors Settings the same way a fresh capture does.

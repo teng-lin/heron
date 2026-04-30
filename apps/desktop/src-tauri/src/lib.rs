@@ -818,26 +818,26 @@ pub fn run() {
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
-            // Tier 4 #17 + #23: read user-configured hotwords and the
-            // "Auto-detect meeting apps" toggle once at boot and push
-            // both into the orchestrator's builder so every session
-            // starts with the latest persisted state. A corrupt /
-            // missing `settings.json` is the first-run state — we
-            // fall back to defaults rather than failing setup,
-            // mirroring `register_startup_hotkey` and matching
-            // `Settings::default()` (`hotwords = []`,
-            // `auto_detect_meeting_app = true`).
-            let (hotwords, auto_detect_meeting_app) = read_settings(&default_settings_path())
-                .map(|s| (s.hotwords, s.auto_detect_meeting_app))
-                .unwrap_or_else(|_| (Vec::new(), true));
             let app_handle = app.handle().clone();
+            // Tier 4 #17 / #19 / #23: read boot settings once and seed
+            // hotwords, file naming, and auto-detect into the
+            // orchestrator. A corrupt / missing `settings.json` is the
+            // first-run state — fall back to defaults rather than
+            // failing setup, mirroring `register_startup_hotkey`.
+            let boot_settings = read_settings(&default_settings_path()).unwrap_or_default();
+            let hotwords = boot_settings.hotwords;
+            let auto_detect_meeting_app = boot_settings.auto_detect_meeting_app;
+            let file_naming_pattern: heron_vault::FileNamingPattern =
+                boot_settings.file_naming_pattern.into();
             tauri::async_runtime::block_on(async move {
                 let mut builder = OrchestratorBuilder::default()
                     .hotwords(hotwords)
+                    .file_naming_pattern(file_naming_pattern)
                     .auto_detect_meeting_app(auto_detect_meeting_app);
                 if let Some(root) = vault_root {
                     tracing::info!(
                         vault_root = %root.display(),
+                        ?file_naming_pattern,
                         auto_detect_meeting_app,
                         "in-process orchestrator: read-side wired against vault",
                     );

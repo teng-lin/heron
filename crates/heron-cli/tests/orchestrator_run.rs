@@ -225,6 +225,7 @@ async fn run_pipeline_with_stub_backends_writes_markdown_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
         persona: None,
         strip_names: false,
         pause_flag: None,
@@ -308,6 +309,7 @@ async fn run_pipeline_with_failing_llm_writes_fallback_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
         persona: None,
         strip_names: false,
         pause_flag: None,
@@ -406,6 +408,7 @@ async fn run_pipeline_with_empty_stt_finalizes_to_idle_with_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
         persona: None,
         strip_names: false,
         pause_flag: None,
@@ -482,6 +485,7 @@ async fn run_pipeline_with_missing_wavs_finalizes_with_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
         persona: None,
         strip_names: false,
         pause_flag: None,
@@ -555,6 +559,10 @@ async fn run_pipeline_uses_calendar_event_for_slug_and_attendees() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        // Tier 4 #19: this test asserts the calendar title shows up in
+        // the filename, which only the slug-bearing patterns produce.
+        // `Id` would yield `<uuid>.md` and lose the title.
+        file_naming_pattern: heron_vault::FileNamingPattern::Slug,
         persona: None,
         strip_names: false,
         pause_flag: None,
@@ -583,9 +591,10 @@ async fn run_pipeline_uses_calendar_event_for_slug_and_attendees() {
         .file_name()
         .and_then(|s| s.to_str())
         .expect("utf-8 filename");
+    // `slugify("Acme sync")` lowercases + dash-separates → "acme-sync".
     assert!(
-        filename.contains("Acme sync"),
-        "filename {filename:?} must include the calendar title"
+        filename.contains("acme-sync"),
+        "filename {filename:?} must include the slugified calendar title"
     );
     assert!(
         !filename.contains("untitled"),

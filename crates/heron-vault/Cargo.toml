@@ -17,6 +17,15 @@ pulldown-cmark = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# Pure-Rust ASCII transliteration of Unicode meeting titles (Tier 4 #19
+# slug pipeline). BSD-3-Clause, allow-listed in `deny.toml`. Pinned at
+# the workspace level so any future bump touches one file.
+deunicode = { workspace = true }
+# Structured warn line on the empty-slug → Id fallback path
+# (`writer::finalize_with_pattern`). Already a transitive dep through
+# the workspace; surfaced here so the writer can log without pulling
+# `log`.
+tracing = { workspace = true }
 
 [[bin]]
 name = "validate-vault"

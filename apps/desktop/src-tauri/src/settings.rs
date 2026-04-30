@@ -69,6 +69,22 @@ pub enum FileNamingPattern {
     Slug,
 }
 
+/// Tier 4 #19 hand-off to the writer-side enum. Both enums carry the
+/// same wire format (`"id"` / `"date_slug"` / `"slug"`) and the same
+/// variant set; this `From` impl is the only seam the orchestrator
+/// boot path uses to convert the persisted settings value into the
+/// pattern the vault writer consumes. Pinned by
+/// `file_naming_pattern_converts_into_vault_enum_one_to_one`.
+impl From<FileNamingPattern> for heron_vault::FileNamingPattern {
+    fn from(value: FileNamingPattern) -> Self {
+        match value {
+            FileNamingPattern::Id => heron_vault::FileNamingPattern::Id,
+            FileNamingPattern::DateSlug => heron_vault::FileNamingPattern::DateSlug,
+            FileNamingPattern::Slug => heron_vault::FileNamingPattern::Slug,
+        }
+    }
+}
+
 /// User-facing settings persisted by the Settings pane.
 ///
 /// Defaults match the §16.1 v1 starting values: STT runs WhisperKit
@@ -743,6 +759,28 @@ mod tests {
         assert_eq!(s.vault_root, "/tmp/vault");
         assert!(s.onboarded);
         assert_eq!(s.active_mode, ActiveMode::Clio);
+    }
+
+    /// Tier 4 #19 hand-off: every variant of the desktop-side
+    /// `FileNamingPattern` must map 1:1 into the vault-writer enum.
+    /// Adding a fourth variant on either side without updating both
+    /// enums + this conversion is a silent break — pin it.
+    #[test]
+    fn file_naming_pattern_converts_into_vault_enum_one_to_one() {
+        for (settings_pat, vault_pat) in [
+            (FileNamingPattern::Id, heron_vault::FileNamingPattern::Id),
+            (
+                FileNamingPattern::DateSlug,
+                heron_vault::FileNamingPattern::DateSlug,
+            ),
+            (
+                FileNamingPattern::Slug,
+                heron_vault::FileNamingPattern::Slug,
+            ),
+        ] {
+            let converted: heron_vault::FileNamingPattern = settings_pat.into();
+            assert_eq!(converted, vault_pat);
+        }
     }
 
     /// `FileNamingPattern` variants must serialize to the exact
