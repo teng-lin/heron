@@ -22,10 +22,9 @@ use chrono::{DateTime, Utc};
 use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
     AudioLevelChannel, AudioLevelData, CalendarEvent, EventPayload, Health, ListMeetingsPage,
-    ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, SessionError, SessionEventBus,
-    CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
-    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
-    SessionOrchestrator, SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
+    ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, PrepareContextRequest,
+    SessionError, SessionEventBus, SessionOrchestrator, SpeakerChangedData, StartCaptureArgs,
+    Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
 use herond::{AppState, AuthConfig, build_app};
