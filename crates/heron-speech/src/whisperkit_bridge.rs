@@ -47,7 +47,11 @@ mod ffi {
             progress_userdata: *mut c_void,
             out_model_dir: *mut *mut c_char,
         ) -> i32;
-        pub(super) fn wk_transcribe(wav_path: *const c_char, out: *mut *mut c_char) -> i32;
+        pub(super) fn wk_transcribe(
+            wav_path: *const c_char,
+            prompt: *const c_char,
+            out: *mut *mut c_char,
+        ) -> i32;
         pub(super) fn wk_free_string(p: *mut c_char);
     }
 }
@@ -306,18 +310,67 @@ unsafe extern "C" fn progress_thunk(userdata: *mut c_void, value: f32) {
     cb(value);
 }
 
+/// Compose a WhisperKit-style prompt string from a hotwords list.
+///
+/// The convention mirrors `WhisperKitCLI/TranscribeCLI.swift`'s
+/// `--prompt` flag handling exactly: the words are joined with a
+/// single space, and the Swift bridge prepends a leading space + runs
+/// the joined text through the tokenizer with the standard special-
+/// token filter. Empty / whitespace-only entries are skipped (they
+/// would silently fuse adjacent tokens during the join, producing a
+/// surprising `"foo  bar"` double-space the tokenizer treats as a
+/// distinct word boundary).
+///
+/// Returns `None` for an empty input or an input where every entry is
+/// whitespace-only — the Tier-4 contract says an empty hotwords vec is
+/// equivalent to "no prompt set" so the decoder behaves identically to
+/// the pre-Tier-4 path. Caller passes the resulting `Option<&str>`
+/// straight through to [`whisperkit_transcribe`].
+pub fn compose_prompt(hotwords: &[String]) -> Option<String> {
+    let mut parts = Vec::with_capacity(hotwords.len());
+    for h in hotwords {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 /// Transcribe `wav_path` and return the JSONL turn array as a `String`.
 ///
 /// One JSON object per line, matching the §5.2 `Turn` shape. v0's
 /// stub returns an empty string and [`WkError::NotYetImplemented`].
+///
+/// `prompt` is an optional vocabulary-boost string (Tier 4 #17). When
+/// `Some(non_empty)`, the Swift bridge tokenizes it and forwards the
+/// token IDs as `DecodingOptions.promptTokens`, mirroring the upstream
+/// `WhisperKitCLI` `--prompt` handling. `None` (or empty) preserves
+/// the pre-Tier-4 decode path byte-for-byte. Use [`compose_prompt`] to
+/// build the string from a `&[String]` of hotwords.
 #[cfg(target_vendor = "apple")]
-pub fn whisperkit_transcribe(wav_path: &Path) -> Result<String, WkError> {
+pub fn whisperkit_transcribe(wav_path: &Path, prompt: Option<&str>) -> Result<String, WkError> {
     let c_path = path_to_cstring(wav_path)?;
+    // The C ABI distinguishes "no prompt" (NULL) from "empty prompt"
+    // ("\0") so the Swift side can skip building DecodingOptions
+    // entirely on `None`, which is the contract that lets an empty
+    // hotwords vec roundtrip into byte-identical decoder output.
+    let c_prompt = match prompt {
+        Some(s) if !s.is_empty() => Some(CString::new(s.as_bytes()).map_err(|_| WkError::PathNul)?),
+        _ => None,
+    };
+    let prompt_ptr = c_prompt.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
     let mut buf: *mut c_char = std::ptr::null_mut();
     // SAFETY: `wk_transcribe` writes a malloc'd buffer into `*out`
     // and returns the status code. We hand ownership back via
-    // `wk_free_string` regardless of which branch we take.
-    let raw = unsafe { ffi::wk_transcribe(c_path.as_ptr(), &mut buf) };
+    // `wk_free_string` regardless of which branch we take. `prompt_ptr`
+    // is either NULL or a valid NUL-terminated C string that lives in
+    // `c_prompt` for the duration of the call.
+    let raw = unsafe { ffi::wk_transcribe(c_path.as_ptr(), prompt_ptr, &mut buf) };
     let status = WkStatus::from_raw(raw);
 
     if buf.is_null() {
@@ -349,7 +402,7 @@ pub fn whisperkit_transcribe(wav_path: &Path) -> Result<String, WkError> {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-pub fn whisperkit_transcribe(_wav_path: &Path) -> Result<String, WkError> {
+pub fn whisperkit_transcribe(_wav_path: &Path, _prompt: Option<&str>) -> Result<String, WkError> {
     Err(WkError::NotYetImplemented)
 }
 
@@ -481,7 +534,7 @@ mod tests {
         // with Internal, so this assertion is robust to ordering.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let wav = tmp.path().join("nope.wav");
-        let result = whisperkit_transcribe(&wav);
+        let result = whisperkit_transcribe(&wav, None);
         assert!(
             matches!(result, Err(WkError::Internal { .. })),
             "expected Internal, got {result:?}"
@@ -496,7 +549,7 @@ mod tests {
         // PathNul rather than panicking or silently truncating.
         use std::path::PathBuf;
         let p = PathBuf::from("foo\0bar.wav");
-        let result = whisperkit_transcribe(&p);
+        let result = whisperkit_transcribe(&p, None);
         assert!(matches!(result, Err(WkError::PathNul)));
     }
 
@@ -519,6 +572,72 @@ mod tests {
         let c = path_to_cstring(path).expect("non-UTF-8 must round-trip");
         // C string drops the trailing NUL the C ABI adds.
         assert_eq!(c.as_bytes(), bytes);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn transcribe_with_nul_in_prompt_is_rejected() {
+        // CString::new bails on any embedded NUL; the wrapper must
+        // surface PathNul rather than silently truncating the prompt.
+        // The Tauri Settings UI + the daemon both pass user-supplied
+        // strings here, so a regression that swallows internal NULs
+        // would corrupt the WhisperKit prompt without telling anyone.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let wav = tmp.path().join("nope.wav");
+        let result = whisperkit_transcribe(&wav, Some("bad\0prompt"));
+        assert!(matches!(result, Err(WkError::PathNul)));
+    }
+
+    #[test]
+    fn compose_prompt_empty_vec_returns_none() {
+        // Empty hotwords vec → no prompt set → byte-identical decoder
+        // output to the pre-Tier-4 path. This is the migration
+        // contract: settings without `hotwords` deserialize to
+        // `Vec::new()` and must not silently change transcription
+        // behavior for existing users.
+        assert_eq!(compose_prompt(&[]), None);
+    }
+
+    #[test]
+    fn compose_prompt_skips_blank_entries() {
+        // A user who hits "Add hotword" then leaves the row empty
+        // shouldn't accidentally inject a double-space into the
+        // tokenizer input — Whisper's BPE treats `"  "` as a distinct
+        // word boundary, which would silently degrade decode quality.
+        let words = vec![
+            String::new(),
+            "  ".to_owned(),
+            "heron".to_owned(),
+            "\t".to_owned(),
+        ];
+        assert_eq!(compose_prompt(&words), Some("heron".to_owned()));
+    }
+
+    #[test]
+    fn compose_prompt_joins_with_single_spaces() {
+        // The Whisper tokenizer is whitespace-sensitive — joining with
+        // anything other than a single space (commas, newlines) would
+        // produce different token IDs and invalidate the
+        // CLI-equivalence rationale documented on `whisperkit_transcribe`.
+        let words = vec![
+            "heron".to_owned(),
+            "WhisperKit".to_owned(),
+            "Anthropic".to_owned(),
+        ];
+        assert_eq!(
+            compose_prompt(&words),
+            Some("heron WhisperKit Anthropic".to_owned())
+        );
+    }
+
+    #[test]
+    fn compose_prompt_trims_per_entry_whitespace() {
+        // Settings.json is a JSON file; users sometimes hand-edit it
+        // and leave trailing whitespace inside string values. Trimming
+        // each entry before the join means that hand-edit doesn't
+        // produce a `"foo " + " bar"` = `"foo  bar"` double-space.
+        let words = vec!["  heron  ".to_owned(), " WhisperKit\n".to_owned()];
+        assert_eq!(compose_prompt(&words), Some("heron WhisperKit".to_owned()));
     }
 
     #[cfg(target_vendor = "apple")]
@@ -550,7 +669,17 @@ mod tests {
             Err(WkError::NotYetImplemented)
         ));
         assert!(matches!(
-            whisperkit_transcribe(&p),
+            whisperkit_transcribe(&p, None),
+            Err(WkError::NotYetImplemented)
+        ));
+        // With an empty prompt the off-Apple stub still returns
+        // NotYetImplemented — the parameter is wired but inert there.
+        assert!(matches!(
+            whisperkit_transcribe(&p, Some("")),
+            Err(WkError::NotYetImplemented)
+        ));
+        assert!(matches!(
+            whisperkit_transcribe(&p, Some("heron")),
             Err(WkError::NotYetImplemented)
         ));
         assert!(matches!(
