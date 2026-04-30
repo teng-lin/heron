@@ -194,17 +194,36 @@ fn purge_by_extension(vault: &Path, days: u32, allowed: &[&str]) -> Result<u32, 
     let mut purged: u32 = 0;
     for entry in fs::read_dir(&vault)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
+        // Concurrency: a sibling process may delete an entry between
+        // `read_dir` returning it and our `file_type` / `metadata`
+        // probes. Treat `NotFound` from the probes as benign (continue
+        // the sweep) — same posture the `remove_file` arm below has
+        // taken since PR-ζ. Other IO errors still abort the sweep.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(DiskError::Io(e)),
+        };
         if file_type.is_symlink() || !file_type.is_file() {
             continue;
         }
-        let path = entry.path();
-        let ext = lowercase_extension(&path);
+        // Filter on the file *name*'s extension before allocating the
+        // full `PathBuf`: most vaults will have non-matching entries
+        // (`.bak`, `.txt`, `.DS_Store`) and `entry.path()` is the only
+        // allocating step in the loop body.
+        let file_name = entry.file_name();
+        let ext = lowercase_extension(Path::new(&file_name));
         if !allowed.contains(&ext.as_str()) {
             continue;
         }
-        let mtime = entry.metadata()?.modified()?;
+        let metadata = match entry.metadata() {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(DiskError::Io(e)),
+        };
+        let mtime = metadata.modified()?;
         if mtime <= cutoff {
+            let path = entry.path();
             // `remove_file` returns NotFound if a concurrent process
             // already deleted the file — treat that as "someone
             // beat us to it" rather than failing the whole purge.
