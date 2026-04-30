@@ -22,7 +22,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { Meeting } from "../lib/types";
-import { extractActionItems, selectActionItems } from "./Review";
+import {
+  extractActionItems,
+  formatActionItemDue,
+  formatProcessingCost,
+  selectActionItems,
+} from "./Review";
 
 function meetingWith(actionItems: Meeting["action_items"]): Meeting {
   return {
@@ -169,5 +174,52 @@ describe("selectActionItems", () => {
     const rows = selectActionItems(meeting, "");
     expect(rows.map((r) => r.id)).toEqual(["legacy:0", "legacy:1"]);
     expect(rows.every((r) => r.structured)).toBe(true);
+  });
+});
+
+describe("formatActionItemDue", () => {
+  test("renders YYYY-MM-DD as a human date in the local calendar", () => {
+    // Parsing the literal `YYYY-MM-DD` string through `new Date(iso)`
+    // would treat it as midnight UTC and shift to the previous day in
+    // negative-offset zones. The formatter splits the parts out so
+    // `2026-05-01` always renders as May 1, 2026 regardless of TZ.
+    const out = formatActionItemDue("2026-05-01");
+    expect(out).toContain("2026");
+    expect(out).toContain("1");
+    expect(out.toLowerCase()).toContain("may");
+  });
+
+  test("falls back to the raw string when the input doesn't match", () => {
+    expect(formatActionItemDue("not a date")).toBe("not a date");
+    expect(formatActionItemDue("2026/05/01")).toBe("2026/05/01");
+  });
+});
+
+describe("formatProcessingCost", () => {
+  test("renders typical dollar amounts at two decimals", () => {
+    expect(formatProcessingCost(1.23)).toBe("$1.23");
+    expect(formatProcessingCost(12)).toBe("$12.00");
+  });
+
+  test("renders sub-cent amounts without collapsing to $0.00", () => {
+    // Anti-regression: a $0.00004 prompt-cache hit must not show as
+    // "$0" — that's the failure mode the prompt called out explicitly.
+    const tiny = formatProcessingCost(0.00004);
+    expect(tiny).not.toBe("$0");
+    expect(tiny).not.toBe("$0.00");
+    expect(tiny).toContain("0.000040");
+  });
+
+  test("renders sub-dollar amounts with four decimals", () => {
+    expect(formatProcessingCost(0.0042)).toBe("$0.0042");
+  });
+
+  test("renders zero as $0.00", () => {
+    expect(formatProcessingCost(0)).toBe("$0.00");
+  });
+
+  test("falls back to em-dash on non-finite input", () => {
+    expect(formatProcessingCost(Number.NaN)).toBe("—");
+    expect(formatProcessingCost(Number.POSITIVE_INFINITY)).toBe("—");
   });
 });

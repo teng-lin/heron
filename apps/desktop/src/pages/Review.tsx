@@ -11,9 +11,20 @@
  *    note. Same bytes as Notes; just prose mode for skimming.
  *  - Notes: editable TipTap NoteEditor.
  *  - Transcript: read-only TranscriptView, click-to-seek.
- *  - Actions: action-items section extracted from the markdown.
+ *  - Actions: action-items rows — prefers `Meeting.action_items`
+ *    (Tier 0 #3, structured rows with owner + due) and falls back
+ *    to a regex bullet extractor against the markdown body for
+ *    legacy notes. Read-only — write-back is Day 8–10.
  *  - Raw: <pre> dump of the markdown source.
  *  - Diagnostics: existing DiagnosticsPanel.
+ *
+ * On wide viewports the tabs share the column with a right-rail
+ * `ProcessingRail` rendering `Meeting.processing` (Tier 0 #2:
+ * model + token counts + cost). Omitted entirely when `processing`
+ * is `undefined` — pre-summarize meetings shouldn't render `—`
+ * placeholders. `Transcribed by` is intentionally absent because
+ * `Frontmatter.stt_model` does not exist yet (separate backend
+ * workstream, not in this PR's scope).
  *
  * Summary vs Notes: in v1 the vault note IS the canonical document
  * (LLM-generated summary the user can edit in place). Splitting them
@@ -44,7 +55,12 @@ import { ResummarizeDiffModal } from "../components/ResummarizeDiffModal";
 import { Button } from "../components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { invoke, type BackupInfo } from "../lib/invoke";
-import type { ActionItem, Meeting, Transcript } from "../lib/types";
+import type {
+  ActionItem,
+  Meeting,
+  MeetingProcessing,
+  Transcript,
+} from "../lib/types";
 import { useSettingsStore } from "../store/settings";
 
 type LoadState =
@@ -78,6 +94,59 @@ function formatBackupTime(iso: string): string {
     timeStyle: "short",
   }).format(d);
 }
+
+/**
+ * `Frontmatter.action_items[].due` is `YYYY-MM-DD` (a calendar date,
+ * not a timestamp). Parsing it through `new Date(iso)` would treat
+ * the string as midnight UTC, which can drift to the prior calendar
+ * day in negative-offset timezones. Pin the parts manually so the
+ * formatted output matches the date the LLM emitted.
+ *
+ * Falls back to the raw string when the input doesn't match the
+ * expected `YYYY-MM-DD` shape (defensive — a future LLM template
+ * change shouldn't render `Invalid Date`).
+ */
+export function formatActionItemDue(iso: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!match) return iso;
+  const [, y, m, d] = match;
+  const date = new Date(Number(y), Number(m) - 1, Number(d));
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(date);
+}
+
+/**
+ * Format `MeetingProcessing.summary_usd` for the right-rail. The
+ * summarizer can emit very small amounts (a $0.00004 prompt-cache hit
+ * shouldn't render as `$0.00`), so step the precision based on
+ * magnitude rather than pinning two decimals. `Intl.NumberFormat`
+ * with `maximumFractionDigits` doesn't hit this on its own — it would
+ * collapse `0.00004` to `0` in the default `currency` style.
+ */
+export function formatProcessingCost(usd: number): string {
+  if (!Number.isFinite(usd)) return "—";
+  const abs = Math.abs(usd);
+  let digits: number;
+  if (abs === 0 || abs >= 1) {
+    digits = 2;
+  } else if (abs >= 0.001) {
+    digits = 4;
+  } else {
+    digits = 6;
+  }
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(usd);
+}
+
+const TOKEN_COUNT_FORMATTER = new Intl.NumberFormat(undefined);
 
 /**
  * Pull the bullet list under `## Action Items` (or `## Actions`)
@@ -168,6 +237,45 @@ export function selectActionItems(
     due: null,
     structured: false,
   }));
+}
+
+function ProcessingRail({ processing }: { processing: MeetingProcessing }) {
+  return (
+    <aside
+      aria-label="Processing"
+      className="rounded border p-4"
+      style={{
+        background: "var(--color-paper-2)",
+        borderColor: "var(--color-rule)",
+        color: "var(--color-ink-2)",
+      }}
+    >
+      <h2
+        className="mb-3 font-mono text-[10px] uppercase tracking-[0.12em]"
+        style={{ color: "var(--color-ink-3)" }}
+      >
+        Processing
+      </h2>
+      <dl className="grid grid-cols-[8rem_1fr] gap-y-2 text-xs">
+        <dt style={{ color: "var(--color-ink-3)" }}>Summarized by</dt>
+        <dd className="font-mono break-all" style={{ color: "var(--color-ink)" }}>
+          {processing.model}
+        </dd>
+        <dt style={{ color: "var(--color-ink-3)" }}>Tokens in</dt>
+        <dd className="font-mono" style={{ color: "var(--color-ink)" }}>
+          {TOKEN_COUNT_FORMATTER.format(processing.tokens_in)}
+        </dd>
+        <dt style={{ color: "var(--color-ink-3)" }}>Tokens out</dt>
+        <dd className="font-mono" style={{ color: "var(--color-ink)" }}>
+          {TOKEN_COUNT_FORMATTER.format(processing.tokens_out)}
+        </dd>
+        <dt style={{ color: "var(--color-ink-3)" }}>Cost</dt>
+        <dd className="font-mono" style={{ color: "var(--color-ink)" }}>
+          {formatProcessingCost(processing.summary_usd)}
+        </dd>
+      </dl>
+    </aside>
+  );
 }
 
 export default function Review() {
@@ -513,7 +621,7 @@ export default function Review() {
       <DaemonDownBanner />
       <div className="flex h-full flex-col">
         <div className="flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-4xl px-8 py-8">
+          <div className="mx-auto max-w-6xl px-8 py-8">
             <header className="mb-6 flex items-end justify-between gap-3">
               <div>
                 <p
@@ -610,156 +718,167 @@ export default function Review() {
             )}
 
             {vaultRoot && sessionId && (
-              <Tabs value={activeTab} onValueChange={onTabChange}>
-                <TabsList>
-                  <TabsTrigger value="summary">Summary</TabsTrigger>
-                  <TabsTrigger value="notes">Notes</TabsTrigger>
-                  <TabsTrigger value="transcript">Transcript</TabsTrigger>
-                  <TabsTrigger value="actions">Actions</TabsTrigger>
-                  <TabsTrigger value="raw">Raw</TabsTrigger>
-                  <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>
-                </TabsList>
+              <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_18rem] lg:gap-6">
+                <div className="min-w-0">
+                  <Tabs value={activeTab} onValueChange={onTabChange}>
+                    <TabsList>
+                      <TabsTrigger value="summary">Summary</TabsTrigger>
+                      <TabsTrigger value="notes">Notes</TabsTrigger>
+                      <TabsTrigger value="transcript">Transcript</TabsTrigger>
+                      <TabsTrigger value="actions">Actions</TabsTrigger>
+                      <TabsTrigger value="raw">Raw</TabsTrigger>
+                      <TabsTrigger value="diagnostics">
+                        Diagnostics
+                      </TabsTrigger>
+                    </TabsList>
 
-                <TabsContent value="summary" className="mt-4">
-                  {load.kind === "loading" && (
-                    <div className="text-sm text-muted-foreground">
-                      Loading summary…
-                    </div>
-                  )}
-                  {load.kind === "error" && (
-                    <div className="text-sm text-destructive">
-                      Failed to load: {load.message}
-                    </div>
-                  )}
-                  {load.kind === "ready" && (
-                    <article className="prose prose-sm max-w-none">
-                      <ReactMarkdown>{liveMarkdown}</ReactMarkdown>
-                    </article>
-                  )}
-                </TabsContent>
-
-                <TabsContent value="notes" className="mt-4">
-                  {load.kind === "loading" && (
-                    <div className="text-sm text-muted-foreground">
-                      Loading note…
-                    </div>
-                  )}
-                  {load.kind === "error" && (
-                    <div className="text-sm text-destructive">
-                      Failed to load: {load.message}
-                    </div>
-                  )}
-                  {load.kind === "ready" && (
-                    <NoteEditor
-                      key={editorKey}
-                      ref={editorRef}
-                      initialMarkdown={load.markdown}
-                      onUpdate={setLiveMarkdown}
-                      onBlurSave={(md) => {
-                        setLiveMarkdown(md);
-                        void save(md);
-                      }}
-                    />
-                  )}
-                </TabsContent>
-
-                <TabsContent value="transcript" className="mt-4">
-                  {transcriptLoad.kind === "loading" ? (
-                    <div className="text-sm text-muted-foreground">
-                      Loading transcript…
-                    </div>
-                  ) : transcriptLoad.kind === "ready" &&
-                    transcriptLoad.data.segments.length > 0 ? (
-                    <TranscriptView
-                      segments={transcriptLoad.data.segments}
-                      onSeek={onTranscriptSeek}
-                    />
-                  ) : (
-                    <>
-                      {transcriptLoad.kind === "unavailable" && (
-                        <p className="mb-3 text-xs text-muted-foreground">
-                          Daemon transcript unavailable:{" "}
-                          {transcriptLoad.message}. Showing transcript
-                          parsed from the note.
-                        </p>
+                    <TabsContent value="summary" className="mt-4">
+                      {load.kind === "loading" && (
+                        <div className="text-sm text-muted-foreground">
+                          Loading summary…
+                        </div>
                       )}
-                      <TranscriptView
-                        markdown={liveMarkdown}
-                        onSeek={onTranscriptSeek}
-                      />
-                    </>
-                  )}
-                </TabsContent>
+                      {load.kind === "error" && (
+                        <div className="text-sm text-destructive">
+                          Failed to load: {load.message}
+                        </div>
+                      )}
+                      {load.kind === "ready" && (
+                        <article className="prose prose-sm max-w-none">
+                          <ReactMarkdown>{liveMarkdown}</ReactMarkdown>
+                        </article>
+                      )}
+                    </TabsContent>
 
-                <TabsContent value="actions" className="mt-4">
-                  {actionItems.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">
-                      No action items extracted from this note.
-                    </p>
-                  ) : (
-                    <ul className="list-disc space-y-2 pl-5 text-sm">
-                      {actionItems.map((item) => (
-                        <li key={item.id}>
-                          <span>{item.text}</span>
-                          {item.owner && (
-                            <span
-                              className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
-                              style={{
-                                background: "var(--color-paper-2)",
-                                borderColor: "var(--color-rule)",
-                                color: "var(--color-ink-2)",
-                              }}
-                              title="Owner"
-                            >
-                              {item.owner}
-                            </span>
+                    <TabsContent value="notes" className="mt-4">
+                      {load.kind === "loading" && (
+                        <div className="text-sm text-muted-foreground">
+                          Loading note…
+                        </div>
+                      )}
+                      {load.kind === "error" && (
+                        <div className="text-sm text-destructive">
+                          Failed to load: {load.message}
+                        </div>
+                      )}
+                      {load.kind === "ready" && (
+                        <NoteEditor
+                          key={editorKey}
+                          ref={editorRef}
+                          initialMarkdown={load.markdown}
+                          onUpdate={setLiveMarkdown}
+                          onBlurSave={(md) => {
+                            setLiveMarkdown(md);
+                            void save(md);
+                          }}
+                        />
+                      )}
+                    </TabsContent>
+
+                    <TabsContent value="transcript" className="mt-4">
+                      {transcriptLoad.kind === "loading" ? (
+                        <div className="text-sm text-muted-foreground">
+                          Loading transcript…
+                        </div>
+                      ) : transcriptLoad.kind === "ready" &&
+                        transcriptLoad.data.segments.length > 0 ? (
+                        <TranscriptView
+                          segments={transcriptLoad.data.segments}
+                          onSeek={onTranscriptSeek}
+                        />
+                      ) : (
+                        <>
+                          {transcriptLoad.kind === "unavailable" && (
+                            <p className="mb-3 text-xs text-muted-foreground">
+                              Daemon transcript unavailable:{" "}
+                              {transcriptLoad.message}. Showing transcript
+                              parsed from the note.
+                            </p>
                           )}
-                          {item.due && (
-                            <span
-                              className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
-                              style={{
-                                background: "var(--color-paper-2)",
-                                borderColor: "var(--color-rule)",
-                                color: "var(--color-ink-2)",
-                              }}
-                              title="Due"
-                            >
-                              due {item.due}
-                            </span>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </TabsContent>
+                          <TranscriptView
+                            markdown={liveMarkdown}
+                            onSeek={onTranscriptSeek}
+                          />
+                        </>
+                      )}
+                    </TabsContent>
 
-                <TabsContent value="raw" className="mt-4">
-                  <pre
-                    className="max-h-[60vh] overflow-auto rounded border p-3 font-mono text-xs"
-                    style={{
-                      background: "var(--color-paper-2)",
-                      borderColor: "var(--color-rule)",
-                      color: "var(--color-ink-2)",
-                    }}
-                  >
-                    {liveMarkdown}
-                  </pre>
-                </TabsContent>
+                    <TabsContent value="actions" className="mt-4">
+                      {actionItems.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">
+                          No action items extracted from this note.
+                        </p>
+                      ) : (
+                        <ul className="list-disc space-y-2 pl-5 text-sm">
+                          {actionItems.map((item) => (
+                            <li key={item.id}>
+                              <span>{item.text}</span>
+                              {item.owner && (
+                                <span
+                                  className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
+                                  style={{
+                                    background: "var(--color-paper-2)",
+                                    borderColor: "var(--color-rule)",
+                                    color: "var(--color-ink-2)",
+                                  }}
+                                  title="Owner"
+                                >
+                                  {item.owner}
+                                </span>
+                              )}
+                              {item.due && (
+                                <span
+                                  className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
+                                  style={{
+                                    background: "var(--color-paper-2)",
+                                    borderColor: "var(--color-rule)",
+                                    color: "var(--color-ink-2)",
+                                  }}
+                                  title={`Due ${item.due}`}
+                                >
+                                  due {formatActionItemDue(item.due)}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </TabsContent>
 
-                <TabsContent value="diagnostics" className="mt-4">
-                  {cacheRoot === null ? (
-                    <div className="text-sm text-muted-foreground">
-                      Loading diagnostics…
-                    </div>
-                  ) : (
-                    <DiagnosticsPanel
-                      cacheRoot={cacheRoot}
-                      sessionId={sessionId}
-                      refreshKey={savedKey}
-                    />
-                  )}
-                </TabsContent>
-              </Tabs>
+                    <TabsContent value="raw" className="mt-4">
+                      <pre
+                        className="max-h-[60vh] overflow-auto rounded border p-3 font-mono text-xs"
+                        style={{
+                          background: "var(--color-paper-2)",
+                          borderColor: "var(--color-rule)",
+                          color: "var(--color-ink-2)",
+                        }}
+                      >
+                        {liveMarkdown}
+                      </pre>
+                    </TabsContent>
+
+                    <TabsContent value="diagnostics" className="mt-4">
+                      {cacheRoot === null ? (
+                        <div className="text-sm text-muted-foreground">
+                          Loading diagnostics…
+                        </div>
+                      ) : (
+                        <DiagnosticsPanel
+                          cacheRoot={cacheRoot}
+                          sessionId={sessionId}
+                          refreshKey={savedKey}
+                        />
+                      )}
+                    </TabsContent>
+                  </Tabs>
+                </div>
+                {meeting?.processing !== undefined && (
+                  <div className="mt-6 lg:mt-0">
+                    <ProcessingRail processing={meeting.processing} />
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>
