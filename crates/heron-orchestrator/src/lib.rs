@@ -193,6 +193,13 @@ pub struct LocalSessionOrchestrator {
     calendar: Arc<dyn CalendarReader>,
     cache_dir: PathBuf,
     stt_backend_name: String,
+    /// Tier 4 #17 vocabulary-boost hotwords forwarded to the WhisperKit
+    /// backend at `start_capture` time. The desktop / `herond` shell
+    /// populates this from `Settings::hotwords`; the legacy CLI path
+    /// (`heron record`) leaves it empty so the v1 decode is byte-
+    /// identical to pre-Tier-4. Cloned per session so a live-edit in
+    /// the Settings pane doesn't mutate an in-flight session's prompt.
+    hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
     /// In-flight captures keyed by `MeetingId`. Each entry pairs the
     /// last-published `Meeting` snapshot with the [`RecordingFsm`]
@@ -411,6 +418,10 @@ pub struct Builder {
     calendar: Option<Arc<dyn CalendarReader>>,
     cache_dir: PathBuf,
     stt_backend_name: String,
+    /// Initial value for [`LocalSessionOrchestrator::hotwords`]. The
+    /// desktop / daemon boot path calls
+    /// [`Builder::hotwords`] to seed this from `Settings::hotwords`.
+    hotwords: Vec<String>,
     llm_preference: heron_llm::Preference,
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
 }
@@ -425,6 +436,7 @@ impl std::fmt::Debug for Builder {
             .field("calendar", &"<Arc<dyn CalendarReader>>")
             .field("cache_dir", &self.cache_dir)
             .field("stt_backend_name", &self.stt_backend_name)
+            .field("hotwords", &self.hotwords)
             .field("llm_preference", &self.llm_preference)
             .field(
                 "live_session_factory",
@@ -447,6 +459,7 @@ impl Default for Builder {
             calendar: None,
             cache_dir: default_cache_dir(),
             stt_backend_name: "sherpa".to_owned(),
+            hotwords: Vec::new(),
             llm_preference: heron_llm::Preference::Auto,
             live_session_factory: None,
         }
@@ -521,6 +534,17 @@ impl Builder {
         self
     }
 
+    /// Tier 4 #17: forward a vocabulary-boost list to the WhisperKit
+    /// backend at `start_capture` time. Mirrors how
+    /// [`stt_backend_name`](Self::stt_backend_name) flows through to
+    /// `CliSessionConfig`. Defaults to the empty vec, which preserves
+    /// pre-Tier-4 decoder behaviour byte-for-byte. The desktop /
+    /// `herond` shell calls this with `Settings::hotwords` at boot.
+    pub fn hotwords(mut self, hotwords: Vec<String>) -> Self {
+        self.hotwords = hotwords;
+        self
+    }
+
     /// Install a [`LiveSessionFactory`] that `start_capture` invokes
     /// to compose the v2 four-layer stack alongside the v1 vault
     /// pipeline. Without this, `start_capture` only runs the v1
@@ -575,6 +599,7 @@ impl Builder {
             calendar,
             cache_dir: self.cache_dir,
             stt_backend_name: self.stt_backend_name,
+            hotwords: self.hotwords,
             llm_preference: self.llm_preference,
             active_meetings: Mutex::new(HashMap::new()),
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
@@ -1394,6 +1419,20 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     cache_dir: self.cache_dir.clone(),
                     vault_root,
                     stt_backend_name: self.stt_backend_name.clone(),
+                    // Tier 4 #17: forward the user-configured
+                    // vocabulary-boost list to the WhisperKit backend.
+                    // Cloned per `start_capture` so each session
+                    // captures a *snapshot* of the orchestrator's
+                    // hotwords at start time. The current orchestrator
+                    // is `&self` and the field is plain
+                    // `Vec<String>`, so there's no concurrent-mutation
+                    // hazard today — but if a future PR adds a
+                    // `Settings.hotwords` live-reload setter (with
+                    // interior mutability via `RwLock` / `Mutex`), the
+                    // snapshot is what keeps in-flight sessions
+                    // pointing at a stable prompt instead of swapping
+                    // mid-decode.
+                    hotwords: self.hotwords.clone(),
                     llm_preference: self.llm_preference,
                     pre_meeting_briefing,
                     // Tier 0b #4: bridge `SpeakerEvent` from the AX

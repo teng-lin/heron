@@ -214,6 +214,9 @@ async fn run_summarize(
         cache_dir: PathBuf::new(),
         vault_root: vault_root.to_path_buf(),
         stt_backend_name: "sherpa".into(),
+        // Re-summarize is a vault-side operation; STT (and therefore
+        // hotwords) is never invoked, so the empty default is fine.
+        hotwords: Vec::new(),
         llm_preference: Preference::Auto,
         // Re-summarize is a vault-side operation; pre-meeting context
         // never participates here.

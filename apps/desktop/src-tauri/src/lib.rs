@@ -36,6 +36,13 @@ pub mod tray;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use heron_orchestrator::Builder as OrchestratorBuilder;
+// `LocalSessionOrchestrator` is only referenced from doc-comments in
+// this file (Tier 4 #17 switched the boot path to use `Builder`
+// directly so we can seed `Settings::hotwords` at startup); kept
+// imported under `allow(unused_imports)` so rustdoc's intra-doc
+// links resolve without warnings.
+#[allow(unused_imports)]
 use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -810,27 +817,35 @@ pub fn run() {
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
+            // Tier 4 #17: read user-configured hotwords once at boot
+            // and seed the orchestrator's `Builder.hotwords` so every
+            // session starts with the latest persisted list. A
+            // corrupt / missing `settings.json` is the first-run
+            // state — we fall back to the empty default rather than
+            // failing setup, mirroring `register_startup_hotkey` and
+            // matching `Settings::default().hotwords`.
+            let hotwords = read_settings(&default_settings_path())
+                .map(|s| s.hotwords)
+                .unwrap_or_default();
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
-                let orchestrator = match vault_root {
-                    Some(root) => {
-                        tracing::info!(
-                            vault_root = %root.display(),
-                            "in-process orchestrator: read-side wired against vault",
-                        );
-                        Arc::new(LocalSessionOrchestrator::with_vault(root))
-                    }
-                    None => {
-                        // Sandboxed test runner / no home dir.
-                        // Substrate-only — every read endpoint will
-                        // return NotYetImplemented, which is the
-                        // honest answer until a vault is configured.
-                        tracing::warn!(
-                            "no vault root resolvable; in-process orchestrator runs substrate-only",
-                        );
-                        Arc::new(LocalSessionOrchestrator::new())
-                    }
-                };
+                let mut builder = OrchestratorBuilder::default().hotwords(hotwords);
+                if let Some(root) = vault_root {
+                    tracing::info!(
+                        vault_root = %root.display(),
+                        "in-process orchestrator: read-side wired against vault",
+                    );
+                    builder = builder.vault_root(root);
+                } else {
+                    // Sandboxed test runner / no home dir.
+                    // Substrate-only — every read endpoint will
+                    // return NotYetImplemented, which is the
+                    // honest answer until a vault is configured.
+                    tracing::warn!(
+                        "no vault root resolvable; in-process orchestrator runs substrate-only",
+                    );
+                }
+                let orchestrator = Arc::new(builder.build());
                 event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
                 daemon::install(&app_handle, orchestrator).await?;
                 // UI revamp PR 4: install the SSE bridge state slot.
