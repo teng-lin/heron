@@ -199,23 +199,40 @@ pub fn strip_speaker_names(transcript_text: &str) -> String {
                     out.push_str(line);
                     continue;
                 }
-                if let Some(serde_json::Value::String(name)) = obj.get("speaker").cloned() {
-                    let pseudo = mapping
-                        .entry(name)
-                        .or_insert_with(|| {
-                            let label = pseudonym_for_index(next_index);
-                            next_index += 1;
-                            label
-                        })
-                        .clone();
-                    obj.insert("speaker".into(), serde_json::Value::String(pseudo));
-                }
+                let original_pseudo =
+                    if let Some(serde_json::Value::String(name)) = obj.get("speaker").cloned() {
+                        let pseudo = mapping
+                            .entry(name)
+                            .or_insert_with(|| {
+                                let label = pseudonym_for_index(next_index);
+                                next_index += 1;
+                                label
+                            })
+                            .clone();
+                        obj.insert("speaker".into(), serde_json::Value::String(pseudo.clone()));
+                        Some(pseudo)
+                    } else {
+                        None
+                    };
                 // `to_string` doesn't pretty-print and preserves the
-                // JSONL one-line-per-turn contract.
-                out.push_str(
-                    &serde_json::to_string(&serde_json::Value::Object(obj))
-                        .unwrap_or_else(|_| trimmed_for_parse.to_owned()),
-                );
+                // JSONL one-line-per-turn contract. On the
+                // (vanishingly unlikely) chance serialization fails
+                // after a successful parse + insert, emit a redacted
+                // placeholder rather than `trimmed_for_parse` — the
+                // latter still contains the real speaker name and
+                // would leak it past the privacy transform (gemini
+                // PR #167 review). Privacy > preserving every other
+                // field on a malformed line.
+                match serde_json::to_string(&serde_json::Value::Object(obj)) {
+                    Ok(s) => out.push_str(&s),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "strip_speaker_names re-serialize failed; emitting redacted placeholder");
+                        let placeholder_speaker = original_pseudo.as_deref().unwrap_or("Speaker ?");
+                        out.push_str(&format!(
+                            r#"{{"speaker":"{placeholder_speaker}","text":"<redacted: re-serialize failed>"}}"#
+                        ));
+                    }
+                }
                 // Preserve the original line ending (`\n` or `\r\n`)
                 // so downstream byte-counting stays accurate.
                 if let Some(stripped) = line.strip_prefix(trimmed_for_parse) {
