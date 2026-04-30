@@ -38,13 +38,15 @@ use serde::Serialize;
 use tokio::fs;
 
 use heron_cli::session::{Orchestrator, SessionConfig, SessionError};
-use heron_cli::summarize::re_summarize_in_vault;
+use heron_cli::summarize::re_summarize_in_vault_with_persona;
 use heron_llm::{Preference, Summarizer, select_summarizer_with_resolver};
-use heron_types::Frontmatter;
+use heron_types::{Frontmatter, Persona};
 use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note};
 
+use crate::default_settings_path;
 use crate::keychain_resolver::EnvThenKeychainResolver;
 use crate::notes::{resolve_note_path, resolve_vault_path, validate_session_id};
+use crate::settings::read_settings;
 
 /// Resolve the `<vault>/<session_id>.md.bak` path the renderer is
 /// allowed to touch. Validation goes through the same checks
@@ -121,6 +123,15 @@ async fn summarize_body(vault: &Path, session_id: &str) -> Result<String, String
         select_summarizer_with_resolver(Preference::Auto, &resolver)
             .map_err(|e| format!("LLM backend: {e}"))?;
 
+    // Tier 4 #18 / #21: read the user's persona + strip-names toggle
+    // from `Settings` and thread them through `run_summarize`. A
+    // missing settings.json (first-run state) yields `Settings::default()`
+    // — persona empty, strip_names = false — so the prompt path stays
+    // byte-identical to pre-Tier-4 unless the user has explicitly
+    // opted in via the Settings pane.
+    let settings =
+        read_settings(&default_settings_path()).map_err(|e| format!("read settings: {e}"))?;
+
     let (ours_fm, ours_body) =
         vault_read_note(&note_path).map_err(|e| format!("read {}: {}", note_path.display(), e))?;
 
@@ -138,12 +149,15 @@ async fn summarize_body(vault: &Path, session_id: &str) -> Result<String, String
         ));
     }
 
+    let persona = persona_from_settings(&settings);
     let output = run_summarize(
         summarizer.as_ref(),
         &canonical_vault,
         &note_path,
         ours_fm.meeting_type,
         &transcript,
+        persona.as_ref(),
+        settings.strip_names_before_summarization,
     )
     .await?;
 
@@ -207,6 +221,8 @@ async fn run_summarize(
     note_path: &Path,
     meeting_type: heron_types::MeetingType,
     transcript: &Path,
+    persona: Option<&Persona>,
+    strip_names: bool,
 ) -> Result<heron_llm::SummarizerOutput, String> {
     let cfg = SessionConfig {
         session_id: uuid::Uuid::nil(),
@@ -221,11 +237,28 @@ async fn run_summarize(
         // Re-summarize never starts a live capture, so there are no
         // AX events to bridge onto the bus.
         event_bus: None,
+        // Tier 4 #18 / #21: forward the user's persona + strip-names
+        // toggle into the LLM call so a desktop-driven re-summarize
+        // honors Settings the same way a fresh capture does.
+        persona: persona.cloned(),
+        strip_names,
     };
     let orch = Orchestrator::new(cfg);
     orch.re_summarize_note(summarizer, note_path, meeting_type, transcript)
         .await
         .map_err(|e: SessionError| format!("re-summarize: {e}"))
+}
+
+/// Convert `Settings.persona` into the `Option<Persona>` the LLM call
+/// expects: an "all empty strings" persona is the no-config sentinel,
+/// so collapse it to `None` at the boundary so callers don't have to
+/// repeat the `is_empty` check. Pinned by tests in `heron_types`.
+fn persona_from_settings(settings: &crate::settings::Settings) -> Option<Persona> {
+    if settings.persona.is_empty() {
+        None
+    } else {
+        Some(settings.persona.clone())
+    }
 }
 
 /// Re-summarize `<vault>/<session_id>.md` in place, returning the new
@@ -261,13 +294,27 @@ pub async fn resummarize(vault: &Path, session_id: &str) -> Result<String, Strin
         select_summarizer_with_resolver(Preference::Auto, &resolver)
             .map_err(|e| format!("LLM backend: {e}"))?;
 
-    // `re_summarize_in_vault` does the work:
+    // Tier 4 #18 / #21: read settings so the apply path uses the same
+    // persona + strip-names knobs the preview path
+    // (`resummarize_preview`) does. Without this, Apply would silently
+    // use a different prompt than the Preview the user just clicked.
+    let settings =
+        read_settings(&default_settings_path()).map_err(|e| format!("read settings: {e}"))?;
+    let persona = persona_from_settings(&settings);
+
+    // `re_summarize_in_vault_with_persona` does the work:
     // 1. Reads the note's frontmatter to find the transcript path.
     // 2. Calls `Orchestrator::re_summarize_note` (§10.5 ID preservation).
     // 3. Calls `VaultWriter::re_summarize` (§10.3 merge + .md.bak rotation).
-    re_summarize_in_vault(summarizer.as_ref(), &canonical_vault, &note_path)
-        .await
-        .map_err(|e| format!("re-summarize: {e}"))?;
+    re_summarize_in_vault_with_persona(
+        summarizer.as_ref(),
+        &canonical_vault,
+        &note_path,
+        persona.as_ref(),
+        settings.strip_names_before_summarization,
+    )
+    .await
+    .map_err(|e| format!("re-summarize: {e}"))?;
 
     // Read the note back so the frontend doesn't need a follow-up
     // `heron_read_note` call.
@@ -604,5 +651,30 @@ cost: null\n\
             "preview must not create <id>.md.bak (found {})",
             bak.display(),
         );
+    }
+
+    /// Tier 4 #18: `persona_from_settings` collapses the all-empty
+    /// `Persona` (the default after `Settings::default()`) to `None`.
+    /// The boundary collapse is the single switch the rest of the
+    /// pipeline depends on for the "no-persona prompt is byte-identical
+    /// to pre-Tier-4" contract — the LLM-side logic in
+    /// `render_meeting_prompt` re-applies the same `is_empty()` check
+    /// (belt-and-suspenders), but breaking either side independently
+    /// could silently turn a no-config user's prompt into a different
+    /// shape, so pin both ends of the contract.
+    #[test]
+    fn persona_from_settings_collapses_empty_persona_to_none() {
+        let settings = crate::settings::Settings::default();
+        assert!(persona_from_settings(&settings).is_none());
+    }
+
+    #[test]
+    fn persona_from_settings_returns_some_when_any_field_set() {
+        let mut settings = crate::settings::Settings::default();
+        settings.persona.name = "Alice".into();
+        let persona = persona_from_settings(&settings).expect("Some");
+        assert_eq!(persona.name, "Alice");
+        assert_eq!(persona.role, "");
+        assert_eq!(persona.working_on, "");
     }
 }

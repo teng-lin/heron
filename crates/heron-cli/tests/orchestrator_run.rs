@@ -224,6 +224,8 @@ async fn run_pipeline_with_stub_backends_writes_markdown_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     };
     let (backends, seen_transcript) = build_backends();
     let mut orch = Orchestrator::with_test_backends(cfg, backends);
@@ -303,6 +305,8 @@ async fn run_pipeline_with_failing_llm_writes_fallback_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     };
     let backends: Backends = (
         Box::new(StubStt),
@@ -397,6 +401,8 @@ async fn run_pipeline_with_empty_stt_finalizes_to_idle_with_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     };
     let llm_seen = Arc::new(Mutex::new(None));
     let llm = StubLlm {
@@ -469,6 +475,8 @@ async fn run_pipeline_with_missing_wavs_finalizes_with_note() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     };
     let (backends, _seen) = build_backends();
     let mut orch = Orchestrator::with_test_backends(cfg, backends);
@@ -538,6 +546,8 @@ async fn run_pipeline_uses_calendar_event_for_slug_and_attendees() {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     };
     let llm_seen = Arc::new(Mutex::new(None));
     let llm = StubLlm {

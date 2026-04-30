@@ -681,6 +681,11 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         // CLI captures have no SSE consumer listening, so the AX
         // bridge stays an offline-aligner-only feed.
         event_bus: None,
+        // Tier 4: CLI captures don't read the desktop's `Settings.persona`
+        // / `Settings.strip_names_before_summarization` — leave both off
+        // so the prompt path stays byte-identical to pre-Tier-4 here.
+        persona: None,
+        strip_names: false,
     };
 
     if args.no_op {

@@ -126,6 +126,135 @@ pub fn build_user_content(prompt: &str, transcript_text: &str) -> String {
     format!("{prompt}\n\nTranscript JSONL (one turn per line):\n```\n{transcript_text}\n```")
 }
 
+/// Tier 4 #21: privacy transform that walks the transcript JSONL line
+/// by line, replacing each unique `speaker` value with a stable
+/// `Speaker A` / `Speaker B` / … pseudonym. Letters are assigned in
+/// first-appearance order so the same speaker maps to the same letter
+/// across every call, which keeps re-summarize stable when the
+/// underlying transcript hasn't changed.
+///
+/// ## Non-goals
+///
+/// - The strip applies *only* to the LLM input. The orchestrator's
+///   round-trip `attendees` list still uses the real names — re-read
+///   from the prior summary's frontmatter via `read_prior_items`.
+/// - The "me" / "them" sentinels heron writes for self / unattributed
+///   channel turns are preserved unchanged: stripping them would
+///   collapse the user's own voice into the same pseudonym as a
+///   remote speaker, which the §11.2 prompt template counts on for
+///   speaker attribution.
+/// - Lines that fail to parse as JSON or that don't carry a
+///   `"speaker"` string field pass through verbatim. The aligner
+///   never emits malformed lines, but a corrupted file shouldn't
+///   poison the whole prompt — better to leak the raw speaker name
+///   on a single bad line than to drop the entire transcript.
+///
+/// ## Letter overflow (>26 unique speakers)
+///
+/// After "Speaker Z", the next pseudonym is "Speaker AA", "Speaker AB",
+/// …, "Speaker AZ", "Speaker BA", … (Excel-style base-26-without-zero).
+/// Real meetings rarely have more than 5–10 distinct speakers, but the
+/// fallback exists so a misbehaving aligner that emits a fresh label
+/// per line never panics or wraps.
+pub fn strip_speaker_names(transcript_text: &str) -> String {
+    use std::collections::HashMap;
+
+    // Sentinel labels heron's writer uses for its own bookkeeping
+    // (mic = self, channel-only = unknown remote). These must not
+    // collapse together — preserving them upstream preserves the
+    // §11.2 attribution contract the prompt template depends on.
+    fn is_sentinel(label: &str) -> bool {
+        matches!(label, "me" | "them" | "")
+    }
+
+    let mut mapping: HashMap<String, String> = HashMap::new();
+    let mut next_index: usize = 0;
+    let mut out = String::with_capacity(transcript_text.len());
+
+    for line in transcript_text.split_inclusive('\n') {
+        // `split_inclusive('\n')` keeps the trailing `\n` on every
+        // intermediate line and yields the final partial line (no
+        // `\n`) as a separate item, so we don't have to special-case
+        // the file's last line.
+        let trimmed_for_parse = line.trim_end_matches(['\n', '\r']);
+        if trimmed_for_parse.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed_for_parse) {
+            Ok(serde_json::Value::Object(mut obj)) => {
+                let needs_rewrite = matches!(
+                    obj.get("speaker"),
+                    Some(serde_json::Value::String(s)) if !is_sentinel(s)
+                );
+                if !needs_rewrite {
+                    // Sentinel speaker / missing speaker / non-string
+                    // speaker — pass the line through verbatim. Re-
+                    // serializing here would reorder the JSON object's
+                    // keys (default serde_json::Map is `BTreeMap`-
+                    // backed without the `preserve_order` feature),
+                    // which would silently change the byte shape of the
+                    // transcript fed to the LLM even when no real-name
+                    // replacement was needed.
+                    out.push_str(line);
+                    continue;
+                }
+                if let Some(serde_json::Value::String(name)) = obj.get("speaker").cloned() {
+                    let pseudo = mapping
+                        .entry(name)
+                        .or_insert_with(|| {
+                            let label = pseudonym_for_index(next_index);
+                            next_index += 1;
+                            label
+                        })
+                        .clone();
+                    obj.insert("speaker".into(), serde_json::Value::String(pseudo));
+                }
+                // `to_string` doesn't pretty-print and preserves the
+                // JSONL one-line-per-turn contract.
+                out.push_str(
+                    &serde_json::to_string(&serde_json::Value::Object(obj))
+                        .unwrap_or_else(|_| trimmed_for_parse.to_owned()),
+                );
+                // Preserve the original line ending (`\n` or `\r\n`)
+                // so downstream byte-counting stays accurate.
+                if let Some(stripped) = line.strip_prefix(trimmed_for_parse) {
+                    out.push_str(stripped);
+                }
+            }
+            // Non-object JSON (a string, number, array) or a parse
+            // error: pass through verbatim. The §3.4 invariant is
+            // "one object per line"; anything else is malformed and
+            // shouldn't survive into the prompt anyway, but better to
+            // leak one bad line than to drop the entire transcript.
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Map a 0-based speaker index to its Excel-style pseudonym:
+/// 0 → "Speaker A", 25 → "Speaker Z", 26 → "Speaker AA",
+/// 27 → "Speaker AB", … Pulled out of [`strip_speaker_names`] so the
+/// >26-speaker contract is testable in isolation.
+fn pseudonym_for_index(index: usize) -> String {
+    let mut letters = String::new();
+    let mut n = index;
+    loop {
+        let rem = n % 26;
+        letters.insert(0, char::from(b'A' + (rem as u8)));
+        n /= 26;
+        if n == 0 {
+            break;
+        }
+        // Excel-style: subtract 1 each iteration past the first so
+        // the carry is base-26-without-zero (A=0 in the LSD; A=1 in
+        // higher digits, hence "AA" follows "Z" instead of "BA").
+        n -= 1;
+    }
+    format!("Speaker {letters}")
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -165,6 +294,160 @@ mod tests {
         let body = read_transcript_capped(&path).expect("read");
         assert!(body.contains("keeper line"));
         assert!(!body.contains(&"a".repeat(MAX_TRANSCRIPT_LINE_BYTES as usize)));
+    }
+
+    #[test]
+    fn strip_speaker_names_assigns_letters_in_first_appearance_order() {
+        // Alice → A, Bob → B, Carol → C, then Alice → A again on her
+        // second turn so a re-summarize over the same transcript stays
+        // stable across runs (key contract for the layer-2 ID matcher
+        // not to wobble when names are pseudonymized).
+        let input = concat!(
+            r#"{"speaker":"Alice","text":"hi"}"#,
+            "\n",
+            r#"{"speaker":"Bob","text":"hello"}"#,
+            "\n",
+            r#"{"speaker":"Carol","text":"hey"}"#,
+            "\n",
+            r#"{"speaker":"Alice","text":"again"}"#,
+            "\n",
+        );
+        let out = strip_speaker_names(input);
+        assert!(out.contains(r#""speaker":"Speaker A""#), "Alice → A: {out}");
+        assert!(out.contains(r#""speaker":"Speaker B""#), "Bob → B: {out}");
+        assert!(out.contains(r#""speaker":"Speaker C""#), "Carol → C: {out}");
+        // Alice's second turn must reuse "Speaker A" — pinning that
+        // re-summarize doesn't reshuffle pseudonyms when the same
+        // transcript is replayed.
+        assert!(
+            !out.contains("Alice"),
+            "real names must not leak through to the LLM input: {out}"
+        );
+        assert_eq!(
+            out.matches(r#""speaker":"Speaker A""#).count(),
+            2,
+            "Alice's two turns should share `Speaker A`: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_speaker_names_preserves_self_and_them_sentinels() {
+        // heron's writer uses `me` for the user's mic channel and
+        // `them` for unattributed channel turns. The §11.2 prompt
+        // template counts on those as semantic markers; pseudonymizing
+        // them would conflate the user with a remote speaker.
+        let input = concat!(
+            r#"{"speaker":"me","text":"my line"}"#,
+            "\n",
+            r#"{"speaker":"them","text":"their line"}"#,
+            "\n",
+            r#"{"speaker":"Alice","text":"named"}"#,
+            "\n",
+        );
+        let out = strip_speaker_names(input);
+        assert!(out.contains(r#""speaker":"me""#), "me preserved: {out}");
+        assert!(out.contains(r#""speaker":"them""#), "them preserved: {out}");
+        assert!(out.contains(r#""speaker":"Speaker A""#), "Alice → A: {out}");
+        assert!(!out.contains("Alice"), "Alice replaced: {out}");
+    }
+
+    #[test]
+    fn strip_speaker_names_is_idempotent() {
+        // Running the strip twice over an already-stripped transcript
+        // must produce the same output. Pseudonyms are not real names,
+        // so they pass through unchanged on the second pass — they
+        // just claim their own pseudonym slots, which is fine because
+        // the pseudonym-to-pseudonym mapping is the identity in the
+        // first appearance.
+        let input = concat!(
+            r#"{"speaker":"Alice","text":"hi"}"#,
+            "\n",
+            r#"{"speaker":"Bob","text":"hello"}"#,
+            "\n",
+        );
+        let once = strip_speaker_names(input);
+        let twice = strip_speaker_names(&once);
+        assert_eq!(once, twice, "strip must be idempotent");
+    }
+
+    #[test]
+    fn strip_speaker_names_excel_style_after_letter_z() {
+        // 27 unique speakers: indices 0..26 → A..Z, index 26 → AA.
+        // Pin the >26 contract here so a future refactor that reverts
+        // to numbered or wraps with `Z+1` fails loudly.
+        let mut input = String::new();
+        for i in 0..27 {
+            input.push_str(&format!(r#"{{"speaker":"name_{i:02}","text":"x"}}"#));
+            input.push('\n');
+        }
+        let out = strip_speaker_names(&input);
+        assert!(out.contains(r#""speaker":"Speaker A""#), "A: {out}");
+        assert!(out.contains(r#""speaker":"Speaker Z""#), "Z: {out}");
+        assert!(
+            out.contains(r#""speaker":"Speaker AA""#),
+            "27th speaker → AA: {out}"
+        );
+        for i in 0..27 {
+            let real = format!("name_{i:02}");
+            assert!(!out.contains(&real), "real name `{real}` leaked: {out}");
+        }
+    }
+
+    #[test]
+    fn strip_speaker_names_passes_through_malformed_lines() {
+        // A non-JSON line must survive: the §3.4 invariant is "one
+        // object per line"; anything else is malformed but shouldn't
+        // poison the whole prompt — better to leak one bad line than
+        // to drop the transcript.
+        let input = concat!(
+            "not even json\n",
+            r#"{"speaker":"Alice","text":"hi"}"#,
+            "\n",
+        );
+        let out = strip_speaker_names(input);
+        assert!(out.contains("not even json"), "malformed line preserved");
+        assert!(out.contains(r#""speaker":"Speaker A""#), "Alice → A");
+    }
+
+    #[test]
+    fn strip_speaker_names_passes_through_lines_without_speaker_field() {
+        // A JSON object that's missing `speaker` (or where it's not a
+        // string) shouldn't be mangled — pass it through unchanged.
+        let input = concat!(
+            r#"{"text":"no speaker"}"#,
+            "\n",
+            r#"{"speaker":42,"text":"non-string speaker"}"#,
+            "\n",
+        );
+        let out = strip_speaker_names(input);
+        assert!(out.contains(r#""text":"no speaker""#));
+        assert!(out.contains(r#""speaker":42"#));
+    }
+
+    /// When no real name needs replacing (every speaker is a sentinel
+    /// or absent), the output must be byte-identical to the input —
+    /// re-serializing through serde_json would re-order keys and
+    /// silently change the bytes the LLM sees, which is a hidden
+    /// regression risk for the strip-names contract.
+    #[test]
+    fn strip_speaker_names_is_byte_identical_when_no_real_names_present() {
+        // Use a key order serde_json's default BTreeMap-backed Map
+        // would shuffle if it re-serialized: `t0` < `text` < `speaker`
+        // alphabetically; the input puts `t0` after `speaker`, which
+        // a BTreeMap re-serialize would silently reorder.
+        let input = concat!(
+            r#"{"speaker":"me","t0":0,"text":"hi"}"#,
+            "\n",
+            r#"{"speaker":"them","t0":1,"text":"there"}"#,
+            "\n",
+            r#"{"text":"no speaker field","t0":2}"#,
+            "\n",
+        );
+        let out = strip_speaker_names(input);
+        assert_eq!(
+            out, input,
+            "no real-name lines must pass through byte-identically"
+        );
     }
 
     #[test]

@@ -277,6 +277,8 @@ pub async fn run_pipeline(
         llm.as_ref(),
         &transcript_path,
         config.pre_meeting_briefing.as_deref(),
+        config.persona.as_ref(),
+        config.strip_names,
     )
     .await
     {
@@ -634,10 +636,18 @@ async fn run_stt(
 /// is woven into the summarizer prompt so the LLM can reference what
 /// the user knew going into the call. `None` for the standard
 /// `heron record` CLI path which never stages context.
+///
+/// `persona` and `strip_names` (Tier 4 #18 / #21) are forwarded from
+/// `SessionConfig` — the daemon / desktop orchestrator populates them
+/// from `Settings.persona` / `Settings.strip_names_before_summarization`.
+/// CLI captures default both to "off" so the prompt path stays
+/// byte-identical to pre-Tier-4 unless the user has explicitly opted in.
 async fn summarize(
     llm: &dyn heron_llm::Summarizer,
     transcript: &Path,
     pre_meeting_briefing: Option<&str>,
+    persona: Option<&heron_types::Persona>,
+    strip_names: bool,
 ) -> Result<heron_llm::SummarizerOutput, SessionError> {
     let input = heron_llm::SummarizerInput {
         transcript,
@@ -645,6 +655,8 @@ async fn summarize(
         existing_action_items: None,
         existing_attendees: None,
         pre_meeting_briefing,
+        persona,
+        strip_names,
     };
     Ok(llm.summarize(input).await?)
 }
