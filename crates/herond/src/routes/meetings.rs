@@ -39,6 +39,8 @@ pub fn router() -> Router<AppState> {
         .route("/meetings", get(list_meetings).post(start_capture))
         .route("/meetings/{meeting_id}", get(get_meeting))
         .route("/meetings/{meeting_id}/end", post(end_meeting))
+        .route("/meetings/{meeting_id}/pause", post(pause_meeting))
+        .route("/meetings/{meeting_id}/resume", post(resume_meeting))
         .route("/meetings/{meeting_id}/transcript", get(read_transcript))
         .route("/meetings/{meeting_id}/summary", get(read_summary))
         .route("/meetings/{meeting_id}/audio", get(read_audio))
@@ -116,6 +118,33 @@ async fn start_capture(
 
 async fn end_meeting(State(state): State<AppState>, Path(meeting_id): Path<MeetingId>) -> Response {
     match state.orchestrator.end_meeting(&meeting_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => WireError::from(e).into_response(),
+    }
+}
+
+/// `POST /meetings/{meeting_id}/pause` — flip an active capture to
+/// `Paused`. Tier 3 #16: until this endpoint shipped, the desktop's
+/// Pause button only flipped local frontend state while the daemon
+/// kept writing frames; rewiring the button to call this is what
+/// closes that gap.
+async fn pause_meeting(
+    State(state): State<AppState>,
+    Path(meeting_id): Path<MeetingId>,
+) -> Response {
+    match state.orchestrator.pause_capture(&meeting_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => WireError::from(e).into_response(),
+    }
+}
+
+/// `POST /meetings/{meeting_id}/resume` — flip a paused capture back
+/// to `Recording`.
+async fn resume_meeting(
+    State(state): State<AppState>,
+    Path(meeting_id): Path<MeetingId>,
+) -> Response {
+    match state.orchestrator.resume_capture(&meeting_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => WireError::from(e).into_response(),
     }

@@ -226,6 +226,52 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /meetings/{meeting_id}/pause:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+    post:
+      tags: [meetings]
+      summary: Pause an in-progress capture mid-session.
+      description: |
+        Tier 3 #16. Drives `recording → paused`. The daemon-side
+        capture pipeline drops audio frames on the floor while paused,
+        so the saved WAV (and downstream transcript / m4a) reflect
+        only the un-paused portion of the call. WAV writers stay open
+        — a subsequent `resume` picks back up without sealing the file.
+      responses:
+        "204": { description: Capture transitioned to `paused`. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Meeting is not in a state that accepts `pause` (e.g. it is
+            already paused, or never reached `recording`). Body's
+            `details.current_state` reports where it actually is.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /meetings/{meeting_id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/MeetingIdPath"
+    post:
+      tags: [meetings]
+      summary: Resume a paused capture.
+      description: |
+        Tier 3 #16. Drives `paused → recording`. New audio frames flow
+        back into the WAV writers and the AX speaker collector;
+        envelopes resume publishing on `/events`.
+      responses:
+        "204": { description: Capture transitioned to `recording`. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Meeting is not in a state that accepts `resume` (e.g. it
+            was never paused). Body's `details.current_state` reports
+            where it actually is.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /meetings/{meeting_id}/transcript:
     parameters:
       - $ref: "#/components/parameters/MeetingIdPath"
@@ -609,7 +655,7 @@ components:
 
     MeetingStatus:
       type: string
-      enum: [detected, armed, recording, ended, done, failed]
+      enum: [detected, armed, recording, paused, ended, done, failed]
       description: |
         v1 desktop meeting lifecycle from `heron-cli::session` and
         `architecture.md` — distinct from spec §3, which is the v2
@@ -618,7 +664,9 @@ components:
         terminal-failure (capture aborted, transcript orphaned).
         Both terminal states emit a single `meeting.completed` event
         on `/events` with `data.outcome` carrying success vs failure
-        per Invariant 9.
+        per Invariant 9. `paused` is the Tier 3 #16 mid-session pause
+        state — daemon drops capture frames on the floor; `resume`
+        flips back to `recording`.
 
     Confidence:
       type: string

@@ -28,6 +28,7 @@ fn cfg(tmp: &TempDir) -> SessionConfig {
         event_bus: None,
         persona: None,
         strip_names: false,
+        pause_flag: None,
     }
 }
 

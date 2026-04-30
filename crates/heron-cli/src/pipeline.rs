@@ -24,6 +24,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use heron_event::Envelope;
@@ -443,20 +445,30 @@ async fn run_capture_phase(
     let capture =
         heron_audio::AudioCapture::start(config.session_id, &config.target_bundle_id, &session_dir)
             .await?;
+    // Tier 3 #16: hand the pause flag to every consumer of capture
+    // frames so a paused capture drops frames on the floor without
+    // wedging the broadcast channel. The flag is owned by the daemon
+    // orchestrator (`pause_capture` / `resume_capture`); the pipeline
+    // gets cheap `Arc` clones. `None` for `heron record` CLI runs
+    // (no pause UI) — the pipeline treats that as "never paused".
+    let pause_flag = config.pause_flag.clone();
     let mic_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
         Channel::Mic,
         mic_wav.to_path_buf(),
+        pause_flag.clone(),
     );
     let mic_clean_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
         Channel::MicClean,
         mic_clean_wav.to_path_buf(),
+        pause_flag.clone(),
     );
     let tap_handle = spawn_wav_writer(
         capture.frames.resubscribe(),
         Channel::Tap,
         tap_wav.to_path_buf(),
+        pause_flag.clone(),
     );
 
     // AX listener: subscribe to SpeakerEvents into a Vec we own. The
@@ -477,11 +489,18 @@ async fn run_capture_phase(
     // Audio-level meter (Tier 3 #15). Spawned only when a bus is
     // present — the `heron record` CLI path has no live-level
     // consumer. Cloned ahead of `event_bus` being moved into
-    // `spawn_ax_collector` below.
+    // `spawn_ax_collector` below. Gated by the same pause flag as
+    // the WAV writers and AX collector — a paused capture should not
+    // surface live levels for audio that isn't being recorded.
     let audio_level_handle = event_bus.as_ref().map(|(bus, mid)| {
-        spawn_audio_level_collector(capture.frames.resubscribe(), bus.clone(), *mid)
+        spawn_audio_level_collector(
+            capture.frames.resubscribe(),
+            bus.clone(),
+            *mid,
+            pause_flag.clone(),
+        )
     });
-    let ax_collector = spawn_ax_collector(ax_rx, event_bus);
+    let ax_collector = spawn_ax_collector(ax_rx, event_bus, pause_flag);
 
     let _ = stop_rx.await;
 
@@ -547,6 +566,7 @@ fn spawn_wav_writer(
     mut rx: broadcast::Receiver<heron_audio::CaptureFrame>,
     channel: Channel,
     path: PathBuf,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let spec = hound::WavSpec {
@@ -568,6 +588,22 @@ fn spawn_wav_writer(
             match rx.blocking_recv() {
                 Ok(frame) => {
                     if frame.channel != channel {
+                        continue;
+                    }
+                    // Tier 3 #16: when the orchestrator has flipped the
+                    // pause flag, drop the frame on the floor. We
+                    // intentionally KEEP the writer open so a
+                    // subsequent resume picks up where we left off; a
+                    // `Closed` here would seal the WAV mid-meeting.
+                    // `SeqCst` for the same memory-ordering guarantees
+                    // the orchestrator side uses — pause/resume are
+                    // user-facing and rare, so the conservative ordering
+                    // is the right tradeoff over a per-frame `Relaxed`
+                    // load.
+                    if pause_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::SeqCst))
+                    {
                         continue;
                     }
                     for &sample in &frame.samples {
@@ -609,6 +645,7 @@ fn spawn_wav_writer(
 fn spawn_ax_collector(
     mut rx: mpsc::Receiver<SpeakerEvent>,
     event_bus: Option<(SessionEventBus, MeetingId)>,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) -> JoinHandle<Vec<SpeakerEvent>> {
     // Pre-stringify the meeting id once: it's constant for the lifetime
     // of the task, and `Envelope::with_meeting` would otherwise allocate
@@ -617,6 +654,20 @@ fn spawn_ax_collector(
     tokio::spawn(async move {
         let mut events = Vec::new();
         while let Some(evt) = rx.recv().await {
+            // Tier 3 #16: when paused, neither publish the AX event
+            // onto the bus (a `speaker.changed` envelope mid-pause
+            // would be misleading on the desktop's "now speaking"
+            // indicator) nor record it for the offline aligner — the
+            // user paused mid-call, the audio they're saving has no
+            // gap there, and we want the speaker timeline to match
+            // what's on disk. Same `SeqCst` rationale as the WAV
+            // writers.
+            if pause_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::SeqCst))
+            {
+                continue;
+            }
             if let Some((bus, meeting_id)) = publish_target.as_ref() {
                 let payload = EventPayload::SpeakerChanged(SpeakerChangedData {
                     t: evt.t,
@@ -687,8 +738,15 @@ fn spawn_audio_level_collector(
     frames_rx: broadcast::Receiver<heron_audio::CaptureFrame>,
     bus: SessionEventBus,
     meeting_id: MeetingId,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) -> JoinHandle<()> {
-    spawn_audio_level_collector_with_period(frames_rx, bus, meeting_id, AUDIO_LEVEL_TICK)
+    spawn_audio_level_collector_with_period(
+        frames_rx,
+        bus,
+        meeting_id,
+        pause_flag,
+        AUDIO_LEVEL_TICK,
+    )
 }
 
 /// Test seam exposing the tick period. Pinned with the `_with_period`
@@ -699,6 +757,7 @@ fn spawn_audio_level_collector_with_period(
     mut frames_rx: broadcast::Receiver<heron_audio::CaptureFrame>,
     bus: SessionEventBus,
     meeting_id: MeetingId,
+    pause_flag: Option<Arc<AtomicBool>>,
     tick: std::time::Duration,
 ) -> JoinHandle<()> {
     // Stringify once outside the tick loop: `MeetingId::to_string`
@@ -722,9 +781,24 @@ fn spawn_audio_level_collector_with_period(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            let paused = pause_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::SeqCst));
             tokio::select! {
                 msg = frames_rx.recv() => match msg {
-                    Ok(frame) => fold_frame_into_slot(frame, &mut mic_clean, &mut tap),
+                    Ok(frame) => {
+                        // Tier 3 #16: drop frames + reset accumulators
+                        // on pause so the renderer's last-value-sticks
+                        // contract doesn't paint stale dBFS over a
+                        // paused capture. Same `SeqCst` rationale as
+                        // the WAV writers and AX collector.
+                        if paused {
+                            mic_clean = None;
+                            tap = None;
+                            continue;
+                        }
+                        fold_frame_into_slot(frame, &mut mic_clean, &mut tap);
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!(lagged = n, "audio-level collector dropped frames");
@@ -732,6 +806,13 @@ fn spawn_audio_level_collector_with_period(
                     }
                 },
                 _ = ticker.tick() => {
+                    if paused {
+                        // Suppress publish entirely; renderer freezes
+                        // on its prior reading until resume.
+                        mic_clean = None;
+                        tap = None;
+                        continue;
+                    }
                     publish_slot(&bus, &meeting_id, mic_clean.take());
                     publish_slot(&bus, &meeting_id, tap.take());
                 }
@@ -1122,7 +1203,7 @@ mod tests {
         let mut sub = bus.subscribe();
 
         let (tx, rx) = mpsc::channel(8);
-        let handle = spawn_ax_collector(rx, Some((bus.clone(), meeting_id)));
+        let handle = spawn_ax_collector(rx, Some((bus.clone(), meeting_id)), None);
 
         tx.send(SpeakerEvent {
             t: 1.0,
@@ -1320,6 +1401,7 @@ mod tests {
             rx,
             bus.clone(),
             meeting_id,
+            None,
             std::time::Duration::from_millis(50),
         );
 
@@ -1402,6 +1484,7 @@ mod tests {
             rx,
             bus.clone(),
             meeting_id,
+            None,
             std::time::Duration::from_millis(20),
         );
 
@@ -1414,6 +1497,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_ax_collector_drops_events_when_paused() {
+        // Tier 3 #16 contract: when the shared pause flag is set, the
+        // AX collector must drop both the offline-aligner Vec push
+        // AND the bus envelope. Regression guard against a future
+        // change that flips one but forgets the other — the user
+        // saving a paused capture would otherwise see a "now speaking"
+        // bubble for audio that wasn't recorded.
+        use heron_event::EventBus;
+        use heron_session::MeetingId;
+        use heron_types::{SpeakerEvent, ViewMode};
+
+        let bus: SessionEventBus = EventBus::new(16);
+        let meeting_id = MeetingId::now_v7();
+        let mut sub = bus.subscribe();
+        let pause_flag = Arc::new(AtomicBool::new(true));
+
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_ax_collector(
+            rx,
+            Some((bus.clone(), meeting_id)),
+            Some(pause_flag.clone()),
+        );
+        tx.send(SpeakerEvent {
+            t: 1.0,
+            name: "Alice".into(),
+            started: true,
+            view_mode: ViewMode::ActiveSpeaker,
+            own_tile: false,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        let collected = handle.await.expect("join");
+        assert!(
+            collected.is_empty(),
+            "paused collector must drop alignment events",
+        );
+        assert!(
+            sub.try_recv().is_err(),
+            "paused collector must not publish to bus",
+        );
+        // Sanity: flipping the flag back lets new events flow.
+        pause_flag.store(false, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_ax_collector(rx, None, Some(pause_flag));
+        tx.send(SpeakerEvent {
+            t: 2.0,
+            name: "Bob".into(),
+            started: true,
+            view_mode: ViewMode::ActiveSpeaker,
+            own_tile: false,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        let collected = handle.await.expect("join");
+        assert_eq!(collected.len(), 1, "post-resume events must flow");
+    }
+
+    #[tokio::test]
     async fn spawn_ax_collector_without_bus_still_collects() {
         // CLI captures pass `None` for the bus. The collector must
         // still drain the channel into a Vec — regression guard
@@ -1421,7 +1564,7 @@ mod tests {
         // push when the bus is absent.
         use heron_types::{SpeakerEvent, ViewMode};
         let (tx, rx) = mpsc::channel(8);
-        let handle = spawn_ax_collector(rx, None);
+        let handle = spawn_ax_collector(rx, None, None);
         tx.send(SpeakerEvent {
             t: 0.5,
             name: "them".into(),

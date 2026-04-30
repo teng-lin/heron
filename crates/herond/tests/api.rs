@@ -163,6 +163,9 @@ async fn stub_orchestrator_endpoints_all_return_501() {
         ("GET", &format!("/v1/meetings/{VALID_MTG}/summary")[..]),
         ("GET", &format!("/v1/meetings/{VALID_MTG}/audio")[..]),
         ("GET", "/v1/calendar/upcoming"),
+        // Tier 3 #16: pause / resume routes, same stub-501 contract.
+        ("POST", &format!("/v1/meetings/{VALID_MTG}/pause")[..]),
+        ("POST", &format!("/v1/meetings/{VALID_MTG}/resume")[..]),
     ];
     for (method, path) in cases {
         let res = build_app(stub_state())
@@ -850,6 +853,12 @@ impl SessionOrchestrator for WithCache {
     }
     async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError> {
         self.inner.end_meeting(id).await
+    }
+    async fn pause_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
+        self.inner.pause_capture(id).await
+    }
+    async fn resume_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
+        self.inner.resume_capture(id).await
     }
     async fn read_transcript(&self, id: &MeetingId) -> Result<Transcript, SessionError> {
         self.inner.read_transcript(id).await

@@ -43,6 +43,7 @@ export default function Recording() {
   const stop = useRecordingStore((s) => s.stop);
   const settingsPath = useSettingsStore((s) => s.settingsPath);
   const [stopping, setStopping] = useState(false);
+  const [pauseToggling, setPauseToggling] = useState(false);
 
   const meetings = useMeetingsStore((s) => s.items);
   const loadMeetings = useMeetingsStore((s) => s.load);
@@ -101,6 +102,39 @@ export default function Recording() {
   // /recording without our Home button starting the session. The
   // button is disabled when neither is available.
   const stopTargetId = recordingMeetingId ?? activeMeeting?.id ?? null;
+
+  const handleTogglePause = async () => {
+    // Tier 3 #16: the Pause/Resume button used to be a local-only
+    // flag — the daemon kept writing frames while the user thought
+    // they were paused. Now we hit the daemon's pause/resume HTTP
+    // endpoints; only on a successful 204 do we flip the local flag.
+    // On daemon error we surface a toast and leave the local flag
+    // alone so the button accurately reflects the daemon's view.
+    if (pauseToggling) return;
+    if (stopTargetId === null) {
+      toast.error("No active meeting to pause.");
+      return;
+    }
+    setPauseToggling(true);
+    try {
+      const command = paused ? "heron_resume_meeting" : "heron_pause_meeting";
+      const outcome = await invoke(command, { meetingId: stopTargetId });
+      if (outcome.kind !== "ok") {
+        toast.error(
+          `Could not ${paused ? "resume" : "pause"} recording: ${outcome.detail}`,
+        );
+        return;
+      }
+      togglePause();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(
+        `Could not ${paused ? "resume" : "pause"} recording: ${message}`,
+      );
+    } finally {
+      setPauseToggling(false);
+    }
+  };
 
   const handleStop = async () => {
     if (stopping) return;
@@ -254,8 +288,20 @@ export default function Recording() {
         <TranscriptPane segments={segments} />
 
         <div className="mt-6 flex gap-3">
-          <Button variant="outline" onClick={togglePause} aria-pressed={paused}>
-            {paused ? "Resume" : "Pause"}
+          <Button
+            variant="outline"
+            onClick={() => void handleTogglePause()}
+            aria-pressed={paused}
+            disabled={pauseToggling || stopTargetId === null}
+            aria-busy={pauseToggling}
+          >
+            {pauseToggling
+              ? paused
+                ? "Resuming…"
+                : "Pausing…"
+              : paused
+                ? "Resume"
+                : "Pause"}
           </Button>
           <Button
             variant="destructive"

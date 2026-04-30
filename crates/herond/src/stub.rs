@@ -71,6 +71,14 @@ impl SessionOrchestrator for StubOrchestrator {
         Err(SessionError::NotYetImplemented)
     }
 
+    async fn pause_capture(&self, _id: &MeetingId) -> Result<(), SessionError> {
+        Err(SessionError::NotYetImplemented)
+    }
+
+    async fn resume_capture(&self, _id: &MeetingId) -> Result<(), SessionError> {
+        Err(SessionError::NotYetImplemented)
+    }
+
     async fn read_transcript(&self, _id: &MeetingId) -> Result<Transcript, SessionError> {
         Err(SessionError::NotYetImplemented)
     }

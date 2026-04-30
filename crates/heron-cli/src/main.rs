@@ -690,6 +690,9 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         // so the prompt path stays byte-identical to pre-Tier-4 here.
         persona: None,
         strip_names: false,
+        // CLI captures have no pause UI; the pipeline treats `None`
+        // as "never paused" (see `pause_flag` doc on SessionConfig).
+        pause_flag: None,
     };
 
     if args.no_op {

@@ -258,6 +258,47 @@ pub async fn heron_end_meeting(
     Ok(end_meeting_at(BASE_URL, &bearer, &parsed).await)
 }
 
+/// Tauri command: pause an in-progress capture. Proxies
+/// `POST /v1/meetings/{id}/pause`. Tier 3 #16: the Recording page's
+/// Pause button funnels through here so the daemon-side capture
+/// pipeline actually stops writing frames (previously the button
+/// only flipped local React state).
+#[tauri::command]
+pub async fn heron_pause_meeting(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<PauseMeetingAck>, String> {
+    let parsed = match MeetingId::from_str(&meeting_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(DaemonOutcome::Unavailable {
+                detail: format!("invalid meeting_id: {e}"),
+            });
+        }
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(pause_meeting_at(BASE_URL, &bearer, &parsed).await)
+}
+
+/// Tauri command: resume a paused capture. Proxies
+/// `POST /v1/meetings/{id}/resume`.
+#[tauri::command]
+pub async fn heron_resume_meeting(
+    state: State<'_, DaemonHandle>,
+    meeting_id: String,
+) -> Result<DaemonOutcome<PauseMeetingAck>, String> {
+    let parsed = match MeetingId::from_str(&meeting_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(DaemonOutcome::Unavailable {
+                detail: format!("invalid meeting_id: {e}"),
+            });
+        }
+    };
+    let bearer = state.auth.bearer.clone();
+    Ok(resume_meeting_at(BASE_URL, &bearer, &parsed).await)
+}
+
 /// Tauri command: list upcoming calendar events. Proxies
 /// `GET /v1/calendar/upcoming`.
 ///
@@ -350,6 +391,15 @@ struct StartCaptureBody<'a> {
 /// — guards against accidental ID drift on future refactors.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EndMeetingAck {
+    pub meeting_id: MeetingId,
+}
+
+/// Synthetic ack for a successful `POST /v1/meetings/{id}/pause` or
+/// `POST /v1/meetings/{id}/resume`. Same rationale as
+/// [`EndMeetingAck`] — the daemon emits `204 No Content`, so we echo
+/// the parsed `MeetingId` back to give the JS side a typed handle.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PauseMeetingAck {
     pub meeting_id: MeetingId,
 }
 
@@ -472,6 +522,7 @@ fn status_str(s: MeetingStatus) -> &'static str {
         MeetingStatus::Detected => "detected",
         MeetingStatus::Armed => "armed",
         MeetingStatus::Recording => "recording",
+        MeetingStatus::Paused => "paused",
         MeetingStatus::Ended => "ended",
         MeetingStatus::Done => "done",
         MeetingStatus::Failed => "failed",
@@ -849,6 +900,68 @@ pub async fn end_meeting_at(
     }
     DaemonOutcome::Ok {
         data: EndMeetingAck {
+            meeting_id: *meeting_id,
+        },
+    }
+}
+
+/// Parameterized pause — same split-out rationale as
+/// [`end_meeting_at`]. Tier 3 #16: POSTs to
+/// `POST /v1/meetings/{id}/pause`. The daemon emits `204 No Content`
+/// on success; we echo a [`PauseMeetingAck`] so the JS side has a
+/// typed handle without parsing an empty body.
+pub async fn pause_meeting_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &MeetingId,
+) -> DaemonOutcome<PauseMeetingAck> {
+    pause_or_resume_at(base_url, bearer, meeting_id, "pause").await
+}
+
+/// Parameterized resume — counterpart to [`pause_meeting_at`].
+pub async fn resume_meeting_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &MeetingId,
+) -> DaemonOutcome<PauseMeetingAck> {
+    pause_or_resume_at(base_url, bearer, meeting_id, "resume").await
+}
+
+/// Shared body for [`pause_meeting_at`] / [`resume_meeting_at`]: the
+/// two endpoints have identical wire shapes (POST → 204), only the
+/// path suffix differs. Centralising the reqwest dance keeps the
+/// timeout / status / DaemonOutcome mapping in lockstep across both.
+async fn pause_or_resume_at(
+    base_url: &str,
+    bearer: &str,
+    meeting_id: &MeetingId,
+    action: &'static str,
+) -> DaemonOutcome<PauseMeetingAck> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/meetings/{meeting_id}/{action}");
+    let resp = match client.post(url).bearer_auth(bearer).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: PauseMeetingAck {
             meeting_id: *meeting_id,
         },
     }

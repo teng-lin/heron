@@ -319,6 +319,19 @@ export interface EndMeetingAck {
 }
 
 /**
+ * Synthetic ack for `heron_pause_meeting` / `heron_resume_meeting`.
+ * Mirrors `apps/desktop/src-tauri/src/meetings.rs::PauseMeetingAck`.
+ *
+ * Same rationale as [`EndMeetingAck`]: the daemon emits `204 No
+ * Content`; the proxy echoes the validated meeting id back so the JS
+ * side can flip local recording-store state without re-deriving the
+ * id. Tier 3 #16.
+ */
+export interface PauseMeetingAck {
+  meeting_id: MeetingId;
+}
+
+/**
  * One row in the crash-recovery salvage list. Mirrors the Rust
  * `UnfinalizedSession` struct in `salvage.rs`.
  */
@@ -791,6 +804,27 @@ export interface HeronCommands {
   heron_end_meeting: {
     args: { meetingId: MeetingId };
     returns: DaemonResult<EndMeetingAck>;
+  };
+  /**
+   * Tier 3 #16: proxy `POST /v1/meetings/{id}/pause`. The Recording
+   * page's Pause button funnels through here so the daemon-side
+   * capture pipeline actually drops audio frames (previously the
+   * button only flipped local React state, and frames kept landing
+   * on disk). The daemon emits `204 No Content`; the proxy synthesizes
+   * a `PauseMeetingAck { meeting_id }` so the JS side has a typed
+   * handle without parsing an empty body.
+   */
+  heron_pause_meeting: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<PauseMeetingAck>;
+  };
+  /**
+   * Tier 3 #16: proxy `POST /v1/meetings/{id}/resume`. Counterpart to
+   * `heron_pause_meeting` — flips a paused capture back to recording.
+   */
+  heron_resume_meeting: {
+    args: { meetingId: MeetingId };
+    returns: DaemonResult<PauseMeetingAck>;
   };
   /**
    * Gap #8: proxy `GET /v1/calendar/upcoming`. Powers the Home page's

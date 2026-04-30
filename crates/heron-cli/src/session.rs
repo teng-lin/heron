@@ -22,6 +22,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use heron_llm::{Summarizer, SummarizerInput, SummarizerOutput};
 use heron_session::{MeetingId, SessionEventBus};
@@ -121,6 +123,14 @@ pub struct SessionConfig {
     /// `SummarizerInput::strip_names`. `false` preserves
     /// pre-Tier-4 behavior — speaker labels reach the LLM unchanged.
     pub strip_names: bool,
+    /// Tier 3 #16 pause flag. When `true`, the capture pipeline drops
+    /// frames on the floor (WAV writers, AX collector, and audio-level
+    /// collector all honor this). Owned by the daemon orchestrator so
+    /// it can flip the flag from `pause_capture` / `resume_capture`
+    /// without wedging the pipeline. `None` for `heron record` CLI runs
+    /// (no pause UI to drive it); the pipeline treats `None` as
+    /// "never paused".
+    pub pause_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Outcome of `run_no_op` and `run`.
@@ -399,6 +409,7 @@ mod tests {
             event_bus: None,
             persona: None,
             strip_names: false,
+            pause_flag: None,
         }
     }
 
