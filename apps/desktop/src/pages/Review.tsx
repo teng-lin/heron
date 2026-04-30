@@ -826,11 +826,22 @@ export default function Review() {
                     </TabsContent>
 
                     <TabsContent value="actions" className="mt-4">
-                      {actionItems.length === 0 ? (
+                      {load.kind === "loading" && (
+                        <div className="text-sm text-muted-foreground">
+                          Loading action items…
+                        </div>
+                      )}
+                      {load.kind === "error" && (
+                        <div className="text-sm text-destructive">
+                          Failed to load: {load.message}
+                        </div>
+                      )}
+                      {load.kind === "ready" && actionItems.length === 0 && (
                         <p className="text-sm text-muted-foreground">
                           No action items extracted from this note.
                         </p>
-                      ) : (
+                      )}
+                      {load.kind === "ready" && actionItems.length > 0 && (
                         <ul className="list-disc space-y-2 pl-5 text-sm">
                           {actionItems.map((item) => (
                             <li key={item.id}>
