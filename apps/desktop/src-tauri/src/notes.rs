@@ -21,10 +21,22 @@
 //! All three commands route through [`resolve_note_path`] /
 //! [`resolve_vault_path`], which canonicalize the input and reject
 //! paths that escape the configured vault. The renderer can supply
-//! any string, but only `<vault>/<basename>.md` (no traversal, no
-//! symlink-out, basename matches `[A-Za-z0-9._-]+`) reaches the
-//! filesystem. Without this, a route bug or compromised webview
-//! would have arbitrary local-file capability.
+//! any string, but only `<vault>/meetings/<basename>.md` (no
+//! traversal, no symlink-out, basename matches `[A-Za-z0-9._-]+`
+//! after stripping the wire-form `mtg_` prefix) reaches the
+//! filesystem. The `meetings/` subdirectory matches the layout
+//! `heron_vault::VaultWriter::finalize_with_pattern` writes into.
+//! Without this, a route bug or compromised webview would have
+//! arbitrary local-file capability.
+//!
+//! The `mtg_` strip is exact for `FileNamingPattern::Id` (on-disk
+//! file is `<uuid>.md`). For `Slug` / `DateSlug` patterns the
+//! on-disk basename is `<slug>.md` / `<YYYY-MM-DD>-<slug>.md` and
+//! bears no relation to the `mtg_<uuid>` wire id; those flows must
+//! resolve the basename via the orchestrator (`note_path_for_read`)
+//! or the `list_sessions` round-trip rather than relying on this
+//! strip. Currently every renderer caller passes a basename produced
+//! by `list_sessions` or a wire id matching `Id` pattern.
 //!
 //! Errors surface as `String` to match the existing `lib.rs` pattern
 //! (`AssetError::to_string`, `SettingsError::to_string`) — the React
@@ -89,8 +101,38 @@ pub(crate) async fn resolve_vault_path(vault: &Path) -> Result<PathBuf, String> 
     Ok(canonical)
 }
 
-/// Resolve `<vault>/<session_id>.md` and confirm the result is inside
-/// the canonical vault — no symlink escapes, no `..` shenanigans.
+/// `<vault>/meetings` — the directory `heron_vault::VaultWriter::finalize_with_pattern`
+/// writes finalized session notes into. Kept in one place so the
+/// renderer's read/write path can never drift from the writer's.
+pub(crate) fn meetings_dir(vault: &Path) -> PathBuf {
+    vault.join("meetings")
+}
+
+/// Strip the `mtg_` wire prefix from a meeting id, leaving the bare
+/// uuid the writer used as the basename for `FileNamingPattern::Id`.
+/// See the module-level "Path policy" docstring for the
+/// `Slug` / `DateSlug` caveat.
+pub(crate) fn note_basename(session_id: &str) -> &str {
+    session_id.strip_prefix("mtg_").unwrap_or(session_id)
+}
+
+/// Validate `session_id`, strip its `mtg_` wire prefix, and re-validate
+/// the result. The double-check is load-bearing: a clever id like
+/// `mtg_..` passes the first call (the literal `..` rule only matches
+/// the whole string) but the post-strip basename `..` must not reach
+/// the filesystem. Used by both `resolve_note_path` (`.md`) and
+/// `resummarize::resolve_bak_path` (`.md.bak`) so the two surfaces stay
+/// in lock-step.
+pub(crate) fn validated_basename(session_id: &str) -> Result<&str, String> {
+    validate_session_id(session_id)?;
+    let basename = note_basename(session_id);
+    validate_session_id(basename)?;
+    Ok(basename)
+}
+
+/// Resolve `<vault>/meetings/<basename>.md` (where `<basename>` strips
+/// any `mtg_` prefix from `session_id`) and confirm the result is
+/// inside the canonical vault — no symlink escapes, no `..` shenanigans.
 ///
 /// Returns the path the renderer is allowed to read/write. The
 /// canonicalize step requires the file to exist on read; for write we
@@ -101,9 +143,10 @@ pub(crate) async fn resolve_note_path(
     session_id: &str,
     must_exist: bool,
 ) -> Result<PathBuf, String> {
-    validate_session_id(session_id)?;
+    let basename = validated_basename(session_id)?;
     let canonical_vault = resolve_vault_path(vault).await?;
-    let candidate = canonical_vault.join(format!("{session_id}.md"));
+    let meetings = meetings_dir(&canonical_vault);
+    let candidate = meetings.join(format!("{basename}.md"));
 
     if must_exist {
         let canonical = fs::canonicalize(&candidate)
@@ -118,22 +161,40 @@ pub(crate) async fn resolve_note_path(
         }
         Ok(canonical)
     } else {
-        // For write we re-canonicalize the parent (which must exist —
-        // it's `canonical_vault` itself) and verify containment of the
-        // *parent* so a new file the validator already vetted is
-        // allowed through.
-        if candidate.parent() != Some(&canonical_vault) {
+        // For write we ensure the meetings/ subdir exists (the vault
+        // writer creates it on first capture; the renderer-only Save
+        // path may run before that ever happened) and verify
+        // containment of the *parent* so a new file the validator
+        // already vetted is allowed through.
+        //
+        // The `create_dir_all` → `canonicalize` pair is technically
+        // racy (a hostile process could swap `meetings/` for a
+        // symlink between the two calls). The vault directory is
+        // user-owned by construction, so the threat is theoretical;
+        // the `starts_with(&canonical_vault)` check below still
+        // prevents a vault escape if the swap somehow lands.
+        fs::create_dir_all(&meetings)
+            .await
+            .map_err(|e| format!("mkdir {}: {}", meetings.display(), e))?;
+        let canonical_meetings = fs::canonicalize(&meetings)
+            .await
+            .map_err(|e| format!("canonicalize {}: {}", meetings.display(), e))?;
+        if !canonical_meetings.starts_with(&canonical_vault) {
             return Err(format!(
-                "{} is not inside vault {}",
-                candidate.display(),
+                "meetings dir {} escapes vault {}",
+                canonical_meetings.display(),
                 canonical_vault.display()
             ));
         }
-        Ok(candidate)
+        // `canonical_meetings.join(...).parent()` is `canonical_meetings`
+        // by construction; the `starts_with` above already proved
+        // containment in the vault.
+        Ok(canonical_meetings.join(format!("{basename}.md")))
     }
 }
 
-/// Read `<vault>/<session_id>.md`.
+/// Read `<vault>/meetings/<basename>.md` (where `<basename>` strips
+/// any `mtg_` prefix from `session_id`).
 ///
 /// Errors include the canonicalized path so a Sonner toast displays a
 /// useful message without the React side stitching strings together.
@@ -144,7 +205,8 @@ pub async fn read_note(vault: &Path, session_id: &str) -> Result<String, String>
         .map_err(|e| format!("read {}: {}", path.display(), e))
 }
 
-/// Atomically write `contents` to `<vault>/<session_id>.md`.
+/// Atomically write `contents` to `<vault>/meetings/<basename>.md`
+/// (where `<basename>` strips any `mtg_` prefix from `session_id`).
 ///
 /// Recipe (mirrors `heron_vault::atomic_write` and `settings::write_settings`):
 /// 1. Resolve + validate the path lives inside the vault.
@@ -238,14 +300,23 @@ async fn set_user_only_perms(_path: &Path) -> std::io::Result<()> {
 /// Errors include the directory path.
 pub async fn list_sessions(vault_path: &Path) -> Result<Vec<String>, String> {
     let canonical = resolve_vault_path(vault_path).await?;
+    let meetings = meetings_dir(&canonical);
+    // First-run / pre-capture state: writer hasn't created the dir
+    // yet. An empty list is the honest answer (matches the
+    // orchestrator's `note_paths_newest_first` behaviour) — surfacing
+    // a readdir error would just produce a confusing toast on the
+    // empty Home page. A *permission* error still surfaces; only
+    // NotFound is collapsed.
     let mut out = Vec::new();
-    let mut rd = fs::read_dir(&canonical)
-        .await
-        .map_err(|e| format!("readdir {}: {}", canonical.display(), e))?;
+    let mut rd = match fs::read_dir(&meetings).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("readdir {}: {}", meetings.display(), e)),
+    };
     while let Some(entry) = rd
         .next_entry()
         .await
-        .map_err(|e| format!("readdir {}: {}", canonical.display(), e))?
+        .map_err(|e| format!("readdir {}: {}", meetings.display(), e))?
     {
         let p = entry.path();
         // Skip directories — `.md` matters only for files.
@@ -343,7 +414,9 @@ mod tests {
             .await
             .expect("write");
 
-        let mut rd = fs::read_dir(tmp.path()).await.expect("readdir");
+        let mut rd = fs::read_dir(meetings_dir(tmp.path()))
+            .await
+            .expect("readdir");
         let mut names = Vec::new();
         while let Some(e) = rd.next_entry().await.expect("entry") {
             names.push(e.file_name().to_string_lossy().into_owned());
@@ -352,17 +425,34 @@ mod tests {
         assert_eq!(names, vec!["note.md".to_string()]);
     }
 
+    /// `mtg_<uuid>` is the wire-form id; the on-disk basename is the
+    /// bare uuid because that's the shape `heron_vault::VaultWriter`
+    /// writes for `FileNamingPattern::Id`. Anchors that strip.
+    #[tokio::test]
+    async fn strips_mtg_prefix_for_on_disk_basename() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let id = "mtg_019ddcda-831c-72f0-927b-8b894466902c";
+        write_note_atomic(tmp.path(), id, "body")
+            .await
+            .expect("write");
+        let on_disk = meetings_dir(tmp.path()).join("019ddcda-831c-72f0-927b-8b894466902c.md");
+        assert!(on_disk.exists(), "expected {} to exist", on_disk.display());
+        let read = read_note(tmp.path(), id).await.expect("read");
+        assert_eq!(read, "body");
+    }
+
     #[tokio::test]
     async fn list_sessions_filters_non_md_files() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let dir = tmp.path();
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
         fs::write(dir.join("a.md"), "a").await.expect("seed a");
         fs::write(dir.join("b.md"), "b").await.expect("seed b");
         fs::write(dir.join("c.txt"), "c").await.expect("seed c");
         fs::write(dir.join("d.md.bak"), "d").await.expect("seed d");
         fs::write(dir.join(".DS_Store"), "").await.expect("seed ds");
 
-        let names = list_sessions(dir).await.expect("list");
+        let names = list_sessions(tmp.path()).await.expect("list");
         // Newest-first sort: "b" > "a" lexicographically.
         assert_eq!(names, vec!["b".to_string(), "a".to_string()]);
     }
@@ -370,19 +460,30 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_skips_subdirectories() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let dir = tmp.path();
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
         fs::create_dir(dir.join("subdir.md"))
             .await
             .expect("mkdir subdir");
         fs::write(dir.join("real.md"), "x")
             .await
             .expect("seed real");
-        let names = list_sessions(dir).await.expect("list");
+        let names = list_sessions(tmp.path()).await.expect("list");
         assert_eq!(names, vec!["real".to_string()]);
     }
 
+    /// Pre-capture state: the writer hasn't created `meetings/` yet.
+    /// `list_sessions` returns an empty list rather than erroring so
+    /// the Home page renders cleanly on a fresh install.
     #[tokio::test]
-    async fn list_sessions_missing_dir_errors() {
+    async fn list_sessions_missing_meetings_dir_returns_empty() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let names = list_sessions(tmp.path()).await.expect("list");
+        assert!(names.is_empty(), "got: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_missing_vault_errors() {
         let tmp = tempfile::TempDir::new().expect("tmp");
         let missing = tmp.path().join("nope");
         let err = list_sessions(&missing).await.expect_err("err");
@@ -395,10 +496,11 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_filters_hidden_md_files() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let dir = tmp.path();
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
         fs::write(dir.join(".hidden.md"), "x").await.expect("seed");
         fs::write(dir.join("visible.md"), "y").await.expect("seed");
-        let names = list_sessions(dir).await.expect("list");
+        let names = list_sessions(tmp.path()).await.expect("list");
         assert_eq!(names, vec!["visible".to_string()]);
     }
 
@@ -408,12 +510,13 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_filters_unsafe_filenames() {
         let tmp = tempfile::TempDir::new().expect("tmp");
-        let dir = tmp.path();
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
         fs::write(dir.join("with space.md"), "x")
             .await
             .expect("seed");
         fs::write(dir.join("ok-name.md"), "y").await.expect("seed");
-        let names = list_sessions(dir).await.expect("list");
+        let names = list_sessions(tmp.path()).await.expect("list");
         assert_eq!(names, vec!["ok-name".to_string()]);
     }
 
@@ -490,7 +593,7 @@ mod tests {
         write_note_atomic(tmp.path(), "note", "body")
             .await
             .expect("write");
-        let mode = std::fs::metadata(tmp.path().join("note.md"))
+        let mode = std::fs::metadata(meetings_dir(tmp.path()).join("note.md"))
             .expect("stat")
             .permissions()
             .mode();
@@ -513,8 +616,9 @@ mod tests {
         std::fs::write(&outside, "secret").expect("seed outside");
 
         let vault = tmp.path().join("vault");
-        std::fs::create_dir(&vault).expect("mkdir vault");
-        symlink(&outside, vault.join("escape.md")).expect("symlink");
+        let meetings = meetings_dir(&vault);
+        std::fs::create_dir_all(&meetings).expect("mkdir meetings");
+        symlink(&outside, meetings.join("escape.md")).expect("symlink");
 
         let err = read_note(&vault, "escape")
             .await

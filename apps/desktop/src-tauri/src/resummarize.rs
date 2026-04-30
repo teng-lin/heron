@@ -47,30 +47,43 @@ use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note}
 
 use crate::default_settings_path;
 use crate::keychain_resolver::EnvThenKeychainResolver;
-use crate::notes::{resolve_note_path, resolve_vault_path, validate_session_id};
+use crate::notes::{meetings_dir, resolve_note_path, resolve_vault_path, validated_basename};
 use crate::settings::read_settings;
 
-/// Resolve the `<vault>/<session_id>.md.bak` path the renderer is
-/// allowed to touch. Validation goes through the same checks
-/// [`crate::notes::resolve_note_path`] runs (basename allowlist,
-/// canonicalize the vault, ensure containment) — only the file
-/// extension differs.
+/// Resolve the `<vault>/meetings/<basename>.md.bak` path the renderer
+/// is allowed to touch. Validation mirrors [`crate::notes::resolve_note_path`]
+/// (basename allowlist, canonicalize the vault, ensure containment) —
+/// only the file extension differs. `<basename>` strips the `mtg_`
+/// wire-form prefix so the `.bak` lives next to the bare-uuid `.md`
+/// the vault writer rotates.
 async fn resolve_bak_path(vault: &Path, session_id: &str) -> Result<PathBuf, String> {
-    validate_session_id(session_id)?;
+    let basename = validated_basename(session_id)?;
     let canonical_vault = resolve_vault_path(vault).await?;
-    let candidate = canonical_vault.join(format!("{session_id}.md.bak"));
-    // The parent must equal the canonical vault. `notes::resolve_note_path`
-    // does the same parent-equals-vault check on the write path so a
-    // brand-new file (no canonicalize target) passes; we re-use the
-    // logic here so a missing `.md.bak` (the common case) still resolves.
-    if candidate.parent() != Some(&canonical_vault) {
-        return Err(format!(
-            "{} is not inside vault {}",
-            candidate.display(),
-            canonical_vault.display()
-        ));
-    }
-    Ok(candidate)
+    let meetings = meetings_dir(&canonical_vault);
+    // If `meetings/` exists, canonicalize and confirm it's still
+    // inside the vault — otherwise a symlinked `meetings/` would let
+    // a `.md.bak` read or delete escape. Mirrors the write-side check
+    // in `notes::resolve_note_path`. If `meetings/` is missing
+    // (pre-capture state), the `.md.bak` can't exist either; the
+    // lexical path under `canonical_vault` is safe because the
+    // basename is validated, and the subsequent metadata / read call
+    // surfaces NotFound which `check_backup` / `restore_backup`
+    // translate into "no backup" / a clear error.
+    let parent = match fs::canonicalize(&meetings).await {
+        Ok(canonical_meetings) => {
+            if !canonical_meetings.starts_with(&canonical_vault) {
+                return Err(format!(
+                    "meetings dir {} escapes vault {}",
+                    canonical_meetings.display(),
+                    canonical_vault.display()
+                ));
+            }
+            canonical_meetings
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => meetings,
+        Err(e) => return Err(format!("canonicalize {}: {}", meetings.display(), e)),
+    };
+    Ok(parent.join(format!("{basename}.md.bak")))
 }
 
 /// Metadata about a `<note>.md.bak` file the Review UI can show next
@@ -432,21 +445,33 @@ pub async fn restore_backup(vault: &Path, session_id: &str) -> Result<String, St
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::notes::note_basename;
     use tokio::fs;
+
+    /// Path to the on-disk note (or backup) for a session, mirroring
+    /// the writer's `<vault>/meetings/<basename>.md` layout. Test-only
+    /// helper — production reads go through `resolve_note_path`.
+    fn test_note_path(vault: &Path, session_id: &str, ext: &str) -> PathBuf {
+        meetings_dir(vault).join(format!("{}{ext}", note_basename(session_id)))
+    }
 
     /// Helper: seed a vault with a note. The body alone (no
     /// frontmatter) is enough for `check_backup` / `restore_backup`
     /// since they don't parse the markdown.
     async fn seed_note(vault: &Path, session_id: &str, body: &str) {
-        fs::write(vault.join(format!("{session_id}.md")), body)
+        let path = test_note_path(vault, session_id, ".md");
+        fs::create_dir_all(path.parent().expect("parent"))
             .await
-            .expect("seed note");
+            .expect("mkdir meetings");
+        fs::write(&path, body).await.expect("seed note");
     }
 
     async fn seed_bak(vault: &Path, session_id: &str, body: &str) {
-        fs::write(vault.join(format!("{session_id}.md.bak")), body)
+        let path = test_note_path(vault, session_id, ".md.bak");
+        fs::create_dir_all(path.parent().expect("parent"))
             .await
-            .expect("seed bak");
+            .expect("mkdir meetings");
+        fs::write(&path, body).await.expect("seed bak");
     }
 
     /// `check_backup` returns `None` when no `.md.bak` exists. The
@@ -508,13 +533,13 @@ mod tests {
         assert_eq!(restored, "previous");
 
         // Note now contains the backup body.
-        let on_disk = fs::read_to_string(vault.join("note.md"))
+        let on_disk = fs::read_to_string(test_note_path(vault, "note", ".md"))
             .await
             .expect("read note");
         assert_eq!(on_disk, "previous");
 
         // .bak is gone.
-        let bak = vault.join("note.md.bak");
+        let bak = test_note_path(vault, "note", ".md.bak");
         assert!(!bak.exists(), "expected .md.bak to be deleted");
 
         // Subsequent check_backup returns None.
@@ -550,7 +575,7 @@ mod tests {
         seed_bak(vault, "note", "previous").await;
         restore_backup(vault, "note").await.expect("restore");
 
-        let mode = std::fs::metadata(vault.join("note.md"))
+        let mode = std::fs::metadata(test_note_path(vault, "note", ".md"))
             .expect("stat")
             .permissions()
             .mode();
@@ -572,6 +597,30 @@ mod tests {
                 .expect_err(&format!("must reject {evil}"));
             assert!(!err.is_empty());
         }
+    }
+
+    /// A symlinked `meetings/` must not let a `.md.bak` escape the
+    /// vault. The lexical-join precursor to this test failed silently
+    /// — `check_backup`/`restore_backup` would happily stat / read /
+    /// delete a file outside the vault. Anchors the canonicalize +
+    /// `starts_with` defense in `resolve_bak_path`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_bak_path_rejects_symlinked_meetings_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path().join("vault");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&vault).expect("mkdir vault");
+        std::fs::create_dir(&outside).expect("mkdir outside");
+        // Plant a `.md.bak` we'd be able to read if the escape worked.
+        std::fs::write(outside.join("note.md.bak"), b"secret").expect("seed");
+        symlink(&outside, vault.join("meetings")).expect("symlink");
+
+        let err = resolve_bak_path(&vault, "note")
+            .await
+            .expect_err("symlinked meetings/ must be rejected");
+        assert!(err.contains("escapes vault"), "got: {err}");
     }
 
     /// PR-ξ (phase 76): `resummarize_preview` rejects the same
@@ -648,9 +697,7 @@ action_items: []\n\
 attendees: []\n\
 cost: null\n\
 ---\n# Body\n";
-        fs::write(vault.join("note.md"), original_body)
-            .await
-            .expect("seed note");
+        seed_note(vault, "note", original_body).await;
         fs::write(vault.join("transcript.txt"), "stub transcript")
             .await
             .expect("seed transcript");
@@ -662,13 +709,13 @@ cost: null\n\
 
         // `<id>.md` must be byte-identical — no rotate, no merge-
         // and-write side effect.
-        let on_disk = fs::read_to_string(vault.join("note.md"))
+        let on_disk = fs::read_to_string(test_note_path(vault, "note", ".md"))
             .await
             .expect("read note");
         assert_eq!(on_disk, original_body, "preview must not modify <id>.md",);
 
         // `<id>.md.bak` must not have been created.
-        let bak = vault.join("note.md.bak");
+        let bak = test_note_path(vault, "note", ".md.bak");
         assert!(
             !bak.exists(),
             "preview must not create <id>.md.bak (found {})",

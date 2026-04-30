@@ -106,8 +106,9 @@ fn validate_patch(patch: &ActionItemPatch) -> Result<(), String> {
 }
 
 /// Apply [`patch`] to the action-item row identified by `item_id` in
-/// `<vault>/<session_id>.md`'s frontmatter and atomically rewrite the
-/// note. Returns the post-merge row.
+/// `<vault>/meetings/<basename>.md`'s frontmatter (where `<basename>`
+/// strips any `mtg_` wire prefix from `session_id`) and atomically
+/// rewrite the note. Returns the post-merge row.
 ///
 /// The function is the testable core; the `#[tauri::command]` shim in
 /// `lib.rs` is a thin wrapper that threads renderer-supplied strings
@@ -236,12 +237,14 @@ mod tests {
             },
         ];
 
-        // Write directly via heron-vault and the canonical
-        // `<vault>/<session_id>.md` shape (no `meetings/` subdir) so
-        // the desktop crate's `resolve_note_path` finds it.
+        // Seed at `<vault>/meetings/<session_id>.md` to match the
+        // shape `heron_vault::VaultWriter::finalize_with_pattern`
+        // writes (and the shape `notes::resolve_note_path` resolves).
         let body = "\n## Action items\n\n- [ ] Send pricing deck\n- [ ] Schedule kickoff\n";
         let rendered = heron_vault::render_note(&fm, body).expect("render");
-        let note_path = tmp.path().join(format!("{session_id}.md"));
+        let meetings = crate::notes::meetings_dir(tmp.path());
+        std::fs::create_dir_all(&meetings).expect("mkdir meetings");
+        let note_path = meetings.join(format!("{session_id}.md"));
         heron_vault::atomic_write(&note_path, rendered.as_bytes()).expect("seed note");
         let _ = VaultWriter::new(tmp.path()); // pin the import shape
         (note_path, id_a, id_b)
@@ -272,7 +275,7 @@ mod tests {
         assert_eq!(view.due.as_deref(), Some("2026-05-01"));
 
         // Sibling row untouched — read back via vault directly.
-        let note_path = tmp.path().join("note.md");
+        let note_path = crate::notes::meetings_dir(tmp.path()).join("note.md");
         let (fm, _body) = heron_vault::read_note(&note_path).expect("read");
         let row_b = fm.action_items.iter().find(|i| i.id == id_b).expect("b");
         assert!(!row_b.done);
