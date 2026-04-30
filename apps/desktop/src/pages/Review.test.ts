@@ -22,7 +22,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { Meeting } from "../lib/types";
-import { extractActionItems, selectActionItems } from "./Review";
+import {
+  extractActionItems,
+  formatActionItemDue,
+  formatProcessingCost,
+  selectActionItems,
+} from "./Review";
 
 function meetingWith(actionItems: Meeting["action_items"]): Meeting {
   return {
@@ -169,5 +174,124 @@ describe("selectActionItems", () => {
     const rows = selectActionItems(meeting, "");
     expect(rows.map((r) => r.id)).toEqual(["legacy:0", "legacy:1"]);
     expect(rows.every((r) => r.structured)).toBe(true);
+  });
+});
+
+// Strip all non-digit characters so currency assertions don't break
+// on hosts that swap `,`/`.` (e.g. de-DE) or move the `$`. We assert
+// digit-sequence + sign + presence of `$`, which captures the
+// implementation contract without locking into en-US punctuation.
+function digitsOf(s: string): string {
+  return s.replace(/\D/g, "");
+}
+
+describe("formatActionItemDue", () => {
+  test("renders a non-raw human date for a valid YYYY-MM-DD", () => {
+    // Parsing the literal `YYYY-MM-DD` string through `new Date(iso)`
+    // would treat it as midnight UTC and shift to the previous day in
+    // negative-offset zones. The formatter splits the parts out so
+    // `2026-05-01` always renders the date the LLM emitted regardless
+    // of TZ. Locale-agnostic check: the year survives, a day digit
+    // survives, and the output isn't the raw input or `Invalid Date`.
+    const out = formatActionItemDue("2026-05-01");
+    expect(out).not.toBe("2026-05-01");
+    expect(out).not.toContain("Invalid");
+    expect(out).toContain("2026");
+    expect(out).toMatch(/\b0?1\b/);
+  });
+
+  test("falls back to the raw string when the input doesn't match", () => {
+    expect(formatActionItemDue("not a date")).toBe("not a date");
+    expect(formatActionItemDue("2026/05/01")).toBe("2026/05/01");
+  });
+
+  test("rejects out-of-range month and day instead of rolling them over", () => {
+    // The `Date` constructor accepts and silently rolls these:
+    // `2026-13-01` would become Jan 1, 2027; `2026-02-31` becomes
+    // Mar 3, 2026. Returning the raw string surfaces a buggy LLM
+    // emission instead of rendering a confidently-wrong real date.
+    expect(formatActionItemDue("2026-13-01")).toBe("2026-13-01");
+    expect(formatActionItemDue("2026-02-31")).toBe("2026-02-31");
+    expect(formatActionItemDue("2026-04-31")).toBe("2026-04-31");
+    expect(formatActionItemDue("2026-00-15")).toBe("2026-00-15");
+    expect(formatActionItemDue("2026-05-32")).toBe("2026-05-32");
+    expect(formatActionItemDue("0000-00-00")).toBe("0000-00-00");
+  });
+
+  test("rejects ISO timestamps and surrounding whitespace", () => {
+    // Anchored regex enforces date-only shape; pinning here so a
+    // future maintainer doesn't loosen `^...$` and accidentally
+    // start passing timestamps through the part-parser.
+    expect(formatActionItemDue("2026-05-01T00:00:00Z")).toBe(
+      "2026-05-01T00:00:00Z",
+    );
+    expect(formatActionItemDue(" 2026-05-01")).toBe(" 2026-05-01");
+    expect(formatActionItemDue("2026-05-01\n")).toBe("2026-05-01\n");
+  });
+});
+
+describe("formatProcessingCost", () => {
+  test("renders typical dollar amounts at two decimals", () => {
+    expect(formatProcessingCost(1.23)).toContain("$");
+    expect(digitsOf(formatProcessingCost(1.23))).toBe("123");
+    expect(digitsOf(formatProcessingCost(12))).toBe("1200");
+  });
+
+  test("renders sub-cent amounts without collapsing to $0.00", () => {
+    // Anti-regression: a $0.00004 prompt-cache hit must not show as
+    // "$0" — that's the failure mode the prompt called out explicitly.
+    const tiny = formatProcessingCost(0.00004);
+    expect(tiny).toContain("$");
+    expect(digitsOf(tiny)).toBe("0000040");
+  });
+
+  test("renders sub-dollar amounts with four decimals", () => {
+    expect(digitsOf(formatProcessingCost(0.0042))).toBe("00042");
+  });
+
+  test("renders zero with two-decimal precision", () => {
+    expect(formatProcessingCost(0)).toContain("$");
+    expect(digitsOf(formatProcessingCost(0))).toBe("000");
+  });
+
+  test("falls back to em-dash on non-finite input", () => {
+    expect(formatProcessingCost(Number.NaN)).toBe("—");
+    expect(formatProcessingCost(Number.POSITIVE_INFINITY)).toBe("—");
+    expect(formatProcessingCost(Number.NEGATIVE_INFINITY)).toBe("—");
+  });
+
+  test("renders sub-dollar values >= 1 cent at two decimals", () => {
+    // Anti-regression: the previous threshold pinned 4 digits below
+    // $1, so $0.50 rendered as "$0.5000". Standard currency precision
+    // takes over once the value rounds to at least one cent.
+    expect(digitsOf(formatProcessingCost(0.5))).toBe("050");
+    expect(digitsOf(formatProcessingCost(0.01))).toBe("001");
+    expect(digitsOf(formatProcessingCost(0.99))).toBe("099");
+  });
+
+  test("buckets on the post-rounding magnitude to avoid threshold inversions", () => {
+    // `0.0009999` and `0.001` both round to the same displayed value
+    // and must use the same precision; the previous logic gave
+    // "$0.001000" vs "$0.0010" for adjacent inputs.
+    expect(formatProcessingCost(0.0009999)).toBe(
+      formatProcessingCost(0.001),
+    );
+  });
+
+  test("renders negative amounts with sign", () => {
+    const out = formatProcessingCost(-1.23);
+    expect(out).toContain("$");
+    expect(out).toContain("-");
+    expect(digitsOf(out)).toBe("123");
+    const tiny = formatProcessingCost(-0.0042);
+    expect(tiny).toContain("-");
+    expect(digitsOf(tiny)).toBe("00042");
+  });
+
+  test("renders very large amounts without scientific notation", () => {
+    const out = formatProcessingCost(1_000_000);
+    expect(out).toContain("$");
+    expect(out).not.toMatch(/e/i);
+    expect(digitsOf(out)).toBe("100000000");
   });
 });
