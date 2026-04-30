@@ -181,7 +181,7 @@ export function AskBar() {
           type="button"
           onClick={() => setDrawerOpen((v) => !v)}
           aria-expanded={drawerOpen}
-          aria-haspopup="menu"
+          aria-haspopup="dialog"
           className="inline-flex items-center gap-1.5 rounded-full border-dashed border px-2.5 py-1 text-[11.5px] transition-colors hover:bg-paper-3"
           style={{
             color: "var(--color-ink-3)",
@@ -202,14 +202,14 @@ export function AskBar() {
       </div>
 
       {drawerOpen && (
-        // Plain labelled popover rather than `role="menu"` —
-        // implementing the full ARIA menu pattern would mean
-        // arrow-key navigation, typeahead, focus traps, the works,
-        // and the chrome here is just a list of buttons. Without
-        // that machinery `role="menu"` reads worse to screen
-        // readers than the default semantics.
+        // `role="dialog"` (paired with `aria-haspopup="dialog"` on
+        // the trigger) describes the container as a generic popover
+        // — the right semantic for a list of action buttons that
+        // doesn't implement the full ARIA menu pattern (arrow-key
+        // navigation, typeahead, focus traps).
         <div
           ref={drawerRef}
+          role="dialog"
           aria-label="All recipes"
           className="absolute z-50 grid grid-cols-2 gap-1.5 rounded-md border p-2.5 shadow-lg"
           style={{

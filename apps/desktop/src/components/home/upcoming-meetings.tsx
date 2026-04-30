@@ -52,6 +52,18 @@ export function ComingUpBand({
     () => new Set(),
   );
 
+  // Tick once a minute so relative-time labels ("in 12 min", "next in K
+  // min", "starting now") don't go stale while the user lingers on the
+  // Home page. The `setTick` doesn't drive any layout — it just
+  // invalidates the closures that read `Date.now()` at render time. The
+  // `Intl.DateTimeFormat` instances are module-scoped, so the periodic
+  // re-render is allocation-free.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   useEffect(() => {
     void ensureFresh();
   }, [ensureFresh]);
@@ -73,8 +85,19 @@ export function ComingUpBand({
   async function onAutoRecordChange(evt: CalendarEvent, enabled: boolean) {
     setPendingAutoRecordIds((ids) => new Set(ids).add(evt.id));
     let ok = false;
+    // The store's `setEventAutoRecord` already wraps `invoke` in
+    // try/catch and returns `false` on failure, but a future change
+    // (or a transient hiccup the store doesn't anticipate) could
+    // surface as a thrown rejection. Catching it here and surfacing
+    // the message keeps the row pending-flag honest and avoids the
+    // unhandled promise rejection the parent's `void` would
+    // otherwise swallow.
+    let errorDetail: string | null = null;
     try {
       ok = await setEventAutoRecord(evt.id, enabled);
+    } catch (err) {
+      errorDetail = err instanceof Error ? err.message : String(err);
+      ok = false;
     } finally {
       setPendingAutoRecordIds((ids) => {
         const next = new Set(ids);
@@ -83,10 +106,12 @@ export function ComingUpBand({
       });
     }
     if (!ok) {
+      const verb = enabled ? "enable" : "disable";
+      const subject = evt.title || "this meeting";
       toast.error(
-        `Could not ${enabled ? "enable" : "disable"} auto-record for ${
-          evt.title || "this meeting"
-        }.`,
+        errorDetail
+          ? `Could not ${verb} auto-record for ${subject}: ${errorDetail}`
+          : `Could not ${verb} auto-record for ${subject}.`,
       );
     }
   }
