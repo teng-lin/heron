@@ -110,10 +110,13 @@ export function UpcomingMeetings({
           >
             <div className="min-w-0 flex-1">
               <div
-                className="truncate font-serif text-base"
+                className="flex flex-wrap items-center gap-2 font-serif text-base"
                 style={{ color: "var(--color-ink)" }}
               >
-                {evt.title || "Untitled meeting"}
+                <span className="min-w-0 flex-1 truncate">
+                  {evt.title || "Untitled meeting"}
+                </span>
+                {evt.primed && <PrimedBadge />}
               </div>
               <div
                 className="mt-0.5 flex flex-wrap items-center gap-x-3 text-xs"
@@ -139,6 +142,30 @@ export function UpcomingMeetings({
         ))}
       </ul>
     </section>
+  );
+}
+
+/**
+ * Tiny inline indicator: pre-meeting context (attendees, related
+ * notes once RAG lands) is already staged for this event. The store
+ * fans `heron_prepare_context` out automatically after every
+ * successful `load()`; per-event store patches arrive as each Tauri
+ * call settles, so an unprimed event flips its badge a few hundred
+ * milliseconds after the rail first renders.
+ */
+function PrimedBadge() {
+  return (
+    <span
+      title="Pre-meeting context staged"
+      className="inline-flex shrink-0 items-center rounded-full border px-1.5 py-px font-mono text-[10px] uppercase tracking-[0.08em]"
+      style={{
+        color: "var(--color-ink-3)",
+        borderColor: "var(--color-rule)",
+        background: "var(--color-paper-2)",
+      }}
+    >
+      primed
+    </span>
   );
 }
 
