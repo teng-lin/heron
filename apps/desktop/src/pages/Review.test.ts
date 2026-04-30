@@ -193,6 +193,30 @@ describe("formatActionItemDue", () => {
     expect(formatActionItemDue("not a date")).toBe("not a date");
     expect(formatActionItemDue("2026/05/01")).toBe("2026/05/01");
   });
+
+  test("rejects out-of-range month and day instead of rolling them over", () => {
+    // The `Date` constructor accepts and silently rolls these:
+    // `2026-13-01` would become Jan 1, 2027; `2026-02-31` becomes
+    // Mar 3, 2026. Returning the raw string surfaces a buggy LLM
+    // emission instead of rendering a confidently-wrong real date.
+    expect(formatActionItemDue("2026-13-01")).toBe("2026-13-01");
+    expect(formatActionItemDue("2026-02-31")).toBe("2026-02-31");
+    expect(formatActionItemDue("2026-04-31")).toBe("2026-04-31");
+    expect(formatActionItemDue("2026-00-15")).toBe("2026-00-15");
+    expect(formatActionItemDue("2026-05-32")).toBe("2026-05-32");
+    expect(formatActionItemDue("0000-00-00")).toBe("0000-00-00");
+  });
+
+  test("rejects ISO timestamps and surrounding whitespace", () => {
+    // Anchored regex enforces date-only shape; pinning here so a
+    // future maintainer doesn't loosen `^...$` and accidentally
+    // start passing timestamps through the part-parser.
+    expect(formatActionItemDue("2026-05-01T00:00:00Z")).toBe(
+      "2026-05-01T00:00:00Z",
+    );
+    expect(formatActionItemDue(" 2026-05-01")).toBe(" 2026-05-01");
+    expect(formatActionItemDue("2026-05-01\n")).toBe("2026-05-01\n");
+  });
 });
 
 describe("formatProcessingCost", () => {
@@ -221,5 +245,33 @@ describe("formatProcessingCost", () => {
   test("falls back to em-dash on non-finite input", () => {
     expect(formatProcessingCost(Number.NaN)).toBe("—");
     expect(formatProcessingCost(Number.POSITIVE_INFINITY)).toBe("—");
+    expect(formatProcessingCost(Number.NEGATIVE_INFINITY)).toBe("—");
+  });
+
+  test("renders sub-dollar values >= 1 cent at two decimals", () => {
+    // Anti-regression: the previous threshold pinned 4 digits below
+    // $1, so $0.50 rendered as "$0.5000". Standard currency precision
+    // takes over once the value rounds to at least one cent.
+    expect(formatProcessingCost(0.5)).toBe("$0.50");
+    expect(formatProcessingCost(0.01)).toBe("$0.01");
+    expect(formatProcessingCost(0.99)).toBe("$0.99");
+  });
+
+  test("buckets on the post-rounding magnitude to avoid threshold inversions", () => {
+    // `0.0009999` and `0.001` both round to the same displayed value
+    // and must use the same precision; the previous logic gave
+    // "$0.001000" vs "$0.0010" for adjacent inputs.
+    expect(formatProcessingCost(0.0009999)).toBe(
+      formatProcessingCost(0.001),
+    );
+  });
+
+  test("renders negative amounts with sign", () => {
+    expect(formatProcessingCost(-1.23)).toBe("-$1.23");
+    expect(formatProcessingCost(-0.0042)).toBe("-$0.0042");
+  });
+
+  test("renders very large amounts without scientific notation", () => {
+    expect(formatProcessingCost(1_000_000)).toBe("$1,000,000.00");
   });
 });

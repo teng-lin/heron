@@ -110,8 +110,22 @@ export function formatActionItemDue(iso: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
   if (!match) return iso;
   const [, y, m, d] = match;
-  const date = new Date(Number(y), Number(m) - 1, Number(d));
-  if (Number.isNaN(date.getTime())) return iso;
+  const yi = Number(y);
+  const mi = Number(m);
+  const di = Number(d);
+  const date = new Date(yi, mi - 1, di);
+  // The `Date` constructor rolls invalid components silently —
+  // `2026-02-31` becomes `Mar 3, 2026`, `2026-13-01` becomes
+  // `Jan 1, 2027`. Reject anything where the round-trip doesn't
+  // match the input so a buggy LLM template surfaces as raw text
+  // instead of a confidently-wrong calendar date.
+  if (
+    date.getFullYear() !== yi ||
+    date.getMonth() !== mi - 1 ||
+    date.getDate() !== di
+  ) {
+    return iso;
+  }
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
@@ -130,10 +144,15 @@ export function formatActionItemDue(iso: string): string {
 export function formatProcessingCost(usd: number): string {
   if (!Number.isFinite(usd)) return "—";
   const abs = Math.abs(usd);
+  // Bucket on the *post-rounding* magnitude so adjacent inputs across
+  // a threshold render at consistent precision: `0.0009999` and
+  // `0.001` both display as "$0.0010" instead of one rounding up
+  // into the next bucket. Standard currency precision (2 digits)
+  // applies once a value rounds to >= $0.01.
   let digits: number;
-  if (abs === 0 || abs >= 1) {
+  if (abs === 0 || abs >= 0.005) {
     digits = 2;
-  } else if (abs >= 0.001) {
+  } else if (abs >= 0.00005) {
     digits = 4;
   } else {
     digits = 6;
