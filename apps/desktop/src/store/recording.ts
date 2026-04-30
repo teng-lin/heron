@@ -20,8 +20,11 @@
  *     this app (e.g., CLI start) drove us to /recording — in that
  *     case the Stop handler falls back to the active-meeting id from
  *     `useMeetingsStore`.
- *   - `paused` — UI flag for the Pause button. Stub-only; the real
- *     audio pipeline doesn't yet expose pause/resume.
+ *   - `paused` — UI flag for the Pause button. Tier 3 #16 wired the
+ *     daemon-side `POST /v1/meetings/{id}/pause` and `/resume` paths;
+ *     `Recording.tsx`'s pause handler invokes them and only flips this
+ *     flag on a successful daemon ack. The store action itself stays
+ *     pure — it's the page-level wrapper that owns the network call.
  *
  * Actions:
  *
@@ -31,7 +34,11 @@
  *     confirmed.
  *   - `stop()`  — clear `recordingStart` and `meetingId`. Called by
  *     the "Stop & Save" button after `heron_end_meeting` resolves.
- *   - `togglePause()` — flip the local `paused` flag. UI-only.
+ *   - `togglePause()` — flip the local `paused` flag. Tier 3 #16:
+ *     callers MUST first hit the daemon's pause/resume HTTP endpoint
+ *     (via `heron_pause_meeting` / `heron_resume_meeting`) and only
+ *     invoke this on a successful ack. The store stays pure to keep
+ *     it ergonomic in tests.
  */
 
 import { create } from "zustand";

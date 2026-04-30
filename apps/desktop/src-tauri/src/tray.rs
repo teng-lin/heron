@@ -193,6 +193,13 @@ impl TrayVisual {
                 Self::Idle
             }
             RecordingState::Recording => Self::Recording,
+            // Tier 3 #16: paused captures share the recording icon
+            // for now — the tray's binary record/idle palette doesn't
+            // yet have a paused glyph, and showing Idle would lie about
+            // the meeting still being in flight. A dedicated paused
+            // icon is a follow-up; this branch keeps the FSM-merge
+            // honest in the meantime.
+            RecordingState::Paused => Self::Recording,
             RecordingState::Transcribing => Self::Transcribing,
             RecordingState::Summarizing => Self::Summarizing,
         }

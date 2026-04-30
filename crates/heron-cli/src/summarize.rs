@@ -154,6 +154,9 @@ pub async fn re_summarize_in_vault_with_persona(
         event_bus: None,
         persona: persona.cloned(),
         strip_names,
+        // Re-summarize is a vault-only op — no live capture pipeline,
+        // no pause flag to honor.
+        pause_flag: None,
     };
     let orch = session::Orchestrator::new(cfg);
     let output = orch

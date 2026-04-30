@@ -70,6 +70,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -298,6 +299,16 @@ struct ActiveMeeting {
     /// dependency order before — and independently of — the v1
     /// pipeline finalizer.
     live_session: Option<Box<dyn DynLiveSession>>,
+    /// Tier 3 #16 pause flag. The orchestrator owns the flag; the
+    /// pipeline reads it via a clone passed through `SessionConfig`.
+    /// `pause_capture` flips it to `true` (alongside the FSM transition
+    /// to `Paused`); `resume_capture` flips it back. Capture-pipeline
+    /// WAV writers and the AX collector check it on every frame /
+    /// event and drop on the floor when set. Synthetic captures keep a
+    /// flag too so the orchestrator's pause/resume contract is uniform
+    /// across runtime variants — the synthetic path just has no
+    /// pipeline to read it.
+    pause_flag: Arc<AtomicBool>,
 }
 
 /// Runtime backing for an active capture.
@@ -1480,6 +1491,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 .and_then(|cid| self.pending_contexts.remove(cid));
             let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
 
+            let pause_flag = Arc::new(AtomicBool::new(false));
             let runtime = if let Some(vault_root) = self.vault_root.clone() {
                 let (stop_tx, stop_rx) = oneshot::channel();
                 let config = CliSessionConfig {
@@ -1520,6 +1532,12 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     // settings reader.
                     persona: None,
                     strip_names: false,
+                    // Tier 3 #16: hand the pause flag to the pipeline
+                    // so WAV writers + AX collector + audio-level
+                    // collector can drop frames on the floor when
+                    // paused. The orchestrator owns the canonical flag;
+                    // this is a cheap `Arc` clone.
+                    pause_flag: Some(Arc::clone(&pause_flag)),
                 };
                 let handle = tokio::task::spawn_blocking(move || {
                     // CoreAudio/cpal handles in the capture path are
@@ -1553,6 +1571,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     runtime,
                     applied_context: applied_context.clone(),
                     live_session: None,
+                    pause_flag,
                 },
             );
 
@@ -1671,6 +1690,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             runtime,
             applied_context: _,
             live_session,
+            pause_flag: _,
         } = entry;
 
         // Tear the v2 stack down BEFORE the v1 finalizer runs so the
@@ -1780,6 +1800,68 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             duration_secs,
             "capture ended",
         );
+        Ok(())
+    }
+
+    async fn pause_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
+        // Tier 3 #16: drive the FSM through `Recording → Paused` and
+        // flip the shared atomic flag the capture pipeline reads. Both
+        // sides happen under the active-meetings lock so a concurrent
+        // `resume_capture` / `end_meeting` can't observe a torn state
+        // (FSM at `Recording` while flag is `true`, or vice versa).
+        // The publish step is sync — `bus.publish` is non-blocking —
+        // so holding the guard across it is safe per the existing
+        // lock-discipline rules.
+        let snapshot = {
+            let mut active = lock_or_recover(&self.active_meetings);
+            let entry = active.get_mut(id).ok_or_else(|| SessionError::NotFound {
+                what: format!("active meeting {id}"),
+            })?;
+            entry
+                .fsm
+                .on_pause()
+                .map_err(|_| SessionError::InvalidState {
+                    current_state: entry.meeting.status,
+                })?;
+            entry.pause_flag.store(true, Ordering::SeqCst);
+            entry.meeting.status = MeetingStatus::Paused;
+            entry.meeting.clone()
+        };
+        // No dedicated `meeting.paused` event today: the wire surface
+        // is the meeting's `status` field via `GET /meetings/{id}`,
+        // which reflects the orchestrator's snapshot. A future PR can
+        // add a typed bus event without changing the pause/resume HTTP
+        // contract — keeping the `EventPayload` enum stable for now.
+        tracing::info!(meeting_id = %id, "capture paused");
+        let _ = snapshot;
+        Ok(())
+    }
+
+    async fn resume_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
+        // Mirror image of `pause_capture`: drive `Paused → Recording`
+        // and clear the flag under the same lock. `InvalidState`
+        // surfaces when the meeting isn't in `Paused` (e.g. someone
+        // hit Resume while we were already recording, or after end_meeting
+        // dropped the entry — that path is already covered by the
+        // NotFound short-circuit, but the FSM check keeps the typed
+        // error tight).
+        let snapshot = {
+            let mut active = lock_or_recover(&self.active_meetings);
+            let entry = active.get_mut(id).ok_or_else(|| SessionError::NotFound {
+                what: format!("active meeting {id}"),
+            })?;
+            entry
+                .fsm
+                .on_resume()
+                .map_err(|_| SessionError::InvalidState {
+                    current_state: entry.meeting.status,
+                })?;
+            entry.pause_flag.store(false, Ordering::SeqCst);
+            entry.meeting.status = MeetingStatus::Recording;
+            entry.meeting.clone()
+        };
+        tracing::info!(meeting_id = %id, "capture resumed");
+        let _ = snapshot;
         Ok(())
     }
 
@@ -2951,6 +3033,119 @@ mod tests {
             }
             other => panic!("expected MeetingCompleted, got {}", other.event_type()),
         }
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_walks_status_through_paused() {
+        // Tier 3 #16 happy path: pause flips `MeetingStatus::Paused`,
+        // resume flips it back to `Recording`. Round-tripping must
+        // also leave the active meeting still endable — `end_meeting`
+        // through the FSM must work after the pause/resume cycle.
+        let orch = LocalSessionOrchestrator::new();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+
+        orch.pause_capture(&meeting.id).await.expect("pause");
+        let snapshot = orch.get_meeting(&meeting.id).await.expect("get_meeting");
+        assert!(matches!(snapshot.status, MeetingStatus::Paused));
+
+        orch.resume_capture(&meeting.id).await.expect("resume");
+        let snapshot = orch.get_meeting(&meeting.id).await.expect("get_meeting");
+        assert!(matches!(snapshot.status, MeetingStatus::Recording));
+
+        // After a pause/resume cycle the meeting must still finalize
+        // through `end_meeting`. Without this the cycle could leave
+        // the FSM in a state from which `on_hotkey` is illegal —
+        // exactly the regression Tier 3 #16 is supposed to prevent.
+        orch.end_meeting(&meeting.id).await.expect("end_meeting");
+    }
+
+    #[tokio::test]
+    async fn pause_while_paused_returns_invalid_state() {
+        // Idempotent guards: a second `pause_capture` on an
+        // already-paused meeting must surface `InvalidState` so the
+        // HTTP layer returns `409`. Pin the typed error so the wire
+        // shape doesn't drift to `Validation` / `NotFound` on a
+        // future refactor.
+        let orch = LocalSessionOrchestrator::new();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        orch.pause_capture(&meeting.id).await.expect("pause");
+        let err = orch
+            .pause_capture(&meeting.id)
+            .await
+            .expect_err("second pause must error");
+        assert!(matches!(err, SessionError::InvalidState { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_while_recording_returns_invalid_state() {
+        // Mirror image of the pause-while-paused guard. A `resume_capture`
+        // on a meeting that was never paused must be `InvalidState`,
+        // not silently succeed.
+        let orch = LocalSessionOrchestrator::new();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        let err = orch
+            .resume_capture(&meeting.id)
+            .await
+            .expect_err("resume from recording must error");
+        assert!(matches!(err, SessionError::InvalidState { .. }));
+    }
+
+    #[tokio::test]
+    async fn pause_unknown_id_is_not_found() {
+        let orch = LocalSessionOrchestrator::new();
+        let err = orch
+            .pause_capture(&MeetingId::now_v7())
+            .await
+            .expect_err("unknown id must error");
+        assert!(matches!(err, SessionError::NotFound { .. }));
+        let err = orch
+            .resume_capture(&MeetingId::now_v7())
+            .await
+            .expect_err("unknown id must error");
+        assert!(matches!(err, SessionError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn end_meeting_while_paused_finalizes() {
+        // Stop while paused must finalize the note via the same
+        // `end_meeting` path. Without this, a user who paused and
+        // then hit Stop would be stuck — `end_meeting` from
+        // `MeetingStatus::Paused` was the FSM-level regression that
+        // motivated Tier 3 #16's `Paused → Transcribing` edge.
+        let orch = LocalSessionOrchestrator::new();
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        orch.pause_capture(&meeting.id).await.expect("pause");
+        orch.end_meeting(&meeting.id)
+            .await
+            .expect("end_meeting while paused");
     }
 
     #[tokio::test]

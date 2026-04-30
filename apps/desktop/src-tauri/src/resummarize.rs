@@ -245,6 +245,9 @@ async fn run_summarize(
         // honors Settings the same way a fresh capture does.
         persona: persona.cloned(),
         strip_names,
+        // Re-summarize is a vault-only op — no live capture pipeline,
+        // no pause flag to honor.
+        pause_flag: None,
     };
     let orch = Orchestrator::new(cfg);
     orch.re_summarize_note(summarizer, note_path, meeting_type, transcript)

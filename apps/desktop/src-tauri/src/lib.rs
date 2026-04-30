@@ -960,6 +960,13 @@ pub fn run() {
             // as the read proxies above.
             meetings::heron_start_capture,
             meetings::heron_end_meeting,
+            // Tier 3 #16: pause/resume an in-progress capture. The
+            // Recording page's Pause button funnels through here so
+            // the daemon-side capture pipeline actually drops frames
+            // (previously the button only flipped local React state,
+            // and frames kept landing on disk).
+            meetings::heron_pause_meeting,
+            meetings::heron_resume_meeting,
             // Gap #8: backend-ready endpoints the desktop UI never
             // wired. `list_calendar_upcoming` powers the Home page's
             // upcoming-meetings rail; `attach_context` lets a click on

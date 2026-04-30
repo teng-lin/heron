@@ -96,6 +96,12 @@ pub enum MeetingStatus {
     Detected,
     Armed,
     Recording,
+    /// Mid-session pause (Tier 3 #16). Daemon drops capture frames on
+    /// the floor; the orchestrator can resume back to `Recording` or
+    /// stop straight to `Ended`. Distinct from `Recording` so wire
+    /// consumers (the desktop's REC pill, future MCP clients) can show
+    /// a Paused affordance without inferring it from the FSM.
+    Paused,
     Ended,
     Done,
     Failed,
@@ -849,6 +855,25 @@ pub trait SessionOrchestrator: Send + Sync {
     /// `meeting.completed` envelope rather than relying on a
     /// re-end.
     async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError>;
+
+    /// `POST /meetings/{meeting_id}/pause` — flip the active capture
+    /// to a Paused state. Tier 3 #16: the daemon-side pipeline drops
+    /// audio frames on the floor while paused; WAV writers stay open
+    /// so a subsequent `resume_capture` (or `end_meeting`) finds them
+    /// in the right shape. Errors:
+    /// - [`SessionError::NotFound`] (HTTP `404`) if no active meeting
+    ///   for `id`.
+    /// - [`SessionError::InvalidState`] (HTTP `409`) if the meeting is
+    ///   already paused or in any state other than `Recording`.
+    async fn pause_capture(&self, id: &MeetingId) -> Result<(), SessionError>;
+
+    /// `POST /meetings/{meeting_id}/resume` — flip a paused capture
+    /// back to `Recording`. Errors:
+    /// - [`SessionError::NotFound`] (HTTP `404`) if no active meeting
+    ///   for `id`.
+    /// - [`SessionError::InvalidState`] (HTTP `409`) if the meeting is
+    ///   not currently paused.
+    async fn resume_capture(&self, id: &MeetingId) -> Result<(), SessionError>;
 
     // ── transcripts ───────────────────────────────────────────────────
 

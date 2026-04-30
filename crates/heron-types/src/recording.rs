@@ -11,7 +11,10 @@
 //! armed ──(yes)──► recording
 //! armed ──(remind 30s)──► armed-cooldown ──(30s tick)──► armed
 //! armed ──(cancel)──► idle
+//! recording ──(pause)──► paused
+//! paused ──(resume)──► recording
 //! recording ──(hotkey or window close)──► transcribing
+//! paused ──(hotkey or window close)──► transcribing
 //! transcribing ──(done)──► summarizing
 //! summarizing ──(done|fail)──► idle
 //! ```
@@ -29,6 +32,12 @@ pub enum RecordingState {
     Armed,
     ArmedCooldown,
     Recording,
+    /// User paused capture mid-session. Daemon-side audio frames are
+    /// dropped on the floor while in this state, but the WAV writers
+    /// remain open and the FSM can resume to `Recording` (or finalize
+    /// to `Transcribing` via `on_hotkey`). Tier 3 #16 of
+    /// `docs/ux-redesign-backend-prerequisites.md`.
+    Paused,
     Transcribing,
     Summarizing,
 }
@@ -105,13 +114,49 @@ impl RecordingFsm {
             }
             // Hotkey while recording = stop. Per §14.2:
             // "recording ──(hotkey or window close)──► transcribing".
-            RecordingState::Recording => {
+            // Stop while paused must also finalize — Tier 3 #16: a
+            // paused capture is still a capture, and the user pressing
+            // Stop expects their note even though they paused mid-call.
+            RecordingState::Recording | RecordingState::Paused => {
                 self.state = RecordingState::Transcribing;
                 Ok(self.state)
             }
             other => Err(TransitionError::Invalid {
                 from: other,
                 event: "hotkey".into(),
+            }),
+        }
+    }
+
+    /// `recording ──(pause)──► paused`
+    ///
+    /// User-driven mid-session pause. The daemon's capture pipeline
+    /// reads a shared flag set by `pause_capture` on the orchestrator
+    /// and drops frames on the floor while paused; the FSM transition
+    /// here is the legality gate for that flag flip.
+    pub fn on_pause(&mut self) -> Result<RecordingState, TransitionError> {
+        match self.state {
+            RecordingState::Recording => {
+                self.state = RecordingState::Paused;
+                Ok(self.state)
+            }
+            other => Err(TransitionError::Invalid {
+                from: other,
+                event: "pause".into(),
+            }),
+        }
+    }
+
+    /// `paused ──(resume)──► recording`
+    pub fn on_resume(&mut self) -> Result<RecordingState, TransitionError> {
+        match self.state {
+            RecordingState::Paused => {
+                self.state = RecordingState::Recording;
+                Ok(self.state)
+            }
+            other => Err(TransitionError::Invalid {
+                from: other,
+                event: "resume".into(),
             }),
         }
     }
@@ -175,10 +220,12 @@ impl RecordingFsm {
 
     /// `recording ──(window close)──► transcribing` — alias for the
     /// hotkey path so callers can wire onto a window-close event
-    /// without dispatching through hotkey handling.
+    /// without dispatching through hotkey handling. `paused` accepts
+    /// the same edge so a window-close mid-pause still finalizes the
+    /// note rather than orphaning it.
     pub fn on_window_close(&mut self) -> Result<RecordingState, TransitionError> {
         match self.state {
-            RecordingState::Recording => {
+            RecordingState::Recording | RecordingState::Paused => {
                 self.state = RecordingState::Transcribing;
                 Ok(self.state)
             }
@@ -225,11 +272,16 @@ impl RecordingFsm {
     }
 
     /// Whether the FSM is in a state where the user should see a
-    /// "recording" UI affordance. Convenience for the banner.
+    /// "recording" UI affordance. Convenience for the banner. `Paused`
+    /// counts — the user's session is still in flight, just frames
+    /// are being dropped on the floor server-side.
     pub fn is_active(&self) -> bool {
         matches!(
             self.state,
-            RecordingState::Recording | RecordingState::Transcribing | RecordingState::Summarizing
+            RecordingState::Recording
+                | RecordingState::Paused
+                | RecordingState::Transcribing
+                | RecordingState::Summarizing
         )
     }
 }
@@ -364,5 +416,97 @@ mod tests {
     fn idle_reason_serializes_to_snake_case() {
         let s = serde_json::to_string(&IdleReason::SummaryFailed).expect("serialize");
         assert_eq!(s, r#""summary_failed""#);
+    }
+
+    // Tier 3 #16: pause/resume edges. Pin every transition the
+    // daemon-side pause flag plumbing relies on.
+
+    #[test]
+    fn pause_transitions_recording_to_paused() {
+        let mut f = RecordingFsm::new();
+        f.on_hotkey().expect("hotkey");
+        f.on_yes().expect("yes");
+        assert_eq!(f.on_pause().expect("pause"), RecordingState::Paused);
+        assert!(f.is_active(), "paused must still count as active");
+    }
+
+    #[test]
+    fn resume_transitions_paused_to_recording() {
+        let mut f = RecordingFsm::new();
+        f.on_hotkey().expect("hotkey");
+        f.on_yes().expect("yes");
+        f.on_pause().expect("pause");
+        assert_eq!(f.on_resume().expect("resume"), RecordingState::Recording);
+    }
+
+    #[test]
+    fn pause_then_stop_finalizes_via_transcribing() {
+        // Stop (`on_hotkey`) while paused must still finalize — a paused
+        // capture is still a capture, and the user expects their note.
+        let mut f = RecordingFsm::new();
+        f.on_hotkey().expect("hotkey");
+        f.on_yes().expect("yes");
+        f.on_pause().expect("pause");
+        assert_eq!(
+            f.on_hotkey().expect("stop while paused"),
+            RecordingState::Transcribing,
+        );
+    }
+
+    #[test]
+    fn pause_window_close_finalizes_via_transcribing() {
+        // Same contract as `on_hotkey` above: window close while paused
+        // walks straight into `Transcribing`, no orphaned note.
+        let mut f = RecordingFsm::new();
+        f.on_hotkey().expect("hotkey");
+        f.on_yes().expect("yes");
+        f.on_pause().expect("pause");
+        assert_eq!(
+            f.on_window_close().expect("close while paused"),
+            RecordingState::Transcribing,
+        );
+    }
+
+    #[test]
+    fn pause_rejects_when_not_recording() {
+        // `on_pause` is only legal from `Recording`. Hitting it from
+        // any other state must surface a typed `Invalid` so the
+        // orchestrator can map to `SessionError::InvalidState`.
+        let mut f = RecordingFsm::new();
+        // From Idle.
+        let err = f.on_pause().expect_err("pause from idle must error");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+        // From Armed.
+        f.on_hotkey().expect("hotkey");
+        let err = f.on_pause().expect_err("pause from armed must error");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+        // From Paused — already paused.
+        f.on_yes().expect("yes");
+        f.on_pause().expect("first pause");
+        let err = f
+            .on_pause()
+            .expect_err("pause from paused must error (already paused)");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+    }
+
+    #[test]
+    fn resume_rejects_when_not_paused() {
+        // `on_resume` only legal from `Paused`. Recording / Idle / Armed
+        // / Transcribing must all surface `Invalid`.
+        let mut f = RecordingFsm::new();
+        let err = f.on_resume().expect_err("resume from idle");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+        f.on_hotkey().expect("hotkey");
+        let err = f.on_resume().expect_err("resume from armed");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+        f.on_yes().expect("yes");
+        let err = f.on_resume().expect_err("resume from recording");
+        assert!(matches!(err, TransitionError::Invalid { .. }));
+    }
+
+    #[test]
+    fn paused_state_serializes_to_snake_case() {
+        let s = serde_json::to_string(&RecordingState::Paused).expect("serialize");
+        assert_eq!(s, r#""paused""#);
     }
 }
