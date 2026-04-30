@@ -71,16 +71,19 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<StatusFilter>("all");
   // Tag filter is independent of `filter` (status). They compose AND
-  // inside `MeetingsTable`. Three states:
+  // inside `MeetingsTable`. Discriminated union (see `TagFilter`):
   //
-  //   - `null`        — no tag constraint (default).
-  //   - `"untagged"`  — show only meetings with empty / missing `tags`.
-  //   - any string    — show only meetings whose `tags` includes it.
+  //   - `{ kind: "all" }`        — no tag constraint (default).
+  //   - `{ kind: "untagged" }`   — show only meetings with empty `tags`.
+  //   - `{ kind: "tag"; value }` — show only meetings whose `tags` has it.
+  //
+  // The discriminator avoids the `"untagged"` magic-string collision
+  // with an LLM-emitted tag literally named `"untagged"`.
   //
   // Single-select so the chip strip stays a flat segmented-control UX —
   // a multi-tag picker would need a popover, which is more weight than
   // this surface needs.
-  const [tagFilter, setTagFilter] = useState<TagFilter>(null);
+  const [tagFilter, setTagFilter] = useState<TagFilter>({ kind: "all" });
 
   useEffect(() => {
     void loadMeetings();
@@ -327,7 +330,7 @@ export default function Home() {
           query={search}
           filter={filter}
           tagFilter={tagFilter}
-          onTagClick={(tag) => setTagFilter(tag)}
+          onTagClick={(tag) => setTagFilter({ kind: "tag", value: tag })}
         />
       </main>
 
@@ -472,7 +475,7 @@ function TagFilterChips({
   // The "active" state for the segmented pair: a specific-tag value
   // doesn't light either button — only the trailing pill below.
   const segmentValue: "all" | "untagged" | null =
-    value === null ? "all" : value === "untagged" ? "untagged" : null;
+    value.kind === "tag" ? null : value.kind;
   return (
     <div className="inline-flex items-center gap-2">
       <div
@@ -485,7 +488,11 @@ function TagFilterChips({
             <button
               type="button"
               key={opt.id}
-              onClick={() => onChange(opt.id === "all" ? null : "untagged")}
+              onClick={() =>
+                onChange(
+                  opt.id === "all" ? { kind: "all" } : { kind: "untagged" },
+                )
+              }
               className={cn(
                 "px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] transition-colors",
               )}
@@ -501,10 +508,10 @@ function TagFilterChips({
           );
         })}
       </div>
-      {typeof value === "string" && value !== "untagged" && (
+      {value.kind === "tag" && (
         <button
           type="button"
-          onClick={() => onChange(null)}
+          onClick={() => onChange({ kind: "all" })}
           className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] tracking-[0.04em] transition-colors"
           style={{
             background: "var(--color-accent)",
@@ -513,7 +520,7 @@ function TagFilterChips({
           }}
           title="Clear tag filter"
         >
-          <span>#{value}</span>
+          <span>#{value.value}</span>
           <span aria-hidden="true">×</span>
           <span className="sr-only">Clear tag filter</span>
         </button>

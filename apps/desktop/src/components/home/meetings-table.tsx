@@ -10,12 +10,7 @@ interface MeetingsTableProps {
   filter: StatusFilter;
   /**
    * Tag filter compounds with `filter` (status) using AND semantics.
-   *
-   * - `null` — no tag filter applied (default).
-   * - `"untagged"` — show only meetings whose `tags` is missing or empty.
-   * - any other string — show only meetings whose `tags` array contains
-   *   the exact tag (case-insensitive match, since LLM-emitted tags
-   *   aren't case-normalized in the vault).
+   * See `TagFilter` for the discriminated-union shape.
    *
    * Held in Home-page state so the chip click on a row can toggle it
    * without lifting the whole filter machinery into a store.
@@ -32,8 +27,24 @@ interface MeetingsTableProps {
 
 export type StatusFilter = "all" | "active" | "done";
 
-/** See `MeetingsTableProps.tagFilter`. */
-export type TagFilter = null | "untagged" | string;
+/**
+ * Tag-axis filter state. A discriminated union (rather than the
+ * naive `null | "untagged" | string` shape we shipped originally)
+ * so an LLM-emitted tag literally named `"untagged"` cannot collide
+ * with the "no-tags" sentinel — a user clicking a `#untagged` row
+ * chip yields `{ kind: "tag", value: "untagged" }`, NOT the
+ * `{ kind: "untagged" }` magic that hides every tagged meeting.
+ *
+ * - `{ kind: "all" }` — no tag constraint (default).
+ * - `{ kind: "untagged" }` — show only meetings whose `tags` is
+ *   empty / missing.
+ * - `{ kind: "tag"; value }` — show only meetings whose `tags`
+ *   contains `value` (case-insensitive exact match).
+ */
+export type TagFilter =
+  | { kind: "all" }
+  | { kind: "untagged" }
+  | { kind: "tag"; value: string };
 
 /**
  * Pure predicate used by `MeetingsTable` to filter the rendered list.
@@ -48,11 +59,12 @@ export type TagFilter = null | "untagged" | string;
  *       - `"all"` — no status constraint.
  *       - `"active"` — drop `done` / `failed`.
  *       - `"done"` — keep only `done`.
- *   - `tagFilter`:
- *       - `null` — no tag constraint.
- *       - `"untagged"` — keep only meetings whose `tags` is empty / missing.
- *       - any string — keep only meetings whose `tags` contains it
- *         (case-insensitive exact match).
+ *   - `tagFilter` (discriminated union — see `TagFilter`):
+ *       - `{ kind: "all" }` — no tag constraint.
+ *       - `{ kind: "untagged" }` — keep only meetings whose `tags` is
+ *         empty / missing.
+ *       - `{ kind: "tag"; value }` — keep only meetings whose `tags`
+ *         contains `value` (case-insensitive exact match).
  *   - `query` (free text): empty → no constraint. Otherwise the
  *     lowercased substring is searched against title, platform label
  *     (`"Google Meet"`) and wire value (`"google_meet"`), participant
@@ -69,9 +81,7 @@ export function filterMeetings(
 ): Meeting[] {
   const q = query.trim().toLowerCase();
   const normalizedTag =
-    typeof tagFilter === "string" && tagFilter !== "untagged"
-      ? tagFilter.toLowerCase()
-      : null;
+    tagFilter.kind === "tag" ? tagFilter.value.toLowerCase() : null;
   return items.filter((m) => {
     if (filter === "active" && (m.status === "done" || m.status === "failed")) {
       return false;
@@ -83,7 +93,7 @@ export function filterMeetings(
     // `tags` is optional on the wire (back-compat with pre-Tier-0-#1
     // daemons), so coalesce to `[]` before reading.
     const tags = m.tags ?? [];
-    if (tagFilter === "untagged" && tags.length > 0) {
+    if (tagFilter.kind === "untagged" && tags.length > 0) {
       return false;
     }
     if (
@@ -275,9 +285,16 @@ function Row({
         )}
         {tags.length > 0 && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1">
-            {tags.map((tag) => (
+            {/*
+              Key includes `index` because the LLM summarizer can in
+              theory emit duplicate tag strings — `key={tag}` alone
+              would collapse two `#react` chips onto the same React
+              key and trigger the "two children with the same key"
+              warning + lose chip-local state on reorder.
+            */}
+            {tags.map((tag, index) => (
               <TagChip
-                key={tag}
+                key={`${tag}-${index}`}
                 tag={tag}
                 onClick={
                   onTagClick
@@ -328,9 +345,14 @@ const PLATFORM_LABEL: Record<Platform, string> = {
  *
  * Same chip skeleton as `PlatformBadge` (rounded-full border, mono
  * 10px) so the row's badge vocabulary stays visually consistent. When
- * `onClick` is supplied, the chip becomes a button and stops event
- * propagation (the parent `<tr>` is a row-link to /review/{id} —
- * without `stopPropagation` clicking the chip would also navigate).
+ * `onClick` is supplied, the chip becomes a button and stops both
+ * mouse-click AND keydown propagation. The parent `<tr>` in the
+ * meetings table is a row-link to /review/{id} that listens for
+ * `click` (to navigate) and `keydown` of Enter/Space (the same
+ * navigation, for keyboard users) — without `stopPropagation` on the
+ * keydown branch, pressing Enter on a focused chip would BOTH apply
+ * the tag filter AND navigate to the meeting, leaving the user
+ * stranded on the wrong page with the filter silently applied.
  *
  * Exported so the Review page header can render the same shape
  * without re-deriving the tailwind/CSS-var combo.
@@ -355,6 +377,17 @@ export function TagChip({
       <button
         type="button"
         onClick={onClick}
+        onKeyDown={(e) => {
+          // Match the row's keyboard contract — Enter / Space activate
+          // a focusable element. Stop propagation BEFORE the row's
+          // own `onKeyDown` sees the event and navigates. Without this
+          // both handlers fire (button-click via browser default,
+          // navigate via row keydown) and the user lands on /review
+          // with an unintended filter applied.
+          if (e.key === "Enter" || e.key === " ") {
+            e.stopPropagation();
+          }
+        }}
         className={`${className} cursor-pointer transition-colors hover:bg-paper-3`}
         style={style}
         title={`Filter by ${label}`}

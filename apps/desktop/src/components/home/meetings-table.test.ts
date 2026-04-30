@@ -9,15 +9,21 @@
  *
  * Cases covered:
  *
- *   1. `tagFilter === null` — no tag constraint; all meetings pass
+ *   1. `{ kind: "all" }` — no tag constraint; all meetings pass
  *      the tag axis.
- *   2. `tagFilter === "untagged"` — keep only meetings with empty /
+ *   2. `{ kind: "untagged" }` — keep only meetings with empty /
  *      missing `tags` (the back-compat `meeting.tags ?? []` codepath).
- *   3. `tagFilter === "react"` (a specific tag) — keep only meetings
- *      whose `tags` contains that exact tag, case-insensitive.
- *   4. Status × tag compose AND — selecting "active" + "untagged"
+ *   3. `{ kind: "tag", value: "react" }` — keep only meetings whose
+ *      `tags` contains that exact tag, case-insensitive.
+ *   4. Discriminated-union pin: a tag literally named `"untagged"`
+ *      cannot collide with the no-tags sentinel. Regression for the
+ *      original `null | "untagged" | string` shape.
+ *   5. Status × tag compose AND — selecting "active" + "untagged"
  *      drops a `done` meeting even if it's untagged.
- *   5. Free-text query searches tag strings as well as title /
+ *   6. Untagged × free-text composes AND — `react` query plus
+ *      untagged sentinel keeps title-only matches but drops rows
+ *      that only matched via tag strings.
+ *   7. Free-text query searches tag strings as well as title /
  *      platform / participant.
  */
 
@@ -44,15 +50,17 @@ function meetingFixture(overrides: Partial<Meeting>): Meeting {
 }
 
 describe("filterMeetings — tag axis", () => {
-  test("`null` tag filter passes every meeting through the tag axis", () => {
+  test("`{ kind: 'all' }` tag filter passes every meeting through the tag axis", () => {
     const tagged = meetingFixture({ id: "a", tags: ["react"] });
     const untagged = meetingFixture({ id: "b", tags: [] });
     const legacy = meetingFixture({ id: "c", tags: undefined });
-    const out = filterMeetings([tagged, untagged, legacy], "", "all", null);
+    const out = filterMeetings([tagged, untagged, legacy], "", "all", {
+      kind: "all",
+    });
     expect(out.map((m) => m.id)).toEqual(["a", "b", "c"]);
   });
 
-  test("`untagged` keeps only meetings with empty / missing `tags`", () => {
+  test("`{ kind: 'untagged' }` keeps only meetings with empty / missing `tags`", () => {
     // Coverage for the `meeting.tags ?? []` back-compat path. The
     // pre-Tier-0-#1 daemon emits no `tags` field at all; a freshly-
     // armed meeting emits an empty array. Both should pass the
@@ -61,12 +69,9 @@ describe("filterMeetings — tag axis", () => {
     const tagged = meetingFixture({ id: "a", tags: ["react"] });
     const untagged = meetingFixture({ id: "b", tags: [] });
     const legacy = meetingFixture({ id: "c", tags: undefined });
-    const out = filterMeetings(
-      [tagged, untagged, legacy],
-      "",
-      "all",
-      "untagged",
-    );
+    const out = filterMeetings([tagged, untagged, legacy], "", "all", {
+      kind: "untagged",
+    });
     expect(out.map((m) => m.id)).toEqual(["b", "c"]);
   });
 
@@ -79,8 +84,40 @@ describe("filterMeetings — tag axis", () => {
     const a = meetingFixture({ id: "a", tags: ["React", "frontend"] });
     const b = meetingFixture({ id: "b", tags: ["react"] });
     const c = meetingFixture({ id: "c", tags: ["backend"] });
-    const out = filterMeetings([a, b, c], "", "all", "react");
+    const out = filterMeetings([a, b, c], "", "all", {
+      kind: "tag",
+      value: "react",
+    });
     expect(out.map((m) => m.id)).toEqual(["a", "b"]);
+  });
+
+  test("a tag literally named 'untagged' matches `{ kind: 'tag', value: 'untagged' }`", () => {
+    // Regression pin for the magic-string-collision bug the original
+    // `null | "untagged" | string` shape had: an LLM-emitted tag
+    // literally named `"untagged"` would be impossible to filter
+    // for, because the filter would interpret it as the no-tags
+    // sentinel. The discriminated union eliminates the collision —
+    // the literal tag is `{ kind: "tag", value: "untagged" }` and is
+    // distinct from `{ kind: "untagged" }`.
+    const literalUntagged = meetingFixture({
+      id: "a",
+      tags: ["untagged"],
+    });
+    const tagged = meetingFixture({ id: "b", tags: ["react"] });
+    const empty = meetingFixture({ id: "c", tags: [] });
+    // `{ kind: "tag", value: "untagged" }` keeps ONLY the meeting
+    // tagged `untagged` — it is NOT the no-tags sentinel.
+    const tagLiteral = filterMeetings([literalUntagged, tagged, empty], "", "all", {
+      kind: "tag",
+      value: "untagged",
+    });
+    expect(tagLiteral.map((m) => m.id)).toEqual(["a"]);
+    // `{ kind: "untagged" }` is the sentinel — it keeps `c` and
+    // (importantly) DOES NOT match `a`'s `untagged` tag string.
+    const sentinel = filterMeetings([literalUntagged, tagged, empty], "", "all", {
+      kind: "untagged",
+    });
+    expect(sentinel.map((m) => m.id)).toEqual(["c"]);
   });
 
   test("status × tag compose AND", () => {
@@ -97,13 +134,41 @@ describe("filterMeetings — tag axis", () => {
       status: "done",
       tags: [],
     });
-    const out = filterMeetings(
-      [activeUntagged, doneUntagged],
-      "",
-      "active",
-      "untagged",
-    );
+    const out = filterMeetings([activeUntagged, doneUntagged], "", "active", {
+      kind: "untagged",
+    });
     expect(out.map((m) => m.id)).toEqual(["a"]);
+  });
+
+  test("untagged × free-text composes AND — query that only matches tags drops untagged rows", () => {
+    // Reviewer-flagged coverage gap. With `{ kind: "untagged" }`
+    // active, a free-text query of `"react"` must NOT surface a
+    // meeting whose only `react` mention is in its tag strings (the
+    // tag rows are excluded by the untagged axis), but MUST still
+    // surface a meeting that has `react` in its title and is itself
+    // untagged.
+    const taggedReact = meetingFixture({
+      id: "a",
+      title: "Weekly sync",
+      tags: ["react"],
+    });
+    const untaggedReactInTitle = meetingFixture({
+      id: "b",
+      title: "react review",
+      tags: [],
+    });
+    const untaggedUnrelated = meetingFixture({
+      id: "c",
+      title: "1:1",
+      tags: [],
+    });
+    const out = filterMeetings(
+      [taggedReact, untaggedReactInTitle, untaggedUnrelated],
+      "react",
+      "all",
+      { kind: "untagged" },
+    );
+    expect(out.map((m) => m.id)).toEqual(["b"]);
   });
 });
 
@@ -123,7 +188,7 @@ describe("filterMeetings — free-text query searches tags", () => {
       title: "Weekly sync",
       tags: ["backend"],
     });
-    const out = filterMeetings([a, b], "react", "all", null);
+    const out = filterMeetings([a, b], "react", "all", { kind: "all" });
     expect(out.map((m) => m.id)).toEqual(["a"]);
   });
 });

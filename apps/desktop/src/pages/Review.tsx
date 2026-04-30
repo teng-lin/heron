@@ -542,8 +542,15 @@ export default function Review() {
                 */}
                 {meeting && (meeting.tags ?? []).length > 0 && (
                   <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {(meeting.tags ?? []).map((tag) => (
-                      <TagChip key={tag} tag={tag} />
+                    {/*
+                      `${tag}-${index}` (rather than `tag` alone) so a
+                      duplicate tag emitted by the LLM summarizer
+                      doesn't collide on React's reconciliation key —
+                      same shape used by the Home meetings-table chip
+                      strip.
+                    */}
+                    {(meeting.tags ?? []).map((tag, index) => (
+                      <TagChip key={`${tag}-${index}`} tag={tag} />
                     ))}
                   </div>
                 )}
