@@ -352,17 +352,17 @@ pub(crate) fn read_show_tray_indicator(settings_path: &std::path::Path) -> bool 
 /// "we are doing something" colourings are suppressed.
 ///
 /// Pulled out as a pure function so the unit tests can exhaustively
-/// pin the truth table without instantiating a `TrayIcon`.
+/// pin the truth table without instantiating a `TrayIcon`. The
+/// per-variant truth table is asserted in
+/// `gate_visual_with_indicator_collapses_active_visuals_to_idle_when_disabled`,
+/// so a future `TrayVisual` variant that should NOT collapse (none
+/// today, but if one ever lands) must extend this function and the
+/// test together.
 fn gate_visual_with_indicator(visual: TrayVisual, show_indicator: bool) -> TrayVisual {
     if show_indicator {
-        return visual;
-    }
-    match visual {
-        TrayVisual::Idle => TrayVisual::Idle,
-        TrayVisual::Recording
-        | TrayVisual::Transcribing
-        | TrayVisual::Summarizing
-        | TrayVisual::Error => TrayVisual::Idle,
+        visual
+    } else {
+        TrayVisual::Idle
     }
 }
 
