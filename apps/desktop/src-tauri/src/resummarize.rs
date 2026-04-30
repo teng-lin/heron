@@ -39,7 +39,9 @@ use tokio::fs;
 
 use heron_cli::session::{Orchestrator, SessionConfig, SessionError};
 use heron_cli::summarize::re_summarize_in_vault_with_persona;
-use heron_llm::{Preference, Summarizer, select_summarizer_with_resolver};
+use heron_llm::{
+    Preference, Summarizer, parse_settings_backend, select_summarizer_with_user_choice,
+};
 use heron_types::{Frontmatter, Persona};
 use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note};
 
@@ -109,28 +111,36 @@ async fn summarize_body(vault: &Path, session_id: &str) -> Result<String, String
     let note_path = resolve_note_path(vault, session_id, true).await?;
     let canonical_vault = resolve_vault_path(vault).await?;
 
-    // Build a real summarizer per `Preference::Auto`. PR-μ / phase 74:
-    // the desktop crate threads its `EnvThenKeychainResolver` through
-    // so a user who only pasted their key into Settings → Summarizer
-    // (PR-θ) gets the Anthropic backend selected — with the env var
-    // still winning when both are set so CI / docker workflows are
-    // unaffected. Falls back to `claude` / `codex` CLIs if they're on
-    // PATH. Errors surface verbatim so the Review UI can render an
-    // actionable toast ("set ANTHROPIC_API_KEY or paste a key in
-    // Settings → Summarizer", "install claude-code", etc).
-    let resolver = EnvThenKeychainResolver::new();
-    let (summarizer, _backend, _reason) =
-        select_summarizer_with_resolver(Preference::Auto, &resolver)
-            .map_err(|e| format!("LLM backend: {e}"))?;
-
     // Tier 4 #18 / #21: read the user's persona + strip-names toggle
     // from `Settings` and thread them through `run_summarize`. A
     // missing settings.json (first-run state) yields `Settings::default()`
     // — persona empty, strip_names = false — so the prompt path stays
     // byte-identical to pre-Tier-4 unless the user has explicitly
     // opted in via the Settings pane.
+    //
+    // Read first so the same snapshot drives both backend selection
+    // (Tier 2 #14: `settings.llm_backend` honored as the user's
+    // explicit choice) and the persona / strip-names knobs below — a
+    // settings change that races us is fine in either direction
+    // because each field is independently consistent on disk.
     let settings =
         read_settings(&default_settings_path()).map_err(|e| format!("read settings: {e}"))?;
+
+    // Build a real summarizer honoring `settings.llm_backend` when the
+    // user picked one explicitly; fall back to `Preference::Auto`
+    // otherwise. PR-μ / phase 74: the desktop crate threads its
+    // `EnvThenKeychainResolver` through so a user who only pasted
+    // their key into Settings → Summarizer (PR-θ) gets the API
+    // backend selected — env var still wins when both are set so CI
+    // / docker workflows are unaffected. Errors surface verbatim so
+    // the Review UI can render an actionable toast ("set
+    // ANTHROPIC_API_KEY or paste a key in Settings → Summarizer",
+    // "install claude-code", etc).
+    let resolver = EnvThenKeychainResolver::new();
+    let user_choice = parse_settings_backend(&settings.llm_backend);
+    let (summarizer, _backend, _reason) =
+        select_summarizer_with_user_choice(user_choice, Preference::Auto, &resolver)
+            .map_err(|e| format!("LLM backend: {e}"))?;
 
     let (ours_fm, ours_body) =
         vault_read_note(&note_path).map_err(|e| format!("read {}: {}", note_path.display(), e))?;
@@ -288,27 +298,32 @@ pub async fn resummarize(vault: &Path, session_id: &str) -> Result<String, Strin
     let note_path = resolve_note_path(vault, session_id, true).await?;
     let canonical_vault = resolve_vault_path(vault).await?;
 
-    // Build a real summarizer per `Preference::Auto`. PR-μ / phase 74:
-    // the desktop crate threads its `EnvThenKeychainResolver` through
-    // so a user who only pasted their key into Settings → Summarizer
-    // (PR-θ) gets the Anthropic backend selected — with the env var
-    // still winning when both are set so CI / docker workflows are
-    // unaffected. Falls back to `claude` / `codex` CLIs if they're on
-    // PATH. Errors surface verbatim so the Review UI can render an
-    // actionable toast ("set ANTHROPIC_API_KEY or paste a key in
-    // Settings → Summarizer", "install claude-code", etc).
-    let resolver = EnvThenKeychainResolver::new();
-    let (summarizer, _backend, _reason) =
-        select_summarizer_with_resolver(Preference::Auto, &resolver)
-            .map_err(|e| format!("LLM backend: {e}"))?;
-
     // Tier 4 #18 / #21: read settings so the apply path uses the same
     // persona + strip-names knobs the preview path
     // (`resummarize_preview`) does. Without this, Apply would silently
     // use a different prompt than the Preview the user just clicked.
+    //
+    // Tier 2 #14: also drives the user's explicit `llm_backend` choice
+    // into `select_summarizer_with_user_choice` so Apply picks the
+    // same backend the Preview did — the snapshot is read once here
+    // and reused for both decisions.
     let settings =
         read_settings(&default_settings_path()).map_err(|e| format!("read settings: {e}"))?;
     let persona = persona_from_settings(&settings);
+
+    // Build a real summarizer honoring `settings.llm_backend` when the
+    // user picked one explicitly; fall back to `Preference::Auto`
+    // otherwise. PR-μ / phase 74: the desktop crate threads its
+    // `EnvThenKeychainResolver` through so a user who only pasted
+    // their key into Settings → Summarizer (PR-θ) gets the API
+    // backend selected — env var still wins when both are set so CI
+    // / docker workflows are unaffected. Errors surface verbatim so
+    // the Review UI can render an actionable toast.
+    let resolver = EnvThenKeychainResolver::new();
+    let user_choice = parse_settings_backend(&settings.llm_backend);
+    let (summarizer, _backend, _reason) =
+        select_summarizer_with_user_choice(user_choice, Preference::Auto, &resolver)
+            .map_err(|e| format!("LLM backend: {e}"))?;
 
     // `re_summarize_in_vault_with_persona` does the work:
     // 1. Reads the note's frontmatter to find the transcript path.

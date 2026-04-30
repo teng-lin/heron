@@ -48,8 +48,8 @@ pub use cost::{CostError, ModelPricing, ModelRate, RATE_TABLE, compute_cost, loo
 pub use key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
 pub use openai::{OpenAIClient, OpenAIClientConfig};
 pub use select::{
-    Availability, Preference, SelectError, SelectionReason, select_backend, select_summarizer,
-    select_summarizer_with_resolver,
+    Availability, Preference, SelectError, SelectionReason, parse_settings_backend, select_backend,
+    select_summarizer, select_summarizer_with_resolver, select_summarizer_with_user_choice,
 };
 
 /// Convenience alias so the public surface doesn't leak `String` for

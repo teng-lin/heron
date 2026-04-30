@@ -87,13 +87,21 @@ const AUTOSAVE_DEBOUNCE_MS = 500;
 
 /**
  * Wire-format strings for `Settings.llm_backend`. Mirrors the
- * `"anthropic" | "claude_code_cli" | "codex_cli"` values the Rust side
- * accepts (see `settings.rs`).
+ * `"anthropic" | "openai" | "claude_code_cli" | "codex_cli"` values the
+ * Rust side accepts (see `settings.rs`). The desktop side honors the
+ * user's choice via `heron_llm::parse_settings_backend` →
+ * `select_summarizer_with_user_choice`; an unrecognized string routes
+ * to `Preference::Auto`.
+ *
+ * Grouped visually by hosted-API vs local-CLI per the IA note in the
+ * UX-redesign brief: the user reads "API providers" as one billing
+ * model and "local CLI" as another.
  */
 const LLM_BACKENDS = [
-  { value: "anthropic", label: "Anthropic API" },
-  { value: "claude_code_cli", label: "Claude Code CLI" },
-  { value: "codex_cli", label: "Codex CLI" },
+  { value: "anthropic", label: "Anthropic API", group: "api" },
+  { value: "openai", label: "OpenAI API", group: "api" },
+  { value: "claude_code_cli", label: "Claude Code CLI", group: "cli" },
+  { value: "codex_cli", label: "Codex CLI", group: "cli" },
 ] as const;
 
 /**

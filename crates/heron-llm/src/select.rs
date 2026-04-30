@@ -328,6 +328,93 @@ pub fn select_summarizer_with_resolver(
     ))
 }
 
+/// Map a `Settings.llm_backend` wire string to a typed [`Backend`].
+///
+/// Accepts the four wire-format strings the desktop crate persists:
+/// `"anthropic"`, `"openai"`, `"claude_code_cli"`, `"codex_cli"`.
+/// Returns `None` for any other value so a stale on-disk setting
+/// (typo, hand-edit, pre-migration default) routes the caller to the
+/// `Preference::Auto` fallback rather than hard-erroring at startup.
+///
+/// The wire format is the snake-cased Rust enum name; the heron-cli
+/// `--backend` flag uses a different spelling (`claude-code` /
+/// `codex`) and lives on its own parser
+/// [`crate::summarize::parse_backend_flag`] in heron-cli.
+pub fn parse_settings_backend(s: &str) -> Option<Backend> {
+    match s {
+        "anthropic" => Some(Backend::Anthropic),
+        "openai" => Some(Backend::OpenAI),
+        "claude_code_cli" => Some(Backend::ClaudeCodeCli),
+        "codex_cli" => Some(Backend::CodexCli),
+        _ => None,
+    }
+}
+
+/// Honor the user's `Settings.llm_backend` choice when the
+/// corresponding key / CLI is available; fall back to `fallback`
+/// otherwise.
+///
+/// Tier 2 wiring entry point. The desktop crate reads `settings.llm_backend`,
+/// converts it through [`parse_settings_backend`], and threads the
+/// resulting `Option<Backend>` here. Behavior:
+///
+/// - `Some(backend)` + that backend is reachable (key resolves / CLI
+///   on PATH) → build it directly with
+///   [`SelectionReason::PreferredBackendAvailable`].
+/// - `Some(backend)` + that backend is unreachable → fall through to
+///   [`select_summarizer_with_resolver`] with `fallback`. We log a
+///   warn with the reason so a user with a stale setting (chose
+///   `openai` after deleting their key) gets a diagnostic trail rather
+///   than a silent fall-back.
+/// - `None` (parse failed / setting is empty) → fall through to
+///   `fallback` directly.
+///
+/// Resolver `Backend` errors propagate as [`LlmError::Backend`] —
+/// same contract as [`select_summarizer_with_resolver`].
+pub fn select_summarizer_with_user_choice(
+    user_choice: Option<Backend>,
+    fallback: Preference,
+    resolver: &dyn KeyResolver,
+) -> Result<(Box<dyn Summarizer>, Backend, SelectionReason), LlmError> {
+    if let Some(backend) = user_choice {
+        // Probe availability for the user's chosen backend. We do a
+        // targeted check rather than `Availability::detect_with_resolver`
+        // so a `Backend` error from the resolver propagates instead of
+        // being silently treated as "key unavailable" — that masking
+        // would map a corrupted keychain entry to an unwanted Auto
+        // fallback.
+        let available = match backend {
+            Backend::Anthropic => match resolver.resolve(KeyName::AnthropicApiKey) {
+                Ok(_) => true,
+                Err(KeyResolveError::NotFound(_)) => false,
+                Err(KeyResolveError::Backend(msg)) => {
+                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
+                }
+            },
+            Backend::OpenAI => match resolver.resolve(KeyName::OpenAiApiKey) {
+                Ok(_) => true,
+                Err(KeyResolveError::NotFound(_)) => false,
+                Err(KeyResolveError::Backend(msg)) => {
+                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
+                }
+            },
+            Backend::ClaudeCodeCli => which_on_path("claude").is_some(),
+            Backend::CodexCli => which_on_path("codex").is_some(),
+        };
+        if available {
+            return Ok((
+                build_summarizer_with_resolver(backend, resolver),
+                backend,
+                SelectionReason::PreferredBackendAvailable(backend),
+            ));
+        }
+        tracing::warn!(
+            "user-selected backend {backend:?} is unavailable; falling back to {fallback:?}"
+        );
+    }
+    select_summarizer_with_resolver(fallback, resolver)
+}
+
 /// Tiny PATH-walker shared with `heron-cli`'s status preflight. Has
 /// the same executable-bit check on unix so a non-executable file
 /// at `PATH/binary` doesn't get reported as available.
@@ -728,6 +815,129 @@ mod tests {
             select_summarizer_with_resolver(Preference::PremiumOnly, &StubResolverOpenAIOnly)
                 .expect("select");
         assert_eq!(backend, Backend::OpenAI);
+    }
+
+    #[test]
+    fn parse_settings_backend_known_values() {
+        assert_eq!(
+            parse_settings_backend("anthropic"),
+            Some(Backend::Anthropic)
+        );
+        assert_eq!(parse_settings_backend("openai"), Some(Backend::OpenAI));
+        assert_eq!(
+            parse_settings_backend("claude_code_cli"),
+            Some(Backend::ClaudeCodeCli)
+        );
+        assert_eq!(parse_settings_backend("codex_cli"), Some(Backend::CodexCli));
+    }
+
+    #[test]
+    fn parse_settings_backend_rejects_unknown() {
+        // Unknown strings collapse to None so the caller falls through
+        // to Preference::Auto rather than hard-erroring on a stale or
+        // typo'd on-disk value.
+        assert_eq!(parse_settings_backend(""), None);
+        assert_eq!(parse_settings_backend("Anthropic"), None);
+        assert_eq!(parse_settings_backend("gpt-99"), None);
+        // Wrong dialect: heron-cli's `--backend` flag uses kebab-case
+        // (`claude-code`); the desktop wire format is snake_case.
+        assert_eq!(parse_settings_backend("claude-code"), None);
+    }
+
+    #[test]
+    fn select_with_user_choice_picks_chosen_backend_when_available() {
+        // User chose Anthropic, key is present → must pick Anthropic
+        // verbatim (`PreferredBackendAvailable`), regardless of any
+        // Auto-mode preference order.
+        let (_summarizer, backend, reason) = select_summarizer_with_user_choice(
+            Some(Backend::Anthropic),
+            Preference::Auto,
+            &StubResolverYes,
+        )
+        .expect("select");
+        assert_eq!(backend, Backend::Anthropic);
+        assert_eq!(
+            reason,
+            SelectionReason::PreferredBackendAvailable(Backend::Anthropic)
+        );
+    }
+
+    #[test]
+    fn select_with_user_choice_picks_openai_when_user_picks_openai() {
+        // The desktop crate's contract: when the user picks "openai",
+        // OpenAI must win even though Auto would have preferred
+        // Anthropic. StubResolverYes returns Ok for both keys so this
+        // pin only changes if the wire-routing intentionally moves.
+        let (_summarizer, backend, reason) = select_summarizer_with_user_choice(
+            Some(Backend::OpenAI),
+            Preference::Auto,
+            &StubResolverYes,
+        )
+        .expect("select");
+        assert_eq!(backend, Backend::OpenAI);
+        assert_eq!(
+            reason,
+            SelectionReason::PreferredBackendAvailable(Backend::OpenAI)
+        );
+    }
+
+    #[test]
+    fn select_with_user_choice_falls_back_when_chosen_backend_unavailable() {
+        // User chose Anthropic, no keys configured → fall through to
+        // Auto. Result depends on which CLIs are on PATH; what we pin
+        // is "the resolver Backend error did NOT propagate" and we
+        // didn't pick Anthropic.
+        match select_summarizer_with_user_choice(
+            Some(Backend::Anthropic),
+            Preference::Auto,
+            &StubResolverNo,
+        ) {
+            Ok((_, backend, _)) => assert_ne!(
+                backend,
+                Backend::Anthropic,
+                "user chose Anthropic but no key configured; \
+                 must fall back, not silently pick the unreachable backend"
+            ),
+            // No CLI on PATH: NoBackendAvailable is fine.
+            Err(LlmError::Backend(_)) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_with_user_choice_no_choice_falls_through_to_fallback() {
+        // None means "user setting was empty / unparseable"; behavior
+        // must be byte-equivalent to calling
+        // `select_summarizer_with_resolver(Preference::Auto, …)`
+        // directly. With StubResolverYes both keys present → Auto
+        // picks Anthropic.
+        let (_summarizer, backend, _) =
+            select_summarizer_with_user_choice(None, Preference::Auto, &StubResolverYes)
+                .expect("select");
+        assert_eq!(backend, Backend::Anthropic);
+    }
+
+    #[test]
+    fn select_with_user_choice_propagates_resolver_backend_error() {
+        // Corrupted keychain → Backend error must propagate even when
+        // the user explicitly picked an API backend. Without this, a
+        // broken keychain entry would silently downgrade to a CLI
+        // backend (or NoBackendAvailable) without telling the user
+        // why.
+        match select_summarizer_with_user_choice(
+            Some(Backend::Anthropic),
+            Preference::Auto,
+            &StubResolverErr,
+        ) {
+            Ok(_) => panic!("Backend error must propagate"),
+            Err(LlmError::Backend(msg)) => {
+                assert!(
+                    msg.contains("api key resolver"),
+                    "expected resolver-prefixed error, got: {msg}"
+                );
+            }
+            Err(other) => panic!("Backend errors must surface as LlmError::Backend, not {other:?}"),
+        }
     }
 
     #[test]
