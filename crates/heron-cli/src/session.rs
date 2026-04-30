@@ -71,6 +71,13 @@ pub struct SessionConfig {
     /// `"whisperkit"` or `"sherpa"`; resolves via
     /// [`heron_speech::build_backend`].
     pub stt_backend_name: String,
+    /// Tier 4 #17 vocabulary-boost hotwords. The Settings pane edits
+    /// this list; the daemon orchestrator copies it from
+    /// `Settings::hotwords` at `start_capture` time and forwards it
+    /// here so the WhisperKit backend can compose a tokenized prompt.
+    /// Empty vec → no prompt is set (migration-safe; identical decoder
+    /// output to pre-Tier-4 builds).
+    pub hotwords: Vec<String>,
     /// User-expressed LLM backend preference. Phase 40's selector
     /// picks the first viable backend under this preference at
     /// `backends()` call time; the returned `SelectionReason` is
@@ -259,7 +266,8 @@ impl Orchestrator {
     ///   inspecting logs can tell whether the API path was picked or a
     ///   CLI fallback fired.
     pub fn backends(&self) -> Result<Backends, SessionError> {
-        let stt = heron_speech::build_backend(&self.config.stt_backend_name)?;
+        let stt =
+            heron_speech::build_backend(&self.config.stt_backend_name, &self.config.hotwords)?;
         let ax = heron_zoom::select_ax_backend();
         let (llm, backend, reason) = heron_llm::select_summarizer(self.config.llm_preference)?;
         tracing::info!(?backend, ?reason, "LLM backend selected");
@@ -362,6 +370,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/heron-test-cache"),
             vault_root: PathBuf::from("/tmp/heron-test-vault"),
             stt_backend_name: "sherpa".into(),
+            hotwords: Vec::new(),
             // Auto picks Anthropic when ANTHROPIC_API_KEY is set,
             // else falls back to a CLI; the test machine's
             // environment determines which path runs.

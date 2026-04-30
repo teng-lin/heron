@@ -107,6 +107,22 @@ export interface Meeting {
    * here, not `null`.
    */
   processing?: MeetingProcessing;
+  /**
+   * Tier 0 #3: structured action-item rows lifted from the vault
+   * note's `Frontmatter.action_items`. Empty during the live
+   * recording lifecycle (`detected` / `armed` / `recording` /
+   * `ended`); populated once the note finalizes. Optional on the
+   * wire because pre-Tier-0-#3 daemons (and any cached responses
+   * from a previous build) don't emit the field — Review.tsx falls
+   * back to a regex bullet extractor over the markdown body in that
+   * case.
+   *
+   * **Read path only.** Edits made in the desktop UI flow through
+   * `NoteEditor` → `heron_write_note_atomic` (markdown), not back
+   * through this field. See
+   * `docs/ux-redesign-backend-prerequisites.md` Tier 0 #3.
+   */
+  action_items?: ActionItem[];
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:482`. */
@@ -127,6 +143,22 @@ export interface ListMeetingsPage {
 
 /** Mirrors `crates/heron-session/src/lib.rs:216`. */
 export interface ActionItem {
+  /**
+   * Stable `ItemId` minted by the vault writer (UUIDv7). Survives
+   * merge-on-write so React lists / future checkbox state can key on
+   * it across re-summarize cycles. Optional on the wire because
+   * pre-Tier-0-#3 daemons used `#[serde(default)]` to fill it with
+   * the nil UUID — Tier 0 #3 added the field on the Rust side; this
+   * mirror takes it as `string | undefined` so callers can synthesize
+   * a fallback key for React when it's absent on legacy items. (The
+   * regex-extractor fallback in `Review.tsx` is a separate path,
+   * triggered when `meeting.action_items` itself is missing or empty,
+   * not when `id` is absent on a present item.)
+   *
+   * Carried as an opaque string on the JS side; the Rust side serializes
+   * `uuid::Uuid` as a hyphenated lowercase string.
+   */
+  id?: string;
   text: string;
   owner: string | null;
   /** ISO date (`YYYY-MM-DD`); `null` when no due date. */
@@ -201,6 +233,14 @@ export interface CalendarEvent {
   attendees: AttendeeContext[];
   meeting_url: string | null;
   related_meetings: MeetingId[];
+  /**
+   * `true` once a `PreMeetingContext` is staged for this event id
+   * (via `heron_prepare_context` or `heron_attach_context`). The
+   * upcoming-meetings rail renders a "primed" indicator from this
+   * field. Daemon defaults it to `false` when omitted, so older
+   * builds keep deserializing.
+   */
+  primed: boolean;
 }
 
 /** Mirrors herond's `CalendarPage` wire shape (serialize-only daemon-side). */
@@ -228,6 +268,18 @@ export interface PreMeetingContext {
 export interface PreMeetingContextRequest {
   calendar_event_id: string;
   context: PreMeetingContext;
+}
+
+/**
+ * Body for `heron_prepare_context` (`POST /v1/context/prepare`). The
+ * daemon synthesizes a minimal `PreMeetingContext` from `attendees`
+ * (lifted into `attendees_known`) and stores it under
+ * `calendar_event_id`. Idempotent — never overwrites an existing
+ * staged context.
+ */
+export interface PrepareContextRequest {
+  calendar_event_id: string;
+  attendees: AttendeeContext[];
 }
 
 /** Synthetic ack for a successful `PUT /v1/context` (daemon emits 204). */

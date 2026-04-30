@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use heron_event::{EventId, ReplayCache, ReplayError};
+pub use heron_types::ItemId;
 pub use heron_types::prefixed_id::IdParseError;
 
 // ── identity ──────────────────────────────────────────────────────────
@@ -186,6 +187,20 @@ pub struct Meeting {
     /// $`). UI for the panel is a separate PR; this is bridge-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing: Option<MeetingProcessing>,
+    /// Structured action items lifted from `Frontmatter.action_items`
+    /// when the meeting note is on disk. Empty during the live
+    /// recording lifecycle (`Detected` / `Armed` / `Recording` /
+    /// `Ended`); populated from the vault frontmatter once the note
+    /// finalizes. `#[serde(default)]` so pre-Tier-0 #3 wire shapes
+    /// keep parsing — the desktop falls back to a regex extractor
+    /// over the markdown body in that case.
+    ///
+    /// **Read path only.** Edits made in the desktop UI do not flow
+    /// back through this field today; the desktop's writeback path
+    /// is markdown-only. See
+    /// `docs/ux-redesign-backend-prerequisites.md` Tier 0 #3.
+    #[serde(default)]
+    pub action_items: Vec<ActionItem>,
 }
 
 /// Per-meeting LLM cost telemetry projected onto the wire.
@@ -262,6 +277,20 @@ pub struct Transcript {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionItem {
+    /// Stable `ItemId` minted by the vault writer (UUIDv7 — see
+    /// `heron_types::ItemId`). Survives merge-on-write per
+    /// `heron_vault::merge_action_items`, so the desktop can key
+    /// React lists / checkbox state on it across re-summarize cycles
+    /// without that state aliasing onto a different bullet.
+    ///
+    /// `#[serde(default)]` for back-compat: pre-Tier-0 #3 daemon
+    /// payloads (and any cached responses sitting on disk from a
+    /// previous build) omitted this field. Falling back to the nil
+    /// UUID lets old wire shapes still parse; clients that want the
+    /// stable-id contract should re-read the meeting from a daemon
+    /// new enough to populate it.
+    #[serde(default)]
+    pub id: ItemId,
     pub text: String,
     /// Display name of the person the item is assigned to, when the
     /// LLM extracted one. Free text — heron does not resolve this
@@ -305,6 +334,13 @@ pub struct CalendarEvent {
     /// calendar event in one round trip.
     #[serde(default)]
     pub related_meetings: Vec<MeetingId>,
+    /// `true` when a `PreMeetingContext` is already staged for this
+    /// event id (via `prepare_context` or `attach_context`). Lets the
+    /// upcoming-meetings rail render a "primed" indicator without a
+    /// second round trip. `#[serde(default)]` so older daemon builds
+    /// (which omitted the field) deserialize as un-primed.
+    #[serde(default)]
+    pub primed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +380,25 @@ pub struct PreMeetingContextRequest {
     /// to.
     pub calendar_event_id: String,
     pub context: PreMeetingContext,
+}
+
+/// Body shape for `POST /context/prepare`. The daemon synthesizes a
+/// minimal default `PreMeetingContext` from the fields present here —
+/// today just `attendees`, lifted into `attendees_known`. Surfaces as
+/// the rail's auto-prime path: callers don't have to construct the
+/// full `PreMeetingContext` themselves, and as the synthesizer learns
+/// new sources (related-notes lookup, agenda extraction) older clients
+/// pick up the richer context without a wire change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareContextRequest {
+    pub calendar_event_id: String,
+    /// Carried over verbatim from the calendar event; copied into
+    /// `PreMeetingContext::attendees_known`. Empty is fine — priming
+    /// with no attendees still flips the `primed` flag so the UI
+    /// surfaces the indicator and `start_capture` finds the staged
+    /// entry.
+    #[serde(default)]
+    pub attendees: Vec<AttendeeContext>,
 }
 
 // ── health ────────────────────────────────────────────────────────────
@@ -801,6 +856,18 @@ pub trait SessionOrchestrator: Send + Sync {
     /// `calendar_event_id` wins.
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError>;
 
+    /// `POST /context/prepare` — auto-stage a minimal default
+    /// `PreMeetingContext` for `req.calendar_event_id`. The
+    /// orchestrator synthesizes the context from the request fields
+    /// (today: `attendees` → `attendees_known`); future expansions
+    /// (related-notes lookup, agenda extraction) live behind this
+    /// method so the wire shape stays stable.
+    ///
+    /// Idempotent. Skips when an entry already exists for the id (so
+    /// a manual `attach_context` is never clobbered by a later
+    /// `prepare_context`); returns `Ok(())` either way.
+    async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError>;
+
     // ── ops ───────────────────────────────────────────────────────────
 
     /// `GET /health`. Mirrors what `heron-doctor` reports offline.
@@ -860,6 +927,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let envelope = Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
             .with_meeting(meeting.id.to_string());
@@ -873,6 +941,42 @@ mod prefix_tests {
         assert!(obj.contains_key("data"), "missing data field: {json}");
         let back: EventEnvelope = serde_json::from_value(json).expect("deserialize");
         assert!(matches!(back.payload, EventPayload::MeetingDetected(_)));
+    }
+
+    #[test]
+    fn calendar_event_primed_defaults_false_when_field_omitted() {
+        // Backwards-compat pin: an older daemon build that pre-dates
+        // Tier 5 #25 emits `CalendarEvent` without the `primed` field.
+        // The desktop deserialization path must default it to `false`
+        // rather than fail; otherwise rolling out the desktop binary
+        // ahead of the daemon (or vice versa) bricks the rail.
+        let raw = r#"{
+            "id": "evt_legacy",
+            "title": "Legacy event",
+            "start": "2026-04-29T15:00:00Z",
+            "end": "2026-04-29T15:30:00Z",
+            "attendees": [],
+            "meeting_url": null,
+            "related_meetings": []
+        }"#;
+        let parsed: CalendarEvent = serde_json::from_str(raw).expect("deserialize");
+        assert!(!parsed.primed);
+
+        // And the round-trip with `primed: true` preserves the flag.
+        let staged = CalendarEvent {
+            id: "evt_new".into(),
+            title: "New event".into(),
+            start: Utc::now(),
+            end: Utc::now(),
+            attendees: Vec::new(),
+            meeting_url: None,
+            related_meetings: Vec::new(),
+            primed: true,
+        };
+        let json = serde_json::to_value(&staged).expect("serialize");
+        assert_eq!(json.get("primed").and_then(|v| v.as_bool()), Some(true));
+        let back: CalendarEvent = serde_json::from_value(json).expect("deserialize");
+        assert!(back.primed);
     }
 
     #[test]
@@ -961,6 +1065,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Ready,
             tags: vec!["acme".into(), "pricing".into()],
             processing: None,
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         // Pin the wire-key explicitly so a `#[serde(rename)]` typo
@@ -1066,6 +1171,7 @@ mod prefix_tests {
             summary_status: SummaryLifecycle::Pending,
             tags: vec![],
             processing: None,
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         let obj = json.as_object().expect("object");
@@ -1101,6 +1207,7 @@ mod prefix_tests {
                 tokens_out: 612,
                 model: "claude-sonnet-4-6".into(),
             }),
+            action_items: vec![],
         };
         let json = serde_json::to_value(&meeting).expect("serialize");
         let processing = json

@@ -36,7 +36,8 @@ pub use selection::{
 };
 pub use sherpa::SherpaBackend;
 pub use whisperkit_bridge::{
-    DEFAULT_WK_VARIANT, WkError, WkStatus, whisperkit_fetch, whisperkit_init, whisperkit_transcribe,
+    DEFAULT_WK_VARIANT, WkError, WkStatus, compose_prompt, whisperkit_fetch, whisperkit_init,
+    whisperkit_transcribe,
 };
 
 /// Per-backend telemetry collected during a successful transcription.
@@ -124,13 +125,34 @@ pub trait SttBackend: Send + Sync {
 /// `~/Library/Caches/heron/sherpa/`), so a missing-model failure
 /// surfaces inside the orchestrator's progress UI rather than at
 /// flag-parse.
-pub fn build_backend(name: &str) -> Result<Box<dyn SttBackend>, SttError> {
+///
+/// `hotwords` is the Tier 4 #17 vocabulary-boost list. The WhisperKit
+/// backend forwards it as a tokenized prompt on every `transcribe`
+/// call; the Sherpa backend ignores it for now (Sherpa has its own
+/// hotword API that ships in a sibling Tier-4 PR). An empty slice is
+/// the migration-safe default — `build_backend("whisperkit", &[])`
+/// reproduces the pre-Tier-4 decode path byte-for-byte.
+pub fn build_backend(name: &str, hotwords: &[String]) -> Result<Box<dyn SttBackend>, SttError> {
     match name {
         #[cfg(target_vendor = "apple")]
-        "whisperkit" => Ok(Box::new(WhisperKitBackend::from_env())),
+        "whisperkit" => Ok(Box::new(
+            WhisperKitBackend::from_env().with_hotwords(hotwords.to_vec()),
+        )),
         #[cfg(not(target_vendor = "apple"))]
-        "whisperkit" => Ok(Box::new(stub::WhisperKitStub)),
-        "sherpa" => Ok(Box::new(sherpa::SherpaBackend::from_env())),
+        "whisperkit" => {
+            // Off-Apple stub doesn't decode anything; hotwords have
+            // nowhere to land. Discard rather than carrying through a
+            // never-read field on the stub.
+            let _ = hotwords;
+            Ok(Box::new(stub::WhisperKitStub))
+        }
+        "sherpa" => {
+            // Sherpa has its own hotword config (sibling Tier-4 PR);
+            // for now we accept-and-ignore so the call-site signature
+            // is uniform across backends.
+            let _ = hotwords;
+            Ok(Box::new(sherpa::SherpaBackend::from_env()))
+        }
         other => {
             tracing::warn!(name = other, "unknown stt backend requested");
             Err(SttError::Unavailable(format!("unknown backend: {other}")))
@@ -163,6 +185,11 @@ pub struct WhisperKitBackend {
     location: ModelLocation,
     /// WhisperKit variant identifier, e.g. `"openai_whisper-small.en"`.
     variant: String,
+    /// Tier 4 #17 vocabulary-boost terms, joined with single spaces and
+    /// passed to WhisperKit as `DecodingOptions.promptTokens`. Empty
+    /// → no prompt set (migration-safe default; preserves pre-Tier-4
+    /// decode behaviour byte-for-byte).
+    hotwords: Vec<String>,
     /// Resolved model folder after a successful `ensure_model` —
     /// the directory we actually pass to `wk_init`. Initialized
     /// exactly once across concurrent `ensure_model` callers.
@@ -191,6 +218,7 @@ impl WhisperKitBackend {
         Self {
             location: ModelLocation::Override(model_dir),
             variant: DEFAULT_WK_VARIANT.to_owned(),
+            hotwords: Vec::new(),
             init_cell: OnceCell::new(),
         }
     }
@@ -201,8 +229,24 @@ impl WhisperKitBackend {
         Self {
             location: ModelLocation::Cache(cache_root),
             variant: DEFAULT_WK_VARIANT.to_owned(),
+            hotwords: Vec::new(),
             init_cell: OnceCell::new(),
         }
+    }
+
+    /// Override the [`hotwords`](Self::hotwords) field. Builder-style
+    /// so the construction call site stays a single chain:
+    /// `WhisperKitBackend::from_env().with_hotwords(settings.hotwords)`.
+    /// An empty `Vec` is equivalent to "no prompt" — see
+    /// [`compose_prompt`] for the join semantics. Stored
+    /// verbatim; the per-`transcribe`-call composition runs at
+    /// transcribe time so a future `update_hotwords` setter (e.g.
+    /// driven by a Settings live-reload) can swap in a new vec
+    /// without rebuilding the backend.
+    #[must_use]
+    pub fn with_hotwords(mut self, hotwords: Vec<String>) -> Self {
+        self.hotwords = hotwords;
+        self
     }
 
     /// Construct from environment.
@@ -349,14 +393,24 @@ impl SttBackend for WhisperKitBackend {
         let started = std::time::Instant::now();
 
         let wav_owned = wav_path.to_path_buf();
-        let body = tokio::task::spawn_blocking(move || whisperkit_transcribe(&wav_owned))
-            .await
-            .map_err(|e| SttError::Failed(format!("whisperkit transcribe join failed: {e}")))?
-            .map_err(|e| match e {
-                WkError::ModelMissing => SttError::ModelMissing(String::new()),
-                WkError::NotYetImplemented => SttError::NotYetImplemented,
-                other => SttError::Failed(format!("whisperkit transcribe: {other}")),
-            })?;
+        // Compose the prompt up-front (cheap join over a small Vec)
+        // and move it into the blocking task. Doing it here rather than
+        // inside spawn_blocking lets a misconfigured prompt — say, a
+        // user who sneaked an internal NUL into a hotword — surface
+        // synchronously where the call site has the original
+        // `&self.hotwords` slice for diagnostics, rather than in a
+        // boxed-error string from a join handle.
+        let prompt = compose_prompt(&self.hotwords);
+        let body = tokio::task::spawn_blocking(move || {
+            whisperkit_transcribe(&wav_owned, prompt.as_deref())
+        })
+        .await
+        .map_err(|e| SttError::Failed(format!("whisperkit transcribe join failed: {e}")))?
+        .map_err(|e| match e {
+            WkError::ModelMissing => SttError::ModelMissing(String::new()),
+            WkError::NotYetImplemented => SttError::NotYetImplemented,
+            other => SttError::Failed(format!("whisperkit transcribe: {other}")),
+        })?;
 
         // Open the partial-writer eagerly so a transcription with zero
         // segments still leaves an (empty) on-disk artifact for the
@@ -498,7 +552,7 @@ mod tests {
                 "/nonexistent/heron-whisperkit-model-dir",
             );
         }
-        let b = build_backend("whisperkit").expect("build");
+        let b = build_backend("whisperkit", &[]).expect("build");
         assert_eq!(b.name(), "whisperkit");
         let result = b.ensure_model(Box::new(|_p| {})).await;
         unsafe {
@@ -526,6 +580,59 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tmp");
         let b = WhisperKitBackend::with_cache_root(tmp.path().to_path_buf());
         assert_eq!(b.variant, DEFAULT_WK_VARIANT);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn whisperkit_backend_default_hotwords_is_empty() {
+        // Migration contract: a backend constructed without
+        // `with_hotwords` decodes byte-identically to the pre-Tier-4
+        // path. The empty default in `new` / `with_cache_root` is what
+        // upholds that contract.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let b = WhisperKitBackend::new(tmp.path().to_path_buf());
+        assert!(b.hotwords.is_empty());
+        let b2 = WhisperKitBackend::with_cache_root(tmp.path().to_path_buf());
+        assert!(b2.hotwords.is_empty());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn whisperkit_backend_with_hotwords_sets_field() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let b = WhisperKitBackend::new(tmp.path().to_path_buf())
+            .with_hotwords(vec!["heron".into(), "WhisperKit".into()]);
+        assert_eq!(
+            b.hotwords,
+            vec!["heron".to_owned(), "WhisperKit".to_owned()]
+        );
+    }
+
+    #[test]
+    fn build_backend_accepts_hotwords_for_every_known_name() {
+        // The Tauri/desktop hand-off calls
+        // `build_backend(stt_backend_name, settings.hotwords)`. This
+        // test pins the contract that the hotwords parameter is
+        // accepted by every recognized backend name without erroring —
+        // a regression that hard-errored on Sherpa (which currently
+        // has no hotwords API of its own) would silently disable
+        // recording for any user with `stt_backend = "sherpa"` who
+        // also configured hotwords.
+        //
+        // Coverage of the "hotwords actually reach the WhisperKit
+        // backend" property lives on
+        // `whisperkit_backend_with_hotwords_sets_field` (Apple-only)
+        // and the `compose_prompt` unit tests in
+        // `whisperkit_bridge::tests`; this test only asserts the
+        // factory's own contract.
+        for name in ["whisperkit", "sherpa"] {
+            let result = build_backend(name, &["heron".to_owned(), "Anthropic".to_owned()]);
+            assert!(
+                result.is_ok(),
+                "build_backend({name}) with hotwords must succeed; got error: {:?}",
+                result.err(),
+            );
+        }
     }
 
     /// End-to-end fetch + init against a real WhisperKit download.
@@ -575,7 +682,7 @@ mod tests {
         // declines to transcribe before `ensure_model` has populated
         // the cache directory — that last shape gives the orchestrator
         // a `ModelMissing` to drive its first-run download UI off of.
-        let b = build_backend("sherpa").expect("build");
+        let b = build_backend("sherpa", &[]).expect("build");
         assert_eq!(b.name(), "sherpa");
         assert!(b.is_available());
 
@@ -618,7 +725,7 @@ mod tests {
 
     #[test]
     fn unknown_backend_name_errors() {
-        let result = build_backend("magic-asr");
+        let result = build_backend("magic-asr", &[]);
         assert!(matches!(result, Err(SttError::Unavailable(_))));
     }
 
@@ -633,8 +740,8 @@ mod tests {
         //     Sherpa per §8.6.
         // The test runs the real predicate against the host so a
         // CI machine that loses Apple Silicon would surface the drift.
-        let wk = build_backend("whisperkit").expect("wk");
-        let sh = build_backend("sherpa").expect("sh");
+        let wk = build_backend("whisperkit", &[]).expect("wk");
+        let sh = build_backend("sherpa", &[]).expect("sh");
         let expected_wk = cfg!(target_vendor = "apple") && {
             let p = RealPlatform;
             p.is_apple_silicon() && p.is_macos_14_plus()

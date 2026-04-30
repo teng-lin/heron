@@ -30,11 +30,21 @@ pub mod resummarize;
 pub mod runtime_checks;
 pub mod salvage;
 pub mod settings;
+pub mod shortcuts;
 pub mod tray;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use heron_orchestrator::Builder as OrchestratorBuilder;
+// `LocalSessionOrchestrator` is only referenced from doc-comments in
+// this file (Tier 4 #17 switched the boot path to use `Builder`
+// directly so we can seed `Settings::hotwords` at startup; Tier 4 #23
+// extends that path to also push `Settings::auto_detect_meeting_app`
+// into the same builder); kept imported under `allow(unused_imports)`
+// so rustdoc's intra-doc links resolve without warnings.
+#[allow(unused_imports)]
+use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -42,7 +52,9 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 pub use asset_protocol::{AssetError, AssetSource, resolve_recording_uri};
 pub use daemon::{DaemonHandle, DaemonStatus};
 pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagnostics};
-pub use disk::{DiskError, DiskUsage, disk_usage, purge_audio_older_than};
+pub use disk::{
+    DiskError, DiskUsage, disk_usage, purge_audio_older_than, purge_summaries_older_than,
+};
 pub use onboarding::{
     TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
     test_audio_tap_async, test_calendar, test_calendar_async, test_daemon, test_daemon_async,
@@ -226,9 +238,13 @@ fn heron_default_cache_root() -> String {
 }
 
 /// Phase 68 (PR-ζ): event name fired on the main webview when the
-/// global hotkey triggers. The Rust handler logs + emits this; real
-/// Start/Stop wiring lands in a future phase.
-const EVENT_HOTKEY_FIRED: &str = "hotkey:fired";
+/// global hotkey triggers. Tier 4 #24 emits this only for the canonical
+/// [`shortcuts::ACTION_TOGGLE_RECORDING`] action id (see
+/// [`shortcuts::emit_for_action`]) — pre–Tier-4 listeners that toggle
+/// recording on `hotkey:fired` continue to work unchanged, while new
+/// action ids (e.g. `summarize_now`) emit only their per-action
+/// `shortcut:<id>` event.
+pub(crate) const EVENT_HOTKEY_FIRED: &str = "hotkey:fired";
 
 /// Tauri command: register `combo` as the system-wide Start/Stop
 /// Recording hotkey.
@@ -239,29 +255,28 @@ const EVENT_HOTKEY_FIRED: &str = "hotkey:fired";
 /// app already owns this chord". The frontend renders the message
 /// verbatim under the input.
 ///
-/// The handler is intentionally a stub for PR-ζ: it logs `"hotkey
-/// fired"` and emits the [`EVENT_HOTKEY_FIRED`] event so a future
-/// recording-wiring PR can replace the body with a real FSM
-/// transition without touching the registration plumbing.
+/// Tier 4 #24: routes through `on_shortcut` with the canonical
+/// [`shortcuts::ACTION_TOGGLE_RECORDING`] action id so the same
+/// `shortcut:toggle_recording` + legacy `hotkey:fired` events fire
+/// regardless of whether the chord was registered at startup or from
+/// the Settings pane's "Save" button.
 #[tauri::command]
 fn heron_register_hotkey(app: tauri::AppHandle, combo: String) -> Result<(), String> {
     let manager = app.global_shortcut();
     // Idempotent re-register: if the user clicks Save twice with the
-    // same chord, the second `register()` would error with "already
+    // same chord, the second `on_shortcut` would error with "already
     // registered". Treat the in-app re-register as a no-op rather than
     // surfacing an error the user can't act on.
     if manager.is_registered(combo.as_str()) {
         return Ok(());
     }
     manager
-        .register(combo.as_str())
-        .map_err(|e| e.to_string())?;
-    // The plugin's per-shortcut handler isn't bound here — we register
-    // a global handler at plugin-build time (see `run`) that fires for
-    // every chord. That sidesteps the lifetime gymnastics of holding
-    // an `AppHandle` inside a `'static` closure passed to
-    // `on_shortcut`.
-    Ok(())
+        .on_shortcut(combo.as_str(), |app, _shortcut, event| {
+            if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                shortcuts::emit_for_action_public(app, shortcuts::ACTION_TOGGLE_RECORDING);
+            }
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Tauri command: probe whether `combo` would conflict with an
@@ -299,6 +314,23 @@ fn heron_check_hotkey(app: tauri::AppHandle, combo: String) -> Result<bool, Stri
     }
 }
 
+/// Tauri command (Tier 4 #24): drain and return any
+/// [`shortcuts::ConflictNotice`]s captured during startup
+/// registration.
+///
+/// The frontend calls this once on mount to surface a one-shot Sonner
+/// toast for each conflict the user introduced by hand-editing
+/// `settings.json`. Pairs with the [`shortcuts::EVENT_CONFLICT`] event
+/// (live conflicts after launch); together they cover both the
+/// "webview wasn't listening yet" startup case and the eventual
+/// hot-reload path.
+#[tauri::command]
+fn heron_take_pending_shortcut_conflicts(
+    state: tauri::State<'_, shortcuts::PendingConflicts>,
+) -> Vec<shortcuts::ConflictNotice> {
+    state.drain()
+}
+
 /// Tauri command: release a previously-registered hotkey.
 ///
 /// Tolerant of "not registered" — the Settings pane calls this with
@@ -328,6 +360,16 @@ fn heron_disk_usage(vault_path: String) -> Result<DiskUsage, String> {
 #[tauri::command]
 fn heron_purge_audio_older_than(vault_path: String, days: u32) -> Result<u32, String> {
     purge_audio_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
+}
+
+/// Tauri command: Tier 4 sibling of [`heron_purge_audio_older_than`].
+/// Purges `.md` summary files at the vault root whose mtime is older
+/// than `days` days. Returns the count actually deleted. Driven by
+/// `Settings.summary_retention_days`; the audio sidecars are never
+/// candidates (see `purge_summaries_keeps_audio_deletes_old_md`).
+#[tauri::command]
+fn heron_purge_summaries_older_than(vault_path: String, days: u32) -> Result<u32, String> {
+    purge_summaries_older_than(Path::new(&vault_path), days).map_err(|e| e.to_string())
 }
 
 /// Tauri command: persist the "wizard finished" flag (§13.3 / PR-ι).
@@ -595,13 +637,20 @@ fn heron_keychain_list() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Register the user's saved hotkey at app startup so the chord works
+/// Register the user's saved hotkeys at app startup so the chords work
 /// from anywhere in macOS without first opening the Settings pane.
 ///
-/// Reads `default_settings_path()` and consults the `record_hotkey`
-/// field; an empty string short-circuits ("hotkey disabled"). Any
-/// failure is logged and swallowed — the app should still launch even
-/// if the user's saved chord conflicts with another app, since the
+/// Tier 4 #24: iterates [`Settings::shortcuts`] (an action_id → accel
+/// map) and registers each entry via `tauri-plugin-global-shortcut`,
+/// emitting `shortcut:<action_id>` to the renderer on each firing.
+/// [`Settings::record_hotkey`] is preserved as the default for the
+/// canonical [`shortcuts::ACTION_TOGGLE_RECORDING`] action id; an
+/// explicit `shortcuts.toggle_recording` entry overrides it. See
+/// [`crate::shortcuts`] for the full merge / conflict / invalid-accel
+/// contract.
+///
+/// Any failure is logged and swallowed — the app should still launch
+/// even if a saved chord conflicts with another app, since the
 /// Settings pane is the user's recovery path.
 fn register_startup_hotkey(app: &tauri::AppHandle) {
     let path = default_settings_path();
@@ -611,19 +660,7 @@ fn register_startup_hotkey(app: &tauri::AppHandle) {
         // surface the error if it persists.
         return;
     };
-    if settings.record_hotkey.is_empty() {
-        return;
-    }
-    if let Err(e) = app
-        .global_shortcut()
-        .register(settings.record_hotkey.as_str())
-    {
-        tracing::warn!(
-            "could not register saved hotkey {:?}: {}",
-            settings.record_hotkey,
-            e
-        );
-    }
+    let _ = shortcuts::register_all(app, &settings.record_hotkey, &settings.shortcuts);
 }
 
 /// Default settings location.
@@ -707,25 +744,18 @@ pub fn run() {
         // surface the native folder picker. Registering the plugin
         // here wires up the IPC handler the JS bridge talks to.
         .plugin(tauri_plugin_dialog::init())
-        // Phase 68 (PR-ζ): system-wide Start/Stop Recording hotkey.
-        // The `with_handler` closure fires for *every* chord this app
-        // registers — we currently only register one (the user's
-        // Settings pane choice), so the handler can unconditionally
-        // log + emit. Real recording wiring lands in a future phase.
-        // The `Pressed` filter avoids a duplicate fire on key-release.
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        tracing::info!("hotkey fired");
-                        // Best-effort emit; a missing main window
-                        // (e.g. during shutdown) drops the event
-                        // rather than panicking.
-                        let _ = app.emit(EVENT_HOTKEY_FIRED, ());
-                    }
-                })
-                .build(),
-        )
+        // Phase 68 (PR-ζ) + Tier 4 #24: system-wide global shortcut
+        // plugin. The previous incarnation registered a `with_handler`
+        // that fired `hotkey:fired` for *every* chord — fine when only
+        // one was ever registered, but a regression once Tier 4 lets
+        // users bind multiple action ids (e.g. `summarize_now`), since
+        // every chord would falsely toggle recording on pre–Tier-4
+        // listeners. Per-shortcut handlers are now installed by
+        // `shortcuts::register_all` (called from
+        // `register_startup_hotkey` and the `record_hotkey` Tauri
+        // command), and `shortcuts::emit_for_action` re-emits
+        // `hotkey:fired` only for [`shortcuts::ACTION_TOGGLE_RECORDING`].
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // Phase 75 (PR-ν): native notification surface used by the
         // tray's "Open last note…" no-notes-yet fallback. Registered
         // unconditionally — on first use macOS prompts the user for
@@ -788,20 +818,22 @@ pub fn run() {
             // block_on so a bind error is observable here (logged +
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
-            // Tier 4 #23: read the user's Settings → Recording →
+            // Tier 4 #17 + #23: read user-configured hotwords and the
             // "Auto-detect meeting apps" toggle once at boot and push
-            // it into the orchestrator's builder. Runtime toggles from
-            // the Settings pane re-write the same field; future work
-            // adds a settings-change subscriber that re-applies the
-            // value without an app restart. Defaults to `true` on any
-            // settings-read failure so the pre-Tier-4 behavior is
-            // preserved for users without a settings.json yet.
-            let auto_detect_meeting_app = read_settings(&default_settings_path())
-                .map(|s| s.auto_detect_meeting_app)
-                .unwrap_or(true);
+            // both into the orchestrator's builder so every session
+            // starts with the latest persisted state. A corrupt /
+            // missing `settings.json` is the first-run state — we
+            // fall back to defaults rather than failing setup,
+            // mirroring `register_startup_hotkey` and matching
+            // `Settings::default()` (`hotwords = []`,
+            // `auto_detect_meeting_app = true`).
+            let (hotwords, auto_detect_meeting_app) = read_settings(&default_settings_path())
+                .map(|s| (s.hotwords, s.auto_detect_meeting_app))
+                .unwrap_or_else(|_| (Vec::new(), true));
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
-                let mut builder = heron_orchestrator::Builder::default()
+                let mut builder = OrchestratorBuilder::default()
+                    .hotwords(hotwords)
                     .auto_detect_meeting_app(auto_detect_meeting_app);
                 if let Some(root) = vault_root {
                     tracing::info!(
@@ -835,6 +867,16 @@ pub fn run() {
             // Hotkey tab. Failures (e.g. another app already owns the
             // chord) are logged but don't block launch; the user can
             // pick a different chord in Settings without re-launching.
+            //
+            // Tier 4 #24: install the pending-conflicts buffer *before*
+            // `register_startup_hotkey` so any conflicts surfaced
+            // during this synchronous registration loop land in
+            // managed state. The webview drains it on mount via
+            // [`heron_take_pending_shortcut_conflicts`] — Tauri events
+            // emitted from `setup` aren't reliably delivered because
+            // the webview hasn't subscribed yet, so the buffer is the
+            // canonical surface for cold-start conflicts.
+            app.manage(shortcuts::PendingConflicts::default());
             register_startup_hotkey(app.handle());
             Ok(())
         })
@@ -883,8 +925,15 @@ pub fn run() {
             heron_register_hotkey,
             heron_check_hotkey,
             heron_unregister_hotkey,
+            // Tier 4 #24: cold-start drain for shortcut-registration
+            // conflicts captured during the Tauri `setup` hook before
+            // the webview was listening.
+            heron_take_pending_shortcut_conflicts,
             heron_disk_usage,
             heron_purge_audio_older_than,
+            // Tier 4 #20 — summary retention sweeper. Sibling of the
+            // audio sweeper above; consumes `Settings.summary_retention_days`.
+            heron_purge_summaries_older_than,
             // Phase 73 (PR-λ) — pre-flight checks.
             heron_check_disk_for_recording,
             tray::heron_emit_capture_degraded,
@@ -920,6 +969,12 @@ pub fn run() {
             // auth/Origin/CSP rationale as the read proxies above.
             meetings::heron_list_calendar_upcoming,
             meetings::heron_attach_context,
+            // Tier 5 #25: auto-prepare a minimal pre-meeting context
+            // for every event surfaced by the rail's `ensureFresh`
+            // pass. Daemon synthesizes a default `PreMeetingContext`
+            // (today: just `attendees_known`); the rail renders a
+            // "primed" indicator on each event card.
+            meetings::heron_prepare_context,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

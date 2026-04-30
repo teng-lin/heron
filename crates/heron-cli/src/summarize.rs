@@ -118,6 +118,8 @@ pub async fn re_summarize_in_vault(
         cache_dir: PathBuf::new(),
         vault_root: vault_root.to_path_buf(),
         stt_backend_name: "sherpa".into(),
+        // Re-summarize never invokes STT; hotwords are inert here.
+        hotwords: Vec::new(),
         llm_preference: heron_llm::Preference::Auto,
         // CLI re-summarize never carries pre-meeting context — that
         // surface only flows through the daemon's `attach_context`.

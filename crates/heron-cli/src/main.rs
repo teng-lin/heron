@@ -674,6 +674,10 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         cache_dir: cache,
         vault_root,
         stt_backend_name: "sherpa".into(),
+        // The `heron record` CLI doesn't read Tauri Settings; it ships
+        // with no hotwords by default. Daemon callers (Tauri / herond)
+        // populate this from `Settings::hotwords` instead.
+        hotwords: Vec::new(),
         llm_preference: heron_llm::Preference::Auto,
         // CLI captures never stage pre-meeting context — that path is
         // a daemon-only concern (`attach_context` -> `start_capture`).
