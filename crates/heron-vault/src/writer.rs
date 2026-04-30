@@ -510,7 +510,13 @@ fn sync_body_bullet(
         let Some(text_part) = after_glyph.strip_prefix(prefix.as_str()) else {
             continue;
         };
-        if text_part == original_text {
+        // Trim trailing whitespace on the body line — markdown editors
+        // sometimes leave a trailing space and the strict equality
+        // would otherwise miss. The replacement uses `resolved_text`
+        // verbatim, so any trailing spaces in the source bullet are
+        // dropped (acceptable: the user's intent is the new text, not
+        // the incidental whitespace).
+        if text_part.trim_end() == original_text {
             let indent = trimmed_end[..indent_len].to_string();
             matches.push((line_start, glyph, indent));
         }
@@ -1528,6 +1534,50 @@ mod tests {
         assert!(
             body.contains("  - [x] Send pricing deck"),
             "indent must be preserved on the rewritten bullet; got: {body}",
+        );
+    }
+
+    /// Markdown editors sometimes leave a trailing space on bullet
+    /// lines (autosave / strip-trailing-whitespace settings vary). The
+    /// matcher trims trailing whitespace before comparing so a body
+    /// bullet like `- [ ] Send pricing deck ` (note trailing space)
+    /// still round-trips. Per gemini-code-assist suggestion on PR #180.
+    #[test]
+    fn update_action_item_body_bullet_with_trailing_whitespace_round_trips() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let id_a = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![ActionItem {
+            id: id_a,
+            owner: "alice".into(),
+            text: "Send pricing deck".into(),
+            due: None,
+            done: false,
+        }];
+        // Trailing space on the bullet line.
+        let body = "\n## Action items\n\n- [ ] Send pricing deck   \n";
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "trailing", &fm, body)
+            .expect("finalize");
+
+        writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        let (_fm, body) = read_note(&path).expect("read");
+        // The replacement uses `resolved_text` verbatim — trailing
+        // whitespace gets dropped along with the matched portion.
+        assert!(
+            body.contains("- [x] Send pricing deck\n"),
+            "trailing-whitespace bullet should still flip; got: {body}",
         );
     }
 
