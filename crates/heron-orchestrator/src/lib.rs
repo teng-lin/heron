@@ -2061,19 +2061,14 @@ fn list_meetings_impl(
     let mut started_after = after.is_none();
     let mut items = Vec::with_capacity(limit);
     let mut next_cursor: Option<String> = None;
-    let mut last_kept_rel: Option<String> = None;
+    let mut last_kept_cursor: Option<String> = None;
+    let mut listed = Vec::new();
     for path in paths {
         let rel = path
             .strip_prefix(vault_root)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| path.clone());
         let rel_str = rel.to_string_lossy().to_string();
-        if !started_after {
-            if Some(rel_str.as_str()) == after {
-                started_after = true;
-            }
-            continue;
-        }
         let meeting = match meeting_from_note(vault_root, &path) {
             Ok(m) => m,
             Err(e) => {
@@ -2100,14 +2095,37 @@ fn list_meetings_impl(
         {
             continue;
         }
+        listed.push((rel_str, meeting));
+    }
+    // Pattern-based filenames (`slug.md`, `YYYY-MM-DD-slug.md`, or
+    // `<uuid>.md`) are not a reliable chronology. Sort by parsed
+    // frontmatter time first, then by relative path for deterministic
+    // pagination when two notes share the same minute.
+    listed.sort_by(|(a_rel, a), (b_rel, b)| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| b_rel.cmp(a_rel))
+    });
+    for (rel_str, meeting) in listed {
+        let cursor = meeting_list_cursor(&rel_str, &meeting);
+        if !started_after {
+            if Some(cursor.as_str()) == after || Some(rel_str.as_str()) == after {
+                started_after = true;
+            }
+            continue;
+        }
         if items.len() == limit {
-            next_cursor = last_kept_rel.clone();
+            next_cursor = last_kept_cursor.clone();
             break;
         }
         items.push(meeting);
-        last_kept_rel = Some(rel_str);
+        last_kept_cursor = Some(cursor);
     }
     Ok(ListMeetingsPage { items, next_cursor })
+}
+
+fn meeting_list_cursor(rel_path: &str, meeting: &Meeting) -> String {
+    format!("{}|{rel_path}", meeting.started_at.timestamp_millis())
 }
 
 fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionError> {
@@ -2126,8 +2144,8 @@ fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionErr
         })
         .map(|e| e.path())
         .collect();
-    // Note filenames are `YYYY-MM-DD-HHMM <slug>.md` per `docs/archives/plan.md`
-    // §3.2, so a lex-descending sort IS a date-descending sort.
+    // Deterministic input order only. `list_meetings_impl` sorts by
+    // parsed frontmatter time after reading each note.
     entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     Ok(entries)
 }

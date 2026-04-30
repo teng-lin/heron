@@ -235,7 +235,10 @@ impl VaultWriter {
         // invariant intact.
         let path = reserve_unique_path(&meetings_dir, &prefix, &slug)?;
 
-        atomic_write(&path, rendered.as_bytes())?;
+        if let Err(e) = atomic_write(&path, rendered.as_bytes()) {
+            let _ = fs::remove_file(&path);
+            return Err(VaultError::Io(e));
+        }
         atomic_write(&bak_path(&path), rendered.as_bytes())?;
         Ok(path)
     }
