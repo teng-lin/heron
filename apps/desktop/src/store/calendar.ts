@@ -19,6 +19,10 @@
  * `attendees_known`) before the user clicks "Start with context". On
  * each successful prepare we patch the local `primed` flag on the
  * matching event so the rail's indicator flips without a refetch.
+ *
+ * Tier 5 #26: `setEventAutoRecord()` toggles the daemon's per-event
+ * auto-record registry and optimistically mirrors the flag onto the
+ * matching rail row.
  */
 
 import { create } from "zustand";
@@ -40,9 +44,19 @@ export interface CalendarStoreState {
   load: (query?: CalendarQuery) => Promise<void>;
   /** Re-fetch only when the cache is older than `CALENDAR_TTL_MS`. */
   ensureFresh: (query?: CalendarQuery) => Promise<void>;
+  /** Toggle the daemon's per-event auto-record registry. */
+  setEventAutoRecord: (
+    calendarEventId: string,
+    enabled: boolean,
+  ) => Promise<boolean>;
 }
 
 let inFlightLoad: Promise<void> | null = null;
+// Per-event monotonic sequence so out-of-order
+// `setEventAutoRecord` responses can't clobber the latest user
+// intent. Bumped synchronously before each invoke; the response
+// path no-ops when its captured seq isn't the latest one.
+const autoRecordMutationSeq = new Map<string, number>();
 
 export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
   items: [],
@@ -62,8 +76,9 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
         });
         if (result.kind === "ok") {
           const page: CalendarPage = result.data;
+          const items = page.items.map(normalizeCalendarEvent);
           set({
-            items: page.items,
+            items,
             loading: false,
             daemonDown: false,
             error: null,
@@ -73,7 +88,7 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
           // the prepare fan-out. Each successful prepare patches the
           // matching event's `primed` flag in place; failures stay
           // silent (the next `ensureFresh` retries them anyway).
-          void primeUnstagedEvents(page.items);
+          void primeUnstagedEvents(items);
         } else {
           set({
             items: [],
@@ -103,7 +118,68 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
     }
     return get().load(query);
   },
+  setEventAutoRecord: async (calendarEventId, enabled) => {
+    const seq = (autoRecordMutationSeq.get(calendarEventId) ?? 0) + 1;
+    autoRecordMutationSeq.set(calendarEventId, seq);
+    const isStale = () => autoRecordMutationSeq.get(calendarEventId) !== seq;
+
+    const previous = get().items.find((evt) => evt.id === calendarEventId);
+    set({
+      items: get().items.map((evt) =>
+        evt.id === calendarEventId ? { ...evt, auto_record: enabled } : evt,
+      ),
+      error: null,
+    });
+    try {
+      const result = await invoke("heron_set_event_auto_record", {
+        request: {
+          calendar_event_id: calendarEventId,
+          enabled,
+        },
+      });
+      if (result.kind === "ok") {
+        if (isStale()) return false;
+        const ackId = result.data.calendar_event_id;
+        set((s) => ({
+          daemonDown: false,
+          error: null,
+          items: s.items.map((evt) =>
+            evt.id === ackId
+              ? { ...evt, auto_record: result.data.enabled }
+              : evt,
+          ),
+        }));
+        return true;
+      }
+      if (isStale()) return false;
+      rollbackAutoRecord(calendarEventId, previous?.auto_record ?? false);
+      set({ daemonDown: true, error: result.detail });
+      return false;
+    } catch (err) {
+      if (isStale()) return false;
+      const detail = err instanceof Error ? err.message : String(err);
+      rollbackAutoRecord(calendarEventId, previous?.auto_record ?? false);
+      set({ daemonDown: true, error: detail });
+      return false;
+    }
+  },
 }));
+
+function rollbackAutoRecord(calendarEventId: string, previous: boolean): void {
+  useCalendarStore.setState((s) => ({
+    items: s.items.map((evt) =>
+      evt.id === calendarEventId ? { ...evt, auto_record: previous } : evt,
+    ),
+  }));
+}
+
+function normalizeCalendarEvent(event: CalendarEvent): CalendarEvent {
+  return {
+    ...event,
+    primed: event.primed ?? false,
+    auto_record: event.auto_record ?? false,
+  };
+}
 
 /**
  * Fire `heron_prepare_context` for each event that came back un-primed

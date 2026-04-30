@@ -30,6 +30,9 @@ import {
   type CalendarStoreState,
 } from "./calendar";
 
+const invokeStub = mock(() => Promise.resolve({ kind: "ok", data: {} }));
+mock.module("../lib/invoke", () => ({ invoke: invokeStub }));
+
 // Capture the real `load` action once per test so the afterEach reset
 // can restore it even if the test threw before reaching its own
 // restore line. Without this, a failing test that swapped in a mock
@@ -112,9 +115,6 @@ describe("primeUnstagedEvents — auto-prime fan-out", () => {
   // implementation via `invokeStub.mockImplementation`; `mock.module`
   // is hoisted at module load so the helper picks up the stub on its
   // dynamic-import-free `import { invoke } from "../lib/invoke"`.
-  const invokeStub = mock(() => Promise.resolve({ kind: "ok", data: {} }));
-  mock.module("../lib/invoke", () => ({ invoke: invokeStub }));
-
   function attendee(name: string): AttendeeContext {
     return {
       name,
@@ -135,6 +135,7 @@ describe("primeUnstagedEvents — auto-prime fan-out", () => {
       meeting_url: null,
       related_meetings: [],
       primed: false,
+      auto_record: false,
       ...overrides,
     };
   }
@@ -198,5 +199,135 @@ describe("primeUnstagedEvents — auto-prime fan-out", () => {
     await primeUnstagedEvents([evt]);
 
     expect(useCalendarStore.getState().items[0].primed).toBe(false);
+  });
+});
+
+describe("useCalendarStore — auto-record toggle", () => {
+  function event(overrides: Partial<CalendarEvent>): CalendarEvent {
+    return {
+      id: "evt_default",
+      title: "Default",
+      start: "2026-04-29T15:00:00Z",
+      end: "2026-04-29T15:30:00Z",
+      attendees: [],
+      meeting_url: null,
+      related_meetings: [],
+      primed: false,
+      auto_record: false,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    invokeStub.mockReset();
+    invokeStub.mockImplementation(() =>
+      Promise.resolve({
+        kind: "ok",
+        data: { calendar_event_id: "evt_target", enabled: true },
+      }),
+    );
+  });
+
+  test("optimistically patches the row and confirms the daemon ack", async () => {
+    useCalendarStore.setState({ items: [event({ id: "evt_target" })] });
+
+    const ok = await useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", true);
+
+    expect(ok).toBe(true);
+    expect(invokeStub).toHaveBeenCalledWith("heron_set_event_auto_record", {
+      request: { calendar_event_id: "evt_target", enabled: true },
+    });
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(true);
+  });
+
+  test("rolls the optimistic patch back when the daemon rejects", async () => {
+    const evt = event({ id: "evt_target", auto_record: false });
+    useCalendarStore.setState({ items: [evt] });
+    invokeStub.mockImplementation(() =>
+      Promise.resolve({ kind: "unavailable", detail: "daemon down" }),
+    );
+
+    const ok = await useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", true);
+
+    expect(ok).toBe(false);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    expect(useCalendarStore.getState().daemonDown).toBe(true);
+    expect(useCalendarStore.getState().error).toBe("daemon down");
+  });
+
+  test("rollback preserves unrelated row changes from concurrent patches", async () => {
+    const evt = event({ id: "evt_target", auto_record: false });
+    useCalendarStore.setState({ items: [evt] });
+    invokeStub.mockImplementation(async () => {
+      useCalendarStore.setState((s) => ({
+        items: s.items.map((row) =>
+          row.id === "evt_target" ? { ...row, primed: true } : row,
+        ),
+      }));
+      return { kind: "unavailable", detail: "daemon down" };
+    });
+
+    const ok = await useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", true);
+
+    expect(ok).toBe(false);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    expect(useCalendarStore.getState().items[0].primed).toBe(true);
+  });
+
+  test("stale (out-of-order) responses do not clobber the latest toggle", async () => {
+    // Two concurrent toggles for the same event resolve in reverse
+    // order (first call resolves *after* the second). Without the
+    // per-event sequence guard, the older `false` rollback would
+    // overwrite the newer `true` ack and the row would land on the
+    // wrong value.
+    useCalendarStore.setState({ items: [event({ id: "evt_target" })] });
+
+    let resolveSlow!: (
+      v:
+        | { kind: "ok"; data: { calendar_event_id: string; enabled: boolean } }
+        | { kind: "unavailable"; detail: string },
+    ) => void;
+    const slow = new Promise<
+      | { kind: "ok"; data: { calendar_event_id: string; enabled: boolean } }
+      | { kind: "unavailable"; detail: string }
+    >((resolve) => {
+      resolveSlow = resolve;
+    });
+    let call = 0;
+    invokeStub.mockImplementation(() => {
+      call += 1;
+      if (call === 1) return slow;
+      return Promise.resolve({
+        kind: "ok",
+        data: { calendar_event_id: "evt_target", enabled: false },
+      });
+    });
+
+    const firstP = useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", true);
+    const secondP = useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", false);
+    // Second call (the latest user intent) lands first.
+    const secondOk = await secondP;
+    expect(secondOk).toBe(true);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    // Now let the slower first call resolve as a daemon failure —
+    // the rollback path must no-op because its seq is stale.
+    resolveSlow({ kind: "unavailable", detail: "stale" });
+    const firstOk = await firstP;
+    expect(firstOk).toBe(false);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    // And the daemon-down/error fields the stale response would have
+    // set must not have leaked through either.
+    expect(useCalendarStore.getState().daemonDown).toBe(false);
+    expect(useCalendarStore.getState().error).toBeNull();
   });
 });

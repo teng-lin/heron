@@ -693,6 +693,108 @@ async fn list_upcoming_calendar_marks_primed_for_staged_event_ids() {
 }
 
 #[tokio::test]
+async fn set_event_auto_record_persists_and_mirrors_to_calendar_event() {
+    // The rail's per-event toggle reads `CalendarEvent.auto_record`,
+    // which `list_upcoming_calendar` mirrors from the orchestrator's
+    // registry. Pin both ends of the round trip: a `POST /auto-record`
+    // call should make the next list response report the event as
+    // armed.
+    let fix = Fixture::new();
+    let cal: Arc<dyn CalendarReader> = Arc::new(FakeCalendar {
+        events: vec![heron_vault::CalendarEvent {
+            title: "Investor sync".into(),
+            start: 1745660400.0,
+            end: 1745664000.0,
+            attendees: Vec::new(),
+        }],
+    });
+    let orch = fix.orch_with_calendar(cal);
+
+    let events = orch
+        .list_upcoming_calendar(None, None, None)
+        .await
+        .expect("list");
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].auto_record, "starts off");
+    let id = events[0].id.clone();
+
+    orch.set_event_auto_record(heron_session::SetEventAutoRecordRequest {
+        calendar_event_id: id.clone(),
+        enabled: true,
+    })
+    .await
+    .expect("set");
+
+    let listed = orch.list_auto_record_events().await.expect("list registry");
+    assert_eq!(listed.event_ids, vec![id.clone()]);
+
+    let events = orch
+        .list_upcoming_calendar(None, None, None)
+        .await
+        .expect("list after set");
+    assert!(
+        events[0].auto_record,
+        "registry membership mirrors onto event"
+    );
+
+    // Disable round-trips back through the same path.
+    orch.set_event_auto_record(heron_session::SetEventAutoRecordRequest {
+        calendar_event_id: id.clone(),
+        enabled: false,
+    })
+    .await
+    .expect("set off");
+    let events = orch
+        .list_upcoming_calendar(None, None, None)
+        .await
+        .expect("list after disable");
+    assert!(!events[0].auto_record);
+}
+
+#[tokio::test]
+async fn auto_record_registry_persists_across_orchestrator_rebuild() {
+    // The registry is the user's "auto-record this on the next
+    // occurrence" choice — it must survive daemon restart, otherwise
+    // the toggle silently resets every time the daemon updates. Pin
+    // the on-disk persistence path by toggling on one orchestrator,
+    // dropping it, and rebuilding against the same vault root.
+    let fix = Fixture::new();
+    {
+        let orch = fix.orch();
+        orch.set_event_auto_record(heron_session::SetEventAutoRecordRequest {
+            calendar_event_id: "evt_persistent".to_owned(),
+            enabled: true,
+        })
+        .await
+        .expect("set");
+    } // orch dropped — simulates daemon shutdown
+    let orch2 = fix.orch();
+    let listed = orch2.list_auto_record_events().await.expect("list");
+    assert_eq!(
+        listed.event_ids,
+        vec!["evt_persistent"],
+        "registry must rehydrate from <vault_root>/.heron/auto_record.json",
+    );
+}
+
+#[tokio::test]
+async fn set_event_auto_record_rejects_empty_calendar_event_id() {
+    let fix = Fixture::new();
+    let orch = fix.orch();
+    let err = orch
+        .set_event_auto_record(heron_session::SetEventAutoRecordRequest {
+            calendar_event_id: "   ".to_owned(),
+            enabled: true,
+        })
+        .await
+        .expect_err("blank id must be rejected");
+    assert!(
+        matches!(err, SessionError::Validation { .. }),
+        "expected Validation, got {err:?}",
+    );
+}
+
+#[tokio::test]
 async fn attach_context_persists_against_vault_orchestrator() {
     // The vault-backed orchestrator stages context the same way the
     // vault-less one does: in-memory, keyed by `calendar_event_id`,

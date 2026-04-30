@@ -21,10 +21,10 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
-    AudioLevelChannel, AudioLevelData, CalendarEvent, EventPayload, Health, ListMeetingsPage,
-    ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, PrepareContextRequest,
-    SessionError, SessionEventBus, SessionOrchestrator, SpeakerChangedData, StartCaptureArgs,
-    Summary, Transcript,
+    AudioLevelChannel, AudioLevelData, AutoRecordList, CalendarEvent, EventPayload, Health,
+    ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest,
+    PrepareContextRequest, SessionError, SessionEventBus, SessionOrchestrator,
+    SetEventAutoRecordRequest, SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
 use herond::{AppState, AuthConfig, build_app};
@@ -882,6 +882,15 @@ impl SessionOrchestrator for WithCache {
     }
     async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
         self.inner.prepare_context(req).await
+    }
+    async fn set_event_auto_record(
+        &self,
+        req: SetEventAutoRecordRequest,
+    ) -> Result<(), SessionError> {
+        self.inner.set_event_auto_record(req).await
+    }
+    async fn list_auto_record_events(&self) -> Result<AutoRecordList, SessionError> {
+        self.inner.list_auto_record_events().await
     }
     async fn health(&self) -> Health {
         self.inner.health().await

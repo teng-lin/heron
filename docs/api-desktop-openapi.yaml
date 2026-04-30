@@ -577,6 +577,43 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /auto-record:
+    get:
+      tags: [calendar]
+      summary: List calendar events enabled for auto-record.
+      description: |
+        Returns the daemon's persisted per-event auto-record registry.
+        `GET /calendar/upcoming` mirrors membership onto each
+        `CalendarEvent.auto_record` row so most UI consumers do not
+        need this endpoint.
+      responses:
+        "200":
+          description: Snapshot of enabled calendar event ids.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AutoRecordList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [calendar]
+      summary: Toggle auto-record for a calendar event.
+      description: |
+        Enables or disables automatic recording for one calendar
+        event. When enabled, the orchestrator scheduler starts capture
+        as the event enters its start window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetEventAutoRecordRequest" }
+      responses:
+        "204": { description: Auto-record flag updated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: Validation error, for example an empty calendar event id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
 
   securitySchemes:
@@ -821,6 +858,15 @@ components:
             Prior captured meetings whose attendees overlap. Useful
             for clients building a pre-meeting briefing on top of the
             calendar event.
+        primed:
+          type: boolean
+          default: false
+          description: Pre-meeting context is already staged for this event.
+        auto_record:
+          type: boolean
+          default: false
+          description: |
+            This event is enabled in the per-event auto-record registry.
 
     AttendeeContext:
       type: object
@@ -871,6 +917,26 @@ components:
             EventKit identifier of the calendar event the context
             attaches to.
         context: { $ref: "#/components/schemas/PreMeetingContext" }
+
+    SetEventAutoRecordRequest:
+      type: object
+      required: [calendar_event_id, enabled]
+      properties:
+        calendar_event_id:
+          type: string
+          description: EventKit identifier of the calendar event to toggle.
+        enabled:
+          type: boolean
+          description: true to enable auto-record, false to remove it.
+
+    AutoRecordList:
+      type: object
+      required: [event_ids]
+      properties:
+        event_ids:
+          type: array
+          items: { type: string }
+          description: Sorted calendar event ids currently enabled for auto-record.
 
     Health:
       type: object

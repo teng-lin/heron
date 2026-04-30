@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use heron_event::EventBus;
 use heron_session::{
-    CalendarEvent, ComponentState, EventPayload, Health, HealthComponent, HealthComponents,
-    HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
+    AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
+    HealthComponents, HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
     PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
-    SessionOrchestrator, StartCaptureArgs, Summary, Transcript,
+    SessionOrchestrator, SetEventAutoRecordRequest, StartCaptureArgs, Summary, Transcript,
 };
 
 /// Fixed bus capacity for the stub. 1024 covers any vertical-slice
@@ -105,6 +105,17 @@ impl SessionOrchestrator for StubOrchestrator {
     }
 
     async fn prepare_context(&self, _req: PrepareContextRequest) -> Result<(), SessionError> {
+        Err(SessionError::NotYetImplemented)
+    }
+
+    async fn set_event_auto_record(
+        &self,
+        _req: SetEventAutoRecordRequest,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::NotYetImplemented)
+    }
+
+    async fn list_auto_record_events(&self) -> Result<AutoRecordList, SessionError> {
         Err(SessionError::NotYetImplemented)
     }
 

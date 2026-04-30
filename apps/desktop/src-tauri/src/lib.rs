@@ -853,6 +853,7 @@ pub fn run() {
                     );
                 }
                 let orchestrator = Arc::new(builder.build());
+                std::mem::drop(orchestrator.spawn_auto_record_scheduler());
                 event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
                 daemon::install(&app_handle, orchestrator).await?;
                 // UI revamp PR 4: install the SSE bridge state slot.
@@ -982,6 +983,10 @@ pub fn run() {
             // (today: just `attendees_known`); the rail renders a
             // "primed" indicator on each event card.
             meetings::heron_prepare_context,
+            // Tier 5 #26: per-event auto-record flag. The daemon
+            // scheduler auto-starts enabled calendar events as their
+            // start windows open; the Home rail owns the row toggle.
+            meetings::heron_set_event_auto_record,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

@@ -14,9 +14,11 @@
  * case; the rail just renders an empty state and stays out of the way.
  */
 
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 
 import { Button } from "../ui/button";
+import { Switch } from "../ui/switch";
 import { useCalendarStore } from "../../store/calendar";
 import type { AttendeeContext, CalendarEvent } from "../../lib/types";
 
@@ -37,6 +39,10 @@ export function UpcomingMeetings({
   const error = useCalendarStore((s) => s.error);
   const load = useCalendarStore((s) => s.load);
   const ensureFresh = useCalendarStore((s) => s.ensureFresh);
+  const setEventAutoRecord = useCalendarStore((s) => s.setEventAutoRecord);
+  const [pendingAutoRecordIds, setPendingAutoRecordIds] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   useEffect(() => {
     void ensureFresh();
@@ -55,6 +61,29 @@ export function UpcomingMeetings({
   }, [ensureFresh]);
 
   const rows = useMemo(() => filterImminent(items), [items]);
+
+  async function onAutoRecordChange(evt: CalendarEvent, enabled: boolean) {
+    setPendingAutoRecordIds((ids) => new Set(ids).add(evt.id));
+    let ok = false;
+    try {
+      ok = await setEventAutoRecord(evt.id, enabled);
+    } finally {
+      // Always clear the pending flag — if the IPC throws, the row
+      // would otherwise stay disabled until a reload.
+      setPendingAutoRecordIds((ids) => {
+        const next = new Set(ids);
+        next.delete(evt.id);
+        return next;
+      });
+    }
+    if (!ok) {
+      toast.error(
+        `Could not ${enabled ? "enable" : "disable"} auto-record for ${
+          evt.title || "this meeting"
+        }.`,
+      );
+    }
+  }
 
   if (daemonDown) {
     // `DaemonDownBanner` only watches the meetings store, so a
@@ -129,6 +158,23 @@ export function UpcomingMeetings({
                   <span>{summarizeAttendees(evt.attendees)}</span>
                 )}
               </div>
+            </div>
+            <div
+              className="flex shrink-0 items-center gap-2 text-xs"
+              style={{ color: "var(--color-ink-3)" }}
+              title="Start recording automatically when this event begins"
+            >
+              <span className="font-mono uppercase tracking-[0.08em]">
+                Auto
+              </span>
+              <Switch
+                checked={evt.auto_record}
+                disabled={pendingAutoRecordIds.has(evt.id)}
+                aria-label={`Auto-record ${evt.title || "untitled meeting"}`}
+                onCheckedChange={(checked) =>
+                  void onAutoRecordChange(evt, checked)
+                }
+              />
             </div>
             <Button
               size="sm"

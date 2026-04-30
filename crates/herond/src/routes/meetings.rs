@@ -27,7 +27,7 @@ use axum::routing::{get, post, put};
 use chrono::{DateTime, Utc};
 use heron_session::{
     CalendarEvent, ListMeetingsQuery, MeetingId, MeetingStatus, Platform, PreMeetingContextRequest,
-    PrepareContextRequest, StartCaptureArgs, Summary, Transcript,
+    PrepareContextRequest, SetEventAutoRecordRequest, StartCaptureArgs, Summary, Transcript,
 };
 use serde::Deserialize;
 
@@ -47,6 +47,10 @@ pub fn router() -> Router<AppState> {
         .route("/calendar/upcoming", get(list_upcoming_calendar))
         .route("/context", put(attach_context))
         .route("/context/prepare", post(prepare_context))
+        .route(
+            "/auto-record",
+            get(list_auto_record_events).post(set_event_auto_record),
+        )
 }
 
 // ── meetings ──────────────────────────────────────────────────────────
@@ -275,6 +279,25 @@ async fn prepare_context(
 ) -> Response {
     match state.orchestrator.prepare_context(req).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => WireError::from(e).into_response(),
+    }
+}
+
+// ── per-event auto-record (Tier 5 #26) ────────────────────────────────
+
+async fn set_event_auto_record(
+    State(state): State<AppState>,
+    Json(req): Json<SetEventAutoRecordRequest>,
+) -> Response {
+    match state.orchestrator.set_event_auto_record(req).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => WireError::from(e).into_response(),
+    }
+}
+
+async fn list_auto_record_events(State(state): State<AppState>) -> Response {
+    match state.orchestrator.list_auto_record_events().await {
+        Ok(list) => Json(list).into_response(),
         Err(e) => WireError::from(e).into_response(),
     }
 }

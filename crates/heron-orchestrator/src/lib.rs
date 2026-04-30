@@ -88,12 +88,13 @@ use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
 use heron_policy::{EscalationMode, PolicyProfile};
 use heron_realtime::{SessionConfig as RealtimeSessionConfig, TurnDetection};
 use heron_session::{
-    AttendeeContext, CalendarEvent, ComponentState, EventPayload, Health, HealthComponent,
-    HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting,
-    MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Participant, Platform,
-    PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest, SessionError,
-    SessionEventBus, SessionOrchestrator, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
-    TranscriptLifecycle, TranscriptSegment,
+    AttendeeContext, AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health,
+    HealthComponent, HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage,
+    ListMeetingsQuery, Meeting, MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus,
+    Participant, Platform, PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest,
+    SessionError, SessionEventBus, SessionOrchestrator, SetEventAutoRecordRequest,
+    StartCaptureArgs, Summary, SummaryLifecycle, Transcript, TranscriptLifecycle,
+    TranscriptSegment,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
 
@@ -108,6 +109,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 pub mod live_session;
+
+pub(crate) mod auto_record;
 
 /// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
 /// a `MeetingId` from a vault-relative note path. The byte pattern
@@ -125,6 +128,28 @@ pub const MEETING_ID_NAMESPACE: Uuid = Uuid::from_bytes([
 /// malformed transcript that lost its newlines and presents as one
 /// gigantic line.
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
+
+/// How close to the calendar start time an auto-record event must be
+/// before the scheduler fires capture.
+const AUTO_RECORD_START_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
+
+/// How long a fired auto-record event stays suppressed. Bounds retry
+/// spam when capture is already active or the platform cannot start.
+const AUTO_RECORD_DEDUP_TTL: chrono::Duration = chrono::Duration::hours(12);
+
+/// Production scheduler cadence for per-event auto-record. The
+/// start window is wider than the tick interval so a short runtime
+/// stall does not skip an event entirely.
+const AUTO_RECORD_TICK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-tick cap on calendar events the auto-record scheduler pulls.
+/// `list_upcoming_calendar` defaults to 20, which is the right shape
+/// for the Home rail's upcoming-meetings widget but would silently
+/// skip auto-record-enabled meetings for users with a packed week.
+/// 100 mirrors the existing hard ceiling inside
+/// `list_upcoming_calendar` (`limit.unwrap_or(20).min(100)`) — past
+/// that, EventKit reads start to dominate per-tick latency.
+const AUTO_RECORD_EVENT_LIMIT: u32 = 100;
 
 /// Cap on the calendar event identifier `attach_context` accepts.
 /// EventKit ids are short opaque strings and the synthetic ids
@@ -246,6 +271,21 @@ pub struct LocalSessionOrchestrator {
     /// constraint is preserved as a forward-compatibility rule for
     /// any future code path that needs both.
     pending_contexts: PendingContexts,
+    /// Per-event auto-record registry (Tier 5 #26). Persisted under
+    /// `<vault_root>/.heron/auto_record.json` when a vault root is
+    /// configured; in-memory only otherwise. The orchestrator
+    /// mirrors `contains` onto each `CalendarEvent.auto_record` in
+    /// `list_upcoming_calendar` so the rail's toggle reflects the
+    /// current set without a second round trip.
+    auto_record_registry: Arc<auto_record::AutoRecordRegistry>,
+    /// Per-event "we already fired auto-record for this id, suppress
+    /// re-fires until TTL elapses" map. Keyed by `calendar_event_id`,
+    /// value is the wall-clock fire time. The auto-record start
+    /// window for a single event is ~60s wide and the scheduler
+    /// ticks every ~30s, so without this guard the same event would
+    /// re-fire on every tick inside its window. TTL prunes happen
+    /// inside `auto_record_tick` (no separate sweeper task).
+    auto_record_fired: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Held in a `Mutex<Option<…>>` so [`Self::shutdown`] (taking
     /// `&self`) can still consume the sender. Real callers don't
     /// touch the lock; the test seam takes it once.
@@ -678,6 +718,20 @@ impl Builder {
         let calendar = self
             .calendar
             .unwrap_or_else(|| Arc::new(EventKitCalendarReader));
+        // Hydrate the auto-record registry from disk under the
+        // configured vault root. A *malformed* on-disk file is
+        // quarantined (renamed to `auto_record.json.corrupt.<ts>`)
+        // and we boot with an empty registry — the file lives in
+        // user state, and a truncated write or hand-edit shouldn't
+        // brick the daemon until someone fixes it out-of-band.
+        // Hard I/O failures (vault path gone, permission denied)
+        // still panic so a misconfigured vault doesn't quietly run
+        // with toggles disappearing on every restart.
+        let auto_record_registry =
+            match auto_record::AutoRecordRegistry::load_or_quarantine(self.vault_root.as_deref()) {
+                Ok(registry) => Arc::new(registry),
+                Err(err) => panic!("hydrate auto-record registry from vault root: {err}"),
+            };
         LocalSessionOrchestrator {
             bus,
             cache,
@@ -691,6 +745,8 @@ impl Builder {
             active_meetings: Mutex::new(HashMap::new()),
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
             pending_contexts: PendingContexts::new(),
+            auto_record_registry,
+            auto_record_fired: Mutex::new(HashMap::new()),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             recorder: Mutex::new(Some(recorder)),
             finalizers: Mutex::new(Vec::new()),
@@ -819,6 +875,155 @@ impl LocalSessionOrchestrator {
         }
         Ok(())
     }
+
+    /// One pass of the auto-record scheduler (Tier 5 #26). For every
+    /// upcoming event with `auto_record == true` whose start lies in
+    /// `[now, now + AUTO_RECORD_START_WINDOW]` and that hasn't already
+    /// been fired in the last `AUTO_RECORD_DEDUP_TTL`, drives
+    /// `start_capture` with the event's id attached. Returns the
+    /// number of fires this tick triggered — exposed for tests so
+    /// they can drive the scheduler deterministically without
+    /// orchestrating real time. Production callers go through
+    /// [`spawn_auto_record_scheduler`].
+    ///
+    /// Errors from `start_capture` (`CaptureInProgress`,
+    /// `PermissionMissing`, …) are logged at warn level and counted
+    /// against `recently_fired` regardless — the scheduler has done
+    /// its part; re-firing every tick just because the FSM rejected
+    /// the request would spam the log without changing the outcome.
+    ///
+    /// Platform inference: today's `list_upcoming_calendar` always
+    /// returns `meeting_url: None` (the Swift bridge doesn't expose
+    /// it yet), so the scheduler defaults every fire to
+    /// `Platform::Zoom`. When `meeting_url` is wired upstream, this
+    /// branch picks the right platform per event and skips
+    /// unrecognized providers instead of launching the wrong client.
+    pub async fn auto_record_tick(&self, now: DateTime<Utc>) -> usize {
+        // Prune stale dedup entries inline — keeps the map size bound
+        // to the live auto-record set rather than growing forever.
+        {
+            let mut g = lock_or_recover(&self.auto_record_fired);
+            g.retain(|_, fired_at| now.signed_duration_since(*fired_at) < AUTO_RECORD_DEDUP_TTL);
+        }
+        // Use the scheduler's own `now` and start window — the
+        // default `list_upcoming_calendar(None, None, None)` rebuilds
+        // `Utc::now()` internally and caps at 20 events, which would
+        // both break the test seam and silently skip auto-record-
+        // enabled meetings for users with packed calendars.
+        let window_end = now + AUTO_RECORD_START_WINDOW;
+        let events = match self
+            .list_upcoming_calendar(Some(now), Some(window_end), Some(AUTO_RECORD_EVENT_LIMIT))
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "auto-record tick: calendar read failed; skipping",
+                );
+                return 0;
+            }
+        };
+        let mut fired = 0;
+        for event in events {
+            if !event.auto_record {
+                continue;
+            }
+            if event.start < now || event.start > window_end {
+                continue;
+            }
+            // Single-acquisition check + claim: a concurrent tick
+            // (in tests we sometimes drive ticks in parallel) cannot
+            // both pass the membership probe and both insert. We
+            // claim *before* `start_capture` so the parallel-tick
+            // dedup invariant holds; on `Err` we release the claim
+            // below so a transient failure (CaptureInProgress,
+            // permission denied, etc.) doesn't burn the 12h TTL and
+            // suppress retries for the rest of the start window.
+            {
+                let mut g = lock_or_recover(&self.auto_record_fired);
+                if g.contains_key(&event.id) {
+                    continue;
+                }
+                g.insert(event.id.clone(), now);
+            }
+            let platform = match event.meeting_url.as_deref() {
+                None => Platform::Zoom,
+                Some(url) => match platform_from_meeting_url(Some(url)) {
+                    Some(platform) => platform,
+                    None => {
+                        tracing::warn!(
+                            calendar_event_id = %event.id,
+                            meeting_url = url,
+                            "auto-record skipped: unrecognized meeting URL",
+                        );
+                        // Release the claim so a subsequent fix to
+                        // the URL within this start window can re-fire.
+                        lock_or_recover(&self.auto_record_fired).remove(&event.id);
+                        continue;
+                    }
+                },
+            };
+            let event_id = event.id.clone();
+            let result = self
+                .start_capture(StartCaptureArgs {
+                    platform,
+                    hint: Some(event.title.clone()),
+                    calendar_event_id: Some(event_id.clone()),
+                })
+                .await;
+            match result {
+                Ok(meeting) => {
+                    fired += 1;
+                    tracing::info!(
+                        calendar_event_id = %event_id,
+                        meeting_id = %meeting.id,
+                        platform = ?platform,
+                        "auto-record fired",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        calendar_event_id = %event_id,
+                        platform = ?platform,
+                        error = %err,
+                        "auto-record start_capture rejected; will retry next tick",
+                    );
+                    // Release the dedup claim so a transient FSM
+                    // rejection doesn't suppress retries for the
+                    // 12h TTL — only successful fires earn the
+                    // long-lived marker.
+                    lock_or_recover(&self.auto_record_fired).remove(&event_id);
+                }
+            }
+        }
+        fired
+    }
+
+    /// Spawn the production per-event auto-record scheduler.
+    ///
+    /// The task owns only a weak reference between ticks. Dropping the
+    /// returned [`JoinHandle`] detaches the task; dropping every
+    /// `Arc<LocalSessionOrchestrator>` lets the scheduler exit on its
+    /// next interval tick instead of keeping the orchestrator alive.
+    pub fn spawn_auto_record_scheduler(self: &Arc<Self>) -> JoinHandle<()> {
+        let orchestrator = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(AUTO_RECORD_TICK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(orchestrator) = orchestrator.upgrade() else {
+                    tracing::debug!("auto-record scheduler exiting: orchestrator dropped");
+                    return;
+                };
+                let fired = orchestrator.auto_record_tick(Utc::now()).await;
+                if fired > 0 {
+                    tracing::debug!(fired, "auto-record scheduler tick completed");
+                }
+            }
+        })
+    }
 }
 
 impl Drop for LocalSessionOrchestrator {
@@ -859,7 +1064,7 @@ impl Drop for LocalSessionOrchestrator {
 /// while one of those was in progress, which is benign because the
 /// data structure is left in a consistent state and we're not
 /// preserving cross-call invariants across the panic.
-fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -1988,6 +2193,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     ev.title
                 );
                 let primed = self.pending_contexts.contains_key(&id);
+                let auto_record = self.auto_record_registry.contains(&id);
                 CalendarEvent {
                     id,
                     title: ev.title,
@@ -2007,6 +2213,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     meeting_url: None,
                     related_meetings: Vec::new(),
                     primed,
+                    auto_record,
                 }
             })
             .collect();
@@ -2078,6 +2285,44 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             );
         }
         Ok(())
+    }
+
+    async fn set_event_auto_record(
+        &self,
+        req: SetEventAutoRecordRequest,
+    ) -> Result<(), SessionError> {
+        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
+        let registry = Arc::clone(&self.auto_record_registry);
+        let enabled = req.enabled;
+        let write_id = calendar_event_id.clone();
+        // `RegistryError` covers I/O, parse, and unsupported-version
+        // failures — none of which are caller mistakes. Map to
+        // `VaultLocked` (the existing user-actionable retryable
+        // category for vault-state hiccups: iCloud eviction, write
+        // contention, permission denied) rather than `Validation`,
+        // which would misreport these as `400 Bad Request` and bypass
+        // the optimistic-toggle rollback path on the client.
+        let changed = tokio::task::spawn_blocking(move || registry.set(write_id, enabled))
+            .await
+            .map_err(|e| SessionError::VaultLocked {
+                detail: format!("auto-record registry task failed: {e}"),
+            })?
+            .map_err(|e| SessionError::VaultLocked {
+                detail: format!("auto-record registry write failed: {e}"),
+            })?;
+        tracing::info!(
+            calendar_event_id = %calendar_event_id,
+            enabled,
+            changed,
+            "auto-record toggled",
+        );
+        Ok(())
+    }
+
+    async fn list_auto_record_events(&self) -> Result<AutoRecordList, SessionError> {
+        Ok(AutoRecordList {
+            event_ids: self.auto_record_registry.list(),
+        })
     }
 
     async fn health(&self) -> Health {
@@ -2445,6 +2690,21 @@ fn platform_from_source_app(source_app: &str) -> Platform {
     }
 }
 
+fn platform_from_meeting_url(meeting_url: Option<&str>) -> Option<Platform> {
+    let url = meeting_url?.to_ascii_lowercase();
+    if url.contains("zoom.us") || url.contains("zoomgov.com") {
+        Some(Platform::Zoom)
+    } else if url.contains("meet.google.com") {
+        Some(Platform::GoogleMeet)
+    } else if url.contains("teams.microsoft.com") || url.contains("teams.live.com") {
+        Some(Platform::MicrosoftTeams)
+    } else if url.contains("webex.com") {
+        Some(Platform::Webex)
+    } else {
+        None
+    }
+}
+
 fn started_at_from_frontmatter(fm: &heron_types::Frontmatter) -> DateTime<Utc> {
     let date: NaiveDate = fm.date;
     let time = NaiveTime::parse_from_str(&fm.start, "%H:%M")
@@ -2631,6 +2891,27 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    #[test]
+    fn platform_from_meeting_url_matches_known_providers_only() {
+        assert_eq!(
+            platform_from_meeting_url(Some("https://zoom.us/j/123")),
+            Some(Platform::Zoom),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://meet.google.com/abc-defg-hij")),
+            Some(Platform::GoogleMeet),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://teams.microsoft.com/l/meetup-join/x")),
+            Some(Platform::MicrosoftTeams),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://example.com/teams.fake/meeting")),
+            None,
+            "unrecognized URLs must not be treated as Teams just because they contain `teams.`",
+        );
     }
 
     /// Tier 4 #23: the auto-detect gate defaults to `true` so the
