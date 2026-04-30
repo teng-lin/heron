@@ -30,6 +30,7 @@ pub mod resummarize;
 pub mod runtime_checks;
 pub mod salvage;
 pub mod settings;
+pub mod shortcuts;
 pub mod tray;
 
 use std::path::{Path, PathBuf};
@@ -596,13 +597,20 @@ fn heron_keychain_list() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Register the user's saved hotkey at app startup so the chord works
+/// Register the user's saved hotkeys at app startup so the chords work
 /// from anywhere in macOS without first opening the Settings pane.
 ///
-/// Reads `default_settings_path()` and consults the `record_hotkey`
-/// field; an empty string short-circuits ("hotkey disabled"). Any
-/// failure is logged and swallowed — the app should still launch even
-/// if the user's saved chord conflicts with another app, since the
+/// Tier 4 #24: iterates [`Settings::shortcuts`] (an action_id → accel
+/// map) and registers each entry via `tauri-plugin-global-shortcut`,
+/// emitting `shortcut:<action_id>` to the renderer on each firing.
+/// [`Settings::record_hotkey`] is preserved as the default for the
+/// canonical [`shortcuts::ACTION_TOGGLE_RECORDING`] action id; an
+/// explicit `shortcuts.toggle_recording` entry overrides it. See
+/// [`crate::shortcuts`] for the full merge / conflict / invalid-accel
+/// contract.
+///
+/// Any failure is logged and swallowed — the app should still launch
+/// even if a saved chord conflicts with another app, since the
 /// Settings pane is the user's recovery path.
 fn register_startup_hotkey(app: &tauri::AppHandle) {
     let path = default_settings_path();
@@ -612,19 +620,7 @@ fn register_startup_hotkey(app: &tauri::AppHandle) {
         // surface the error if it persists.
         return;
     };
-    if settings.record_hotkey.is_empty() {
-        return;
-    }
-    if let Err(e) = app
-        .global_shortcut()
-        .register(settings.record_hotkey.as_str())
-    {
-        tracing::warn!(
-            "could not register saved hotkey {:?}: {}",
-            settings.record_hotkey,
-            e
-        );
-    }
+    let _ = shortcuts::register_all(app, &settings.record_hotkey, &settings.shortcuts);
 }
 
 /// Default settings location.
