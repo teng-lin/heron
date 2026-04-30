@@ -47,7 +47,10 @@ use heron_vault::{MergeInputs, merge, read_note as vault_read_note, render_note}
 
 use crate::default_settings_path;
 use crate::keychain_resolver::EnvThenKeychainResolver;
-use crate::notes::{meetings_dir, resolve_note_path, resolve_vault_path, validated_basename};
+use crate::notes::{
+    canonicalize_meetings_within, meetings_dir, resolve_note_path, resolve_vault_path,
+    validated_basename,
+};
 use crate::settings::read_settings;
 
 /// Resolve the `<vault>/meetings/<basename>.md.bak` path the renderer
@@ -60,29 +63,17 @@ async fn resolve_bak_path(vault: &Path, session_id: &str) -> Result<PathBuf, Str
     let basename = validated_basename(session_id)?;
     let canonical_vault = resolve_vault_path(vault).await?;
     let meetings = meetings_dir(&canonical_vault);
-    // If `meetings/` exists, canonicalize and confirm it's still
-    // inside the vault — otherwise a symlinked `meetings/` would let
-    // a `.md.bak` read or delete escape. Mirrors the write-side check
-    // in `notes::resolve_note_path`. If `meetings/` is missing
+    // Canonicalize `meetings/` and confirm it's still inside the
+    // vault — otherwise a symlinked `meetings/` would let a
+    // `.md.bak` read or delete escape. If `meetings/` is missing
     // (pre-capture state), the `.md.bak` can't exist either; the
     // lexical path under `canonical_vault` is safe because the
     // basename is validated, and the subsequent metadata / read call
     // surfaces NotFound which `check_backup` / `restore_backup`
     // translate into "no backup" / a clear error.
-    let parent = match fs::canonicalize(&meetings).await {
-        Ok(canonical_meetings) => {
-            if !canonical_meetings.starts_with(&canonical_vault) {
-                return Err(format!(
-                    "meetings dir {} escapes vault {}",
-                    canonical_meetings.display(),
-                    canonical_vault.display()
-                ));
-            }
-            canonical_meetings
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => meetings,
-        Err(e) => return Err(format!("canonicalize {}: {}", meetings.display(), e)),
-    };
+    let parent = canonicalize_meetings_within(&meetings, &canonical_vault)
+        .await?
+        .unwrap_or(meetings);
     Ok(parent.join(format!("{basename}.md.bak")))
 }
 

@@ -108,6 +108,33 @@ pub(crate) fn meetings_dir(vault: &Path) -> PathBuf {
     vault.join("meetings")
 }
 
+/// Canonicalize `meetings` (assumed to be `<canonical_vault>/meetings`)
+/// and verify it still lives inside `canonical_vault`. Returns
+/// `Ok(None)` if the directory doesn't exist (pre-capture state),
+/// `Ok(Some(canonical))` on success, `Err` for IO errors or symlink
+/// escapes. Single source of truth for the `meetings/` containment
+/// check shared by [`resolve_note_path`] (write), `list_sessions`,
+/// and `resummarize::resolve_bak_path`.
+pub(crate) async fn canonicalize_meetings_within(
+    meetings: &Path,
+    canonical_vault: &Path,
+) -> Result<Option<PathBuf>, String> {
+    match fs::canonicalize(meetings).await {
+        Ok(c) => {
+            if !c.starts_with(canonical_vault) {
+                return Err(format!(
+                    "meetings dir {} escapes vault {}",
+                    c.display(),
+                    canonical_vault.display()
+                ));
+            }
+            Ok(Some(c))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("canonicalize {}: {}", meetings.display(), e)),
+    }
+}
+
 /// Strip the `mtg_` wire prefix from a meeting id, leaving the bare
 /// uuid the writer used as the basename for `FileNamingPattern::Id`.
 /// See the module-level "Path policy" docstring for the
@@ -163,32 +190,27 @@ pub(crate) async fn resolve_note_path(
     } else {
         // For write we ensure the meetings/ subdir exists (the vault
         // writer creates it on first capture; the renderer-only Save
-        // path may run before that ever happened) and verify
-        // containment of the *parent* so a new file the validator
-        // already vetted is allowed through.
+        // path may run before that ever happened) before
+        // canonicalizing.
         //
         // The `create_dir_all` → `canonicalize` pair is technically
         // racy (a hostile process could swap `meetings/` for a
         // symlink between the two calls). The vault directory is
         // user-owned by construction, so the threat is theoretical;
-        // the `starts_with(&canonical_vault)` check below still
-        // prevents a vault escape if the swap somehow lands.
+        // the `starts_with` check inside
+        // `canonicalize_meetings_within` still prevents a vault
+        // escape if the swap somehow lands.
         fs::create_dir_all(&meetings)
             .await
             .map_err(|e| format!("mkdir {}: {}", meetings.display(), e))?;
-        let canonical_meetings = fs::canonicalize(&meetings)
-            .await
-            .map_err(|e| format!("canonicalize {}: {}", meetings.display(), e))?;
-        if !canonical_meetings.starts_with(&canonical_vault) {
-            return Err(format!(
-                "meetings dir {} escapes vault {}",
-                canonical_meetings.display(),
-                canonical_vault.display()
-            ));
-        }
-        // `canonical_meetings.join(...).parent()` is `canonical_meetings`
-        // by construction; the `starts_with` above already proved
-        // containment in the vault.
+        let canonical_meetings = canonicalize_meetings_within(&meetings, &canonical_vault)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "meetings dir {} disappeared after create_dir_all",
+                    meetings.display()
+                )
+            })?;
         Ok(canonical_meetings.join(format!("{basename}.md")))
     }
 }
@@ -301,22 +323,26 @@ async fn set_user_only_perms(_path: &Path) -> std::io::Result<()> {
 pub async fn list_sessions(vault_path: &Path) -> Result<Vec<String>, String> {
     let canonical = resolve_vault_path(vault_path).await?;
     let meetings = meetings_dir(&canonical);
-    // First-run / pre-capture state: writer hasn't created the dir
-    // yet. An empty list is the honest answer (matches the
-    // orchestrator's `note_paths_newest_first` behaviour) — surfacing
-    // a readdir error would just produce a confusing toast on the
-    // empty Home page. A *permission* error still surfaces; only
-    // NotFound is collapsed.
     let mut out = Vec::new();
-    let mut rd = match fs::read_dir(&meetings).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(format!("readdir {}: {}", meetings.display(), e)),
+    // Canonicalize + containment-check before reading. A symlinked
+    // `meetings/` would otherwise let `list_sessions` enumerate
+    // filenames outside the vault — a defense-in-depth concern
+    // because `resolve_note_path` would still reject the subsequent
+    // read, but Heron treats vault containment as a hard boundary.
+    // Pre-capture state (no `meetings/` yet) returns an empty list,
+    // matching the orchestrator's `note_paths_newest_first`. A
+    // *permission* error on the dir still surfaces.
+    let canonical_meetings = match canonicalize_meetings_within(&meetings, &canonical).await? {
+        Some(c) => c,
+        None => return Ok(out),
     };
+    let mut rd = fs::read_dir(&canonical_meetings)
+        .await
+        .map_err(|e| format!("readdir {}: {}", canonical_meetings.display(), e))?;
     while let Some(entry) = rd
         .next_entry()
         .await
-        .map_err(|e| format!("readdir {}: {}", meetings.display(), e))?
+        .map_err(|e| format!("readdir {}: {}", canonical_meetings.display(), e))?
     {
         let p = entry.path();
         // Skip directories — `.md` matters only for files.
@@ -627,5 +653,30 @@ mod tests {
             err.contains("escapes vault") || err.contains("outside"),
             "got: {err}"
         );
+    }
+
+    /// `list_sessions` must reject a `meetings/` symlink that points
+    /// outside the vault. Without this guard the renderer could
+    /// enumerate filenames in any directory the symlink targets —
+    /// `resolve_note_path` would still block the subsequent read, but
+    /// vault containment is treated as a hard boundary in
+    /// defense-in-depth.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_sessions_rejects_symlinked_meetings_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path().join("vault");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&vault).expect("mkdir vault");
+        std::fs::create_dir(&outside).expect("mkdir outside");
+        // Plant a `.md` file we'd be able to enumerate if the escape worked.
+        std::fs::write(outside.join("leaked.md"), b"x").expect("seed");
+        symlink(&outside, vault.join("meetings")).expect("symlink");
+
+        let err = list_sessions(&vault)
+            .await
+            .expect_err("symlinked meetings/ must be rejected");
+        assert!(err.contains("escapes vault"), "got: {err}");
     }
 }
