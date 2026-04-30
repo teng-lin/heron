@@ -349,6 +349,61 @@ async fn read_summary_returns_body_and_action_items() {
 }
 
 #[tokio::test]
+async fn list_meetings_carries_structured_action_items_with_stable_ids() {
+    // Tier 0 #3 of the UX redesign: structured rows on the wire so
+    // the desktop's Review/Actions tab can replace the regex bullet
+    // extractor with a typed read. Pin the projection here:
+    //
+    // - `Frontmatter.action_items[i].id` (UUIDv7) survives onto
+    //   `Meeting.action_items[i].id` so React lists / future
+    //   checkbox state can key on a stable identifier across
+    //   re-summarize cycles.
+    // - Empty `owner` strings collapse to `None` on the wire.
+    // - ISO-formatted `due` strings parse to `NaiveDate`.
+    // - Reading list_meetings + get_meeting projects the same shape.
+    let fix = Fixture::new();
+    let date = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+    let id_a = ItemId::now_v7();
+    let id_b = ItemId::now_v7();
+    fix.write_note_with_action_ids(
+        "team",
+        date,
+        "10:00",
+        "Acme",
+        "Body.\n",
+        &[
+            (id_a, "Teng", "Write the doc", Some("2026-05-01")),
+            (id_b, "", "Pick a reviewer", None),
+        ],
+    );
+
+    let orch = fix.orch();
+    let listed = orch
+        .list_meetings(ListMeetingsQuery::default())
+        .await
+        .unwrap();
+    let meeting = &listed.items[0];
+    assert_eq!(meeting.action_items.len(), 2);
+    assert_eq!(meeting.action_items[0].id, id_a);
+    assert_eq!(meeting.action_items[0].text, "Write the doc");
+    assert_eq!(meeting.action_items[0].owner.as_deref(), Some("Teng"));
+    assert_eq!(
+        meeting.action_items[0].due,
+        Some(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
+    );
+    // Empty owner on disk → `None` on the wire.
+    assert_eq!(meeting.action_items[1].id, id_b);
+    assert_eq!(meeting.action_items[1].owner, None);
+    assert_eq!(meeting.action_items[1].due, None);
+
+    // get_meeting must surface the same projection.
+    let fetched = orch.get_meeting(&meeting.id).await.unwrap();
+    assert_eq!(fetched.action_items.len(), 2);
+    assert_eq!(fetched.action_items[0].id, id_a);
+    assert_eq!(fetched.action_items[1].id, id_b);
+}
+
+#[tokio::test]
 async fn audio_path_returns_recording_when_present() {
     let fix = Fixture::new();
     let date = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
@@ -732,6 +787,27 @@ impl Fixture {
             .iter()
             .map(|(owner, text, due)| ActionItem {
                 id: ItemId::nil(),
+                owner: (*owner).to_owned(),
+                text: (*text).to_owned(),
+                due: due.map(str::to_owned),
+            })
+            .collect();
+        self.write_note_inner(slug, date, start, company, body, &items, None, &[]);
+    }
+
+    fn write_note_with_action_ids(
+        &self,
+        slug: &str,
+        date: NaiveDate,
+        start: &str,
+        company: &str,
+        body: &str,
+        actions: &[(ItemId, &str, &str, Option<&str>)],
+    ) {
+        let items: Vec<ActionItem> = actions
+            .iter()
+            .map(|(id, owner, text, due)| ActionItem {
+                id: *id,
                 owner: (*owner).to_owned(),
                 text: (*text).to_owned(),
                 due: due.map(str::to_owned),
