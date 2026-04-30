@@ -552,6 +552,61 @@ async fn list_upcoming_calendar_translates_denied_to_permission_missing() {
 }
 
 #[tokio::test]
+async fn list_upcoming_calendar_marks_primed_for_staged_event_ids() {
+    // The rail's "primed" indicator reads from `CalendarEvent.primed`.
+    // The orchestrator must mirror `pending_contexts.contains_key(id)`
+    // onto each event so the indicator survives a refetch — without
+    // this, the rail would lose the badge every time the calendar
+    // store re-runs `ensureFresh` past the TTL.
+    let fix = Fixture::new();
+    let cal: Arc<dyn CalendarReader> = Arc::new(FakeCalendar {
+        events: vec![
+            heron_vault::CalendarEvent {
+                title: "1:1 with Alex".into(),
+                start: 1745660400.0,
+                end: 1745664000.0,
+                attendees: Vec::new(),
+            },
+            heron_vault::CalendarEvent {
+                title: "Team standup".into(),
+                start: 1745670000.0,
+                end: 1745671800.0,
+                attendees: Vec::new(),
+            },
+        ],
+    });
+    let orch = fix.orch_with_calendar(cal);
+
+    // Before any priming: both events come back un-primed.
+    let events = orch
+        .list_upcoming_calendar(None, None, None)
+        .await
+        .expect("list");
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| !e.primed), "no entry staged yet");
+
+    // Prime the first event by id; second stays cold.
+    let primed_id = events[0].id.clone();
+    orch.prepare_context(heron_session::PrepareContextRequest {
+        calendar_event_id: primed_id.clone(),
+        attendees: Vec::new(),
+    })
+    .await
+    .expect("prepare");
+
+    let events = orch
+        .list_upcoming_calendar(None, None, None)
+        .await
+        .expect("list after prepare");
+    let primed: Vec<&str> = events
+        .iter()
+        .filter(|e| e.primed)
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(primed, vec![primed_id.as_str()]);
+}
+
+#[tokio::test]
 async fn attach_context_persists_against_vault_orchestrator() {
     // The vault-backed orchestrator stages context the same way the
     // vault-less one does: in-memory, keyed by `calendar_event_id`,

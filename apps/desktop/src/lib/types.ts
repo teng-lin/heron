@@ -201,6 +201,14 @@ export interface CalendarEvent {
   attendees: AttendeeContext[];
   meeting_url: string | null;
   related_meetings: MeetingId[];
+  /**
+   * `true` once a `PreMeetingContext` is staged for this event id
+   * (via `heron_prepare_context` or `heron_attach_context`). The
+   * upcoming-meetings rail renders a "primed" indicator from this
+   * field. Daemon defaults it to `false` when omitted, so older
+   * builds keep deserializing.
+   */
+  primed: boolean;
 }
 
 /** Mirrors herond's `CalendarPage` wire shape (serialize-only daemon-side). */
@@ -228,6 +236,18 @@ export interface PreMeetingContext {
 export interface PreMeetingContextRequest {
   calendar_event_id: string;
   context: PreMeetingContext;
+}
+
+/**
+ * Body for `heron_prepare_context` (`POST /v1/context/prepare`). The
+ * daemon synthesizes a minimal `PreMeetingContext` from `attendees`
+ * (lifted into `attendees_known`) and stores it under
+ * `calendar_event_id`. Idempotent — never overwrites an existing
+ * staged context.
+ */
+export interface PrepareContextRequest {
+  calendar_event_id: string;
+  attendees: AttendeeContext[];
 }
 
 /** Synthetic ack for a successful `PUT /v1/context` (daemon emits 204). */

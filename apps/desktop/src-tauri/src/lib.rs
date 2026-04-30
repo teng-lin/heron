@@ -909,6 +909,12 @@ pub fn run() {
             // auth/Origin/CSP rationale as the read proxies above.
             meetings::heron_list_calendar_upcoming,
             meetings::heron_attach_context,
+            // Tier 5 #25: auto-prepare a minimal pre-meeting context
+            // for every event surfaced by the rail's `ensureFresh`
+            // pass. Daemon synthesizes a default `PreMeetingContext`
+            // (today: just `attendees_known`); the rail renders a
+            // "primed" indicator on each event card.
+            meetings::heron_prepare_context,
             // UI revamp PR 4: Tauri-side SSE bridge for the daemon's
             // `/v1/events` stream. Same auth/Origin/CSP rationale as
             // the meetings proxy — the webview cannot connect

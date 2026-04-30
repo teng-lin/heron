@@ -32,6 +32,7 @@ import type {
   MeetingId,
   Platform,
   PreMeetingContextRequest,
+  PrepareContextRequest,
   Summary,
   Transcript,
 } from "./types";
@@ -805,6 +806,17 @@ export interface HeronCommands {
    */
   heron_attach_context: {
     args: { request: PreMeetingContextRequest };
+    returns: DaemonResult<AttachContextAck>;
+  };
+  /**
+   * Tier 5 #25: proxy `POST /v1/context/prepare`. Auto-stages a
+   * minimal default `PreMeetingContext` (today: just
+   * `attendees_known`) so the rail can render a "primed" indicator on
+   * each event card. Idempotent on the daemon side: never overwrites
+   * a context attached manually via `heron_attach_context`.
+   */
+  heron_prepare_context: {
+    args: { request: PrepareContextRequest };
     returns: DaemonResult<AttachContextAck>;
   };
   /**
