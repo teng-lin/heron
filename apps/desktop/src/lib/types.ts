@@ -163,6 +163,14 @@ export interface ActionItem {
   owner: string | null;
   /** ISO date (`YYYY-MM-DD`); `null` when no due date. */
   due: string | null;
+  /**
+   * Day 8–10 (action-item write-back): user-toggleable completion
+   * flag. Optional on the wire to stay back-compat with daemons that
+   * predate the field — `Review.tsx::selectActionItems` coalesces
+   * missing values to `false`. The backend agent's parallel PR
+   * tightens this to a required field once the Rust struct ships.
+   */
+  done?: boolean;
 }
 
 /** Mirrors `crates/heron-session/src/lib.rs:226`. */

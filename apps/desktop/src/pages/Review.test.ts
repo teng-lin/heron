@@ -103,6 +103,9 @@ describe("selectActionItems", () => {
       text: "Write the doc",
       owner: "Teng",
       due: "2026-05-01",
+      // Day 8–10: `done` is coalesced to `false` for back-compat
+      // with daemons that don't emit the field yet.
+      done: false,
       structured: true,
     });
     expect(rows[1].owner).toBeNull();
@@ -140,6 +143,7 @@ describe("selectActionItems", () => {
         text: "still works",
         owner: null,
         due: null,
+        done: false,
         structured: false,
       },
     ]);
@@ -156,6 +160,7 @@ describe("selectActionItems", () => {
         text: "offline-friendly",
         owner: null,
         due: null,
+        done: false,
         structured: false,
       },
     ]);

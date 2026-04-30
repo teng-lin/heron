@@ -209,6 +209,7 @@ mod tests {
             owner: "alice".to_owned(),
             text: text.to_owned(),
             due: None,
+            done: false,
         }
     }
 

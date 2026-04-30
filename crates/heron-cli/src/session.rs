@@ -556,6 +556,7 @@ mod tests {
             owner: "alice".into(),
             text: "Send pricing deck to Acme".into(),
             due: None,
+            done: false,
         };
         let prior_attendee = Attendee {
             id: base_attendee_id,
@@ -605,6 +606,7 @@ mod tests {
                 owner: "alice".into(),
                 text: "Send the pricing deck to Acme".into(),
                 due: None,
+                done: false,
             }],
             attendees: vec![prior_attendee.clone()],
             cost: Cost {

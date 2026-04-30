@@ -107,6 +107,16 @@ pub struct ActionItem {
     pub owner: String,
     pub text: String,
     pub due: Option<String>,
+    /// User-checkbox state for the action item. Tagged `#[serde(default)]`
+    /// so pre-existing frontmatter (Tier 0 #3 vault notes that didn't
+    /// model `done`) deserializes cleanly with `done = false`. The
+    /// write-back path (`heron_update_action_item`) is the only thing
+    /// that flips this to `true`; the LLM never emits it because the
+    /// summarizer prompt deliberately doesn't surface a "done" concept
+    /// — re-summarize must not silently uncheck a user-checked item.
+    /// See `merge::merge_action_items` for the matching merge rule.
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// User self-context the summarizer can inject into the LLM system
@@ -512,6 +522,56 @@ custom_nested:
         let s = serde_json::to_string(&p).expect("serialize");
         let back: Persona = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn read_pre_done_action_item_fills_default() {
+        // Migration pin: pre-existing Tier 0 #3 frontmatter on disk
+        // has no `done` field. The Day 8-10 write-back path adds
+        // `done: bool` with `#[serde(default)]` so old vaults
+        // deserialize cleanly with `done = false`. If a future
+        // refactor drops the serde-default attribute, this test fails
+        // loudly rather than silently rejecting every legacy note.
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "owner": "me",
+            "text": "Send pricing deck",
+            "due": null
+        }"#;
+        let item: ActionItem = serde_json::from_str(json).expect("legacy item must parse");
+        assert_eq!(item.text, "Send pricing deck");
+        assert!(!item.done, "missing `done` field must default to false");
+
+        // YAML mirror — vault notes are YAML, not JSON; round-trip
+        // through serde_yaml too so the on-disk legacy shape is pinned.
+        let yaml = r#"id: 00000000-0000-0000-0000-000000000002
+owner: alice
+text: Schedule kickoff
+due: 2026-05-01
+"#;
+        let item: ActionItem = serde_yaml::from_str(yaml).expect("legacy yaml must parse");
+        assert_eq!(item.due.as_deref(), Some("2026-05-01"));
+        assert!(!item.done);
+    }
+
+    #[test]
+    fn action_item_round_trips_with_done_true() {
+        // Forward-compat: once the write-back path flips `done: true`,
+        // the field must serialize / deserialize round-trip without
+        // drift. `done: false` and `done: true` are both valid wire
+        // shapes; the `serde(default)` only governs missing-field
+        // deserialization, not serialize-side suppression.
+        let item = ActionItem {
+            id: uuid::Uuid::nil(),
+            owner: "me".into(),
+            text: "Ship the writer".into(),
+            due: None,
+            done: true,
+        };
+        let s = serde_json::to_string(&item).expect("serialize");
+        let back: ActionItem = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, item);
+        assert!(back.done);
     }
 
     #[test]

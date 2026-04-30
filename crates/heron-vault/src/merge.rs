@@ -134,17 +134,34 @@ pub fn merge_action_items(
     let mut out = Vec::with_capacity(theirs.len() + ours.len());
 
     // First pass: walk theirs, choosing per-id source per the rules.
+    //
+    // `done` is a per-field exception: it always tracks `ours.done` when
+    // an `ours` row exists, regardless of whether the rest of the row is
+    // taken from `theirs` (LLM refresh) or `ours` (user edit). The user-
+    // facing checkbox is the canonical state — re-summarize must never
+    // reset a checked item just because the LLM polished its text.
+    //
+    // The `ours == base` user-edit detector compares text/owner/due
+    // only; `done` is excluded so a user who *only* toggled the
+    // checkbox still gets the LLM's text polish. See the
+    // `merged_action_items_*_done` regression tests.
     for t in theirs {
         let chosen = match (base_by_id.get(&t.id), ours_by_id.get(&t.id)) {
             (Some(b), Some(o)) => {
-                if (*o) == *b {
+                let mut row = if action_item_content_equal(o, b) {
+                    // User untouched on text/owner/due; take theirs
+                    // (LLM refresh).
                     t.clone()
                 } else {
+                    // User edited; ours wins on text/owner/due.
                     (*o).clone()
-                }
+                };
+                row.done = o.done;
+                row
             }
             // collision: theirs has an id that's in ours but not base.
-            // Treat as user-owned to avoid clobbering.
+            // Treat as user-owned to avoid clobbering. ours.done already
+            // applies because we're taking the entire `ours` row.
             (None, Some(o)) => (*o).clone(),
             // user deleted; skip.
             (Some(_), None) => continue,
@@ -269,6 +286,19 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// User-edit detector for [`ActionItem`] that ignores the `done` flag.
+///
+/// The list-merge in [`merge_action_items`] needs to ask "did the user
+/// edit the textual content of this row?" without the answer flipping
+/// just because the user also (or only) toggled the done checkbox.
+/// Comparing the full `ActionItem` (which derives `PartialEq` over every
+/// field including `done`) would conflate the two — a user who *only*
+/// toggled `done` would be misclassified as having "edited" the row,
+/// and would then lose any LLM text polish on the next re-summarize.
+fn action_item_content_equal(a: &ActionItem, b: &ActionItem) -> bool {
+    a.id == b.id && a.owner == b.owner && a.text == b.text && a.due == b.due
+}
+
 /// Pick `theirs` for an `llm_inferred` field if `ours == base`
 /// (user untouched); otherwise keep `ours` (user edit).
 fn pick_llm_inferred<T: Clone + PartialEq>(base: &T, ours: &T, theirs: &T) -> T {
@@ -305,6 +335,7 @@ mod tests {
             owner: owner.into(),
             text: text.into(),
             due: None,
+            done: false,
         }
     }
 
@@ -442,6 +473,103 @@ mod tests {
         assert_eq!(merged[0].id, id_b); // theirs first
         assert_eq!(merged[1].id, id_a); // theirs first
         assert_eq!(merged[2].id, id_c); // user-added appended
+    }
+
+    /// Helper: build an `ActionItem` with an explicit `done` flag so the
+    /// regression tests below stay readable. The `ai()` helper above
+    /// always sets `done: false`; merging needs both states.
+    fn ai_done(id: ItemId, owner: &str, text: &str, done: bool) -> ActionItem {
+        ActionItem {
+            id,
+            owner: owner.into(),
+            text: text.into(),
+            due: None,
+            done,
+        }
+    }
+
+    /// Day 8-10 write-back: the merge rule for `done` must prefer the
+    /// `ours` value when present so a user-checked checkbox survives a
+    /// re-summarize. The LLM never emits `done` (the summarizer prompt
+    /// doesn't surface a "done" concept), but a forward-compat
+    /// LLM-emitted value still loses to `ours` here so the user's
+    /// in-app toggle is the canonical state.
+    #[test]
+    fn merged_action_items_prefer_ours_done_over_theirs() {
+        let id = next_id();
+        // Base says not-done. User checked the box (ours.done = true).
+        // The LLM re-summarized and (forward-compat path) emits
+        // theirs.done = false. The merge must keep ours.done = true.
+        let base = vec![ai_done(id, "me", "Send pricing deck", false)];
+        let ours = vec![ai_done(id, "me", "Send pricing deck", true)];
+        let theirs = vec![ai_done(id, "me", "Send pricing deck", false)];
+
+        let merged = merge_action_items(&base, &ours, &theirs);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].done,
+            "user-checked done flag must survive re-summarize",
+        );
+    }
+
+    /// Mirror: when `ours` has the item but `done` is unchanged from
+    /// `base`, the merge still uses `ours.done` (which equals `base`).
+    /// This is the steady-state path — the user hasn't toggled the box,
+    /// re-summarize doesn't suddenly invent a checked state.
+    #[test]
+    fn merged_action_items_keep_ours_done_when_unchanged() {
+        let id = next_id();
+        let base = vec![ai_done(id, "me", "Send pricing deck", false)];
+        let ours = vec![ai_done(id, "me", "Send pricing deck", false)];
+        let theirs = vec![ai_done(id, "me", "Polished pricing deck", false)];
+
+        let merged = merge_action_items(&base, &ours, &theirs);
+        assert_eq!(merged.len(), 1);
+        // Text refresh: ours == base on text, so theirs wins.
+        assert_eq!(merged[0].text, "Polished pricing deck");
+        assert!(!merged[0].done);
+    }
+
+    /// Cross path: user toggled `done = true`, LLM polished the text in
+    /// `theirs`. The merge must combine BOTH refreshes — adopt the
+    /// polished text from `theirs` AND keep `done = true` from `ours`.
+    /// Without the per-field `done` rule, this case would either lose
+    /// the user's checkbox (if theirs wins outright) or lose the LLM
+    /// polish (if ours wins outright, because `done` differs from base).
+    #[test]
+    fn merged_action_items_combine_theirs_text_with_ours_done() {
+        let id = next_id();
+        let base = vec![ai_done(id, "me", "Send pricing deck", false)];
+        // User checked the box but didn't edit the text.
+        let ours = vec![ai_done(id, "me", "Send pricing deck", true)];
+        // LLM polished the text on the next re-summarize.
+        let theirs = vec![ai_done(id, "me", "Send the pricing deck to Acme", false)];
+
+        let merged = merge_action_items(&base, &ours, &theirs);
+        assert_eq!(merged.len(), 1);
+        // ours == base on (text, owner, due) — only `done` differs —
+        // so the row body comes from theirs (LLM refresh wins on
+        // text), but `done` tracks ours.
+        assert_eq!(merged[0].text, "Send the pricing deck to Acme");
+        assert!(
+            merged[0].done,
+            "ours.done = true must survive LLM text polish"
+        );
+    }
+
+    /// LLM-only path: an item appears only in `theirs` (genuinely new
+    /// from the LLM, no `ours` row). The merge takes `theirs.done`
+    /// verbatim — there is no `ours.done` to prefer.
+    #[test]
+    fn merged_action_items_take_theirs_done_when_no_ours() {
+        let id = next_id();
+        let base: Vec<ActionItem> = vec![];
+        let ours: Vec<ActionItem> = vec![];
+        let theirs = vec![ai_done(id, "alice", "Brand new item", false)];
+
+        let merged = merge_action_items(&base, &ours, &theirs);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].done);
     }
 
     #[test]

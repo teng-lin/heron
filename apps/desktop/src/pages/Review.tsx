@@ -45,6 +45,7 @@ import { toast } from "sonner";
 import { RotateCcw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
+import { ActionItemsEditor } from "../components/ActionItemsEditor";
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
 import { TagChip } from "../components/home/meetings-table";
 import { NoteEditor, type NoteEditorHandle } from "../components/NoteEditor";
@@ -215,6 +216,14 @@ export interface ActionItemRow {
   owner: string | null;
   due: string | null;
   /**
+   * Day 8–10 (action-item write-back). Mirrors `ActionItem.done` from
+   * the wire. Always `false` for `structured: false` rows because the
+   * regex-fallback path can't recover the flag — and the editor hides
+   * the checkbox on those rows anyway, so the value is just a default
+   * that satisfies the type.
+   */
+  done: boolean;
+  /**
    * `true` when this row came from the structured
    * `Meeting.action_items` wire field (Tier 0 #3); `false` when it
    * was reconstructed from the markdown body via the legacy regex
@@ -250,6 +259,10 @@ export function selectActionItems(
       text: item.text,
       owner: item.owner,
       due: item.due,
+      // Day 8–10: `done` is required on the wire post-write-back.
+      // Coalesce missing for back-compat with daemons that haven't
+      // shipped the field yet — the read path treats it as `false`.
+      done: item.done ?? false,
       structured: true,
     }));
   }
@@ -258,6 +271,7 @@ export function selectActionItems(
     text,
     owner: null,
     due: null,
+    done: false,
     structured: false,
   }));
 }
@@ -864,39 +878,12 @@ export default function Review() {
                         </p>
                       )}
                       {load.kind === "ready" && actionItems.length > 0 && (
-                        <ul className="list-disc space-y-2 pl-5 text-sm">
-                          {actionItems.map((item) => (
-                            <li key={item.id}>
-                              <span>{item.text}</span>
-                              {item.owner && (
-                                <span
-                                  className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
-                                  style={{
-                                    background: "var(--color-paper-2)",
-                                    borderColor: "var(--color-rule)",
-                                    color: "var(--color-ink-2)",
-                                  }}
-                                  title="Owner"
-                                >
-                                  {item.owner}
-                                </span>
-                              )}
-                              {item.due && (
-                                <span
-                                  className="ml-2 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em]"
-                                  style={{
-                                    background: "var(--color-paper-2)",
-                                    borderColor: "var(--color-rule)",
-                                    color: "var(--color-ink-2)",
-                                  }}
-                                  title={`Due ${item.due}`}
-                                >
-                                  due {formatActionItemDue(item.due)}
-                                </span>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
+                        <ActionItemsEditor
+                          rows={actionItems}
+                          vaultPath={vaultRoot}
+                          meetingId={sessionId}
+                          onError={(message) => toast.error(message)}
+                        />
                       )}
                     </TabsContent>
 

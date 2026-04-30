@@ -21,8 +21,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use heron_types::{ActionItem, Attendee, Frontmatter};
-use serde::{Deserialize, Serialize};
+use heron_types::{ActionItem, Attendee, Frontmatter, ItemId};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -40,6 +40,69 @@ pub enum VaultError {
     MissingFrontmatter { path: PathBuf },
     #[error("note has unterminated `---` frontmatter at {path}")]
     UnterminatedFrontmatter { path: PathBuf },
+    /// Day 8-10 write-back: the note's frontmatter has no
+    /// `action_items[i].id == id` row. Surfaces as a 404 NotFound at the
+    /// IPC boundary so the renderer can drop the optimistic UI for that
+    /// row and re-fetch the meeting.
+    #[error("action item {id} not found in note frontmatter")]
+    ActionItemNotFound { id: ItemId },
+}
+
+/// JSON Merge Patch for a single [`ActionItem`].
+///
+/// The renderer encodes "no change" as a missing field, "clear this
+/// nullable field" as `null`, and "set to value" as the value itself —
+/// the canonical [JSON Merge Patch] shape (RFC 7396). For the two
+/// nullable string fields (`owner`, `due`) that maps to
+/// `Option<Option<String>>`:
+///
+/// - omitted from the JSON: `None` (outer absent → "no change")
+/// - `null` in JSON: `Some(None)` ("clear")
+/// - string in JSON: `Some(Some(s))` ("set")
+///
+/// Serde's default `Option<Option<T>>` deserializer collapses missing
+/// and `null` to `None`, which would lose the "clear" signal. The
+/// custom [`deserialize_double_option`] below distinguishes the two by
+/// only setting the outer `Some(None)` when the field is *present and
+/// null*. The container-level `#[serde(default)]` covers the "missing"
+/// case for `text` and `done` too — both are then `None`.
+///
+/// [JSON Merge Patch]: https://datatracker.ietf.org/doc/html/rfc7396
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ActionItemPatch {
+    /// New text body when present. Renderer sends the trimmed string;
+    /// the writer doesn't trim again (the renderer's UX validation is
+    /// load-bearing — empty strings should never reach the wire).
+    pub text: Option<String>,
+    /// `Some(None)` clears the owner; `Some(Some(s))` sets it; `None`
+    /// (outer absent) leaves it untouched. See type-level docs.
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub owner: Option<Option<String>>,
+    /// ISO `YYYY-MM-DD`. Same double-option semantics as `owner`.
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub due: Option<Option<String>>,
+    /// New `done` flag when present. Setting `done` is the only path
+    /// that flips the user-checkbox state on disk — the LLM never
+    /// emits this field; see [`heron_types::ActionItem::done`].
+    pub done: Option<bool>,
+}
+
+/// `Option<Option<T>>` deserializer that distinguishes missing-from-JSON
+/// (outer `None`) from JSON `null` (`Some(None)`) from JSON value
+/// (`Some(Some(v))`). Implements the "JSON Merge Patch" double-option
+/// trick without pulling in `serde_with` for one helper.
+///
+/// Pin: container-level `#[serde(default)]` on [`ActionItemPatch`] is
+/// what lets a missing field decode to `Option<Option<T>>::None`. This
+/// helper is only invoked when the field is *present*, at which point
+/// it returns `Some(None)` for null and `Some(Some(v))` for a value.
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Maximum slug length, in chars, before any date prefix or
@@ -243,6 +306,110 @@ impl VaultWriter {
         Ok(path)
     }
 
+    /// Day 8-10 write-back path: apply a per-field [`ActionItemPatch`] to
+    /// the row identified by `item_id` in `meeting_path`'s frontmatter
+    /// and atomically write the merged note back. Returns the post-merge
+    /// `ActionItem` so the renderer can drop its optimistic UI for that
+    /// row.
+    ///
+    /// **Frontmatter only.** Action items appear in the markdown body as
+    /// bullets like `- [ ] task text`, but those bullets carry no
+    /// `ItemId` — the IDs live exclusively in the YAML frontmatter. So
+    /// the patch updates frontmatter; the body is left alone unless
+    /// `text` changes (in which case we best-effort update the matching
+    /// bullet by text-equality, with a `tracing::warn` on miss). For
+    /// `done = true`, we best-effort flip the matching `[ ]` body
+    /// bullet to `[x]`. Either body update missing is non-fatal — the
+    /// next re-summarize regenerates the body from frontmatter anyway.
+    ///
+    /// Concurrent-write safety comes from the existing [`atomic_write`]
+    /// rename: a racing reader either sees the pre-patch note in full
+    /// or the post-patch note in full, never a half-written mix.
+    ///
+    /// **Known limitation:** if `update_action_item` and `re_summarize`
+    /// run concurrently against the same note, the read-modify-write is
+    /// last-writer-wins per the atomic-rename — there's no per-row mtime
+    /// check or 3-way merge between the two paths. In practice both are
+    /// user-initiated (checkbox click vs. "Re-summarize" button) and the
+    /// race window is small; if it becomes an issue, gate via an
+    /// orchestrator-level mutex rather than retrofitting a CRDT here.
+    ///
+    /// Errors:
+    /// - [`VaultError::ActionItemNotFound`] when `item_id` doesn't match
+    ///   any row in the frontmatter — the renderer should drop the
+    ///   optimistic UI for that row and re-fetch the meeting.
+    /// - [`VaultError::Io`] / [`VaultError::Yaml`] for filesystem /
+    ///   serialize failures (iCloud eviction, permission errors, etc.).
+    pub fn update_action_item(
+        &self,
+        meeting_path: &Path,
+        item_id: &ItemId,
+        patch: ActionItemPatch,
+    ) -> Result<ActionItem, VaultError> {
+        let (mut frontmatter, mut body) = read_note(meeting_path)?;
+
+        let row_idx = frontmatter
+            .action_items
+            .iter()
+            .position(|i| i.id == *item_id)
+            .ok_or(VaultError::ActionItemNotFound { id: *item_id })?;
+
+        // Snapshot the pre-patch text so we can update the matching
+        // body bullet (best-effort — see method-level doc) before we
+        // mutate the frontmatter copy.
+        let original_text = frontmatter.action_items[row_idx].text.clone();
+        let original_done = frontmatter.action_items[row_idx].done;
+
+        let item = &mut frontmatter.action_items[row_idx];
+        if let Some(new_text) = &patch.text {
+            item.text = new_text.clone();
+        }
+        if let Some(new_owner) = patch.owner {
+            // The desktop frontend's `commitOwner` sends `{owner: null}`
+            // for empty / whitespace-only input, so a literal
+            // `Some(Some(""))` here would only come from a buggy direct
+            // caller. The vault tolerates an empty-string owner
+            // verbatim per `read_note_round_trips_structured_action_items_with_stable_ids`,
+            // so we don't second-guess it here — the renderer will
+            // display it the same as a cleared field.
+            item.owner = new_owner.unwrap_or_default();
+        }
+        if let Some(new_due) = patch.due {
+            item.due = new_due;
+        }
+        if let Some(new_done) = patch.done {
+            item.done = new_done;
+        }
+
+        // Best-effort body bullet sync: if `text` changed, replace the
+        // matching `- [ ] <old>` bullet with the new text in the same
+        // checkbox state. If `done` flipped to `true`, swap `[ ]` →
+        // `[x]` on the matching bullet. Both fall through with a
+        // `tracing::warn` when the body bullet doesn't match what's in
+        // frontmatter — re-summarize regenerates the body anyway.
+        let new_text = patch.text.as_deref();
+        let new_done = patch.done;
+        if new_text.is_some() || new_done.is_some() {
+            body = sync_body_bullet(
+                &body,
+                &original_text,
+                new_text,
+                original_done,
+                new_done,
+                item_id,
+            );
+        }
+
+        let rendered = render_note(&frontmatter, &body)?;
+        atomic_write(meeting_path, rendered.as_bytes())?;
+
+        // Clone (not `swap_remove`) so the post-merge return value is a
+        // standalone owned row; `frontmatter` itself is dropped here,
+        // but a future caller that wants the full updated frontmatter
+        // can chain a `read_note` against `meeting_path`.
+        Ok(frontmatter.action_items[row_idx].clone())
+    }
+
     /// Re-summarize path: read `<note>.md`, optionally `<note>.md.bak`,
     /// run the §10 merge against the LLM's fresh `theirs_*` output,
     /// rotate the backup, and atomically write the merged result.
@@ -284,6 +451,108 @@ impl VaultWriter {
         atomic_write(note_path, rendered.as_bytes())?;
         Ok(outcome)
     }
+}
+
+/// Best-effort body-bullet sync for [`VaultWriter::update_action_item`].
+///
+/// Action items appear in the markdown body as bullets like
+/// `- [ ] task text` or `* [x] task text`, possibly indented inside a
+/// nested list. They carry no `ItemId`, so we match per-line by
+/// stripping leading whitespace and the `[-*] [<state>] ` prefix and
+/// comparing the remainder to the pre-patch frontmatter text. On a
+/// unique match we swap in `new_text` (when provided) and the new
+/// checkbox state (when `new_done` flipped), preserving the original
+/// indent and bullet glyph. On zero matches OR multiple matches (two
+/// action items happen to share text) we `tracing::warn` and return
+/// the body unchanged — the next re-summarize regenerates the body
+/// from frontmatter, so a stale bullet self-heals.
+///
+/// The matcher is intentionally narrow: only bullets whose stripped
+/// prefix is `- [ ] `, `- [x] `, `* [ ] `, or `* [x] ` are candidates.
+/// The checkbox state is matched case-sensitively (lowercase `x`) —
+/// heron's writer always emits lowercase, and a hand-edited `[X]` is
+/// rare enough that a warn-log + self-heal-on-resummarize is fine.
+fn sync_body_bullet(
+    body: &str,
+    original_text: &str,
+    new_text: Option<&str>,
+    original_done: bool,
+    new_done: Option<bool>,
+    item_id: &ItemId,
+) -> String {
+    let target_done_marker = if original_done { "[x]" } else { "[ ]" };
+    let resolved_text = new_text.unwrap_or(original_text);
+    let resolved_done = new_done.unwrap_or(original_done);
+    let resolved_marker = if resolved_done { "[x]" } else { "[ ]" };
+
+    // Walk lines (with line endings preserved) and collect every match
+    // so we can detect ambiguous duplicate-text rows. Acting on the
+    // first match would silently flip the wrong bullet when two items
+    // share text; require uniqueness instead.
+    let mut matches: Vec<(usize, char, String)> = Vec::new(); // (byte_idx, bullet_glyph, indent)
+    let mut byte_idx = 0;
+    for line in body.split_inclusive('\n') {
+        let line_start = byte_idx;
+        byte_idx += line.len();
+
+        let trimmed_end = line.trim_end_matches(['\r', '\n']);
+        let indent_len = trimmed_end.len() - trimmed_end.trim_start().len();
+        let stripped = &trimmed_end[indent_len..];
+
+        let glyph = match stripped.chars().next() {
+            Some('-') => '-',
+            Some('*') => '*',
+            _ => continue,
+        };
+        // After the bullet glyph, expect ` [ ] ` or ` [x] ` then text.
+        let after_glyph = &stripped[1..];
+        let prefix = format!(" {target_done_marker} ");
+        let Some(text_part) = after_glyph.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        // Trim trailing whitespace on the body line — markdown editors
+        // sometimes leave a trailing space and the strict equality
+        // would otherwise miss. The replacement uses `resolved_text`
+        // verbatim, so any trailing spaces in the source bullet are
+        // dropped (acceptable: the user's intent is the new text, not
+        // the incidental whitespace).
+        if text_part.trim_end() == original_text {
+            let indent = trimmed_end[..indent_len].to_string();
+            matches.push((line_start, glyph, indent));
+        }
+    }
+
+    if matches.len() != 1 {
+        tracing::warn!(
+            item_id = %item_id,
+            original_text = %original_text,
+            match_count = matches.len(),
+            "action-item body bullet not uniquely matched; frontmatter updated, body left as-is",
+        );
+        return body.to_string();
+    }
+
+    // Unreachable: the `len() != 1` early return above guarantees exactly
+    // one match here, but `let-else` keeps clippy's `expect_used` happy
+    // and documents the invariant.
+    let Some((line_start, glyph, indent)) = matches.into_iter().next() else {
+        return body.to_string();
+    };
+    // Find end-of-line for replacement. The line content (without
+    // trailing `\n` / `\r\n`) starts at `line_start + indent.len()` and
+    // runs through whatever was the original bullet body — locate the
+    // newline boundary so we can preserve it verbatim.
+    let line_end = body[line_start..]
+        .find('\n')
+        .map(|n| line_start + n)
+        .unwrap_or(body.len());
+    let replacement_body = format!("{indent}{glyph} {resolved_marker} {resolved_text}");
+
+    let mut out = String::with_capacity(body.len() + replacement_body.len());
+    out.push_str(&body[..line_start]);
+    out.push_str(&replacement_body);
+    out.push_str(&body[line_end..]);
+    out
 }
 
 /// `<note>.md.bak` companion path.
@@ -814,12 +1083,14 @@ mod tests {
                 owner: "Teng".into(),
                 text: "Write the doc".into(),
                 due: Some("2026-05-01".into()),
+                done: false,
             },
             heron_types::ActionItem {
                 id: id_b,
                 owner: "".into(),
                 text: "Pick a reviewer".into(),
                 due: None,
+                done: false,
             },
         ];
 
@@ -1120,6 +1391,406 @@ mod tests {
         assert_eq!(p1, p2);
         let (_, body) = read_note(&p1).expect("read");
         assert_eq!(body, "v2\n");
+    }
+
+    // ----- Day 8-10: ActionItem write-back path -----
+
+    /// Helper: lay down a finalized note with two distinct action items
+    /// so the round-trip tests can prove patching one doesn't clobber
+    /// the other. Returns `(note_path, id_a, id_b)`.
+    fn seed_two_actions(writer: &VaultWriter) -> (PathBuf, ItemId, ItemId) {
+        let id_a = uuid::Uuid::now_v7();
+        let id_b = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![
+            ActionItem {
+                id: id_a,
+                owner: "alice".into(),
+                text: "Send pricing deck".into(),
+                due: Some("2026-05-01".into()),
+                done: false,
+            },
+            ActionItem {
+                id: id_b,
+                owner: "bob".into(),
+                text: "Schedule kickoff".into(),
+                due: None,
+                done: false,
+            },
+        ];
+        let body = "\n## Action items\n\n- [ ] Send pricing deck\n- [ ] Schedule kickoff\n";
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "writeback", &fm, body)
+            .expect("finalize");
+        (path, id_a, id_b)
+    }
+
+    /// Patching `done = true` flips the frontmatter row, leaves siblings
+    /// alone, and best-effort flips the body bullet to `[x]`.
+    #[test]
+    fn update_action_item_done_round_trips() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let (path, id_a, id_b) = seed_two_actions(&writer);
+
+        let updated = writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        assert_eq!(updated.id, id_a);
+        assert!(updated.done);
+
+        // Frontmatter survives the round-trip in full.
+        let (fm, body) = read_note(&path).expect("read");
+        assert_eq!(fm.action_items.len(), 2, "sibling row must not be dropped");
+        let row_a = fm.action_items.iter().find(|i| i.id == id_a).expect("a");
+        let row_b = fm.action_items.iter().find(|i| i.id == id_b).expect("b");
+        assert!(row_a.done, "patched row done = true on disk");
+        assert!(!row_b.done, "sibling row's done remains false");
+        // Sibling text untouched.
+        assert_eq!(row_b.text, "Schedule kickoff");
+
+        // Body bullet flipped to `[x]` (best-effort match by text).
+        assert!(
+            body.contains("- [x] Send pricing deck"),
+            "body bullet for the patched row should flip to [x]; got: {body}",
+        );
+        // Sibling body bullet untouched.
+        assert!(body.contains("- [ ] Schedule kickoff"));
+    }
+
+    /// Patching `text` rewrites the frontmatter row AND the body bullet
+    /// (best-effort match against the original text). Other rows survive.
+    #[test]
+    fn update_action_item_text_round_trips() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let (path, id_a, _id_b) = seed_two_actions(&writer);
+
+        let updated = writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    text: Some("Send the polished pricing deck".into()),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        assert_eq!(updated.text, "Send the polished pricing deck");
+
+        let (fm, body) = read_note(&path).expect("read");
+        let row_a = fm.action_items.iter().find(|i| i.id == id_a).expect("a");
+        assert_eq!(row_a.text, "Send the polished pricing deck");
+        assert!(body.contains("- [ ] Send the polished pricing deck"));
+        // Sibling bullet stays put.
+        assert!(body.contains("- [ ] Schedule kickoff"));
+    }
+
+    /// Indented body bullets (e.g. nested under a sub-heading) round-
+    /// trip too: leading whitespace is preserved verbatim, only the
+    /// checkbox state and / or text portion changes. This mirrors what
+    /// a Markdown renderer like Obsidian would produce when rendering
+    /// the action-items list under a `## Action items` heading.
+    #[test]
+    fn update_action_item_indented_body_bullet_round_trips() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let id_a = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![ActionItem {
+            id: id_a,
+            owner: "alice".into(),
+            text: "Send pricing deck".into(),
+            due: None,
+            done: false,
+        }];
+        // Two-space indent on the bullet — common nesting depth.
+        let body = "\n## Action items\n\n  - [ ] Send pricing deck\n";
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "indented", &fm, body)
+            .expect("finalize");
+
+        writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        let (_fm, body) = read_note(&path).expect("read");
+        assert!(
+            body.contains("  - [x] Send pricing deck"),
+            "indent must be preserved on the rewritten bullet; got: {body}",
+        );
+    }
+
+    /// Markdown editors sometimes leave a trailing space on bullet
+    /// lines (autosave / strip-trailing-whitespace settings vary). The
+    /// matcher trims trailing whitespace before comparing so a body
+    /// bullet like `- [ ] Send pricing deck ` (note trailing space)
+    /// still round-trips. Per gemini-code-assist suggestion on PR #180.
+    #[test]
+    fn update_action_item_body_bullet_with_trailing_whitespace_round_trips() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let id_a = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![ActionItem {
+            id: id_a,
+            owner: "alice".into(),
+            text: "Send pricing deck".into(),
+            due: None,
+            done: false,
+        }];
+        // Trailing space on the bullet line.
+        let body = "\n## Action items\n\n- [ ] Send pricing deck   \n";
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "trailing", &fm, body)
+            .expect("finalize");
+
+        writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        let (_fm, body) = read_note(&path).expect("read");
+        // The replacement uses `resolved_text` verbatim — trailing
+        // whitespace gets dropped along with the matched portion.
+        assert!(
+            body.contains("- [x] Send pricing deck\n"),
+            "trailing-whitespace bullet should still flip; got: {body}",
+        );
+    }
+
+    /// Two action items with identical text are indistinguishable in
+    /// the body. Patching one's `done` MUST NOT silently flip the
+    /// other's bullet — the matcher demands a unique match and falls
+    /// back to "frontmatter updated, body left as-is" with a warn-log
+    /// when uniqueness fails. The next re-summarize regenerates the
+    /// body from frontmatter, which self-heals.
+    #[test]
+    fn update_action_item_duplicate_text_bullets_leave_body_unchanged() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let id_a = uuid::Uuid::now_v7();
+        let id_b = uuid::Uuid::now_v7();
+        let mut fm = baseline();
+        fm.action_items = vec![
+            ActionItem {
+                id: id_a,
+                owner: "alice".into(),
+                text: "Follow up".into(),
+                due: None,
+                done: false,
+            },
+            ActionItem {
+                id: id_b,
+                owner: "bob".into(),
+                text: "Follow up".into(),
+                due: None,
+                done: false,
+            },
+        ];
+        let body = "\n- [ ] Follow up\n- [ ] Follow up\n";
+        let path = writer
+            .finalize_session("2026-04-24", "1400", "dupes", &fm, body)
+            .expect("finalize");
+        let body_pre = std::fs::read_to_string(&path).expect("read pre");
+
+        writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        // Frontmatter row patched correctly.
+        let (fm_post, body_post) = read_note(&path).expect("read post");
+        let row_a = fm_post
+            .action_items
+            .iter()
+            .find(|i| i.id == id_a)
+            .expect("a");
+        assert!(row_a.done, "frontmatter row done = true on disk");
+
+        // Body unchanged — neither bullet flipped, since the matcher
+        // can't disambiguate between identical-text rows.
+        let body_pre_only_body = body_pre
+            .split("---\n")
+            .nth(2)
+            .expect("body part of pre-write");
+        let post_body = body_post.as_str();
+        assert_eq!(post_body, body_pre_only_body);
+    }
+
+    /// Patching `owner` and `due` honors the JSON Merge Patch
+    /// double-option semantics: `Some(None)` clears, `Some(Some(_))`
+    /// sets, `None` leaves untouched.
+    #[test]
+    fn update_action_item_owner_due_double_option_semantics() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let (path, id_a, _id_b) = seed_two_actions(&writer);
+
+        // Clear `due`, set `owner` to a new value, leave text/done alone.
+        let updated = writer
+            .update_action_item(
+                &path,
+                &id_a,
+                ActionItemPatch {
+                    owner: Some(Some("teng".into())),
+                    due: Some(None),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect("patch");
+
+        assert_eq!(updated.owner, "teng");
+        assert!(updated.due.is_none(), "Some(None) must clear the due date");
+
+        // No-op patch (every field None / outer absent) is a valid
+        // round-trip; the frontmatter is rewritten verbatim.
+        let updated_again = writer
+            .update_action_item(&path, &id_a, ActionItemPatch::default())
+            .expect("noop patch");
+        assert_eq!(updated_again.owner, "teng");
+        assert!(updated_again.due.is_none());
+    }
+
+    /// `update_action_item` returns `ActionItemNotFound` when the id
+    /// doesn't match any frontmatter row. The note on disk is unchanged
+    /// — no atomic-write happens on the not-found path.
+    #[test]
+    fn update_action_item_not_found_returns_error() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let (path, _id_a, _id_b) = seed_two_actions(&writer);
+
+        let bogus = ItemId::from_u128(0xDEAD_BEEF);
+        let err = writer
+            .update_action_item(
+                &path,
+                &bogus,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+            .expect_err("must error on missing id");
+        match err {
+            VaultError::ActionItemNotFound { id } => assert_eq!(id, bogus),
+            other => panic!("expected ActionItemNotFound, got {other:?}"),
+        }
+
+        // Verify the note on disk is unchanged.
+        let (fm, _body) = read_note(&path).expect("read");
+        assert_eq!(fm.action_items.len(), 2);
+        assert!(fm.action_items.iter().all(|i| !i.done));
+    }
+
+    /// JSON Merge Patch wire shape: a field present-and-null deserializes
+    /// to `Some(None)`, missing decodes to outer `None`, and a value
+    /// decodes to `Some(Some(v))`. Pin the deserializer behavior so the
+    /// frontend's `{owner: null}` "clear" signal can't silently drift
+    /// to "no change".
+    #[test]
+    fn action_item_patch_deserializes_double_option() {
+        // owner: null + due omitted → clear owner, leave due alone.
+        let p: ActionItemPatch =
+            serde_json::from_str(r#"{"owner": null}"#).expect("clear-owner patch");
+        assert_eq!(p.owner, Some(None));
+        assert_eq!(p.due, None);
+        assert_eq!(p.text, None);
+        assert_eq!(p.done, None);
+
+        // owner: "teng" + due: "2026-05-01" → set both.
+        let p: ActionItemPatch = serde_json::from_str(r#"{"owner": "teng", "due": "2026-05-01"}"#)
+            .expect("set-both patch");
+        assert_eq!(p.owner, Some(Some("teng".into())));
+        assert_eq!(p.due, Some(Some("2026-05-01".into())));
+
+        // Empty object → all fields None (no change).
+        let p: ActionItemPatch = serde_json::from_str("{}").expect("empty patch");
+        assert_eq!(p, ActionItemPatch::default());
+
+        // done: true round-trips.
+        let p: ActionItemPatch =
+            serde_json::from_str(r#"{"done": true}"#).expect("done-true patch");
+        assert_eq!(p.done, Some(true));
+    }
+
+    /// Concurrent writes on the same note: two patches against
+    /// different rows interleave through `atomic_write`'s tmp+rename so
+    /// each rename is observed atomically. We don't pin a specific
+    /// final state (the second writer wins) but BOTH writes must
+    /// succeed and the result must be a valid note (not a half-written
+    /// mix of the two patches).
+    #[test]
+    fn update_action_item_concurrent_writes_observe_atomic_renames() {
+        let tmp = TempDir::new().expect("tmp");
+        let writer = VaultWriter::new(tmp.path());
+        let (path, id_a, id_b) = seed_two_actions(&writer);
+        let writer = std::sync::Arc::new(writer);
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let writer_a = std::sync::Arc::clone(&writer);
+        let writer_b = std::sync::Arc::clone(&writer);
+
+        let h1 = std::thread::spawn(move || {
+            writer_a.update_action_item(
+                &path_a,
+                &id_a,
+                ActionItemPatch {
+                    done: Some(true),
+                    ..ActionItemPatch::default()
+                },
+            )
+        });
+        let h2 = std::thread::spawn(move || {
+            writer_b.update_action_item(
+                &path_b,
+                &id_b,
+                ActionItemPatch {
+                    text: Some("Schedule kickoff for next Friday".into()),
+                    ..ActionItemPatch::default()
+                },
+            )
+        });
+        h1.join().expect("join h1").expect("h1 patch");
+        h2.join().expect("join h2").expect("h2 patch");
+
+        // The note is well-formed (parses cleanly). Either thread's
+        // write is the final state, but both action_items rows are
+        // present — the read-merge-write race can lose one update,
+        // matching `atomic_write`'s last-writer-wins semantics. We
+        // pin the parse-cleanly invariant since the alternative —
+        // a corrupted YAML frontmatter — is the failure mode the
+        // tmp+rename atomicity exists to prevent.
+        let (fm, _body) = read_note(&path).expect("post-race note must parse");
+        assert_eq!(fm.action_items.len(), 2);
     }
 
     /// `FileNamingPattern` serializes to the snake_case strings the TS

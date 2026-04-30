@@ -1042,6 +1042,7 @@ mod tests {
             owner: "me".into(),
             text: "preexisting".into(),
             due: None,
+            done: false,
         }];
         let out = client
             .summarize(SummarizerInput {
