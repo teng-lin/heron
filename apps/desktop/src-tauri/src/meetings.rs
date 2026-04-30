@@ -55,7 +55,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use heron_session::{
     CalendarEvent, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus,
-    Platform, PreMeetingContextRequest, Summary, Transcript,
+    Platform, PreMeetingContextRequest, PrepareContextRequest, Summary, Transcript,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -304,6 +304,25 @@ pub async fn heron_attach_context(
 ) -> Result<DaemonOutcome<AttachContextAck>, String> {
     let bearer = state.auth.bearer.clone();
     Ok(attach_context_at(BASE_URL, &bearer, &request).await)
+}
+
+/// Tauri command: auto-prepare a minimal pre-meeting context for a
+/// calendar event. Proxies `POST /v1/context/prepare`.
+///
+/// Called from the Home rail's `ensureFresh` path: as soon as a
+/// calendar window is fetched, the renderer fans out one
+/// `prepare_context` per event so the daemon stages a default
+/// `PreMeetingContext` (today: just `attendees_known`) and the rail
+/// renders a "primed" indicator on each event card. Idempotent on the
+/// daemon side: a manual `attach_context` is never overwritten by a
+/// later `prepare_context`.
+#[tauri::command]
+pub async fn heron_prepare_context(
+    state: State<'_, DaemonHandle>,
+    request: PrepareContextRequest,
+) -> Result<DaemonOutcome<AttachContextAck>, String> {
+    let bearer = state.auth.bearer.clone();
+    Ok(prepare_context_at(BASE_URL, &bearer, &request).await)
 }
 
 /// Body shape for `POST /v1/meetings`. Mirrors
@@ -930,6 +949,52 @@ pub async fn attach_context_at(
     }
 }
 
+/// Parameterized context auto-prepare — same split-out rationale as
+/// [`attach_context_at`]. POSTs the [`PrepareContextRequest`] body
+/// and synthesizes the [`AttachContextAck`] from the request itself
+/// on a 2xx, since the daemon's 204 carries no body. Same trim-to-
+/// match echo as [`attach_context_at`].
+pub async fn prepare_context_at(
+    base_url: &str,
+    bearer: &str,
+    request: &PrepareContextRequest,
+) -> DaemonOutcome<AttachContextAck> {
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: format!("client build: {e}"),
+            };
+        }
+    };
+    let url = format!("{base_url}/context/prepare");
+    let resp = match client
+        .post(url)
+        .bearer_auth(bearer)
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return DaemonOutcome::Unavailable {
+                detail: e.to_string(),
+            };
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return DaemonOutcome::Unavailable {
+            detail: format!("daemon returned {status}"),
+        };
+    }
+    DaemonOutcome::Ok {
+        data: AttachContextAck {
+            calendar_event_id: request.calendar_event_id.trim().to_owned(),
+        },
+    }
+}
+
 async fn parse_response<T>(resp: reqwest::Response) -> DaemonOutcome<T>
 where
     T: serde::de::DeserializeOwned + Serialize,
@@ -961,8 +1026,13 @@ mod tests {
     //! `ListMeetingsPage` / `Summary` JSON.
     use super::*;
     use axum::{
-        Json, Router, extract::Path, extract::Query, http::StatusCode, middleware,
-        response::IntoResponse, routing::get,
+        Json, Router,
+        extract::Path,
+        extract::Query,
+        http::StatusCode,
+        middleware,
+        response::IntoResponse,
+        routing::{get, post},
     };
     use chrono::Utc;
     use heron_session::{
@@ -999,6 +1069,7 @@ mod tests {
                 tokens_out: 612,
                 model: "claude-sonnet-4-6".to_owned(),
             }),
+            action_items: Vec::new(),
         }
     }
 
@@ -1553,6 +1624,7 @@ mod tests {
             }],
             meeting_url: Some("https://zoom.us/j/123".to_owned()),
             related_meetings: Vec::new(),
+            primed: false,
         }
     }
 
@@ -1597,9 +1669,25 @@ mod tests {
             }
         };
 
+        // `/v1/context/prepare` shares the same `last_body` slot as
+        // `/v1/context` — only one of the two routes is exercised per
+        // test, so a shared slot keeps the fixture small without
+        // muddying any assertion.
+        let lbc_prep = Arc::clone(&last_body);
+        let prepare_handler = move |Json(body): Json<serde_json::Value>| {
+            let lbc_prep = Arc::clone(&lbc_prep);
+            async move {
+                if let Ok(mut slot) = lbc_prep.lock() {
+                    *slot = Some(body);
+                }
+                StatusCode::NO_CONTENT
+            }
+        };
+
         let app = Router::new()
             .route("/v1/calendar/upcoming", get(calendar_handler))
             .route("/v1/context", axum::routing::put(attach_handler))
+            .route("/v1/context/prepare", post(prepare_handler))
             .layer(middleware::from_fn(require_bearer));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1797,6 +1885,80 @@ mod tests {
             context: PreMeetingContext::default(),
         };
         let outcome = attach_context_at(&base, "test", &req).await;
+        assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn prepare_context_happy_path_posts_event_id_and_attendees() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, last_body) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let req = heron_session::PrepareContextRequest {
+            calendar_event_id: "EVT-prep-1".to_owned(),
+            attendees: vec![AttendeeContext {
+                name: "Alex Chen".to_owned(),
+                email: Some("alex@example.com".to_owned()),
+                last_seen_in: None,
+                relationship: None,
+                notes: None,
+            }],
+        };
+        let outcome = prepare_context_at(&base, "test", &req).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.calendar_event_id, "EVT-prep-1");
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+
+        let body = last_body
+            .lock()
+            .expect("body mutex")
+            .clone()
+            .expect("prepare handler should have observed a body");
+        assert_eq!(body["calendar_event_id"], "EVT-prep-1");
+        assert_eq!(body["attendees"][0]["name"], "Alex Chen");
+        assert_eq!(body["attendees"][0]["email"], "alex@example.com");
+    }
+
+    #[tokio::test]
+    async fn prepare_context_ack_echoes_trimmed_calendar_event_id() {
+        let evt = sample_calendar_event();
+        let (addr, _tx, _q, _b) = spawn_gap8(evt).await;
+        let base = format!("http://{addr}/v1");
+
+        let req = heron_session::PrepareContextRequest {
+            calendar_event_id: "  EVT-prep-pad  ".to_owned(),
+            attendees: Vec::new(),
+        };
+        let outcome = prepare_context_at(&base, "test", &req).await;
+        match outcome {
+            DaemonOutcome::Ok { data } => {
+                assert_eq!(data.calendar_event_id, "EVT-prep-pad");
+            }
+            DaemonOutcome::Unavailable { detail } => {
+                panic!("expected Ok, got Unavailable: {detail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_context_unavailable_when_port_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let base = format!("http://{addr}/v1");
+
+        let req = heron_session::PrepareContextRequest {
+            calendar_event_id: "EVT-x".to_owned(),
+            attendees: Vec::new(),
+        };
+        let outcome = prepare_context_at(&base, "test", &req).await;
         assert!(matches!(outcome, DaemonOutcome::Unavailable { .. }));
     }
 }

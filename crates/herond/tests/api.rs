@@ -23,6 +23,8 @@ use heron_event::{Envelope, EventId, ReplayCache, ReplayError};
 use heron_session::{
     AudioLevelChannel, AudioLevelData, CalendarEvent, EventPayload, Health, ListMeetingsPage,
     ListMeetingsQuery, Meeting, MeetingId, PreMeetingContextRequest, SessionError, SessionEventBus,
+    CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId,
+    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
     SessionOrchestrator, SpeakerChangedData, StartCaptureArgs, Summary, Transcript,
 };
 use herond::stub::StubOrchestrator;
@@ -177,6 +179,53 @@ async fn stub_orchestrator_endpoints_all_return_501() {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "{method} {path}");
     }
+}
+
+#[tokio::test]
+async fn prepare_context_route_requires_bearer() {
+    // The new `POST /v1/context/prepare` route lives next to
+    // `PUT /v1/context` and inherits the same bearer middleware. Pin
+    // the auth gate so a future router refactor can't accidentally
+    // expose it on the unauthenticated surface.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::post("/v1/context/prepare")
+                .header(header::AUTHORIZATION, "Bearer wrong")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"calendar_event_id":"evt_x","attendees":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn prepare_context_route_reaches_orchestrator() {
+    // Pin the URL/method/auth/extractor wiring end-to-end. The stub
+    // returns `NotYetImplemented` → 501; what we're locking in is
+    // that the route is reachable with valid auth and a valid body
+    // (so the JSON extractor accepts the shape) — not the eventual
+    // 204 success path, which the orchestrator unit tests cover.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::post("/v1/context/prepare")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"calendar_event_id":"evt_route_test","attendees":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = body_json(res).await;
+    assert_eq!(body["code"], "HERON_E_NOT_YET_IMPLEMENTED");
 }
 
 #[tokio::test]
@@ -740,6 +789,7 @@ fn sample_envelope() -> Envelope<EventPayload> {
         summary_status: heron_session::SummaryLifecycle::Pending,
         tags: vec![],
         processing: None,
+        action_items: vec![],
     };
     Envelope::new(EventPayload::MeetingDetected(meeting.clone()))
         .with_meeting(meeting.id.to_string())
@@ -821,6 +871,9 @@ impl SessionOrchestrator for WithCache {
     }
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
         self.inner.attach_context(req).await
+    }
+    async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
+        self.inner.prepare_context(req).await
     }
     async fn health(&self) -> Health {
         self.inner.health().await

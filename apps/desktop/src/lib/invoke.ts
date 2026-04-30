@@ -32,6 +32,7 @@ import type {
   MeetingId,
   Platform,
   PreMeetingContextRequest,
+  PrepareContextRequest,
   Summary,
   Transcript,
 } from "./types";
@@ -656,6 +657,17 @@ export interface HeronCommands {
     returns: number;
   };
   /**
+   * Tier 4 #20: purge `.md` summary files whose mtime is older than
+   * `days`. Returns the count actually deleted. Sibling of
+   * `heron_purge_audio_older_than`; consumes
+   * `Settings.summary_retention_days`. The audio sidecars are never
+   * candidates — the two sweepers operate on disjoint extension sets.
+   */
+  heron_purge_summaries_older_than: {
+    args: { vaultPath: string; days: number };
+    returns: number;
+  };
+  /**
    * Phase 73 (PR-λ): pre-flight disk-space gate. Reads
    * `min_free_disk_mib` from the user's settings.json, asks the OS
    * how much free space the cache volume has, and returns the
@@ -805,6 +817,17 @@ export interface HeronCommands {
    */
   heron_attach_context: {
     args: { request: PreMeetingContextRequest };
+    returns: DaemonResult<AttachContextAck>;
+  };
+  /**
+   * Tier 5 #25: proxy `POST /v1/context/prepare`. Auto-stages a
+   * minimal default `PreMeetingContext` (today: just
+   * `attendees_known`) so the rail can render a "primed" indicator on
+   * each event card. Idempotent on the daemon side: never overwrites
+   * a context attached manually via `heron_attach_context`.
+   */
+  heron_prepare_context: {
+    args: { request: PrepareContextRequest };
     returns: DaemonResult<AttachContextAck>;
   };
   /**
