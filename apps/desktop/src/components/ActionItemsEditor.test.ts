@@ -333,6 +333,69 @@ describe("createActionItemEditController", () => {
     expect(c.getRows()[0].owner).toBe("Teng");
   });
 
+  test("stale rollback does not clobber a newer in-flight success", async () => {
+    // Per CodeRabbit on PR #180: two edits on the same row + field can
+    // complete out of order. An older request failing AFTER a newer
+    // request succeeds must not roll back the newer value — otherwise
+    // the UI shows the stale value while the vault has the new one.
+    //
+    // We script the update to: first call rejects (stale), second call
+    // resolves (current). We hand back manual control over each call
+    // via deferred promises so we can sequence the resolution order.
+    let resolveCall1!: () => void;
+    let rejectCall1!: (err: Error) => void;
+    let resolveCall2!: () => void;
+    const calls: Array<{ patch: ActionItemPatch }> = [];
+    let i = 0;
+    const update = async (args: {
+      vaultPath: string;
+      meetingId: string;
+      itemId: string;
+      patch: ActionItemPatch;
+    }) => {
+      calls.push({ patch: args.patch });
+      const idx = i++;
+      return new Promise<unknown>((resolve, reject) => {
+        if (idx === 0) {
+          rejectCall1 = reject;
+          resolveCall1 = () => resolve(undefined);
+        } else {
+          resolveCall2 = resolve as () => void;
+        }
+      });
+    };
+    const errors: string[] = [];
+    const c = createActionItemEditController([row({ owner: null })], {
+      vaultPath: "/test/vault",
+      meetingId: "mtg_test",
+      update,
+      onError: (m) => errors.push(m),
+    });
+
+    // Issue two owner edits on the same row.
+    const p1 = c.commitOwner(TEST_ITEM_ID, "alice");
+    const p2 = c.commitOwner(TEST_ITEM_ID, "bob");
+
+    // Optimistic state reflects the LATEST op (bob).
+    expect(c.getRows()[0].owner).toBe("bob");
+
+    // The newer (second) call resolves first.
+    resolveCall2();
+    await p2;
+
+    // Then the older (first) call rejects — its rollback would set
+    // owner back to null. The sequence guard MUST prevent that.
+    rejectCall1(new Error("daemon hiccup"));
+    await p1;
+
+    expect(c.getRows()[0].owner).toBe("bob");
+    // The error toast still fires for the failed op.
+    expect(errors).toHaveLength(1);
+    // The reverse case (older succeeds, newer rejects) rolls back
+    // correctly because the newer op IS the latest by sequence.
+    void resolveCall1;
+  });
+
   test("subscribe fires on every state change", async () => {
     const { update } = makeUpdate();
     const c = createActionItemEditController([row()], {

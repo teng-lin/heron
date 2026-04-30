@@ -147,6 +147,18 @@ export function createActionItemEditController(
     return rows.find((r) => r.id === itemId);
   }
 
+  // Per-(row, field-set) sequence number. Two in-flight edits on the
+  // same field can complete out of order — without this, an older
+  // failure rolling back AFTER a newer success leaves the UI showing
+  // the old value while the vault has the new one. Each call records
+  // its sequence, and rollback only fires if we're still the latest.
+  // Per CodeRabbit on PR #180.
+  let opSeq = 0;
+  const latestOpByKey = new Map<string, number>();
+  function opKey(itemId: string, patch: ActionItemPatch): string {
+    return `${itemId}:${Object.keys(patch).sort().join(",")}`;
+  }
+
   async function applyOptimistic(
     itemId: string,
     optimistic: Partial<ActionItemRow>,
@@ -158,6 +170,9 @@ export function createActionItemEditController(
     if (!target || !target.structured || !isStableActionItemId(itemId)) {
       return false;
     }
+    const key = opKey(itemId, patch);
+    const myOp = ++opSeq;
+    latestOpByKey.set(key, myOp);
     patchRow(itemId, optimistic);
     try {
       await update({
@@ -166,9 +181,18 @@ export function createActionItemEditController(
         itemId,
         patch,
       });
+      if (latestOpByKey.get(key) === myOp) {
+        latestOpByKey.delete(key);
+      }
       return true;
     } catch (err) {
-      patchRow(itemId, rollback);
+      // Only roll back if no newer op for this (row, field-set) has
+      // already been issued — the newer op's optimistic value should
+      // win regardless of how it ultimately resolves.
+      if (latestOpByKey.get(key) === myOp) {
+        patchRow(itemId, rollback);
+        latestOpByKey.delete(key);
+      }
       const message = err instanceof Error ? err.message : String(err);
       onError(`${errorPrefix}: ${message}`);
       return false;
@@ -514,6 +538,14 @@ export function ActionItemsEditor({
                         e.preventDefault();
                         cancelEdit();
                       }
+                    }}
+                    onBlur={() => {
+                      // Match the text/owner inputs: blur commits.
+                      // `commit` re-validates the format, so a bad
+                      // input still surfaces the inline alert instead
+                      // of firing a rejected IPC. Per CodeRabbit on
+                      // PR #180.
+                      void commit(item, edit);
                     }}
                     aria-label="Edit due date"
                     placeholder="YYYY-MM-DD"
