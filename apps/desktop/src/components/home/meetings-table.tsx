@@ -8,43 +8,130 @@ import type { Meeting, MeetingStatus, Platform } from "../../lib/types";
 interface MeetingsTableProps {
   query: string;
   filter: StatusFilter;
+  /**
+   * Tag filter compounds with `filter` (status) using AND semantics.
+   *
+   * - `null` — no tag filter applied (default).
+   * - `"untagged"` — show only meetings whose `tags` is missing or empty.
+   * - any other string — show only meetings whose `tags` array contains
+   *   the exact tag (case-insensitive match, since LLM-emitted tags
+   *   aren't case-normalized in the vault).
+   *
+   * Held in Home-page state so the chip click on a row can toggle it
+   * without lifting the whole filter machinery into a store.
+   */
+  tagFilter: TagFilter;
+  /**
+   * Click-handler for a row-level tag chip. Optional so callers that
+   * don't want chip-click filtering (e.g. Review page, where tags are
+   * decorative) can omit it. When provided, clicking the chip stops
+   * row navigation and hands the tag string up.
+   */
+  onTagClick?: (tag: string) => void;
 }
 
 export type StatusFilter = "all" | "active" | "done";
 
-export function MeetingsTable({ query, filter }: MeetingsTableProps) {
+/** See `MeetingsTableProps.tagFilter`. */
+export type TagFilter = null | "untagged" | string;
+
+/**
+ * Pure predicate used by `MeetingsTable` to filter the rendered list.
+ *
+ * Extracted so the status × tag × free-text matrix can be unit-pinned
+ * without spinning up a React renderer (the rest of the file's tests
+ * follow the same pure-helper pattern as `Review.test.ts`).
+ *
+ * Semantics:
+ *
+ *   - `filter` (status):
+ *       - `"all"` — no status constraint.
+ *       - `"active"` — drop `done` / `failed`.
+ *       - `"done"` — keep only `done`.
+ *   - `tagFilter`:
+ *       - `null` — no tag constraint.
+ *       - `"untagged"` — keep only meetings whose `tags` is empty / missing.
+ *       - any string — keep only meetings whose `tags` contains it
+ *         (case-insensitive exact match).
+ *   - `query` (free text): empty → no constraint. Otherwise the
+ *     lowercased substring is searched against title, platform label
+ *     (`"Google Meet"`) and wire value (`"google_meet"`), participant
+ *     names, and tag strings (a typed query of `"react"` matches a
+ *     meeting tagged `"react"`).
+ *
+ * All three axes compose with AND.
+ */
+export function filterMeetings(
+  items: Meeting[],
+  query: string,
+  filter: StatusFilter,
+  tagFilter: TagFilter,
+): Meeting[] {
+  const q = query.trim().toLowerCase();
+  const normalizedTag =
+    typeof tagFilter === "string" && tagFilter !== "untagged"
+      ? tagFilter.toLowerCase()
+      : null;
+  return items.filter((m) => {
+    if (filter === "active" && (m.status === "done" || m.status === "failed")) {
+      return false;
+    }
+    if (filter === "done" && m.status !== "done") {
+      return false;
+    }
+    // Tag filter is independent of status filter — they compose AND.
+    // `tags` is optional on the wire (back-compat with pre-Tier-0-#1
+    // daemons), so coalesce to `[]` before reading.
+    const tags = m.tags ?? [];
+    if (tagFilter === "untagged" && tags.length > 0) {
+      return false;
+    }
+    if (
+      normalizedTag !== null &&
+      !tags.some((t) => t.toLowerCase() === normalizedTag)
+    ) {
+      return false;
+    }
+    if (q.length === 0) return true;
+    const title = (m.title ?? "").toLowerCase();
+    const matchesTitle = title.includes(q);
+    // Match against the rendered label ("Google Meet") as well as
+    // the wire value ("google_meet") so a query like "google meet"
+    // hits the row the user is actually looking at. The label
+    // lookup is defensive against platforms the daemon emits ahead
+    // of a frontend update — we fall back to the wire value rather
+    // than crashing the whole table.
+    const platformLabel = (
+      PLATFORM_LABEL[m.platform] ?? m.platform
+    ).toLowerCase();
+    const matchesPlatform =
+      platformLabel.includes(q) || m.platform.includes(q);
+    const matchesParticipant = m.participants.some((p) =>
+      p.display_name.toLowerCase().includes(q),
+    );
+    const matchesTag = tags.some((t) => t.toLowerCase().includes(q));
+    return matchesTitle || matchesPlatform || matchesParticipant || matchesTag;
+  });
+}
+
+/**
+ * Tag chips render with a leading `#` to mirror the social-style tag
+ * vocabulary the LLM summarizer emits and to disambiguate them from
+ * platform/status badges (which are uppercase, no prefix).
+ */
+export function MeetingsTable({
+  query,
+  filter,
+  tagFilter,
+  onTagClick,
+}: MeetingsTableProps) {
   const items = useMeetingsStore((s) => s.items);
   const loading = useMeetingsStore((s) => s.loading);
 
-  const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return items.filter((m) => {
-      if (filter === "active" && (m.status === "done" || m.status === "failed")) {
-        return false;
-      }
-      if (filter === "done" && m.status !== "done") {
-        return false;
-      }
-      if (q.length === 0) return true;
-      const title = (m.title ?? "").toLowerCase();
-      const matchesTitle = title.includes(q);
-      // Match against the rendered label ("Google Meet") as well as
-      // the wire value ("google_meet") so a query like "google meet"
-      // hits the row the user is actually looking at. The label
-      // lookup is defensive against platforms the daemon emits ahead
-      // of a frontend update — we fall back to the wire value rather
-      // than crashing the whole table.
-      const platformLabel = (
-        PLATFORM_LABEL[m.platform] ?? m.platform
-      ).toLowerCase();
-      const matchesPlatform =
-        platformLabel.includes(q) || m.platform.includes(q);
-      const matchesParticipant = m.participants.some((p) =>
-        p.display_name.toLowerCase().includes(q),
-      );
-      return matchesTitle || matchesPlatform || matchesParticipant;
-    });
-  }, [items, query, filter]);
+  const rows = useMemo(
+    () => filterMeetings(items, query, filter, tagFilter),
+    [items, query, filter, tagFilter],
+  );
 
   if (loading && items.length === 0) {
     return <SkeletonRows />;
@@ -100,7 +187,7 @@ export function MeetingsTable({ query, filter }: MeetingsTableProps) {
         </thead>
         <tbody>
           {rows.map((m) => (
-            <Row key={m.id} meeting={m} />
+            <Row key={m.id} meeting={m} onTagClick={onTagClick} />
           ))}
         </tbody>
       </table>
@@ -108,10 +195,19 @@ export function MeetingsTable({ query, filter }: MeetingsTableProps) {
   );
 }
 
-function Row({ meeting }: { meeting: Meeting }) {
+function Row({
+  meeting,
+  onTagClick,
+}: {
+  meeting: Meeting;
+  onTagClick?: (tag: string) => void;
+}) {
   const navigate = useNavigate();
   const fetchSummary = useMeetingsStore((s) => s.fetchSummary);
   const summary = useMeetingsStore((s) => s.summaries[meeting.id]);
+  // Coalesce optional `tags` (back-compat with pre-Tier-0-#1 daemons,
+  // see `Meeting.tags` doc).
+  const tags = meeting.tags ?? [];
 
   const previewText =
     summary && summary !== "unavailable"
@@ -177,6 +273,26 @@ function Row({ meeting }: { meeting: Meeting }) {
             )}
           </div>
         )}
+        {tags.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1">
+            {tags.map((tag) => (
+              <TagChip
+                key={tag}
+                tag={tag}
+                onClick={
+                  onTagClick
+                    ? (e) => {
+                        // Stop the row's onClick from also firing —
+                        // chip click should filter, not navigate.
+                        e.stopPropagation();
+                        onTagClick(tag);
+                      }
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        )}
       </td>
       <td className="px-4 py-3 align-top">
         <PlatformBadge platform={meeting.platform} />
@@ -206,6 +322,53 @@ const PLATFORM_LABEL: Record<Platform, string> = {
   microsoft_teams: "Teams",
   webex: "Webex",
 };
+
+/**
+ * Render an LLM-emitted topic tag as a pill chip with a leading `#`.
+ *
+ * Same chip skeleton as `PlatformBadge` (rounded-full border, mono
+ * 10px) so the row's badge vocabulary stays visually consistent. When
+ * `onClick` is supplied, the chip becomes a button and stops event
+ * propagation (the parent `<tr>` is a row-link to /review/{id} —
+ * without `stopPropagation` clicking the chip would also navigate).
+ *
+ * Exported so the Review page header can render the same shape
+ * without re-deriving the tailwind/CSS-var combo.
+ */
+export function TagChip({
+  tag,
+  onClick,
+}: {
+  tag: string;
+  onClick?: (event: React.MouseEvent<HTMLElement>) => void;
+}) {
+  const className =
+    "inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-[10px] tracking-[0.04em]";
+  const style = {
+    color: "var(--color-ink-3)",
+    borderColor: "var(--color-rule-2)",
+    background: "var(--color-paper-2)",
+  } as const;
+  const label = `#${tag}`;
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`${className} cursor-pointer transition-colors hover:bg-paper-3`}
+        style={style}
+        title={`Filter by ${label}`}
+      >
+        {label}
+      </button>
+    );
+  }
+  return (
+    <span className={className} style={style}>
+      {label}
+    </span>
+  );
+}
 
 function PlatformBadge({ platform }: { platform: Platform }) {
   return (
