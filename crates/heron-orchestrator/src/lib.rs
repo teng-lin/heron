@@ -1536,19 +1536,20 @@ fn health_component(state: ComponentState, message: impl Into<String>) -> Health
 }
 
 fn aggregate_health_status(components: &HealthComponents) -> HealthStatus {
-    // Keep this list in sync with the fields of `HealthComponents`.
-    // A field added there but missed here would silently never flip
-    // `/health` to `Down` even when the new component is broken —
-    // `aggregate_health_status_truth_table` only pins behavior for
-    // the components listed below.
+    // Destructure so the compiler errors on a new `HealthComponents`
+    // field that this aggregator forgets — otherwise a broken new
+    // component could silently never flip `/health` to `Down`
+    // (`aggregate_health_status_truth_table` only pins the components
+    // currently listed).
+    let HealthComponents {
+        capture,
+        whisperkit,
+        vault,
+        eventkit,
+        llm,
+    } = components;
     let mut degraded = false;
-    for component in [
-        &components.capture,
-        &components.whisperkit,
-        &components.vault,
-        &components.eventkit,
-        &components.llm,
-    ] {
+    for component in [capture, whisperkit, vault, eventkit, llm] {
         match component.state {
             ComponentState::Down | ComponentState::PermissionMissing => return HealthStatus::Down,
             ComponentState::Degraded => degraded = true,
@@ -1647,7 +1648,15 @@ fn vault_health_component(vault_root: Option<&Path>) -> HealthComponent {
                 root.display(),
             ),
         ),
-        None => health_component(ComponentState::Down, "vault root is not configured"),
+        // Unconfigured vault keeps the daemon usable via synthetic
+        // capture (see `capture_health_component`); reporting `Down`
+        // here would flip `/health` to `Down` for what is really a
+        // soft, recoverable misconfig — operators expect `Down` to
+        // mean "broken", not "not yet pointed at a directory".
+        None => health_component(
+            ComponentState::Degraded,
+            "vault root is not configured; persistence is disabled until one is set",
+        ),
     }
 }
 
@@ -2439,18 +2448,50 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         // endpoint reports local orchestrator wiring and cheap backend
         // availability; operation-specific failures still surface from
         // the corresponding read/capture/summarize paths.
-        let components = HealthComponents {
-            capture: capture_health_component(self.vault_root.as_deref()),
-            whisperkit: stt_health_component(&self.stt_backend_name),
-            vault: vault_health_component(self.vault_root.as_deref()),
-            eventkit: eventkit_health_component(),
-            llm: llm_health_component(self.llm_preference),
-        };
-        let status = aggregate_health_status(&components);
-        Health {
-            status,
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-            components,
+        //
+        // The probes do touch the filesystem (`Path::exists`) and
+        // PATH (`which` inside `heron_llm::Availability::detect`),
+        // both blocking syscalls — run them on the blocking pool so
+        // an unlucky disk stall can't park the async runtime.
+        let vault_root = self.vault_root.clone();
+        let stt_backend_name = self.stt_backend_name.clone();
+        let llm_preference = self.llm_preference;
+        let probe = tokio::task::spawn_blocking(move || {
+            let components = HealthComponents {
+                capture: capture_health_component(vault_root.as_deref()),
+                whisperkit: stt_health_component(&stt_backend_name),
+                vault: vault_health_component(vault_root.as_deref()),
+                eventkit: eventkit_health_component(),
+                llm: llm_health_component(llm_preference),
+            };
+            let status = aggregate_health_status(&components);
+            Health {
+                status,
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                components,
+            }
+        })
+        .await;
+        match probe {
+            Ok(health) => health,
+            // Probe functions don't panic and the runtime doesn't
+            // cancel us, so a `JoinError` here means a real bug —
+            // surface it as `Down` rather than panic, so a single
+            // bad health probe can't take the daemon down with it.
+            Err(err) => Health {
+                status: HealthStatus::Down,
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                components: HealthComponents {
+                    capture: health_component(
+                        ComponentState::Down,
+                        format!("health probe task failed: {err}"),
+                    ),
+                    whisperkit: health_component(ComponentState::Down, "health probe task failed"),
+                    vault: health_component(ComponentState::Down, "health probe task failed"),
+                    eventkit: health_component(ComponentState::Down, "health probe task failed"),
+                    llm: health_component(ComponentState::Down, "health probe task failed"),
+                },
+            },
         }
     }
 
@@ -3187,12 +3228,16 @@ mod tests {
         // EventKit TCC prompts, model downloads, or hosted LLM calls.
         let orch = LocalSessionOrchestrator::new();
         let h = orch.health().await;
-        assert!(matches!(h.status, HealthStatus::Down));
+        // Aggregate isn't pinned here: capture and vault are both
+        // `Degraded` (no configured root → synthetic-only), but the
+        // `llm` probe depends on env keys / `claude` / `codex` on
+        // PATH and may be `Down`, which would dominate. The truth-
+        // table test pins the aggregation contract directly.
         assert!(matches!(
             h.components.capture.state,
             ComponentState::Degraded
         ));
-        assert!(matches!(h.components.vault.state, ComponentState::Down));
+        assert!(matches!(h.components.vault.state, ComponentState::Degraded));
         assert!(matches!(h.components.eventkit.state, ComponentState::Ok));
         // The default `sherpa` STT backend reports available
         // unconditionally, so whisperkit pins to `Ok` regardless of
