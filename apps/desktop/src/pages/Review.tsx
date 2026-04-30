@@ -95,6 +95,13 @@ function formatBackupTime(iso: string): string {
   }).format(d);
 }
 
+const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ACTION_ITEM_DUE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+
 /**
  * `Frontmatter.action_items[].due` is `YYYY-MM-DD` (a calendar date,
  * not a timestamp). Parsing it through `new Date(iso)` would treat
@@ -107,7 +114,7 @@ function formatBackupTime(iso: string): string {
  * change shouldn't render `Invalid Date`).
  */
 export function formatActionItemDue(iso: string): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  const match = ISO_DATE_RE.exec(iso);
   if (!match) return iso;
   const [, y, m, d] = match;
   const yi = Number(y);
@@ -126,11 +133,7 @@ export function formatActionItemDue(iso: string): string {
   ) {
     return iso;
   }
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  }).format(date);
+  return ACTION_ITEM_DUE_FORMATTER.format(date);
 }
 
 /**
