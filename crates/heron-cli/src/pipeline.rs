@@ -235,8 +235,6 @@ pub async fn run_pipeline(
     fsm.on_transcribe_done()?;
     persist_state(config, SessionPhase::Summarizing, started_at_wall)?;
 
-    let date_str = started_at_wall.format("%Y-%m-%d").to_string();
-    let start_hhmm = started_at_wall.format("%H%M").to_string();
     let frontmatter_start = started_at_wall.format("%H:%M").to_string();
 
     // Calendar lookup. Picks the event whose [start, end] window has
@@ -258,14 +256,18 @@ pub async fn run_pipeline(
             None
         }
     };
-    let (slug_owned, calendar_attendees) = match &calendar_match {
+    // The raw calendar title feeds [`heron_vault::VaultWriter::finalize_with_pattern`]'s
+    // slugify pipeline; Tier 4 #19 owns transliteration / reserved-char
+    // strip / length cap / collision suffix on the writer side. An
+    // empty title (no calendar match) sends the writer down its
+    // empty-slug → `Id` fallback path so the note still finalizes.
+    let (title_for_pattern, calendar_attendees) = match &calendar_match {
         Some(event) => (
-            slug_from_title(&event.title),
+            event.title.clone(),
             Some(calendar_attendees_to_attendees(&event.attendees)),
         ),
-        None => ("untitled".to_owned(), None),
+        None => (String::new(), None),
     };
-    let slug = &slug_owned;
 
     // LLM summarize. A failure here is non-fatal — we still write a
     // transcript-only note so the user has the raw turns to read.
@@ -349,11 +351,24 @@ pub async fn run_pipeline(
     };
 
     let writer = heron_vault::VaultWriter::new(&config.vault_root);
-    let note_path = match writer.finalize_session(&date_str, &start_hhmm, slug, &frontmatter, &body)
-    {
+    // Tier 4 #19: every pattern (`Id` / `Slug` / `DateSlug`) routes
+    // through `finalize_with_pattern`. `Id` writes `<uuid>.md` per
+    // the Tier 1 schema declaration; the slug variants run the
+    // slugify + collision pipeline owned by the writer. The legacy
+    // `finalize_session` (`<date>-<hhmm> <slug>.md` template) stays
+    // on heron-vault for read-side test fixtures that pre-date Tier 4.
+    let date = started_at_wall.date_naive();
+    let note_path = match writer.finalize_with_pattern(
+        config.file_naming_pattern,
+        config.session_id,
+        &title_for_pattern,
+        date,
+        &frontmatter,
+        &body,
+    ) {
         Ok(p) => Some(p),
         Err(e) => {
-            tracing::error!(error = %e, "vault finalize_session failed; note not written");
+            tracing::error!(error = %e, "vault finalize_with_pattern failed; note not written");
             None
         }
     };
@@ -748,12 +763,18 @@ fn pick_best_calendar_event(
 /// bytes; the surrounding `YYYY-MM-DD-HHMM <slug>.md` template eats
 /// 22 bytes (date + space + ".md"), so 200 leaves comfortable room
 /// for date-prefix changes without ever provoking ENAMETOOLONG.
+#[cfg(test)]
 const MAX_SLUG_BYTES: usize = 200;
 
 /// Strip path-unsafe characters from a calendar title so it can sit in
-/// the `YYYY-MM-DD-HHMM <slug>.md` filename template. Keeps spaces
-/// (per §3.2 the template explicitly allows them) and collapses
-/// whitespace runs. Empty or all-stripped titles return `"untitled"`.
+/// the legacy `YYYY-MM-DD-HHMM <slug>.md` filename template. Kept on
+/// the `#[cfg(test)]` surface only — Tier 4 #19 routes the production
+/// pipeline through `heron_vault::slugify`, which handles the same
+/// concerns plus deunicode transliteration. The retained tests pin
+/// historical behavior so a future change that reverts to the legacy
+/// template doesn't silently regress the safety guarantees this fn
+/// already encoded.
+#[cfg(test)]
 fn slug_from_title(title: &str) -> String {
     let cleaned: String = title
         .chars()

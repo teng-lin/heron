@@ -92,6 +92,12 @@ pulldown-cmark = "0.12"
 # but unused unless prompt-side ID preservation fails frequently)
 strsim = "0.11"
 
+# Pure-Rust ASCII transliteration of Unicode meeting titles. Used by
+# `heron-vault::writer` to produce filesystem-safe slugs from
+# non-ASCII calendar event titles ("Café résumé 中文" → "Cafe resume
+# Zhong Wen "). BSD-3-Clause, allow-listed in `deny.toml`.
+deunicode = "1.6"
+
 heron-types = { path = "crates/heron-types" }
 heron-audio = { path = "crates/heron-audio" }
 heron-speech = { path = "crates/heron-speech" }

@@ -790,14 +790,32 @@ pub fn run() {
             // soft-failed inside `daemon::install`).
             let vault_root = resolve_vault_root();
             let app_handle = app.handle().clone();
+            // Tier 4 #19: read the saved `file_naming_pattern` once at
+            // boot so the in-process orchestrator threads the right
+            // slug strategy through every subsequent capture's
+            // `CliSessionConfig`. Settings changes via the Settings
+            // pane only land on the next launch — same cadence the
+            // existing `stt_backend_name` / `llm_preference` fields
+            // use. A read failure (corrupt settings.json, first run
+            // with no file) defaults the pattern to `Id`, preserving
+            // the legacy `<date>-<hhmm> <slug>.md` template.
+            let boot_settings = read_settings(&default_settings_path()).unwrap_or_default();
+            let file_naming_pattern: heron_vault::FileNamingPattern =
+                boot_settings.file_naming_pattern.into();
             tauri::async_runtime::block_on(async move {
                 let orchestrator = match vault_root {
                     Some(root) => {
                         tracing::info!(
                             vault_root = %root.display(),
+                            ?file_naming_pattern,
                             "in-process orchestrator: read-side wired against vault",
                         );
-                        Arc::new(LocalSessionOrchestrator::with_vault(root))
+                        Arc::new(
+                            heron_orchestrator::Builder::default()
+                                .vault_root(root)
+                                .file_naming_pattern(file_naming_pattern)
+                                .build(),
+                        )
                     }
                     None => {
                         // Sandboxed test runner / no home dir.

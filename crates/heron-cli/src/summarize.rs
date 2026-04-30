@@ -125,6 +125,10 @@ pub async fn re_summarize_in_vault(
         // Re-summarize doesn't run a live capture, so there are no AX
         // events to bridge.
         event_bus: None,
+        // Re-summarize never finalizes a fresh note (it merges into an
+        // existing one through `re_summarize_note`), so the field is
+        // unread on this path. Use the `Id` default for shape.
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
     };
     let orch = session::Orchestrator::new(cfg);
     let output = orch

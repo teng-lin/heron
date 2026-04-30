@@ -221,6 +221,8 @@ async fn run_summarize(
         // Re-summarize never starts a live capture, so there are no
         // AX events to bridge onto the bus.
         event_bus: None,
+        // Re-summarize doesn't finalize a fresh note; pattern is unread.
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
     };
     let orch = Orchestrator::new(cfg);
     orch.re_summarize_note(summarizer, note_path, meeting_type, transcript)

@@ -98,7 +98,8 @@ use heron_types::{RecordingFsm, SummaryOutcome};
 
 use crate::live_session::{DynLiveSession, LiveSessionFactory, LiveSessionStartArgs};
 use heron_vault::{
-    CalendarReader, EventKitCalendarReader, VaultError, epoch_seconds_to_utc, read_note,
+    CalendarReader, EventKitCalendarReader, FileNamingPattern, VaultError, epoch_seconds_to_utc,
+    read_note,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
@@ -194,6 +195,16 @@ pub struct LocalSessionOrchestrator {
     cache_dir: PathBuf,
     stt_backend_name: String,
     llm_preference: heron_llm::Preference,
+    /// Tier 4 #19: vault-writer slug strategy forwarded to every
+    /// `CliSessionConfig` this orchestrator hands to the v1 pipeline.
+    /// Read once from `Settings::file_naming_pattern` at orchestrator
+    /// construction, mirroring the existing `stt_backend_name` /
+    /// `llm_preference` cadence — runtime changes via the Settings
+    /// pane only land on the next app launch. Default
+    /// [`FileNamingPattern::Id`] preserves the legacy
+    /// `<date>-<hhmm> <slug>.md` template (heron-cli's pre-Tier-4
+    /// behavior on `Id`).
+    file_naming_pattern: FileNamingPattern,
     /// In-flight captures keyed by `MeetingId`. Each entry pairs the
     /// last-published `Meeting` snapshot with the [`RecordingFsm`]
     /// driving its lifecycle. Held under a sync `Mutex` (no `.await`
@@ -382,6 +393,7 @@ pub struct Builder {
     cache_dir: PathBuf,
     stt_backend_name: String,
     llm_preference: heron_llm::Preference,
+    file_naming_pattern: FileNamingPattern,
     live_session_factory: Option<Arc<dyn LiveSessionFactory>>,
 }
 
@@ -396,6 +408,7 @@ impl std::fmt::Debug for Builder {
             .field("cache_dir", &self.cache_dir)
             .field("stt_backend_name", &self.stt_backend_name)
             .field("llm_preference", &self.llm_preference)
+            .field("file_naming_pattern", &self.file_naming_pattern)
             .field(
                 "live_session_factory",
                 &self
@@ -418,6 +431,7 @@ impl Default for Builder {
             cache_dir: default_cache_dir(),
             stt_backend_name: "sherpa".to_owned(),
             llm_preference: heron_llm::Preference::Auto,
+            file_naming_pattern: FileNamingPattern::Id,
             live_session_factory: None,
         }
     }
@@ -491,6 +505,18 @@ impl Builder {
         self
     }
 
+    /// Tier 4 #19: configure the vault-writer slug strategy forwarded
+    /// to every `CliSessionConfig` this orchestrator builds. Read once
+    /// from `Settings::file_naming_pattern` by the desktop / herond
+    /// boot path. Defaults to [`FileNamingPattern::Id`] — the
+    /// pre-Tier-1 `<date>-<hhmm> <slug>.md` template the CLI produces
+    /// when the field stays at its default — so existing test setups
+    /// that don't call this method see no behavior change.
+    pub fn file_naming_pattern(mut self, pattern: FileNamingPattern) -> Self {
+        self.file_naming_pattern = pattern;
+        self
+    }
+
     /// Install a [`LiveSessionFactory`] that `start_capture` invokes
     /// to compose the v2 four-layer stack alongside the v1 vault
     /// pipeline. Without this, `start_capture` only runs the v1
@@ -546,6 +572,7 @@ impl Builder {
             cache_dir: self.cache_dir,
             stt_backend_name: self.stt_backend_name,
             llm_preference: self.llm_preference,
+            file_naming_pattern: self.file_naming_pattern,
             active_meetings: Mutex::new(HashMap::new()),
             finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
             pending_contexts: PendingContexts::new(),
@@ -1350,6 +1377,10 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     // private channel. Cheap clone — the bus is
                     // `Arc`-backed inside.
                     event_bus: Some((self.bus.clone(), id)),
+                    // Tier 4 #19: forward the orchestrator's slug
+                    // strategy so `pipeline.rs` picks the right
+                    // `<vault>/meetings/<filename>.md` shape.
+                    file_naming_pattern: self.file_naming_pattern,
                 };
                 let handle = tokio::task::spawn_blocking(move || {
                     // CoreAudio/cpal handles in the capture path are
@@ -2434,6 +2465,25 @@ mod tests {
         // any lingering item before re-asserting.
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(orch.cache_len(), 2, "FIFO eviction should cap at 2");
+    }
+
+    /// Tier 4 #19: `Builder::file_naming_pattern` threads through to
+    /// `LocalSessionOrchestrator::file_naming_pattern`, the field
+    /// `start_capture` reads when assembling each `CliSessionConfig`.
+    /// Without this hand-off the desktop / herond boot path's
+    /// `read_settings(...).file_naming_pattern` value lands nowhere.
+    #[tokio::test]
+    async fn builder_file_naming_pattern_threads_through() {
+        let orch = Builder::default()
+            .file_naming_pattern(FileNamingPattern::DateSlug)
+            .build();
+        assert_eq!(orch.file_naming_pattern, FileNamingPattern::DateSlug);
+
+        // Default stays at `Id` so unrelated tests don't see a behavior
+        // change. Pinned alongside the override path so a later
+        // regression that flips the default falls into this test.
+        let default_orch = LocalSessionOrchestrator::new();
+        assert_eq!(default_orch.file_naming_pattern, FileNamingPattern::Id);
     }
 
     #[tokio::test]

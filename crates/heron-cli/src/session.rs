@@ -102,6 +102,12 @@ pub struct SessionConfig {
     ///
     /// [`SpeakerEvent`]: heron_types::SpeakerEvent
     pub event_bus: Option<(SessionEventBus, MeetingId)>,
+    /// Tier 4 #19: vault-writer slug strategy. Forwarded by the daemon
+    /// orchestrator from `Settings::file_naming_pattern`. Defaults to
+    /// [`heron_vault::FileNamingPattern::Id`] (the pre-Tier-1
+    /// `<uuid>.md` convention) so existing callers that don't set the
+    /// field keep their current naming behavior.
+    pub file_naming_pattern: heron_vault::FileNamingPattern,
 }
 
 /// Outcome of `run_no_op` and `run`.
@@ -368,6 +374,7 @@ mod tests {
             llm_preference: heron_llm::Preference::Auto,
             pre_meeting_briefing: None,
             event_bus: None,
+            file_naming_pattern: heron_vault::FileNamingPattern::Id,
         }
     }
 

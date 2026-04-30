@@ -25,6 +25,7 @@ fn cfg(tmp: &TempDir) -> SessionConfig {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
     }
 }
 

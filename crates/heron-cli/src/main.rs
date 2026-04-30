@@ -681,6 +681,10 @@ fn cmd_record(args: RecordArgs, vault: Option<PathBuf>) -> Result<()> {
         // CLI captures have no SSE consumer listening, so the AX
         // bridge stays an offline-aligner-only feed.
         event_bus: None,
+        // CLI captures preserve the legacy `<date>-<hhmm> <slug>.md`
+        // template — the daemon path is the surface that flips this
+        // via `Settings::file_naming_pattern`.
+        file_naming_pattern: heron_vault::FileNamingPattern::Id,
     };
 
     if args.no_op {
