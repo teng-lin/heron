@@ -11,6 +11,11 @@
 //!   `mtime` is older than the configured retention window. The
 //!   matching `.md` summary is **always** kept; only the lossy/lossless
 //!   audio sidecars are candidates.
+//! - [`purge_summaries_older_than`] — Tier 4 sibling of the audio
+//!   sweeper: deletes `.md` summary files whose `mtime` is older than
+//!   the `Settings.summary_retention_days` window. The two predicates
+//!   are mutually exclusive — the audio sweeper never touches `.md`,
+//!   and the summary sweeper never touches `.wav` / `.m4a` / `.bak`.
 //!
 //! ## Path-safety contract
 //!
@@ -45,6 +50,17 @@ use thiserror::Error;
 /// Compared in lowercase against `Path::extension()`'s lossy UTF-8
 /// view; mixed-case (`Foo.WAV`) is treated as audio.
 const AUDIO_EXTENSIONS: &[&str] = &["wav", "m4a"];
+
+/// File extensions Tier 4 considers "summary notes" — the only
+/// candidates [`purge_summaries_older_than`] will delete.
+///
+/// Disjoint from [`AUDIO_EXTENSIONS`] by construction: the summary
+/// sweeper must never delete an audio sidecar, and the audio sweeper
+/// must never delete a summary. The
+/// `summary_extensions_disjoint_from_audio_extensions` test pins the
+/// invariant so a future maintainer who accidentally adds `wav` here
+/// (or `md` to the audio list) sees a red test, not a data-loss bug.
+const SUMMARY_EXTENSIONS: &[&str] = &["md"];
 
 /// Extensions that count toward the "session count" gauge. PR-ε ships
 /// `.bak` next to edited notes; counting them here would double-count
@@ -129,6 +145,40 @@ pub fn disk_usage(vault: &Path) -> Result<DiskUsage, DiskError> {
 /// pane should not let this through (the form clamps to ≥ 1) but the
 /// command is permissive about it for tests + scripted purges.
 pub fn purge_audio_older_than(vault: &Path, days: u32) -> Result<u32, DiskError> {
+    purge_by_extension(vault, days, AUDIO_EXTENSIONS)
+}
+
+/// Delete `.md` summary files at the vault root whose `mtime` is
+/// older than `days` days ago. Returns the count actually purged.
+///
+/// Tier 4 sibling of [`purge_audio_older_than`]. Mirrors the same
+/// shape: walk the (flat) vault, match against an extension allow-
+/// list, delete entries older than the cutoff, return the count.
+///
+/// **Cross-sweeper contract:** `.wav` / `.m4a` audio sidecars are
+/// **never** candidates. The two sweepers' allow-lists are disjoint
+/// by construction (see [`SUMMARY_EXTENSIONS`] vs
+/// [`AUDIO_EXTENSIONS`]) and the
+/// `summary_extensions_disjoint_from_audio_extensions` test pins the
+/// invariant. A regression that conflated the two predicates
+/// (e.g. a future refactor that shared a single allow-list) would
+/// cause the summary sweeper to wipe audio sidecars at the same age,
+/// silently widening the user's data-loss window. The
+/// `purge_summaries_keeps_audio_deletes_old_md` test catches that.
+///
+/// Symlinks are skipped wholesale. A `days = 0` argument is permissive
+/// (purge everything), matching the audio sweeper's semantics — the
+/// Settings pane is expected to clamp at the form layer.
+pub fn purge_summaries_older_than(vault: &Path, days: u32) -> Result<u32, DiskError> {
+    purge_by_extension(vault, days, SUMMARY_EXTENSIONS)
+}
+
+/// Shared walk for the two retention sweepers. Centralizing the
+/// canonicalize → cutoff → walk → filter-by-extension → delete loop
+/// keeps the two surfaces identical except for the allow-list, so a
+/// fix to one (concurrent-delete handling, symlink policy, cutoff
+/// arithmetic) automatically applies to the other.
+fn purge_by_extension(vault: &Path, days: u32, allowed: &[&str]) -> Result<u32, DiskError> {
     let vault = canonical_vault(vault)?;
     let now = SystemTime::now();
     // `u64` seconds in a day fits trivially; use `u64` so the
@@ -150,7 +200,7 @@ pub fn purge_audio_older_than(vault: &Path, days: u32) -> Result<u32, DiskError>
         }
         let path = entry.path();
         let ext = lowercase_extension(&path);
-        if !AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+        if !allowed.contains(&ext.as_str()) {
             continue;
         }
         let mtime = entry.metadata()?.modified()?;
@@ -377,6 +427,140 @@ mod tests {
         let purged = purge_audio_older_than(tmp.path(), 7).expect("purge");
         assert_eq!(purged, 1);
         assert!(!upper.exists());
+    }
+
+    /// Tier 4 disjoint-list invariant: the audio and summary sweepers
+    /// must never share an extension. A future change that put `md`
+    /// in [`AUDIO_EXTENSIONS`] (or `wav`/`m4a` in
+    /// [`SUMMARY_EXTENSIONS`]) would silently widen one sweeper's
+    /// blast radius into the other's territory, deleting user data
+    /// the corresponding setting promised to retain.
+    #[test]
+    fn summary_extensions_disjoint_from_audio_extensions() {
+        for ext in SUMMARY_EXTENSIONS {
+            assert!(
+                !AUDIO_EXTENSIONS.contains(ext),
+                "{ext} appears in both SUMMARY_EXTENSIONS and AUDIO_EXTENSIONS \
+                 — the two retention sweepers must operate on disjoint sets"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_summaries_keeps_audio_deletes_old_md() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let md_old = write_file(tmp.path(), "old.md", b"old-summary");
+        let md_new = write_file(tmp.path(), "new.md", b"fresh-summary");
+        // The cross-test that pins the audio/summary boundary: even
+        // when the audio sidecars are *also* old, the summary sweeper
+        // must leave them untouched. A regression that conflates the
+        // two predicates (e.g. shares a single allow-list) would purge
+        // these too and the assertions below would fail loudly.
+        let wav_old = write_file(tmp.path(), "old.wav", &[0u8; 8]);
+        let m4a_old = write_file(tmp.path(), "old.m4a", &[0u8; 8]);
+
+        backdate(&md_old, 10);
+        backdate(&wav_old, 10);
+        backdate(&m4a_old, 10);
+        // md_new is fresh — leave its mtime alone.
+
+        let purged = purge_summaries_older_than(tmp.path(), 7).expect("purge");
+        assert_eq!(purged, 1);
+        assert!(!md_old.exists());
+        assert!(md_new.exists(), "fresh summary must survive");
+        assert!(
+            wav_old.exists(),
+            ".wav must not be purged by summary sweeper"
+        );
+        assert!(
+            m4a_old.exists(),
+            ".m4a must not be purged by summary sweeper"
+        );
+    }
+
+    #[test]
+    fn purge_summaries_skips_unrelated_extensions_even_when_old() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let bak = write_file(tmp.path(), "session.md.bak", b"old-rollback");
+        let txt = write_file(tmp.path(), "stash.txt", b"old-note");
+        let wav = write_file(tmp.path(), "old.wav", &[0u8; 8]);
+        backdate(&bak, 100);
+        backdate(&txt, 100);
+        backdate(&wav, 100);
+
+        let purged = purge_summaries_older_than(tmp.path(), 7).expect("purge");
+        assert_eq!(purged, 0);
+        assert!(bak.exists(), ".bak must not be purged by summary sweeper");
+        assert!(txt.exists(), ".txt must not be purged by summary sweeper");
+        assert!(wav.exists(), ".wav must not be purged by summary sweeper");
+    }
+
+    #[test]
+    fn purge_summaries_zero_days_deletes_all_md() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let md = write_file(tmp.path(), "fresh.md", b"x");
+        // Pin the audio-boundary contract even at the `days = 0`
+        // extreme: a fresh `.wav` co-located with the `.md` must
+        // survive. The audio sweeper's matching `purge_zero_days_*`
+        // test pins the symmetric direction.
+        let wav = write_file(tmp.path(), "fresh.wav", &[0u8; 8]);
+        let purged = purge_summaries_older_than(tmp.path(), 0).expect("purge");
+        assert_eq!(purged, 1);
+        assert!(!md.exists());
+        assert!(wav.exists(), ".wav must survive a zero-day summary purge");
+    }
+
+    #[test]
+    fn purge_summaries_returns_zero_when_nothing_to_purge() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        write_file(tmp.path(), "session.wav", &[0u8; 8]);
+        let purged = purge_summaries_older_than(tmp.path(), 7).expect("purge");
+        assert_eq!(purged, 0);
+    }
+
+    #[test]
+    fn purge_summaries_case_insensitive_extension() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let upper = write_file(tmp.path(), "LOUD.MD", &[0u8; 8]);
+        backdate(&upper, 30);
+        let purged = purge_summaries_older_than(tmp.path(), 7).expect("purge");
+        assert_eq!(purged, 1);
+        assert!(!upper.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_summaries_skips_top_level_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let real = tmp.path().join("real.md");
+        fs::write(&real, b"real-summary").expect("real");
+        backdate(&real, 30);
+
+        // Mirror the audio sweeper's symlink-safety test: a malicious
+        // vault that contains a `.md` symlink pointing at a file
+        // outside the vault must not get that target deleted by the
+        // summary sweeper. The walk inspects `file_type` (which does
+        // not dereference) before doing anything destructive.
+        let outside_dir = tempfile::TempDir::new().expect("outside");
+        let outside_target = outside_dir.path().join("outside.md");
+        fs::write(&outside_target, b"victim").expect("outside fixture");
+        backdate(&outside_target, 100);
+
+        let link = tmp.path().join("link.md");
+        symlink(&outside_target, &link).expect("symlink");
+
+        let purged = purge_summaries_older_than(tmp.path(), 7).expect("purge");
+        assert_eq!(purged, 1);
+        assert!(!real.exists());
+        assert!(
+            outside_target.exists(),
+            "symlink target outside the vault must not be deleted"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "symlink entry should remain in the vault after purge"
+        );
     }
 
     #[cfg(unix)]
