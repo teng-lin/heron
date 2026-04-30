@@ -1442,6 +1442,15 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     // private channel. Cheap clone — the bus is
                     // `Arc`-backed inside.
                     event_bus: Some((self.bus.clone(), id)),
+                    // Tier 4 #18 / #21: the daemon orchestrator does
+                    // not currently read the desktop's `Settings.persona`
+                    // / `Settings.strip_names_before_summarization`. The
+                    // desktop's `resummarize.rs` threads them in for the
+                    // re-summarize path; live capture inherits the
+                    // pre-Tier-4 prompt path until the daemon grows a
+                    // settings reader.
+                    persona: None,
+                    strip_names: false,
                 };
                 let handle = tokio::task::spawn_blocking(move || {
                     // CoreAudio/cpal handles in the capture path are

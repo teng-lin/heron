@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::{NoContext, Timestamp, Uuid};
 
+// Re-export `Persona` from `heron-types` so existing `crate::settings::Persona`
+// imports keep working after the Tier-4 move. The struct is shared with
+// `heron_llm::SummarizerInput::persona` so the LLM prompt-injection path and
+// the on-disk `Settings.persona` field reference one source-of-truth shape
+// rather than duplicating a serde struct across the wire boundary.
+pub use heron_types::Persona;
+
 #[derive(Debug, Error)]
 pub enum SettingsError {
     #[error(transparent)]
@@ -43,23 +50,6 @@ pub enum ActiveMode {
     Clio,
     Athena,
     Pollux,
-}
-
-/// User self-context the summarizer can inject into the LLM prompt
-/// (Tier 4 wiring). Three discrete inputs so the Settings UI's
-/// "Your name" / "Your role" / "What you're working on" fields can
-/// bind to named struct members rather than parsing a free-form string.
-///
-/// The container-level `#[serde(default)]` makes each field optional on
-/// read so a partially hand-edited `settings.json` (e.g. only `name`
-/// present) deserializes cleanly rather than hard-erroring on the missing
-/// sibling fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Persona {
-    pub name: String,
-    pub role: String,
-    pub working_on: String,
 }
 
 /// Vault writer slug strategy (Tier 4 wiring). Controls how the

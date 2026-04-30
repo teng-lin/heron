@@ -26,6 +26,8 @@ fn cfg(tmp: &TempDir) -> SessionConfig {
         llm_preference: heron_llm::Preference::Auto,
         pre_meeting_briefing: None,
         event_bus: None,
+        persona: None,
+        strip_names: false,
     }
 }
 

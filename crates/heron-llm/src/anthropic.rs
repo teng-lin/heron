@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::parse_content_json;
 use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
-use crate::transcript::{build_user_content, read_transcript_capped};
+use crate::transcript::{build_user_content, read_transcript_capped, strip_speaker_names};
 use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
 
 // Re-export the transcript-cap constants at their historical names
@@ -176,7 +176,15 @@ impl Summarizer for AnthropicClient {
                  consider chunked summarize or a higher-context model"
             );
         }
-        let user_content = build_user_content(&prompt, &transcript_text);
+        // Tier 4 #21: pseudonymize speaker names *only* for the LLM
+        // input. The orchestrator's `attendees` round-trip still uses
+        // real names re-read from the prior summary.
+        let transcript_for_llm = if input.strip_names {
+            strip_speaker_names(&transcript_text)
+        } else {
+            transcript_text
+        };
+        let user_content = build_user_content(&prompt, &transcript_for_llm);
 
         let body = MessagesRequest {
             model: &self.config.model,
@@ -742,6 +750,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("4xx should error");
@@ -896,6 +906,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect("summarize");
@@ -935,6 +947,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("4xx must surface");
@@ -975,6 +989,8 @@ mod tests {
                 existing_action_items: None,
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect_err("5xx must surface");
@@ -1034,6 +1050,8 @@ mod tests {
                 existing_action_items: Some(&priors),
                 existing_attendees: None,
                 pre_meeting_briefing: None,
+                persona: None,
+                strip_names: false,
             })
             .await
             .expect("ok");
