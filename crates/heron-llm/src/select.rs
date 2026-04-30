@@ -285,29 +285,16 @@ pub fn select_summarizer_with_resolver(
     let (has_anthropic_key, has_openai_key) = match pref {
         Preference::FreeOnly => (false, false),
         Preference::Auto | Preference::PremiumOnly => {
-            // Probe explicitly so a `Backend` error surfaces as
-            // `LlmError::Backend(...)` instead of being swallowed by
-            // `detect_with_resolver` and masquerading as either
-            // `NoBackendAvailable` (Auto fall-through) or
-            // `PremiumOnlyMissingApiKey` (PremiumOnly). This is the
-            // path the desktop crate's `EnvThenKeychainResolver`
-            // relies on so a corrupted keychain entry produces an
-            // actionable renderer toast distinct from "paste a key
-            // in Settings".
-            let has_anthropic = match resolver.resolve(KeyName::AnthropicApiKey) {
-                Ok(_) => true,
-                Err(KeyResolveError::NotFound(_)) => false,
-                Err(KeyResolveError::Backend(msg)) => {
-                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
-                }
-            };
-            let has_openai = match resolver.resolve(KeyName::OpenAiApiKey) {
-                Ok(_) => true,
-                Err(KeyResolveError::NotFound(_)) => false,
-                Err(KeyResolveError::Backend(msg)) => {
-                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
-                }
-            };
+            // Probe explicitly through `probe_api_key` so a `Backend`
+            // error surfaces as `LlmError::Backend(...)` instead of
+            // being swallowed by `detect_with_resolver` and masquerading
+            // as either `NoBackendAvailable` (Auto fall-through) or
+            // `PremiumOnlyMissingApiKey` (PremiumOnly). The desktop
+            // crate's `EnvThenKeychainResolver` relies on this so a
+            // corrupted keychain entry produces an actionable renderer
+            // toast distinct from "paste a key in Settings".
+            let has_anthropic = probe_api_key(resolver, KeyName::AnthropicApiKey)?;
+            let has_openai = probe_api_key(resolver, KeyName::OpenAiApiKey)?;
             (has_anthropic, has_openai)
         }
     };
@@ -326,6 +313,31 @@ pub fn select_summarizer_with_resolver(
         backend,
         reason,
     ))
+}
+
+/// Probe whether `name` is resolvable through `resolver`, mapping the
+/// resolver's three outcomes to the contract every selector path
+/// here relies on:
+///
+/// - `Ok(_)`                     → `Ok(true)`  (key is present)
+/// - `Err(NotFound(_))`          → `Ok(false)` (steady-state "no key")
+/// - `Err(Backend(msg))`         → `Err(LlmError::Backend("api key resolver: …"))`
+///
+/// Centralizing the mapping keeps `select_summarizer_with_resolver`
+/// and `select_summarizer_with_user_choice` byte-identical on the
+/// "what does a corrupted keychain entry surface as?" question — the
+/// desktop crate's `EnvThenKeychainResolver` integration depends on
+/// the renderer-side toast being able to distinguish "paste a key in
+/// Settings" (NotFound) from "macOS keychain returned an error"
+/// (Backend) regardless of which path built the summarizer.
+fn probe_api_key(resolver: &dyn KeyResolver, name: KeyName) -> Result<bool, LlmError> {
+    match resolver.resolve(name) {
+        Ok(_) => Ok(true),
+        Err(KeyResolveError::NotFound(_)) => Ok(false),
+        Err(KeyResolveError::Backend(msg)) => {
+            Err(LlmError::Backend(format!("api key resolver: {msg}")))
+        }
+    }
 }
 
 /// Map a `Settings.llm_backend` wire string to a typed [`Backend`].
@@ -377,27 +389,14 @@ pub fn select_summarizer_with_user_choice(
     resolver: &dyn KeyResolver,
 ) -> Result<(Box<dyn Summarizer>, Backend, SelectionReason), LlmError> {
     if let Some(backend) = user_choice {
-        // Probe availability for the user's chosen backend. We do a
-        // targeted check rather than `Availability::detect_with_resolver`
-        // so a `Backend` error from the resolver propagates instead of
-        // being silently treated as "key unavailable" — that masking
-        // would map a corrupted keychain entry to an unwanted Auto
-        // fallback.
+        // Probe availability for the user's chosen backend. The
+        // [`probe_api_key`] helper threads `KeyResolveError::Backend`
+        // through as `LlmError::Backend` so a corrupted keychain entry
+        // doesn't get silently flattened to "key unavailable" and
+        // unwantedly fall back to Auto.
         let available = match backend {
-            Backend::Anthropic => match resolver.resolve(KeyName::AnthropicApiKey) {
-                Ok(_) => true,
-                Err(KeyResolveError::NotFound(_)) => false,
-                Err(KeyResolveError::Backend(msg)) => {
-                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
-                }
-            },
-            Backend::OpenAI => match resolver.resolve(KeyName::OpenAiApiKey) {
-                Ok(_) => true,
-                Err(KeyResolveError::NotFound(_)) => false,
-                Err(KeyResolveError::Backend(msg)) => {
-                    return Err(LlmError::Backend(format!("api key resolver: {msg}")));
-                }
-            },
+            Backend::Anthropic => probe_api_key(resolver, KeyName::AnthropicApiKey)?,
+            Backend::OpenAI => probe_api_key(resolver, KeyName::OpenAiApiKey)?,
             Backend::ClaudeCodeCli => which_on_path("claude").is_some(),
             Backend::CodexCli => which_on_path("codex").is_some(),
         };

@@ -1182,26 +1182,46 @@ function SummarizerTab() {
     <section className="space-y-6">
       <h2 className="text-lg font-medium">Summarizer</h2>
 
-      <fieldset className="space-y-2">
+      <fieldset className="space-y-3">
         <legend className="text-sm font-medium">LLM backend</legend>
-        <div className="space-y-2">
-          {LLM_BACKENDS.map((opt) => (
-            <label
-              key={opt.value}
-              className="flex items-center gap-2 text-sm cursor-pointer"
-            >
-              <input
-                type="radio"
-                name="llm-backend"
-                value={opt.value}
-                checked={settings.llm_backend === opt.value}
-                onChange={() => update({ llm_backend: opt.value })}
-                className="h-4 w-4 accent-primary"
-              />
-              {opt.label}
-            </label>
-          ))}
-        </div>
+        {/*
+          Visual grouping per the UX-redesign IA note: hosted "API
+          providers" (billed per-token) and local "CLI" (zero-billed,
+          spawn the user's installed binary) are read as different
+          billing models. Rendered as two stacked subgroups with a
+          subheading each. The data lives on the `LLM_BACKENDS.group`
+          discriminator so the order is the array order within each
+          group.
+        */}
+        {(["api", "cli"] as const).map((group) => {
+          const heading = group === "api" ? "API providers" : "Local CLI";
+          const opts = LLM_BACKENDS.filter((o) => o.group === group);
+          return (
+            <div key={group} className="space-y-1">
+              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {heading}
+              </div>
+              <div className="space-y-2">
+                {opts.map((opt) => (
+                  <label
+                    key={opt.value}
+                    className="flex items-center gap-2 text-sm cursor-pointer"
+                  >
+                    <input
+                      type="radio"
+                      name="llm-backend"
+                      value={opt.value}
+                      checked={settings.llm_backend === opt.value}
+                      onChange={() => update({ llm_backend: opt.value })}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    {opt.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </fieldset>
 
       {showAnthropicModelPicker && (
