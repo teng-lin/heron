@@ -715,10 +715,11 @@ impl Builder {
         // the registry from scratch would drop the user's saved
         // toggles; loud failure surfaces as a startup panic the
         // packager / smoke test catches before users see it.
-        let auto_record_registry = Arc::new(
-            auto_record::AutoRecordRegistry::load(self.vault_root.as_deref())
-                .expect("hydrate auto-record registry from vault root"),
-        );
+        let auto_record_registry =
+            match auto_record::AutoRecordRegistry::load(self.vault_root.as_deref()) {
+                Ok(registry) => Arc::new(registry),
+                Err(err) => panic!("hydrate auto-record registry from vault root: {err}"),
+            };
         LocalSessionOrchestrator {
             bus,
             cache,
