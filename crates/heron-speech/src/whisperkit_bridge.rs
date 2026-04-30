@@ -124,6 +124,8 @@ pub enum WkError {
     InvalidUtf8(#[from] std::str::Utf8Error),
     #[error("path contains a NUL byte; can't pass to FFI")]
     PathNul,
+    #[error("prompt contains a NUL byte; can't pass to FFI")]
+    PromptNul,
     #[error("WhisperKit Swift bridge timed out waiting for the async Task")]
     Timeout,
     #[error("WhisperKit internal error (code {code})")]
@@ -360,7 +362,13 @@ pub fn whisperkit_transcribe(wav_path: &Path, prompt: Option<&str>) -> Result<St
     // entirely on `None`, which is the contract that lets an empty
     // hotwords vec roundtrip into byte-identical decoder output.
     let c_prompt = match prompt {
-        Some(s) if !s.is_empty() => Some(CString::new(s.as_bytes()).map_err(|_| WkError::PathNul)?),
+        Some(s) if !s.is_empty() => {
+            // Distinct from `WkError::PathNul`: a NUL in the wav path
+            // and a NUL in the prompt are surfaced separately so the
+            // operator's error message tells them WHICH input was
+            // pathological, not just "something contained a NUL".
+            Some(CString::new(s.as_bytes()).map_err(|_| WkError::PromptNul)?)
+        }
         _ => None,
     };
     let prompt_ptr = c_prompt.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
@@ -578,14 +586,16 @@ mod tests {
     #[test]
     fn transcribe_with_nul_in_prompt_is_rejected() {
         // CString::new bails on any embedded NUL; the wrapper must
-        // surface PathNul rather than silently truncating the prompt.
-        // The Tauri Settings UI + the daemon both pass user-supplied
-        // strings here, so a regression that swallows internal NULs
-        // would corrupt the WhisperKit prompt without telling anyone.
+        // surface `PromptNul` (not `PathNul`) rather than silently
+        // truncating the prompt. The Tauri Settings UI + the daemon
+        // both pass user-supplied strings here, so a regression that
+        // swallows internal NULs would corrupt the WhisperKit prompt
+        // without telling anyone — and the distinct variant is what
+        // tells an operator WHICH input went wrong.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let wav = tmp.path().join("nope.wav");
         let result = whisperkit_transcribe(&wav, Some("bad\0prompt"));
-        assert!(matches!(result, Err(WkError::PathNul)));
+        assert!(matches!(result, Err(WkError::PromptNul)));
     }
 
     #[test]

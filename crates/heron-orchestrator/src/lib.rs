@@ -1368,11 +1368,17 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     stt_backend_name: self.stt_backend_name.clone(),
                     // Tier 4 #17: forward the user-configured
                     // vocabulary-boost list to the WhisperKit backend.
-                    // Cloned per `start_capture` so a future
-                    // `Settings.hotwords` live-edit doesn't mutate an
-                    // in-flight session's prompt mid-decode (the
-                    // shared `hotwords` field on the orchestrator
-                    // would otherwise tear under a concurrent write).
+                    // Cloned per `start_capture` so each session
+                    // captures a *snapshot* of the orchestrator's
+                    // hotwords at start time. The current orchestrator
+                    // is `&self` and the field is plain
+                    // `Vec<String>`, so there's no concurrent-mutation
+                    // hazard today — but if a future PR adds a
+                    // `Settings.hotwords` live-reload setter (with
+                    // interior mutability via `RwLock` / `Mutex`), the
+                    // snapshot is what keeps in-flight sessions
+                    // pointing at a stable prompt instead of swapping
+                    // mid-decode.
                     hotwords: self.hotwords.clone(),
                     llm_preference: self.llm_preference,
                     pre_meeting_briefing,
