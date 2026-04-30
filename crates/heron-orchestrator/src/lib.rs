@@ -268,7 +268,7 @@ pub struct LocalSessionOrchestrator {
     /// mirrors `contains` onto each `CalendarEvent.auto_record` in
     /// `list_upcoming_calendar` so the rail's toggle reflects the
     /// current set without a second round trip.
-    auto_record_registry: auto_record::AutoRecordRegistry,
+    auto_record_registry: Arc<auto_record::AutoRecordRegistry>,
     /// Per-event "we already fired auto-record for this id, suppress
     /// re-fires until TTL elapses" map. Keyed by `calendar_event_id`,
     /// value is the wall-clock fire time. The auto-record start
@@ -715,9 +715,10 @@ impl Builder {
         // the registry from scratch would drop the user's saved
         // toggles; loud failure surfaces as a startup panic the
         // packager / smoke test catches before users see it.
-        let auto_record_registry =
+        let auto_record_registry = Arc::new(
             auto_record::AutoRecordRegistry::load(self.vault_root.as_deref())
-                .expect("hydrate auto-record registry from vault root");
+                .expect("hydrate auto-record registry from vault root"),
+        );
         LocalSessionOrchestrator {
             bus,
             cache,
@@ -882,7 +883,8 @@ impl LocalSessionOrchestrator {
     /// returns `meeting_url: None` (the Swift bridge doesn't expose
     /// it yet), so the scheduler defaults every fire to
     /// `Platform::Zoom`. When `meeting_url` is wired upstream, this
-    /// branch picks the right platform per event automatically.
+    /// branch picks the right platform per event and skips
+    /// unrecognized providers instead of launching the wrong client.
     pub async fn auto_record_tick(&self, now: DateTime<Utc>) -> usize {
         // Prune stale dedup entries inline — keeps the map size bound
         // to the live auto-record set rather than growing forever.
@@ -919,8 +921,20 @@ impl LocalSessionOrchestrator {
                 }
                 g.insert(event.id.clone(), now);
             }
-            let platform =
-                platform_from_meeting_url(event.meeting_url.as_deref()).unwrap_or(Platform::Zoom);
+            let platform = match event.meeting_url.as_deref() {
+                None => Platform::Zoom,
+                Some(url) => match platform_from_meeting_url(Some(url)) {
+                    Some(platform) => platform,
+                    None => {
+                        tracing::warn!(
+                            calendar_event_id = %event.id,
+                            meeting_url = url,
+                            "auto-record skipped: unrecognized meeting URL",
+                        );
+                        continue;
+                    }
+                },
+            };
             let event_id = event.id.clone();
             let result = self
                 .start_capture(StartCaptureArgs {
@@ -2244,15 +2258,20 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         req: SetEventAutoRecordRequest,
     ) -> Result<(), SessionError> {
         let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        let changed = self
-            .auto_record_registry
-            .set(calendar_event_id.clone(), req.enabled)
+        let registry = Arc::clone(&self.auto_record_registry);
+        let enabled = req.enabled;
+        let write_id = calendar_event_id.clone();
+        let changed = tokio::task::spawn_blocking(move || registry.set(write_id, enabled))
+            .await
+            .map_err(|e| SessionError::Validation {
+                detail: format!("auto-record registry task failed: {e}"),
+            })?
             .map_err(|e| SessionError::Validation {
                 detail: format!("auto-record registry write failed: {e}"),
             })?;
         tracing::info!(
             calendar_event_id = %calendar_event_id,
-            enabled = req.enabled,
+            enabled,
             changed,
             "auto-record toggled",
         );
@@ -2636,10 +2655,7 @@ fn platform_from_meeting_url(meeting_url: Option<&str>) -> Option<Platform> {
         Some(Platform::Zoom)
     } else if url.contains("meet.google.com") {
         Some(Platform::GoogleMeet)
-    } else if url.contains("teams.microsoft.com")
-        || url.contains("teams.live.com")
-        || url.contains("teams.")
-    {
+    } else if url.contains("teams.microsoft.com") || url.contains("teams.live.com") {
         Some(Platform::MicrosoftTeams)
     } else if url.contains("webex.com") {
         Some(Platform::Webex)
@@ -2834,6 +2850,27 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    #[test]
+    fn platform_from_meeting_url_matches_known_providers_only() {
+        assert_eq!(
+            platform_from_meeting_url(Some("https://zoom.us/j/123")),
+            Some(Platform::Zoom),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://meet.google.com/abc-defg-hij")),
+            Some(Platform::GoogleMeet),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://teams.microsoft.com/l/meetup-join/x")),
+            Some(Platform::MicrosoftTeams),
+        );
+        assert_eq!(
+            platform_from_meeting_url(Some("https://example.com/teams.fake/meeting")),
+            None,
+            "unrecognized URLs must not be treated as Teams just because they contain `teams.`",
+        );
     }
 
     /// Tier 4 #23: the auto-detect gate defaults to `true` so the
