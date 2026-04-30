@@ -142,6 +142,15 @@ const AUTO_RECORD_DEDUP_TTL: chrono::Duration = chrono::Duration::hours(12);
 /// stall does not skip an event entirely.
 const AUTO_RECORD_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Per-tick cap on calendar events the auto-record scheduler pulls.
+/// `list_upcoming_calendar` defaults to 20, which is the right shape
+/// for the Home rail's upcoming-meetings widget but would silently
+/// skip auto-record-enabled meetings for users with a packed week.
+/// 100 mirrors the existing hard ceiling inside
+/// `list_upcoming_calendar` (`limit.unwrap_or(20).min(100)`) — past
+/// that, EventKit reads start to dominate per-tick latency.
+const AUTO_RECORD_EVENT_LIMIT: u32 = 100;
+
 /// Cap on the calendar event identifier `attach_context` accepts.
 /// EventKit ids are short opaque strings and the synthetic ids
 /// `list_upcoming_calendar` mints are bounded by `(start, end, title)`
@@ -710,13 +719,16 @@ impl Builder {
             .calendar
             .unwrap_or_else(|| Arc::new(EventKitCalendarReader));
         // Hydrate the auto-record registry from disk under the
-        // configured vault root. A malformed file is fatal here —
-        // `expect` is the right discipline because silently re-keying
-        // the registry from scratch would drop the user's saved
-        // toggles; loud failure surfaces as a startup panic the
-        // packager / smoke test catches before users see it.
+        // configured vault root. A *malformed* on-disk file is
+        // quarantined (renamed to `auto_record.json.corrupt.<ts>`)
+        // and we boot with an empty registry — the file lives in
+        // user state, and a truncated write or hand-edit shouldn't
+        // brick the daemon until someone fixes it out-of-band.
+        // Hard I/O failures (vault path gone, permission denied)
+        // still panic so a misconfigured vault doesn't quietly run
+        // with toggles disappearing on every restart.
         let auto_record_registry =
-            match auto_record::AutoRecordRegistry::load(self.vault_root.as_deref()) {
+            match auto_record::AutoRecordRegistry::load_or_quarantine(self.vault_root.as_deref()) {
                 Ok(registry) => Arc::new(registry),
                 Err(err) => panic!("hydrate auto-record registry from vault root: {err}"),
             };
@@ -893,7 +905,16 @@ impl LocalSessionOrchestrator {
             let mut g = lock_or_recover(&self.auto_record_fired);
             g.retain(|_, fired_at| now.signed_duration_since(*fired_at) < AUTO_RECORD_DEDUP_TTL);
         }
-        let events = match self.list_upcoming_calendar(None, None, None).await {
+        // Use the scheduler's own `now` and start window — the
+        // default `list_upcoming_calendar(None, None, None)` rebuilds
+        // `Utc::now()` internally and caps at 20 events, which would
+        // both break the test seam and silently skip auto-record-
+        // enabled meetings for users with packed calendars.
+        let window_end = now + AUTO_RECORD_START_WINDOW;
+        let events = match self
+            .list_upcoming_calendar(Some(now), Some(window_end), Some(AUTO_RECORD_EVENT_LIMIT))
+            .await
+        {
             Ok(events) => events,
             Err(err) => {
                 tracing::debug!(
@@ -903,7 +924,6 @@ impl LocalSessionOrchestrator {
                 return 0;
             }
         };
-        let window_end = now + AUTO_RECORD_START_WINDOW;
         let mut fired = 0;
         for event in events {
             if !event.auto_record {
@@ -914,7 +934,12 @@ impl LocalSessionOrchestrator {
             }
             // Single-acquisition check + claim: a concurrent tick
             // (in tests we sometimes drive ticks in parallel) cannot
-            // both pass the membership probe and both insert.
+            // both pass the membership probe and both insert. We
+            // claim *before* `start_capture` so the parallel-tick
+            // dedup invariant holds; on `Err` we release the claim
+            // below so a transient failure (CaptureInProgress,
+            // permission denied, etc.) doesn't burn the 12h TTL and
+            // suppress retries for the rest of the start window.
             {
                 let mut g = lock_or_recover(&self.auto_record_fired);
                 if g.contains_key(&event.id) {
@@ -932,6 +957,9 @@ impl LocalSessionOrchestrator {
                             meeting_url = url,
                             "auto-record skipped: unrecognized meeting URL",
                         );
+                        // Release the claim so a subsequent fix to
+                        // the URL within this start window can re-fire.
+                        lock_or_recover(&self.auto_record_fired).remove(&event.id);
                         continue;
                     }
                 },
@@ -959,8 +987,13 @@ impl LocalSessionOrchestrator {
                         calendar_event_id = %event_id,
                         platform = ?platform,
                         error = %err,
-                        "auto-record start_capture rejected; suppressing re-fires for TTL",
+                        "auto-record start_capture rejected; will retry next tick",
                     );
+                    // Release the dedup claim so a transient FSM
+                    // rejection doesn't suppress retries for the
+                    // 12h TTL — only successful fires earn the
+                    // long-lived marker.
+                    lock_or_recover(&self.auto_record_fired).remove(&event_id);
                 }
             }
         }
@@ -2262,12 +2295,19 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         let registry = Arc::clone(&self.auto_record_registry);
         let enabled = req.enabled;
         let write_id = calendar_event_id.clone();
+        // `RegistryError` covers I/O, parse, and unsupported-version
+        // failures — none of which are caller mistakes. Map to
+        // `VaultLocked` (the existing user-actionable retryable
+        // category for vault-state hiccups: iCloud eviction, write
+        // contention, permission denied) rather than `Validation`,
+        // which would misreport these as `400 Bad Request` and bypass
+        // the optimistic-toggle rollback path on the client.
         let changed = tokio::task::spawn_blocking(move || registry.set(write_id, enabled))
             .await
-            .map_err(|e| SessionError::Validation {
+            .map_err(|e| SessionError::VaultLocked {
                 detail: format!("auto-record registry task failed: {e}"),
             })?
-            .map_err(|e| SessionError::Validation {
+            .map_err(|e| SessionError::VaultLocked {
                 detail: format!("auto-record registry write failed: {e}"),
             })?;
         tracing::info!(

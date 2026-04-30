@@ -121,6 +121,56 @@ impl AutoRecordRegistry {
         })
     }
 
+    /// Resilient hydration: same as `load`, but on a parse / version
+    /// failure the bad file is renamed aside (`.corrupt.<unix-ts>`)
+    /// and an empty registry is returned instead. Used at orchestrator
+    /// startup so a truncated write or hand-edit doesn't brick boot —
+    /// the user just loses the few toggles in the bad file rather than
+    /// having the daemon panic until they fix it manually.
+    ///
+    /// I/O errors (permission denied, disk gone) still propagate —
+    /// silently returning an empty registry there would happily mask
+    /// a misconfigured vault path.
+    pub(crate) fn load_or_quarantine(
+        vault_root: Option<&std::path::Path>,
+    ) -> Result<Self, RegistryError> {
+        match Self::load(vault_root) {
+            Ok(reg) => Ok(reg),
+            Err(err @ (RegistryError::Parse(_) | RegistryError::UnsupportedVersion(_))) => {
+                if let Some(root) = vault_root {
+                    let path = root.join(HERON_STATE_DIR).join(AUTO_RECORD_FILENAME);
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let quarantine = path.with_extension(format!("json.corrupt.{stamp}"));
+                    match fs::rename(&path, &quarantine) {
+                        Ok(()) => tracing::warn!(
+                            error = %err,
+                            quarantined_to = %quarantine.display(),
+                            "auto-record registry corrupt; quarantined and starting empty",
+                        ),
+                        Err(rename_err) => tracing::warn!(
+                            error = %err,
+                            rename_error = %rename_err,
+                            "auto-record registry corrupt; quarantine rename failed, starting empty in-memory",
+                        ),
+                    }
+                    Ok(Self {
+                        inner: Mutex::new(HashSet::new()),
+                        path: Some(path),
+                    })
+                } else {
+                    // No vault root means there was no on-disk file
+                    // to corrupt in the first place; surface the
+                    // (impossible) error rather than swallow it.
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Constructor for substrate-only tests that don't need a vault.
     /// Real callers go through [`Self::load`].
     #[cfg(test)]
@@ -286,6 +336,63 @@ mod tests {
         // restart resets the set.
         let reg = AutoRecordRegistry::in_memory();
         assert!(reg.set("evt_alpha".to_owned(), true).expect("set"));
+        assert!(reg.contains("evt_alpha"));
+    }
+
+    #[test]
+    fn load_or_quarantine_starts_empty_when_file_is_garbage() {
+        // A truncated write or hand-edit must not brick the daemon —
+        // `load_or_quarantine` renames the bad file aside and returns
+        // an empty registry so startup can proceed. Subsequent writes
+        // re-create a clean file at the original path.
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(HERON_STATE_DIR)).expect("mkdir");
+        std::fs::write(
+            dir.path().join(HERON_STATE_DIR).join(AUTO_RECORD_FILENAME),
+            b"{not even close to json",
+        )
+        .expect("write");
+
+        let reg = AutoRecordRegistry::load_or_quarantine(Some(dir.path()))
+            .expect("quarantine variant must not propagate parse errors");
+        assert!(
+            reg.list().is_empty(),
+            "starts with no entries after quarantine"
+        );
+
+        // Bad file is no longer at the canonical path.
+        let canonical = dir.path().join(HERON_STATE_DIR).join(AUTO_RECORD_FILENAME);
+        assert!(
+            !canonical.exists(),
+            "the corrupt file must be moved aside so the next write doesn't reparse it",
+        );
+        // And a sibling `.corrupt.<ts>` quarantine file should now exist.
+        let entries: Vec<_> = std::fs::read_dir(dir.path().join(HERON_STATE_DIR))
+            .expect("readdir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("auto_record.json.corrupt.")),
+            "expected a quarantine file alongside the registry, got {entries:?}",
+        );
+
+        // New writes flush back to the canonical path.
+        reg.set("evt_alpha".to_owned(), true)
+            .expect("set after quarantine");
+        let reload = AutoRecordRegistry::load(Some(dir.path())).expect("reload");
+        assert!(reload.contains("evt_alpha"));
+    }
+
+    #[test]
+    fn load_or_quarantine_passes_through_when_file_is_fine() {
+        let dir = tempdir().expect("tempdir");
+        let seed = AutoRecordRegistry::load(Some(dir.path())).expect("seed");
+        seed.set("evt_alpha".to_owned(), true).expect("set");
+
+        let reg = AutoRecordRegistry::load_or_quarantine(Some(dir.path())).expect("loads cleanly");
         assert!(reg.contains("evt_alpha"));
     }
 }

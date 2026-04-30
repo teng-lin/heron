@@ -64,12 +64,18 @@ export function UpcomingMeetings({
 
   async function onAutoRecordChange(evt: CalendarEvent, enabled: boolean) {
     setPendingAutoRecordIds((ids) => new Set(ids).add(evt.id));
-    const ok = await setEventAutoRecord(evt.id, enabled);
-    setPendingAutoRecordIds((ids) => {
-      const next = new Set(ids);
-      next.delete(evt.id);
-      return next;
-    });
+    let ok = false;
+    try {
+      ok = await setEventAutoRecord(evt.id, enabled);
+    } finally {
+      // Always clear the pending flag — if the IPC throws, the row
+      // would otherwise stay disabled until a reload.
+      setPendingAutoRecordIds((ids) => {
+        const next = new Set(ids);
+        next.delete(evt.id);
+        return next;
+      });
+    }
     if (!ok) {
       toast.error(
         `Could not ${enabled ? "enable" : "disable"} auto-record for ${

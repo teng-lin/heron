@@ -52,6 +52,11 @@ export interface CalendarStoreState {
 }
 
 let inFlightLoad: Promise<void> | null = null;
+// Per-event monotonic sequence so out-of-order
+// `setEventAutoRecord` responses can't clobber the latest user
+// intent. Bumped synchronously before each invoke; the response
+// path no-ops when its captured seq isn't the latest one.
+const autoRecordMutationSeq = new Map<string, number>();
 
 export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
   items: [],
@@ -114,6 +119,10 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
     return get().load(query);
   },
   setEventAutoRecord: async (calendarEventId, enabled) => {
+    const seq = (autoRecordMutationSeq.get(calendarEventId) ?? 0) + 1;
+    autoRecordMutationSeq.set(calendarEventId, seq);
+    const isStale = () => autoRecordMutationSeq.get(calendarEventId) !== seq;
+
     const previous = get().items.find((evt) => evt.id === calendarEventId);
     set({
       items: get().items.map((evt) =>
@@ -129,6 +138,7 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
         },
       });
       if (result.kind === "ok") {
+        if (isStale()) return false;
         const ackId = result.data.calendar_event_id;
         set((s) => ({
           daemonDown: false,
@@ -141,10 +151,12 @@ export const useCalendarStore = create<CalendarStoreState>((set, get) => ({
         }));
         return true;
       }
+      if (isStale()) return false;
       rollbackAutoRecord(calendarEventId, previous?.auto_record ?? false);
       set({ daemonDown: true, error: result.detail });
       return false;
     } catch (err) {
+      if (isStale()) return false;
       const detail = err instanceof Error ? err.message : String(err);
       rollbackAutoRecord(calendarEventId, previous?.auto_record ?? false);
       set({ daemonDown: true, error: detail });

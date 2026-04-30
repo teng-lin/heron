@@ -279,4 +279,55 @@ describe("useCalendarStore — auto-record toggle", () => {
     expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
     expect(useCalendarStore.getState().items[0].primed).toBe(true);
   });
+
+  test("stale (out-of-order) responses do not clobber the latest toggle", async () => {
+    // Two concurrent toggles for the same event resolve in reverse
+    // order (first call resolves *after* the second). Without the
+    // per-event sequence guard, the older `false` rollback would
+    // overwrite the newer `true` ack and the row would land on the
+    // wrong value.
+    useCalendarStore.setState({ items: [event({ id: "evt_target" })] });
+
+    let resolveSlow!: (
+      v:
+        | { kind: "ok"; data: { calendar_event_id: string; enabled: boolean } }
+        | { kind: "unavailable"; detail: string },
+    ) => void;
+    const slow = new Promise<
+      | { kind: "ok"; data: { calendar_event_id: string; enabled: boolean } }
+      | { kind: "unavailable"; detail: string }
+    >((resolve) => {
+      resolveSlow = resolve;
+    });
+    let call = 0;
+    invokeStub.mockImplementation(() => {
+      call += 1;
+      if (call === 1) return slow;
+      return Promise.resolve({
+        kind: "ok",
+        data: { calendar_event_id: "evt_target", enabled: false },
+      });
+    });
+
+    const firstP = useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", true);
+    const secondP = useCalendarStore
+      .getState()
+      .setEventAutoRecord("evt_target", false);
+    // Second call (the latest user intent) lands first.
+    const secondOk = await secondP;
+    expect(secondOk).toBe(true);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    // Now let the slower first call resolve as a daemon failure —
+    // the rollback path must no-op because its seq is stale.
+    resolveSlow({ kind: "unavailable", detail: "stale" });
+    const firstOk = await firstP;
+    expect(firstOk).toBe(false);
+    expect(useCalendarStore.getState().items[0].auto_record).toBe(false);
+    // And the daemon-down/error fields the stale response would have
+    // set must not have leaked through either.
+    expect(useCalendarStore.getState().daemonDown).toBe(false);
+    expect(useCalendarStore.getState().error).toBeNull();
+  });
 });
