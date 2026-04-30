@@ -76,6 +76,7 @@ import { TestStatus } from "../components/TestStatus";
 import {
   invoke,
   type DiskUsage,
+  type FileNamingPattern,
   type KeychainAccount,
   type TestOutcome,
 } from "../lib/invoke";
@@ -107,6 +108,55 @@ const ANTHROPIC_MODELS = [
   { value: "claude-opus-4-5", label: "Claude Opus 4.5" },
   { value: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
   { value: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+] as const;
+
+/**
+ * Tier 1 — `Settings.file_naming_pattern` options. Wire values match the
+ * Rust `FileNamingPattern` enum's `#[serde(rename_all = "snake_case")]`
+ * variants. The vault writer's slug pipeline (Tier 4 #19, PR #168)
+ * consumes the chosen pattern.
+ *
+ * `satisfies` pins each `value` to the imported `FileNamingPattern`
+ * union so a typo here is a build error; `as const` keeps the array
+ * immutable + narrows each entry's type to its literal so TS treats
+ * the radio's `value` as the typed union, matching the
+ * `ANTHROPIC_MODELS` / `LLM_BACKENDS` pattern in this file.
+ */
+const FILE_NAMING_PATTERNS = [
+  {
+    value: "id",
+    label: "UUID",
+    description: "<uuid>.md — original convention; preserves vault on upgrade.",
+  },
+  {
+    value: "date_slug",
+    label: "Date + slug",
+    description: "<YYYY-MM-DD>-<slug>.md — chronological + readable.",
+  },
+  {
+    value: "slug",
+    label: "Slug only",
+    description: "<slug>.md — readable filename without date prefix.",
+  },
+] as const satisfies readonly {
+  value: FileNamingPattern;
+  label: string;
+  description: string;
+}[];
+
+/**
+ * Tier 1 — `Settings.shortcuts` action ids the renderer knows about.
+ * `toggle_recording` is the only canonical action id today (defined in
+ * `apps/desktop/src-tauri/src/shortcuts.rs::ACTION_TOGGLE_RECORDING`)
+ * — the rest of the map is a free-form key/value editor so a future
+ * orchestrator action can be bound without a UI change. Listed first
+ * here so the "+ Add shortcut" preset surfaces it as a default option.
+ */
+const KNOWN_SHORTCUT_ACTIONS = [
+  {
+    value: "toggle_recording",
+    label: "Toggle recording (overrides Hotkey tab default)",
+  },
 ] as const;
 
 export default function Settings() {
@@ -355,6 +405,88 @@ function GeneralTab() {
           onCheckedChange={(checked) => update({ crash_telemetry: checked })}
         />
       </div>
+
+      <div className="rounded-md border border-border p-4 space-y-3">
+        <div>
+          <Label className="text-sm font-medium">Your context</Label>
+          <p className="text-xs text-muted-foreground">
+            Tier 4 (PR #167) feeds these into the summarizer's system
+            prompt — the LLM sees who is taking the meeting and what
+            they're working on. Leave blank to omit.
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="persona-name">Your name</Label>
+          <Input
+            id="persona-name"
+            value={settings.persona.name}
+            onChange={(e) =>
+              update({
+                persona: { ...settings.persona, name: e.target.value },
+              })
+            }
+            placeholder="e.g. Maya Patel"
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="persona-role">Your role</Label>
+          <Input
+            id="persona-role"
+            value={settings.persona.role}
+            onChange={(e) =>
+              update({
+                persona: { ...settings.persona, role: e.target.value },
+              })
+            }
+            placeholder="e.g. Founding engineer at Acme"
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="persona-working-on">What you're working on</Label>
+          <Input
+            id="persona-working-on"
+            value={settings.persona.working_on}
+            onChange={(e) =>
+              update({
+                persona: { ...settings.persona, working_on: e.target.value },
+              })
+            }
+            placeholder="e.g. Migration from Postgres 14 to 16"
+          />
+        </div>
+      </div>
+
+      <fieldset className="space-y-3">
+        <legend className="text-sm font-medium">Vault file naming</legend>
+        <p className="text-xs text-muted-foreground">
+          Tier 4 (PR #168). Controls how each session's `.md` filename is
+          derived. Existing files are not renamed; only new sessions
+          adopt the pattern.
+        </p>
+        <div className="space-y-2">
+          {FILE_NAMING_PATTERNS.map((opt) => (
+            <label
+              key={opt.value}
+              className="flex items-start gap-2 text-sm cursor-pointer"
+            >
+              <input
+                type="radio"
+                name="file-naming-pattern"
+                value={opt.value}
+                checked={settings.file_naming_pattern === opt.value}
+                onChange={() => update({ file_naming_pattern: opt.value })}
+                className="mt-0.5 h-4 w-4 accent-primary"
+              />
+              <div>
+                <div>{opt.label}</div>
+                <div className="text-xs text-muted-foreground">
+                  {opt.description}
+                </div>
+              </div>
+            </label>
+          ))}
+        </div>
+      </fieldset>
     </section>
   );
 }
@@ -902,7 +1034,170 @@ function AudioTab() {
           Recording is disabled when free disk drops below this amount.
         </p>
       </div>
+
+      <SummaryRetentionField />
+
+      <HotwordsField />
+
+      <div className="flex items-start justify-between gap-4 pt-4 border-t border-border">
+        <div>
+          <Label htmlFor="show-tray-indicator">Show tray indicator</Label>
+          <p className="text-xs text-muted-foreground">
+            Tier 4 (PR #170). When off, the menu-bar icon stops cycling
+            through Recording / Transcribing / Summarizing colors but
+            stays clickable.
+          </p>
+        </div>
+        <Switch
+          id="show-tray-indicator"
+          checked={settings.show_tray_indicator}
+          onCheckedChange={(checked) => update({ show_tray_indicator: checked })}
+        />
+      </div>
+
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <Label htmlFor="auto-detect-meeting-app">Auto-detect meeting apps</Label>
+          <p className="text-xs text-muted-foreground">
+            Tier 4 (PR #170). Lets heron prime a recording when a
+            configured meeting app launches. Manual record (button /
+            hotkey) is unaffected.
+          </p>
+        </div>
+        <Switch
+          id="auto-detect-meeting-app"
+          checked={settings.auto_detect_meeting_app}
+          onCheckedChange={(checked) =>
+            update({ auto_detect_meeting_app: checked })
+          }
+        />
+      </div>
     </section>
+  );
+}
+
+/**
+ * Summary-retention picker. Mirrors the Audio retention radio shape
+ * (`null` = keep all; `Some(N)` = purge older than N days), but the
+ * Tier 4 sweeper (PR #163) only deletes the `.md` summary — never the
+ * audio sidecars, which live on `audio_retention_days`.
+ */
+function SummaryRetentionField() {
+  const settings = useSettingsStore((s) => s.settings);
+  const update = useSettingsStore((s) => s.update);
+  const [draft, setDraft] = useState<number>(
+    settings?.summary_retention_days ?? DEFAULT_RETENTION_DAYS,
+  );
+
+  if (settings === null) return null;
+
+  const mode =
+    settings.summary_retention_days === null ? "keep_all" : "purge";
+
+  return (
+    <fieldset className="space-y-3 pt-4 border-t border-border">
+      <legend className="text-sm font-medium">Summary retention</legend>
+      <p className="text-xs text-muted-foreground">
+        Tier 4 (PR #163). Distinct from the audio sidecar retention
+        above — controls how long the markdown summary survives.
+      </p>
+      <label className="flex items-start gap-2 text-sm cursor-pointer">
+        <input
+          type="radio"
+          name="summary-retention"
+          checked={mode === "keep_all"}
+          onChange={() => update({ summary_retention_days: null })}
+          className="mt-1 h-4 w-4 accent-primary"
+        />
+        <div>
+          <div>Keep all summaries</div>
+          <div className="text-xs text-muted-foreground">
+            Markdown summaries are never deleted.
+          </div>
+        </div>
+      </label>
+
+      <label className="flex items-start gap-2 text-sm cursor-pointer">
+        <input
+          type="radio"
+          name="summary-retention"
+          checked={mode === "purge"}
+          onChange={() => update({ summary_retention_days: draft })}
+          className="mt-1 h-4 w-4 accent-primary"
+        />
+        <div className="space-y-2">
+          <div>
+            Purge summaries older than{" "}
+            <Input
+              type="number"
+              min={1}
+              max={3650}
+              value={draft}
+              onChange={(e) => {
+                const raw = e.target.valueAsNumber;
+                const next = Number.isNaN(raw)
+                  ? DEFAULT_RETENTION_DAYS
+                  : Math.max(1, Math.floor(raw));
+                setDraft(next);
+                if (mode === "purge") {
+                  update({ summary_retention_days: next });
+                }
+              }}
+              className="inline-block w-20 mx-1 align-middle"
+            />{" "}
+            days
+          </div>
+        </div>
+      </label>
+    </fieldset>
+  );
+}
+
+/**
+ * Hotwords vocabulary boost. Persisted as `Vec<String>` and threaded
+ * through to the WhisperKit `DecodingOptions.promptTokens` per Tier 4
+ * (PR #166). One word/phrase per line; blank lines are stripped on save.
+ */
+function HotwordsField() {
+  const settings = useSettingsStore((s) => s.settings);
+  const update = useSettingsStore((s) => s.update);
+
+  if (settings === null) return null;
+
+  // Render as newline-joined text in the textarea. Splitting on save —
+  // `\n`-delimited string mid-edit would jitter the cursor as the user
+  // typed; the controlled value here is pure local string state derived
+  // from the Vec<String>.
+  const value = settings.hotwords.join("\n");
+
+  return (
+    <div className="space-y-2 pt-4 border-t border-border">
+      <Label htmlFor="hotwords">Vocabulary (hotwords)</Label>
+      <p className="text-xs text-muted-foreground">
+        Tier 4 (PR #166). One term per line. The list is fed to
+        WhisperKit as a prompt so domain words / proper nouns get
+        biased toward correct spelling.
+      </p>
+      <textarea
+        id="hotwords"
+        value={value}
+        onChange={(e) => {
+          const next = e.target.value
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line !== "");
+          update({ hotwords: next });
+        }}
+        placeholder={"Acme Corp\nKubernetes\nplaywright"}
+        rows={5}
+        className={
+          "flex w-full rounded-md border border-border bg-background " +
+          "px-3 py-2 text-sm font-mono leading-relaxed " +
+          "focus-visible:outline-none focus-visible:ring-2 " +
+          "focus-visible:ring-primary"
+        }
+      />
+    </div>
   );
 }
 
@@ -1247,6 +1542,40 @@ function SummarizerTab() {
           onCheckedChange={(checked) => update({ auto_summarize: checked })}
         />
       </div>
+
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <Label htmlFor="strip-names">Strip participant names</Label>
+          <p className="text-xs text-muted-foreground">
+            Tier 4 (PR #167). Replace `display_name` with `Speaker A/B/C`
+            in the transcript before sending it to the LLM. Privacy
+            mitigation; the on-disk transcript is unchanged.
+          </p>
+        </div>
+        <Switch
+          id="strip-names"
+          checked={settings.strip_names_before_summarization}
+          onCheckedChange={(checked) =>
+            update({ strip_names_before_summarization: checked })
+          }
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor="openai-model">OpenAI model</Label>
+        <Input
+          id="openai-model"
+          value={settings.openai_model}
+          onChange={(e) => update({ openai_model: e.target.value })}
+          placeholder="gpt-4o-mini"
+          className="font-mono"
+        />
+        <p className="text-xs text-muted-foreground">
+          Used when the LLM backend is OpenAI. The OpenAI summarizer
+          (PR #156) sends this as the `model` field on
+          `/v1/chat/completions`.
+        </p>
+      </div>
     </section>
   );
 }
@@ -1421,7 +1750,180 @@ function HotkeyTab() {
           Triggers Start/Stop Recording from anywhere in macOS.
         </p>
       </div>
+
+      <CustomShortcutsCard />
     </section>
+  );
+}
+
+/**
+ * Tier 1 / Tier 4 (PR #164) shortcuts table. Persists a
+ * `BTreeMap<ActionId, Accelerator>` that the Rust startup hook
+ * iterates and registers via `tauri-plugin-global-shortcut`.
+ *
+ * Rendering shape: one row per (action_id, accelerator) entry with
+ * inline edits + remove. An "Add shortcut" button appends a blank row
+ * the user can fill in. Empty / duplicate keys are flagged inline so
+ * the autosave doesn't persist a broken map (the Rust side would log a
+ * warn + skip the entry, but the user wouldn't see why).
+ */
+function CustomShortcutsCard() {
+  const settings = useSettingsStore((s) => s.settings);
+  const update = useSettingsStore((s) => s.update);
+  // Local editor copy keyed by an array of (id, accel) tuples — the
+  // Record<string,string> shape can't represent "two rows mid-edit
+  // both blank". Same trick the Recorded apps card uses.
+  const storeShortcuts = settings?.shortcuts;
+  const [editor, setEditor] = useState<[string, string][]>(() =>
+    Object.entries(storeShortcuts ?? {}),
+  );
+  const lastSyncedRef = useRef<Record<string, string> | null>(null);
+
+  // Mirror an external store change (load, or another tab editing
+  // the same field) into the editor copy. Reference-equal incoming
+  // values skip the reset so an in-flight save doesn't clobber the
+  // user's mid-edit rows.
+  useEffect(() => {
+    if (storeShortcuts === undefined) return;
+    if (storeShortcuts === lastSyncedRef.current) return;
+    setEditor(Object.entries(storeShortcuts));
+    lastSyncedRef.current = storeShortcuts;
+  }, [storeShortcuts]);
+
+  if (settings === null) return null;
+
+  function commit(next: [string, string][]) {
+    setEditor(next);
+    const ids = next.map(([id]) => id.trim());
+    const hasEmpty = ids.some((id) => id === "");
+    const hasDupe = ids.length !== new Set(ids).size;
+    if (hasEmpty || hasDupe) return;
+    const map: Record<string, string> = {};
+    for (const [id, accel] of next) {
+      map[id.trim()] = accel.trim();
+    }
+    lastSyncedRef.current = map;
+    update({ shortcuts: map });
+  }
+
+  function setRow(idx: number, field: 0 | 1, value: string) {
+    const next = editor.slice();
+    const [id, accel] = next[idx] ?? ["", ""];
+    next[idx] = field === 0 ? [value, accel] : [id, value];
+    commit(next);
+  }
+
+  function removeRow(idx: number) {
+    const next = editor.slice();
+    next.splice(idx, 1);
+    commit(next);
+  }
+
+  function addRow(actionId: string) {
+    commit([...editor, [actionId, ""]]);
+  }
+
+  const ids = editor.map(([id]) => id.trim());
+  const hasEmpty = ids.some((id) => id === "");
+  const hasDupe = ids.length !== new Set(ids).size;
+
+  return (
+    <div className="rounded-md border border-border p-4 space-y-3">
+      <div className="text-sm font-medium">Custom shortcuts</div>
+      <p className="text-xs text-muted-foreground">
+        Tier 4 (PR #164). Bind action ids to accelerators. The renderer
+        listens on <code>shortcut:&lt;action_id&gt;</code> events; an
+        entry for <code>toggle_recording</code> overrides the default
+        chord above.
+      </p>
+
+      {editor.length === 0 ? (
+        <p className="text-xs text-muted-foreground italic">
+          No custom shortcuts. The default record chord above is still
+          active.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {editor.map(([id, accel], idx) => (
+            <div
+              // eslint-disable-next-line react/no-array-index-key
+              key={idx}
+              className="grid grid-cols-[1fr_1fr_auto] items-center gap-2"
+            >
+              <Input
+                value={id}
+                onChange={(e) => setRow(idx, 0, e.target.value)}
+                placeholder="action_id"
+                className="font-mono"
+                aria-label={`Action id ${idx + 1}`}
+              />
+              <Input
+                value={accel}
+                onChange={(e) => setRow(idx, 1, e.target.value)}
+                placeholder="CmdOrCtrl+Shift+R"
+                className="font-mono"
+                aria-label={`Accelerator ${idx + 1}`}
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => removeRow(idx)}
+                aria-label={`Remove ${id || "row"}`}
+                title="Remove"
+              >
+                <Trash2 className="h-4 w-4" aria-hidden="true" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => addRow("")}
+          aria-label="Add shortcut"
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+          Add shortcut
+        </Button>
+        <span className="text-xs text-muted-foreground">Quick add:</span>
+        <select
+          aria-label="Quick-add known action id"
+          className={
+            "h-8 rounded-md border border-border bg-background px-2 " +
+            "text-xs focus-visible:outline-none focus-visible:ring-2 " +
+            "focus-visible:ring-primary"
+          }
+          value=""
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === "") return;
+            if (!ids.includes(v)) {
+              addRow(v);
+            }
+            // Reset selection — `value=""` is the controlled placeholder.
+            e.currentTarget.value = "";
+          }}
+        >
+          <option value="">Choose…</option>
+          {KNOWN_SHORTCUT_ACTIONS.map((a) => (
+            <option key={a.value} value={a.value}>
+              {a.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {(hasEmpty || hasDupe) && (
+        <p className="text-xs text-destructive">
+          {hasEmpty && "Action ids must not be empty."}
+          {hasEmpty && hasDupe && " "}
+          {hasDupe && "Each action id must be unique."}
+        </p>
+      )}
+    </div>
   );
 }
 
