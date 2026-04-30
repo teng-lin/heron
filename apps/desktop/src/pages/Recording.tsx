@@ -15,7 +15,7 @@
  * meetings store's active meeting id).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Mic } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -44,6 +44,7 @@ export default function Recording() {
   const settingsPath = useSettingsStore((s) => s.settingsPath);
   const [stopping, setStopping] = useState(false);
   const [pauseToggling, setPauseToggling] = useState(false);
+  const pauseTogglingRef = useRef(false);
 
   const meetings = useMeetingsStore((s) => s.items);
   const loadMeetings = useMeetingsStore((s) => s.load);
@@ -110,11 +111,12 @@ export default function Recording() {
     // endpoints; only on a successful 204 do we flip the local flag.
     // On daemon error we surface a toast and leave the local flag
     // alone so the button accurately reflects the daemon's view.
-    if (pauseToggling) return;
+    if (pauseTogglingRef.current) return;
     if (stopTargetId === null) {
       toast.error("No active meeting to pause.");
       return;
     }
+    pauseTogglingRef.current = true;
     setPauseToggling(true);
     try {
       const command = paused ? "heron_resume_meeting" : "heron_pause_meeting";
@@ -132,6 +134,7 @@ export default function Recording() {
         `Could not ${paused ? "resume" : "pause"} recording: ${message}`,
       );
     } finally {
+      pauseTogglingRef.current = false;
       setPauseToggling(false);
     }
   };
