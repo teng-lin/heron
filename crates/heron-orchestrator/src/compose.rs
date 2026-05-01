@@ -59,7 +59,7 @@ pub(crate) fn build_live_session_start_args(
     meeting: &Meeting,
     applied_context: Option<&PreMeetingContext>,
 ) -> LiveSessionStartArgs {
-    let bot_context = applied_context
+    let mut bot_context = applied_context
         .map(translate_to_bot_context)
         .unwrap_or_default();
 
@@ -70,14 +70,25 @@ pub(crate) fn build_live_session_start_args(
     // context (the persona prompt by itself is still a valid
     // session config) and log so an operator can correlate with the
     // attach-context call that staged a too-large payload.
-    let rendered_context = heron_bot::render_context(&bot_context).unwrap_or_else(|err| {
-        tracing::warn!(
-            meeting_id = %meeting_id,
-            error = %err,
-            "rendered context exceeds spec budget; dropping context from system prompt",
-        );
-        String::new()
-    });
+    //
+    // Issue #215 finding 4 — when render fails we ALSO reset
+    // `bot_context` to default so the oversized payload doesn't
+    // get smuggled into `BotCreateArgs.context` and out to the bot
+    // driver / Recall on the wire. Without this, the realtime
+    // prompt was sanitized but the bot side could still trip the
+    // same 48 KiB invariant downstream and fail the live session.
+    let rendered_context = match heron_bot::render_context(&bot_context) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            tracing::warn!(
+                meeting_id = %meeting_id,
+                error = %err,
+                "rendered context exceeds spec budget; dropping context from system prompt and bot args",
+            );
+            bot_context = BotPreMeetingContext::default();
+            String::new()
+        }
+    };
     let system_prompt = if rendered_context.is_empty() {
         DEFAULT_PERSONA_PROMPT.to_owned()
     } else {
@@ -199,5 +210,93 @@ pub(crate) fn pre_meeting_briefing_for_v1(
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! Issue #215 finding 4 — when `heron_bot::render_context`
+    //! rejects an oversized [`PreMeetingContext`], the realtime
+    //! system prompt was already sanitized but `bot_context` (which
+    //! flows into `BotCreateArgs.context` and out to Recall on the
+    //! wire) was not. Confirm both sides drop the oversized payload.
+    use super::*;
+    use heron_bot::MAX_CONTEXT_BYTES;
+    use heron_session::{Meeting, MeetingStatus, SummaryLifecycle, TranscriptLifecycle};
+
+    fn empty_meeting(id: MeetingId) -> Meeting {
+        Meeting {
+            id,
+            status: MeetingStatus::Done,
+            platform: Platform::Zoom,
+            title: Some("Standup".into()),
+            calendar_event_id: None,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            duration_secs: None,
+            participants: Vec::new(),
+            transcript_status: TranscriptLifecycle::Pending,
+            summary_status: SummaryLifecycle::Pending,
+            tags: Vec::new(),
+            processing: None,
+            action_items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_live_session_drops_oversized_context_from_bot_args() {
+        let meeting_id = MeetingId::now_v7();
+        let meeting = empty_meeting(meeting_id);
+        // Stuff the agenda past the 48 KiB cap so `render_context`
+        // returns `ContextError::TooLarge`.
+        let oversized = PreMeetingContext {
+            agenda: Some("a".repeat(MAX_CONTEXT_BYTES + 4096)),
+            attendees_known: Vec::new(),
+            related_notes: Vec::new(),
+            prior_decisions: Vec::new(),
+            user_briefing: None,
+        };
+
+        let args =
+            build_live_session_start_args(meeting_id, Platform::Zoom, &meeting, Some(&oversized));
+
+        // Realtime prompt must not contain the oversized agenda.
+        assert!(
+            !args.realtime.system_prompt.contains("aaaaaaa"),
+            "realtime system_prompt leaked oversized agenda",
+        );
+        // Pre-fix: `args.bot.context` would still carry the
+        // oversized agenda. The fix resets it to default on render
+        // failure, so all fields must be empty.
+        assert!(
+            args.bot.context.agenda.is_none(),
+            "bot.context.agenda leaked through after render failure: {:?}",
+            args.bot.context.agenda.as_ref().map(|s| s.len()),
+        );
+        assert!(args.bot.context.attendees_known.is_empty());
+        assert!(args.bot.context.related_notes.is_empty());
+        assert!(args.bot.context.user_briefing.is_none());
+    }
+
+    #[test]
+    fn build_live_session_keeps_in_budget_context() {
+        // Sanity: a normal-sized context still flows through to
+        // both the realtime prompt and the bot args. (Guards against
+        // the fix over-correcting and resetting on success.)
+        let meeting_id = MeetingId::now_v7();
+        let meeting = empty_meeting(meeting_id);
+        let ctx = PreMeetingContext {
+            agenda: Some("ship the alpha".to_owned()),
+            attendees_known: Vec::new(),
+            related_notes: Vec::new(),
+            prior_decisions: Vec::new(),
+            user_briefing: None,
+        };
+
+        let args = build_live_session_start_args(meeting_id, Platform::Zoom, &meeting, Some(&ctx));
+
+        assert!(args.realtime.system_prompt.contains("ship the alpha"));
+        assert_eq!(args.bot.context.agenda.as_deref(), Some("ship the alpha"));
     }
 }
