@@ -15,6 +15,7 @@
 
 pub mod action_items;
 pub mod asset_protocol;
+pub mod asset_scope;
 pub mod daemon;
 pub mod diagnostics;
 pub mod disk;
@@ -150,9 +151,21 @@ fn heron_default_settings_path() -> String {
 }
 
 /// Tauri command: persist user settings.
+///
+/// Per issue #197, also extends the runtime asset-protocol scope to
+/// cover the new `vault_root` so the playback bar can keep playing
+/// archival m4a files via `convertFileSrc` after the user moves their
+/// vault. Scope is additive — a user who switches vaults back and forth
+/// retains read access to both for the lifetime of the app process.
 #[tauri::command]
-fn heron_write_settings(settings_path: String, settings: Settings) -> Result<(), String> {
-    write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())
+fn heron_write_settings(
+    app: tauri::AppHandle,
+    settings_path: String,
+    settings: Settings,
+) -> Result<(), String> {
+    write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())?;
+    asset_scope::extend_for_vault(&app, &settings.vault_root);
+    Ok(())
 }
 
 /// Tauri command: read `<vault>/meetings/<basename>.md`, where
@@ -862,6 +875,18 @@ pub fn run() {
                 "" => resolve_vault_root(),
                 s => Some(PathBuf::from(s)),
             };
+            // Issue #197: tighten the asset-protocol scope from `["**"]`
+            // to exactly the directories the playback bar reads. Cache
+            // covers `<cache>/sessions/<id>/{mic,tap}.raw` (salvage) and
+            // `<cache>/daemon-audio/<id>.m4a` (daemon fetch); vault
+            // covers `<vault>/meetings/<basename>.m4a` (archival). The
+            // `heron_write_settings` command extends scope when the user
+            // moves their vault from Settings.
+            asset_scope::install_initial_scope(
+                app.handle(),
+                &default_cache_root(),
+                vault_root.as_deref(),
+            );
             let hotwords = boot_settings.hotwords;
             let auto_detect_meeting_app = boot_settings.auto_detect_meeting_app;
             let file_naming_pattern: heron_vault::FileNamingPattern =
