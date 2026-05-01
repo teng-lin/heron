@@ -14,7 +14,7 @@
  */
 
 import { updateActionItem, type ActionItemPatch } from "../../lib/invoke";
-import type { ActionItemRow } from "../../pages/Review";
+import type { ActionItemRow } from "../../pages/review/utils/format";
 import { isStableActionItemId, isValidIsoDate } from "./validation";
 
 export interface ActionItemEditController {

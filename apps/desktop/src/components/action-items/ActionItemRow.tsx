@@ -1,5 +1,7 @@
-import type { ActionItemRow as ActionItemRowData } from "../../pages/Review";
-import { formatActionItemDue } from "../../pages/Review";
+import {
+  formatActionItemDue,
+  type ActionItemRow as ActionItemRowData,
+} from "../../pages/review/utils/format";
 import type { ActionItemEditController } from "./edit-controller";
 import { isStableActionItemId, isValidIsoDate } from "./validation";
 

@@ -34,7 +34,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import type { ActionItemRow as ActionItemRowData } from "../pages/Review";
+import type { ActionItemRow as ActionItemRowData } from "../pages/review/utils/format";
 import { ActionItemRow, type RowEditState } from "./action-items/ActionItemRow";
 import { createActionItemEditController } from "./action-items/edit-controller";
 
