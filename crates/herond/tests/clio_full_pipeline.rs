@@ -277,7 +277,18 @@ async fn clio_real_pipeline_writes_summarized_meeting_note() {
     let vault_root = tmp.path().join("vault");
     let session_dir = cache_dir.join("sessions").join(session_id.to_string());
 
-    seed_session_wavs(&session_dir, &fixture);
+    // `seed_session_wavs` is sync I/O (mkdir + std::fs::copy + a
+    // hound writer); hop onto the blocking pool so the test's tokio
+    // runtime worker isn't parked on disk for the duration of the
+    // copy. The fixture is small (~3 MB) but on a slow CI runner the
+    // copy can still measurably stall an executor thread.
+    {
+        let sd = session_dir.clone();
+        let fx = fixture.clone();
+        tokio::task::spawn_blocking(move || seed_session_wavs(&sd, &fx))
+            .await
+            .expect("spawn_blocking seed_session_wavs join");
+    }
 
     let cfg = SessionConfig {
         session_id,
@@ -369,14 +380,21 @@ async fn clio_real_pipeline_writes_summarized_meeting_note() {
         fm.cost.tokens_out
     );
 
-    // Body contract: a successful summarize lands a non-empty body.
-    // We don't pin specific text — the real LLM produces variable
-    // output run-to-run — but the body must not be the
-    // `(no summarizer)` fallback the pipeline writes when the LLM
-    // fails (see `pipeline::fallback_body`). That fallback string is
-    // checked for explicitly so a regression that silently drops
-    // the API call into the fallback branch trips this assertion
-    // even before the cost-line check.
+    // Body + frontmatter contract: a successful summarize lands a
+    // non-empty body. We don't pin specific text — the real LLM
+    // produces variable output run-to-run — but the result must not
+    // carry either of the two LLM-failure signals the pipeline emits:
+    //
+    //   - the body's `# Transcript (no summary)` header, written by
+    //     `pipeline::fallback_body` when the LLM call errored, and
+    //   - the frontmatter's `cost.model = "(no summarizer)"`, which
+    //     `pipeline.rs` stamps on the same fallback path (see the
+    //     `match llm_out { … None => Cost { model: "(no summarizer)", … } }`
+    //     branch).
+    //
+    // Checking both is belt-and-braces: a future refactor that
+    // changes one fallback marker without the other should still
+    // surface here rather than silently passing on a regressed run.
     assert!(
         !body.trim().is_empty(),
         "summary body must be non-empty on a successful real-LLM run"
@@ -385,6 +403,12 @@ async fn clio_real_pipeline_writes_summarized_meeting_note() {
         !body.contains("Transcript (no summary)"),
         "body must not be the fallback transcript-only render — \
          the real Anthropic call was expected to succeed; got body:\n{body}"
+    );
+    assert_ne!(
+        fm.cost.model, "(no summarizer)",
+        "frontmatter cost.model must not be the LLM-failed fallback — \
+         the real Anthropic call was expected to succeed; got cost={:?}",
+        fm.cost,
     );
 
     // Action-items contract per issue #194 acceptance + PR #203's
