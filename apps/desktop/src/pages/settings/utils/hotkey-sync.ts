@@ -117,7 +117,19 @@ export function createHotkeySyncController(
         // previous shape did this in reverse order — a failed register
         // left the user with no working hotkey. Issue #212 item 6.
         await deps.registerHotkey(next);
-        if (syncGen !== myGen) return;
+        if (syncGen !== myGen) {
+          // A newer sync started while we were registering. Roll back
+          // our orphan OS-level claim so rapid edits don't leak ghost
+          // registrations the user never asked for. The newer sync
+          // will register its own combo independently.
+          try {
+            await deps.unregisterHotkey(next);
+          } catch {
+            // Best-effort rollback. A stale unregister is ignorable —
+            // the next live sync will reconcile the OS state.
+          }
+          return;
+        }
         if (previous !== null && previous !== next) {
           try {
             await deps.unregisterHotkey(previous);

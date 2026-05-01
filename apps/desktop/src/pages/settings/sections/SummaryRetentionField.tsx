@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Input } from "../../../components/ui/input";
 import { useSettingsStore } from "../../../store/settings";
@@ -17,12 +17,22 @@ export function SummaryRetentionField() {
   const [draft, setDraft] = useState<number>(
     savedDays ?? DEFAULT_RETENTION_DAYS,
   );
+  // Track the last value we synced *into* the draft from the store
+  // so an in-flight save round-tripping back through `savedDays`
+  // doesn't clobber the user's mid-edit number. Mirrors the
+  // `lastSyncedRef` pattern in `RecordedAppsCard` / `HotwordsField`.
+  const lastSyncedRef = useRef<number | null | undefined>(savedDays);
 
   // Re-seed `draft` when a load resolves (or another tab edits the
   // saved value). Without this, mounting before `load()` resolves
   // locks the draft at `DEFAULT_RETENTION_DAYS`, and the next radio
-  // toggle to "purge" overwrites the user's real saved value.
+  // toggle to "purge" overwrites the user's real saved value. The
+  // ref guard skips the re-seed when the incoming value matches what
+  // we last synced (i.e., the round-trip from our own update()) so
+  // we don't fight an in-flight save.
   useEffect(() => {
+    if (savedDays === lastSyncedRef.current) return;
+    lastSyncedRef.current = savedDays;
     if (typeof savedDays === "number") {
       setDraft(savedDays);
     }
@@ -45,7 +55,10 @@ export function SummaryRetentionField() {
           type="radio"
           name="summary-retention"
           checked={mode === "keep_all"}
-          onChange={() => update({ summary_retention_days: null })}
+          onChange={() => {
+            lastSyncedRef.current = null;
+            update({ summary_retention_days: null });
+          }}
           className="mt-1 h-4 w-4 accent-primary"
         />
         <div>
@@ -61,7 +74,10 @@ export function SummaryRetentionField() {
           type="radio"
           name="summary-retention"
           checked={mode === "purge"}
-          onChange={() => update({ summary_retention_days: draft })}
+          onChange={() => {
+            lastSyncedRef.current = draft;
+            update({ summary_retention_days: draft });
+          }}
           className="mt-1 h-4 w-4 accent-primary"
         />
         <div className="space-y-2">
@@ -82,6 +98,9 @@ export function SummaryRetentionField() {
                   : Math.min(3650, Math.max(1, Math.floor(raw)));
                 setDraft(next);
                 if (mode === "purge") {
+                  // Pre-mark the ref so the round-trip back through
+                  // `savedDays` doesn't trip the re-seed effect.
+                  lastSyncedRef.current = next;
                   update({ summary_retention_days: next });
                 }
               }}

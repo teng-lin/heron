@@ -189,6 +189,57 @@ describe("createHotkeySyncController", () => {
     // The latest sync wins.
     expect(c.getRegisteredCombo()).toBe("B");
   });
+
+  test("stale-bail after successful register rolls back the orphan registration", async () => {
+    // Polish review (Gemini critical): without this rollback, rapid
+    // hotkey edits leak ghost OS-level registrations — register(A)
+    // succeeds for a stale gen but the controller bails without
+    // claiming the ref, leaving A registered with the OS but
+    // forgotten by the controller.
+    const calls: Call[] = [];
+    let resolveA!: () => void;
+    let resolveB!: () => void;
+    const c = createHotkeySyncController({
+      registerHotkey: async (combo) => {
+        calls.push({ kind: "register", combo });
+        return new Promise<void>((resolve) => {
+          if (combo === "A") resolveA = resolve;
+          else resolveB = resolve;
+        });
+      },
+      unregisterHotkey: async (combo) => {
+        calls.push({ kind: "unregister", combo });
+        return undefined;
+      },
+    });
+
+    const p1 = c.sync("A");
+    const p2 = c.sync("B");
+
+    // B resolves first and becomes the live combo.
+    resolveB();
+    await p2;
+
+    // A resolves later — gen is stale. The controller MUST roll back
+    // the orphan A registration; otherwise the OS keeps A live even
+    // though the user only asked for B.
+    resolveA();
+    await p1;
+
+    expect(c.getRegisteredCombo()).toBe("B");
+    // The stale-rollback unregister(A) MUST appear after register(A)
+    // resolved. We don't assert exact ordering of the unregister
+    // calls vs. each other (B's flow already had its own unregister
+    // path), only that A's orphan was cleaned up.
+    const aRegisters = calls.filter(
+      (c) => c.kind === "register" && c.combo === "A",
+    );
+    const aUnregisters = calls.filter(
+      (c) => c.kind === "unregister" && c.combo === "A",
+    );
+    expect(aRegisters).toHaveLength(1);
+    expect(aUnregisters.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe("createHotkeyTestController", () => {

@@ -34,6 +34,14 @@ export function HotkeyTab() {
   const currentComboRef = useRef<string>(settings?.record_hotkey ?? "");
   useEffect(() => {
     currentComboRef.current = settings?.record_hotkey ?? "";
+    // Changing the saved chord invalidates any in-flight Test result.
+    // Without this, a late `heron_check_hotkey` response that the
+    // controller drops as stale would leave `conflict` stuck on
+    // "checking" — the spinner would never resolve and the Test
+    // button would stay disabled. The captureChord handler covers
+    // the keyboard path; this useEffect covers external paths
+    // (settings load resolving mid-test, another tab editing, etc.).
+    setConflict("unknown");
   }, [settings?.record_hotkey]);
 
   // Pure state-machine controller for the OS-level hotkey registration.
