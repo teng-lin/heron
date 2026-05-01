@@ -2231,6 +2231,7 @@ dependencies = [
  "heron-audio",
  "heron-event",
  "heron-llm",
+ "heron-pipeline",
  "heron-session",
  "heron-speech",
  "heron-types",
@@ -2385,6 +2386,31 @@ dependencies = [
  "heron-speech",
  "heron-types",
  "heron-vault",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "heron-pipeline"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "heron-audio",
+ "heron-event",
+ "heron-llm",
+ "heron-session",
+ "heron-speech",
+ "heron-types",
+ "heron-vault",
+ "heron-zoom",
+ "hound",
  "serde",
  "serde_json",
  "serde_yaml",
