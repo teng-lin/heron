@@ -459,11 +459,14 @@ impl LocalSessionOrchestrator {
     /// orchestrating real time. Production callers go through
     /// [`Self::spawn_auto_record_scheduler`].
     ///
-    /// Errors from `start_capture` (`CaptureInProgress`,
-    /// `PermissionMissing`, …) are logged at warn level and counted
-    /// against `recently_fired` regardless — the scheduler has done
-    /// its part; re-firing every tick just because the FSM rejected
-    /// the request would spam the log without changing the outcome.
+    /// On a `start_capture` rejection (`CaptureInProgress`,
+    /// `PermissionMissing`, unrecognized meeting URL, …) the dedup
+    /// claim is released so the next tick can retry inside the same
+    /// start window — only successful fires earn the 12h
+    /// `AUTO_RECORD_DEDUP_TTL` marker. The error is logged at warn
+    /// level and otherwise swallowed; bubbling it up would force every
+    /// scheduler tick to handle vendor flake the user already sees in
+    /// the log.
     ///
     /// Platform inference: today's `list_upcoming_calendar` always
     /// returns `meeting_url: None` (the Swift bridge doesn't expose

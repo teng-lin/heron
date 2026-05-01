@@ -32,7 +32,7 @@ use crate::{LocalSessionOrchestrator, lock_or_recover};
 /// returned by `start_capture` keeps resolving after the background
 /// pipeline writes the note) and falling back to a path-derived
 /// lookup against the vault.
-pub(crate) fn note_path_for_read(
+fn note_path_for_read(
     orch: &LocalSessionOrchestrator,
     vault_root: &Path,
     id: &MeetingId,

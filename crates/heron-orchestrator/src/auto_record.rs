@@ -21,11 +21,21 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
+use heron_session::{
+    AutoRecordList, Platform, SessionError, SessionOrchestrator, SetEventAutoRecordRequest,
+    StartCaptureArgs,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::lock_or_recover;
+use crate::validation::normalize_calendar_event_id;
+use crate::vault_read::platform_from_meeting_url;
+use crate::{
+    AUTO_RECORD_DEDUP_TTL, AUTO_RECORD_EVENT_LIMIT, AUTO_RECORD_START_WINDOW,
+    LocalSessionOrchestrator, lock_or_recover,
+};
 
 /// File-format envelope. Versioned so a future schema change (per-event
 /// metadata, expirations, etc.) can land without breaking older
@@ -232,23 +242,12 @@ impl AutoRecordRegistry {
 ///
 /// Returns the number of fires this tick triggered — exposed for
 /// tests so they can drive the scheduler deterministically without
-/// orchestrating real time. Errors from `start_capture`
-/// (`CaptureInProgress`, `PermissionMissing`, …) are logged at warn
-/// level and counted against `recently_fired` regardless: the
-/// scheduler has done its part; re-firing every tick just because
-/// the FSM rejected the request would spam the log without changing
-/// the outcome.
-pub(crate) async fn tick(
-    orch: &crate::LocalSessionOrchestrator,
-    now: chrono::DateTime<chrono::Utc>,
-) -> usize {
-    use heron_session::{Platform, SessionOrchestrator, StartCaptureArgs};
-
-    use crate::vault_read::platform_from_meeting_url;
-    use crate::{
-        AUTO_RECORD_DEDUP_TTL, AUTO_RECORD_EVENT_LIMIT, AUTO_RECORD_START_WINDOW, lock_or_recover,
-    };
-
+/// orchestrating real time. On a `start_capture` rejection
+/// (`CaptureInProgress`, `PermissionMissing`, unrecognized meeting
+/// URL, …) the dedup claim is released so the next tick can retry
+/// inside the same start window — only successful fires earn the
+/// 12h dedup marker.
+pub(crate) async fn tick(orch: &LocalSessionOrchestrator, now: DateTime<Utc>) -> usize {
     // Prune stale dedup entries inline — keeps the map size bound
     // to the live auto-record set rather than growing forever.
     {
@@ -357,15 +356,9 @@ pub(crate) async fn tick(
 /// denied) rather than the "400 Bad Request" classification a
 /// `Validation` error would imply.
 pub(crate) async fn set_event_auto_record(
-    orch: &crate::LocalSessionOrchestrator,
-    req: heron_session::SetEventAutoRecordRequest,
-) -> Result<(), heron_session::SessionError> {
-    use std::sync::Arc;
-
-    use heron_session::SessionError;
-
-    use crate::validation::normalize_calendar_event_id;
-
+    orch: &LocalSessionOrchestrator,
+    req: SetEventAutoRecordRequest,
+) -> Result<(), SessionError> {
     let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
     let registry = Arc::clone(&orch.auto_record_registry);
     let enabled = req.enabled;
@@ -398,9 +391,9 @@ pub(crate) async fn set_event_auto_record(
 /// I/O — the registry's in-memory snapshot is the source of truth
 /// after boot-time hydration.
 pub(crate) async fn list_auto_record_events(
-    orch: &crate::LocalSessionOrchestrator,
-) -> Result<heron_session::AutoRecordList, heron_session::SessionError> {
-    Ok(heron_session::AutoRecordList {
+    orch: &LocalSessionOrchestrator,
+) -> Result<AutoRecordList, SessionError> {
+    Ok(AutoRecordList {
         event_ids: orch.auto_record_registry.list(),
     })
 }

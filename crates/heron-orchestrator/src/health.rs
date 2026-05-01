@@ -23,10 +23,7 @@ use heron_session::{ComponentState, Health, HealthComponent, HealthComponents, H
 
 use crate::LocalSessionOrchestrator;
 
-pub(crate) fn health_component(
-    state: ComponentState,
-    message: impl Into<String>,
-) -> HealthComponent {
+fn health_component(state: ComponentState, message: impl Into<String>) -> HealthComponent {
     HealthComponent {
         state,
         message: Some(message.into()),
@@ -62,7 +59,7 @@ pub(crate) fn aggregate_health_status(components: &HealthComponents) -> HealthSt
     }
 }
 
-pub(crate) fn stt_health_component(backend_name: &str) -> HealthComponent {
+fn stt_health_component(backend_name: &str) -> HealthComponent {
     match heron_speech::build_backend(backend_name, &[]) {
         Ok(backend) if backend.is_available() => health_component(
             ComponentState::Ok,
@@ -79,7 +76,7 @@ pub(crate) fn stt_health_component(backend_name: &str) -> HealthComponent {
     }
 }
 
-pub(crate) fn llm_health_component(preference: heron_llm::Preference) -> HealthComponent {
+fn llm_health_component(preference: heron_llm::Preference) -> HealthComponent {
     let availability = heron_llm::Availability::detect();
     match heron_llm::select_backend(preference, &availability) {
         Ok((backend, reason)) => {
@@ -101,7 +98,7 @@ pub(crate) fn llm_health_component(preference: heron_llm::Preference) -> HealthC
     }
 }
 
-pub(crate) fn eventkit_health_component() -> HealthComponent {
+fn eventkit_health_component() -> HealthComponent {
     // Avoid calling EventKit from /health: on a fresh macOS install
     // the permission prompt blocks the caller. The read endpoint
     // reports PermissionMissing/Timeout with the real TCC result.
@@ -111,7 +108,7 @@ pub(crate) fn eventkit_health_component() -> HealthComponent {
     )
 }
 
-pub(crate) fn capture_health_component(vault_root: Option<&Path>) -> HealthComponent {
+fn capture_health_component(vault_root: Option<&Path>) -> HealthComponent {
     match vault_root {
         Some(root) if root.exists() => health_component(
             ComponentState::Ok,
@@ -134,7 +131,7 @@ pub(crate) fn capture_health_component(vault_root: Option<&Path>) -> HealthCompo
     }
 }
 
-pub(crate) fn vault_health_component(vault_root: Option<&Path>) -> HealthComponent {
+fn vault_health_component(vault_root: Option<&Path>) -> HealthComponent {
     match vault_root {
         Some(root) if root.exists() => health_component(
             ComponentState::Ok,
