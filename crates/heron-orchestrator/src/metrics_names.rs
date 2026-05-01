@@ -47,18 +47,22 @@ pub(crate) const CAPTURE_ACTIVE: &str = "capture_active_count";
 pub(crate) const SALVAGE_CANDIDATES_PENDING: &str = "salvage_candidates_pending";
 
 /// Counter incremented at the cache-retain decision in the v1 capture
-/// pipeline finalisation. Outcome label is one of the pinned
+/// pipeline finalisation (`complete_pipeline_meeting` in
+/// `pipeline_glue.rs`). Outcome label is one of the pinned
 /// `redacted!` enum literals:
 ///
-/// - `recovered` — capture finished cleanly, m4a verified, cache was
-///   purged (no salvage candidate left behind for the next launch).
-/// - `abandoned` — capture finished but m4a verify failed (or hit a
-///   transient encode error), so the WAV cache is retained for the
-///   user to recover from. Each occurrence bumps the candidate set
-///   that `salvage_candidates_pending` will count on the next boot.
-/// - `failed` — capture aborted before STT (audio capture errored,
-///   FSM rejected the finalisation edge); the partially-written
-///   `state.json` + WAVs are still on disk for `heron salvage`.
+/// - `recovered` — pipeline finished cleanly, cache was purged (no
+///   salvage candidate left behind for the next launch).
+/// - `abandoned` — pipeline finished with an error so the WAV cache
+///   is retained for the user to recover from. Each occurrence bumps
+///   the candidate set that `salvage_candidates_pending` will count on
+///   the next boot. Today this is the only failure-case outcome the
+///   call site emits — see follow-up issue #238 for splitting it into
+///   pre-STT vs post-STT failure modes.
+/// - `failed` — reserved for a future hard-error recovery path (an
+///   attempt to recover a previous session's cache that itself errored
+///   out). Currently never emitted; declared here so the dimension is
+///   stable when the recovery flow lands.
 pub(crate) const SALVAGE_RECOVERY_TOTAL: &str = "salvage_recovery_total";
 
 #[cfg(test)]
