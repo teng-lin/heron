@@ -33,9 +33,21 @@ export function AudioTab() {
   // canonical source — every keystroke re-saves via `update()`.
   // Seeded from the loaded settings so a returning user sees their
   // saved value, not a hardcoded default.
+  const savedAudioDays = settings?.audio_retention_days;
   const [retentionDraft, setRetentionDraft] = useState<number>(
-    settings?.audio_retention_days ?? DEFAULT_RETENTION_DAYS,
+    savedAudioDays ?? DEFAULT_RETENTION_DAYS,
   );
+
+  // Re-seed `retentionDraft` once the saved value lands. Without
+  // this, mounting before `load()` resolves locks the draft at
+  // `DEFAULT_RETENTION_DAYS`, and the next "purge" radio toggle
+  // overwrites the user's real saved value. Same shape as the
+  // `SummaryRetentionField` re-seed.
+  useEffect(() => {
+    if (typeof savedAudioDays === "number") {
+      setRetentionDraft(savedAudioDays);
+    }
+  }, [savedAudioDays]);
 
   // Re-poll disk usage on tab focus + periodic refresh while open. The
   // poll is cheap (single non-recursive `read_dir`) and lets the gauge
