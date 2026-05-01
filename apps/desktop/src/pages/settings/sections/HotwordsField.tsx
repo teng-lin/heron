@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+
 import { Label } from "../../../components/ui/label";
 import { useSettingsStore } from "../../../store/settings";
 
@@ -9,14 +11,44 @@ import { useSettingsStore } from "../../../store/settings";
 export function HotwordsField() {
   const settings = useSettingsStore((s) => s.settings);
   const update = useSettingsStore((s) => s.update);
+  const storeHotwords = settings?.hotwords;
+  // Local draft so the textarea owns its own per-keystroke string. The
+  // store-side `Vec<String>` is normalized (split on `\n`, trimmed,
+  // empties dropped) only on blur — splitting on every keystroke
+  // collapses in-progress newlines / whitespace and jitters the
+  // cursor while the user is mid-edit.
+  const [draft, setDraft] = useState<string>(() =>
+    (storeHotwords ?? []).join("\n"),
+  );
+  const lastSyncedRef = useRef<readonly string[] | null>(null);
+
+  // Mirror an external store change (load, or another tab editing the
+  // same field) into the draft. Reference-equal incoming values skip
+  // the reset so an in-flight save doesn't clobber the user's typing.
+  useEffect(() => {
+    if (storeHotwords === undefined) return;
+    if (storeHotwords === lastSyncedRef.current) return;
+    setDraft(storeHotwords.join("\n"));
+    lastSyncedRef.current = storeHotwords;
+  }, [storeHotwords]);
 
   if (settings === null) return null;
 
-  // Render as newline-joined text in the textarea. Splitting on save —
-  // `\n`-delimited string mid-edit would jitter the cursor as the user
-  // typed; the controlled value here is pure local string state derived
-  // from the Vec<String>.
-  const value = settings.hotwords.join("\n");
+  function normalize(raw: string): string[] {
+    return raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "");
+  }
+
+  function commitOnBlur() {
+    const next = normalize(draft);
+    // Re-render the textarea with the normalized form so the user sees
+    // exactly what got saved.
+    setDraft(next.join("\n"));
+    lastSyncedRef.current = next;
+    update({ hotwords: next });
+  }
 
   return (
     <div className="space-y-2 pt-4 border-t border-border">
@@ -28,14 +60,9 @@ export function HotwordsField() {
       </p>
       <textarea
         id="hotwords"
-        value={value}
-        onChange={(e) => {
-          const next = e.target.value
-            .split("\n")
-            .map((line) => line.trim())
-            .filter((line) => line !== "");
-          update({ hotwords: next });
-        }}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commitOnBlur}
         placeholder={"Acme Corp\nKubernetes\nplaywright"}
         rows={5}
         className={

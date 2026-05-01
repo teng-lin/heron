@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -33,9 +33,31 @@ export function AudioTab() {
   // canonical source — every keystroke re-saves via `update()`.
   // Seeded from the loaded settings so a returning user sees their
   // saved value, not a hardcoded default.
+  const savedAudioDays = settings?.audio_retention_days;
   const [retentionDraft, setRetentionDraft] = useState<number>(
-    settings?.audio_retention_days ?? DEFAULT_RETENTION_DAYS,
+    savedAudioDays ?? DEFAULT_RETENTION_DAYS,
   );
+  // Track the last value we synced *into* the draft from the store
+  // so an in-flight save round-tripping back through `savedAudioDays`
+  // doesn't clobber the user's mid-edit number. Mirrors the
+  // `lastSyncedRef` pattern elsewhere in the Settings tree.
+  const lastSyncedAudioDaysRef = useRef<number | null | undefined>(
+    savedAudioDays,
+  );
+
+  // Re-seed `retentionDraft` once the saved value lands. Without
+  // this, mounting before `load()` resolves locks the draft at
+  // `DEFAULT_RETENTION_DAYS`, and the next "purge" radio toggle
+  // overwrites the user's real saved value. Same shape as the
+  // `SummaryRetentionField` re-seed; the ref guard avoids fighting
+  // our own in-flight save's round-trip.
+  useEffect(() => {
+    if (savedAudioDays === lastSyncedAudioDaysRef.current) return;
+    lastSyncedAudioDaysRef.current = savedAudioDays;
+    if (typeof savedAudioDays === "number") {
+      setRetentionDraft(savedAudioDays);
+    }
+  }, [savedAudioDays]);
 
   // Re-poll disk usage on tab focus + periodic refresh while open. The
   // poll is cheap (single non-recursive `read_dir`) and lets the gauge
@@ -81,10 +103,12 @@ export function AudioTab() {
   const purgeMode = settings.audio_retention_days === null ? "keep_all" : "purge";
 
   function setKeepAll() {
+    lastSyncedAudioDaysRef.current = null;
     update({ audio_retention_days: null });
   }
 
   function setPurgeMode() {
+    lastSyncedAudioDaysRef.current = retentionDraft;
     update({ audio_retention_days: retentionDraft });
   }
 
@@ -189,9 +213,12 @@ export function AudioTab() {
                   const raw = e.target.valueAsNumber;
                   const next = Number.isNaN(raw)
                     ? DEFAULT_RETENTION_DAYS
-                    : Math.max(1, Math.floor(raw));
+                    : Math.min(3650, Math.max(1, Math.floor(raw)));
                   setRetentionDraft(next);
                   if (purgeMode === "purge") {
+                    // Pre-mark the ref so the round-trip back through
+                    // `savedAudioDays` doesn't trip the re-seed effect.
+                    lastSyncedAudioDaysRef.current = next;
                     update({ audio_retention_days: next });
                   }
                 }}
