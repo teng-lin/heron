@@ -83,6 +83,23 @@ pub(crate) fn complete_pipeline_meeting(
     mut meeting: Meeting,
     result: Result<CliSessionOutcome, SessionError>,
 ) {
+    // Issue #238 — distinguish post-STT failures (`abandoned`, the
+    // transcript is on disk so the user can retry summarisation) from
+    // pre-STT failures (`failed`, no transcript yet so retry means
+    // re-record). The `Ok(_)` arm always reached transcription (the
+    // pipeline returns `Ok` only after STT). The `Err(_)` arm depends
+    // on which `SessionError` variant fired.
+    let pre_stt_failure = matches!(
+        &result,
+        Err(SessionError::NotFound { .. }
+            | SessionError::InvalidState { .. }
+            | SessionError::CaptureInProgress { .. }
+            | SessionError::VaultLocked { .. }
+            | SessionError::TooEarly
+            | SessionError::PermissionMissing { .. }
+            | SessionError::Validation { .. }
+            | SessionError::NotYetImplemented,)
+    );
     let (note_path, failure_reason) = match result {
         Ok(outcome) => {
             let note_path = outcome.note_path;
@@ -149,21 +166,20 @@ pub(crate) fn complete_pipeline_meeting(
         "reason" => outcome_label.into_inner(),
     )
     .increment(1);
-    // Salvage recovery counter. The v1 capture pipeline is the only
-    // path that writes a `state.json` cache today, and its purge-or-
-    // retain decision in `heron-pipeline` already encodes the
-    // disposition we care about: a successful finalize purged the
-    // cache (no salvage left behind = `recovered`), a failed
-    // finalize retained the WAVs for the user to manually salvage on
-    // next launch (= `abandoned`). The third arm `failed` is reserved
-    // for the future hard-error recovery path (an attempt to recover
-    // a previous session's cache that errored out); without that
-    // flow today, only `recovered` and `abandoned` fire from this
-    // call site. The `outcome` label dimension matches the spec in
-    // #224 / `docs/observability.md` so a future hard-error
-    // instrumentation slots in without renaming.
+    // Salvage recovery counter. Three outcomes per #238:
+    // - `recovered`: pipeline finished cleanly, cache purged.
+    // - `abandoned`: post-STT failure (transcript on disk, summary
+    //   or finalize failed). User can retry summarisation without
+    //   re-recording.
+    // - `failed`: pre-STT failure (capture errored before reaching
+    //   transcription). No transcript yet, retry means re-record.
+    // Pre-STT detection lives in `pre_stt_failure` above — branches on
+    // `SessionError` variants that fire before the pipeline reaches
+    // STT (vault-lock, permission-missing, validation, FSM rejection).
     let salvage_label = if success {
         redacted!("recovered")
+    } else if pre_stt_failure {
+        redacted!("failed")
     } else {
         redacted!("abandoned")
     };

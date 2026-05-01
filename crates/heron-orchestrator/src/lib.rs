@@ -2590,22 +2590,13 @@ mod tests {
         );
     }
 
-    /// Failure-path coverage for the pipeline-side disposition
-    /// counter. Drives `complete_pipeline_meeting` directly with a
-    /// failure result so we don't need a real audio pipeline.
-    #[test]
-    fn complete_pipeline_meeting_emits_error_and_abandoned_on_failure() {
-        let handle = heron_metrics::init_prometheus_recorder().expect("install recorder for test");
-
-        // Construct a minimal fake meeting + bus and drive the
-        // helper. The assertions key on counter deltas so other
-        // tests in the same process can run interleaved.
-        let bus: SessionEventBus = heron_event::EventBus::new(8);
-        let finalized: std::sync::Mutex<HashMap<MeetingId, FinalizedMeeting>> =
-            std::sync::Mutex::new(HashMap::new());
+    /// Helper: build a fresh `Meeting` + `RecordingFsm` walked through
+    /// `idle → armed → recording → transcribing` so
+    /// `complete_pipeline_meeting`'s `on_transcribe_done` edge is
+    /// legal. Used by the failure-mode tests below.
+    fn fresh_in_flight_meeting() -> (MeetingId, RecordingFsm, Meeting) {
         let id = MeetingId::now_v7();
         let mut fsm = RecordingFsm::new();
-        // Walk the FSM far enough that `on_transcribe_done` is legal.
         fsm.on_hotkey().expect("idle->armed");
         fsm.on_yes().expect("armed->recording");
         fsm.on_hotkey().expect("recording->transcribing");
@@ -2625,6 +2616,24 @@ mod tests {
             processing: None,
             action_items: vec![],
         };
+        (id, fsm, meeting)
+    }
+
+    /// Failure-path coverage for the pipeline-side disposition
+    /// counter. Drives `complete_pipeline_meeting` directly with two
+    /// failure variants so we don't need a real audio pipeline.
+    ///
+    /// Two assertions in one test (rather than two separate tests)
+    /// because the prometheus recorder is process-global — running
+    /// the variants in parallel races on shared counter values. Per
+    /// #238: pre-STT failures (Validation) → `outcome=failed`, post-
+    /// STT failures (LlmProviderFailed) → `outcome=abandoned`.
+    #[test]
+    fn complete_pipeline_meeting_splits_outcome_by_pre_post_stt_failure() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("install recorder for test");
+        let bus: SessionEventBus = heron_event::EventBus::new(8);
+        let finalized: std::sync::Mutex<HashMap<MeetingId, FinalizedMeeting>> =
+            std::sync::Mutex::new(HashMap::new());
 
         let before = handle.render();
         let before_error = scrape_counter_with_label(
@@ -2632,20 +2641,42 @@ mod tests {
             metrics_names::CAPTURE_ENDED_TOTAL,
             "reason=\"error\"",
         );
+        let before_failed = scrape_counter_with_label(
+            &before,
+            metrics_names::SALVAGE_RECOVERY_TOTAL,
+            "outcome=\"failed\"",
+        );
         let before_abandoned = scrape_counter_with_label(
             &before,
             metrics_names::SALVAGE_RECOVERY_TOTAL,
             "outcome=\"abandoned\"",
         );
 
+        // Pre-STT failure: Validation fires before any transcription.
+        let (id1, fsm1, meeting1) = fresh_in_flight_meeting();
         complete_pipeline_meeting(
             &bus,
             &finalized,
-            id,
-            fsm,
-            meeting,
+            id1,
+            fsm1,
+            meeting1,
             Err(SessionError::Validation {
-                detail: "synthetic failure".into(),
+                detail: "synthetic pre-STT failure".into(),
+            }),
+        );
+
+        // Post-STT failure: LlmProviderFailed fires after STT lands
+        // the transcript and the LLM stage runs.
+        let (id2, fsm2, meeting2) = fresh_in_flight_meeting();
+        complete_pipeline_meeting(
+            &bus,
+            &finalized,
+            id2,
+            fsm2,
+            meeting2,
+            Err(SessionError::LlmProviderFailed {
+                provider: "anthropic".into(),
+                detail: "synthetic post-STT failure".into(),
             }),
         );
 
@@ -2655,6 +2686,11 @@ mod tests {
             metrics_names::CAPTURE_ENDED_TOTAL,
             "reason=\"error\"",
         );
+        let after_failed = scrape_counter_with_label(
+            &after,
+            metrics_names::SALVAGE_RECOVERY_TOTAL,
+            "outcome=\"failed\"",
+        );
         let after_abandoned = scrape_counter_with_label(
             &after,
             metrics_names::SALVAGE_RECOVERY_TOTAL,
@@ -2662,15 +2698,20 @@ mod tests {
         );
         assert_eq!(
             after_error - before_error,
+            2,
+            "two failures must each bump capture_ended_total{{reason=error}}; rendered:\n{after}"
+        );
+        assert_eq!(
+            after_failed - before_failed,
             1,
-            "pipeline-failure path must bump capture_ended_total{{reason=error}} exactly once; \
+            "Validation pre-STT path must bump salvage_recovery_total{{outcome=failed}}; \
              rendered:\n{after}"
         );
         assert_eq!(
             after_abandoned - before_abandoned,
             1,
-            "pipeline-failure path must bump salvage_recovery_total{{outcome=abandoned}} \
-             exactly once; rendered:\n{after}"
+            "LlmProviderFailed post-STT path must bump salvage_recovery_total{{outcome=abandoned}}; \
+             rendered:\n{after}"
         );
     }
 
