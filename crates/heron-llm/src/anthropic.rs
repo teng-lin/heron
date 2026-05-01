@@ -173,14 +173,16 @@ impl Summarizer for AnthropicClient {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
         // Wrap the entire summarize path in the shared timing helper so
         // duration + failure-reason metrics emit identically to the
-        // OpenAI / CLI backends. The label `op` dimension carries the
-        // backend so dashboards can pivot without label-set drift; the
-        // post-success token/cost counters add `backend, model` once the
-        // wire-side model identifier is known.
+        // OpenAI / CLI backends. The `backend` label dimension matches
+        // the #225 spec key (#239); the post-success token/cost
+        // counters add `backend, model` once the wire-side model
+        // identifier is known. The duration / failures wrappers do
+        // NOT carry `model` yet — see #239's deferred item for the
+        // `timed_io_async` redesign that adds it.
         heron_metrics::timed_io_async(
             LLM_CALL_DURATION_SECONDS,
             LLM_CALL_FAILURES_TOTAL,
-            ("op", backend_label(Backend::Anthropic)),
+            ("backend", backend_label(Backend::Anthropic)),
             self.summarize_inner(input),
         )
         .await

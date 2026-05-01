@@ -17,12 +17,18 @@ use heron_metrics::{ClassifyFailure, RedactedLabel, redacted};
 use crate::writer::VaultError;
 
 pub(crate) const VAULT_WRITE_DURATION_SECONDS: &str = "vault_write_duration_seconds";
-pub(crate) const VAULT_WRITE_FAILURES_TOTAL: &str = "vault_write_failures_total";
 /// Public so `heron-orchestrator::vault_read` can reuse the canonical
-/// read-side metric names without re-declaring them — keeps the
-/// vault_read.rs and vault writer instrumentation consistent.
+/// read-side duration metric without re-declaring it.
 pub const VAULT_READ_DURATION_SECONDS: &str = "vault_read_duration_seconds";
-pub const VAULT_READ_FAILURES_TOTAL: &str = "vault_read_failures_total";
+/// Unified failures counter (#239). Read and write paths share a
+/// single \`vault_failures_total\{op, reason}\` series so dashboards
+/// see "any vault op failed" in one place; the \`op\` label
+/// distinguishes \`atomic_write\` / \`update_action_item\` / \`finalize\`
+/// (and future read-side ops once read-path instrumentation lands).
+/// Public so the orchestrator's \`vault_read\` can emit on the same
+/// series. Replaces the prior \`vault_write_failures_total\` and
+/// \`vault_read_failures_total\` split.
+pub const VAULT_FAILURES_TOTAL: &str = "vault_failures_total";
 
 /// Pinned `op` labels for vault write metrics. Closed set keeps
 /// cardinality at the {atomic_write, update_action_item, finalize}
@@ -38,6 +44,10 @@ pub(crate) fn op_update_action_item() -> RedactedLabel {
 
 pub(crate) fn op_finalize() -> RedactedLabel {
     redacted!("finalize")
+}
+
+pub(crate) fn op_re_summarize() -> RedactedLabel {
+    redacted!("re_summarize")
 }
 
 impl ClassifyFailure for VaultError {
@@ -85,9 +95,8 @@ mod tests {
     fn vault_metric_names_match_convention() {
         for name in [
             VAULT_WRITE_DURATION_SECONDS,
-            VAULT_WRITE_FAILURES_TOTAL,
             VAULT_READ_DURATION_SECONDS,
-            VAULT_READ_FAILURES_TOTAL,
+            VAULT_FAILURES_TOTAL,
         ] {
             validate_metric_name(name)
                 .unwrap_or_else(|e| panic!("metric name {name:?} drifted: {e}"));

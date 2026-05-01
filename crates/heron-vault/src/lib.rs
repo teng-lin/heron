@@ -25,7 +25,7 @@ pub use calendar::{
 pub use encode::{EncodeError, encode_to_m4a, verify_m4a};
 pub use id_match::{LayerTwoMatch, MIN_SIMILARITY, apply_matches, match_action_items_by_text};
 pub use merge::{MergeInputs, MergeOutcome, merge, merge_action_items, merge_attendees};
-pub use metrics_emit::{VAULT_READ_DURATION_SECONDS, VAULT_READ_FAILURES_TOTAL};
+pub use metrics_emit::{VAULT_FAILURES_TOTAL, VAULT_READ_DURATION_SECONDS};
 pub use purge::{PurgeOutcome, purge_after_verify};
 pub use validate::{Issue, validate_vault};
 pub use writer::{

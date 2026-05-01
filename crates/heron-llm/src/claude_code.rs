@@ -109,7 +109,7 @@ impl Summarizer for ClaudeCodeClient {
         heron_metrics::timed_io_async(
             LLM_CALL_DURATION_SECONDS,
             LLM_CALL_FAILURES_TOTAL,
-            ("op", backend_label(Backend::ClaudeCodeCli)),
+            ("backend", backend_label(Backend::ClaudeCodeCli)),
             self.summarize_inner(input),
         )
         .await

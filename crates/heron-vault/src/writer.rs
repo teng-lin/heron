@@ -28,8 +28,8 @@ use uuid::Uuid;
 
 use crate::merge::{MergeInputs, MergeOutcome, merge};
 use crate::metrics_emit::{
-    IoErrorReason, VAULT_WRITE_DURATION_SECONDS, VAULT_WRITE_FAILURES_TOTAL, op_atomic_write,
-    op_finalize, op_update_action_item,
+    IoErrorReason, VAULT_FAILURES_TOTAL, VAULT_WRITE_DURATION_SECONDS, op_atomic_write,
+    op_finalize, op_re_summarize, op_update_action_item,
 };
 
 const FRONTMATTER_FENCE: &str = "---\n";
@@ -195,7 +195,7 @@ impl VaultWriter {
         // "what slowed down" panel can drill from finalize → write.
         heron_metrics::timed_io_sync(
             VAULT_WRITE_DURATION_SECONDS,
-            VAULT_WRITE_FAILURES_TOTAL,
+            VAULT_FAILURES_TOTAL,
             ("op", op_finalize()),
             || self.finalize_session_inner(date_str, start_hhmm, slug, frontmatter, body),
         )
@@ -264,7 +264,7 @@ impl VaultWriter {
     ) -> Result<PathBuf, VaultError> {
         heron_metrics::timed_io_sync(
             VAULT_WRITE_DURATION_SECONDS,
-            VAULT_WRITE_FAILURES_TOTAL,
+            VAULT_FAILURES_TOTAL,
             ("op", op_finalize()),
             || {
                 self.finalize_with_pattern_inner(
@@ -401,7 +401,7 @@ impl VaultWriter {
     ) -> Result<ActionItem, VaultError> {
         heron_metrics::timed_io_sync(
             VAULT_WRITE_DURATION_SECONDS,
-            VAULT_WRITE_FAILURES_TOTAL,
+            VAULT_FAILURES_TOTAL,
             ("op", op_update_action_item()),
             || self.update_action_item_inner(meeting_path, item_id, patch),
         )
@@ -487,6 +487,24 @@ impl VaultWriter {
     /// the body to "no semantic change, theirs wins" — the natural
     /// behavior for a fresh summarize. See `docs/archives/merge-model.md`.
     pub fn re_summarize(
+        &self,
+        note_path: &Path,
+        theirs_frontmatter: &Frontmatter,
+        theirs_body: &str,
+    ) -> Result<MergeOutcome, VaultError> {
+        // Top-level write op for dashboards (#239). Inner
+        // `atomic_write`/`atomic_copy` calls still emit their own
+        // rows under `op="atomic_write"` so a slow re_summarize can
+        // be drilled into.
+        heron_metrics::timed_io_sync(
+            VAULT_WRITE_DURATION_SECONDS,
+            VAULT_FAILURES_TOTAL,
+            ("op", op_re_summarize()),
+            || self.re_summarize_inner(note_path, theirs_frontmatter, theirs_body),
+        )
+    }
+
+    fn re_summarize_inner(
         &self,
         note_path: &Path,
         theirs_frontmatter: &Frontmatter,
@@ -739,7 +757,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     // so callers see no API change.
     heron_metrics::timed_io_sync(
         VAULT_WRITE_DURATION_SECONDS,
-        VAULT_WRITE_FAILURES_TOTAL,
+        VAULT_FAILURES_TOTAL,
         ("op", op_atomic_write()),
         || atomic_write_inner(path, contents).map_err(IoErrorReason),
     )
