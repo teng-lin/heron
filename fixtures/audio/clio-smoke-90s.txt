@@ -1,0 +1,11 @@
+Good morning everyone, thanks for joining the Tuesday product sync. Let's keep this short and run through status, current blockers, and action items for the rest of the week.
+
+First, on the onboarding redesign. The new welcome flow is in staging and the conversion numbers look promising, up about twelve percent week over week. We still want to validate that lift on a larger sample. Action item: I will send the updated design document and the experiment write up to the working group by Friday afternoon so everyone can review the results before the all hands.
+
+Second, on the billing migration. We finished the dry run against the staging database last night and there were no errors, but the latency on the invoice endpoint is still well above our target. Action item: please schedule a meeting with the platform team this week to walk through the query plan and decide whether we add an index, rewrite the aggregation, or split the report into two passes.
+
+Third, a quick reminder. The company all hands is on Wednesday at four in the afternoon. Action item: prepare a three slide update on the quarter so far and share it in the shared drive by Tuesday evening so the chief of staff can stitch the deck together.
+
+Finally, a heads up that the security audit findings landed yesterday. There are two medium severity items we own and one informational item. Action item: assign clear owners for each finding by end of day Thursday and post the tracking issue numbers in the engineering channel so anyone can follow along.
+
+That is everything from me. Any questions before we wrap? Great, thanks everyone, talk soon.
