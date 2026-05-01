@@ -1,0 +1,9 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 320
+expression: value
+---
+{
+  "detail": "connect refused",
+  "kind": "unavailable"
+}

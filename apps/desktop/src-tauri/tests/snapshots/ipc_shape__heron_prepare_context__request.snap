@@ -1,0 +1,24 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 381
+expression: value
+---
+{
+  "attendees": [
+    {
+      "email": "alice@example.com",
+      "last_seen_in": "mtg_00000000-0000-0000-0000-000000000000",
+      "name": "Alice",
+      "notes": "PM on launch",
+      "relationship": "teammate"
+    },
+    {
+      "email": null,
+      "last_seen_in": null,
+      "name": "Bob",
+      "notes": null,
+      "relationship": null
+    }
+  ],
+  "calendar_event_id": "cal-event-abc-123"
+}

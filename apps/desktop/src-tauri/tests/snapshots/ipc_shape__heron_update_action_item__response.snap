@@ -1,0 +1,12 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 219
+expression: value
+---
+{
+  "done": true,
+  "due": "2026-05-15",
+  "id": "11111111-1111-7111-8111-111111111111",
+  "owner": "Alex",
+  "text": "Send the recap email"
+}

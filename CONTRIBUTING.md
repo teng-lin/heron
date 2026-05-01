@@ -118,6 +118,28 @@ Three live in `swift/`. New bridges mirror the canonical
   involved, prefer lower bounds (`>= X`) over upper bounds (`<= Y`)
   so CI's GitHub Actions runner doesn't false-fail on scheduler jitter.
 
+### Updating insta snapshots
+
+`apps/desktop/src-tauri/tests/ipc_shape.rs` (issue #186) pins the JSON
+shape of high-traffic Tauri command payloads via `insta`. A wire-format
+change (renaming a field, adding a `#[serde(rename = "...")]`, dropping
+a `#[serde(default)]`) fails the snapshot assertion.
+
+To accept a deliberate change:
+
+1. Run `cargo test -p heron-desktop --test ipc_shape`. Drift writes
+   each new shape to a sibling `.snap.new` file.
+2. `cargo install cargo-insta` (one-time).
+3. `cargo insta review` — interactive accept / reject for each diff;
+   reviewed `.snap` files replace the originals.
+4. Commit the updated `.snap` files in the same PR as the wire-format
+   change so the renderer-side TS types and the Rust serde shape land
+   together.
+
+Snapshots live under `apps/desktop/src-tauri/tests/snapshots/` and are
+checked into the repo so the diff shows up at PR-review time alongside
+the type-definition change.
+
 ## Commit messages
 
 ```
