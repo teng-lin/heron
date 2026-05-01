@@ -1,0 +1,295 @@
+name: nightly
+
+# Real-pipeline (Clio) nightly run. Exercises the WhisperKit STT +
+# Anthropic Messages API + vault writer end-to-end against a small
+# synthetic audio fixture. Off-hours on UTC so the macos-14 runner
+# pool is uncontended; manual `workflow_dispatch` lets a maintainer
+# replay the run on demand without flipping the cron clock forward.
+#
+# Requires the following GitHub Actions secrets — see the issue #194
+# PR body or `docs/testing-roadmap.md` for the up-to-date list:
+#
+#   - ANTHROPIC_API_KEY      (mandatory; consumed by heron-llm + the
+#                             cross-crate clio_full_pipeline test)
+#   - HERON_WHISPERKIT_MODEL_DOWNLOAD_URL
+#                            (optional — defaults to the public
+#                             HuggingFace argmaxinc/whisperkit-coreml
+#                             tiny.en bundle; override if you want to
+#                             pin a different model size)
+#
+# Requires the GitHub label `nightly-failure` to exist on the repo
+# before the first run that would file an issue. The label-creation
+# step is documented in the issue #194 PR body and called out in this
+# file's comment trail; this workflow does NOT auto-create the label
+# (creating it dynamically here would require a separate `gh label
+# create` call gated on a list-and-check, and the one-time human
+# `gh label create nightly-failure --color B60205` setup is simpler).
+
+on:
+  schedule:
+    # 09:30 UTC = 02:30 PT / 05:30 ET — well outside any reasonable
+    # interactive window so the macos-14 runner pool latency is
+    # bounded by build-cache state, not runner availability.
+    - cron: "30 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  # `issues: write` is required for the 3-strikes failure-tracking
+  # job to file the dedup'd `nightly-failure` issue. Read-only on
+  # contents (default in the per-job override below) means a
+  # compromised dependency installed in the test step cannot mutate
+  # the repo.
+  contents: read
+  issues: write
+
+concurrency:
+  # One nightly run at a time. A manual `workflow_dispatch` cancels
+  # an in-flight scheduled run rather than queuing — the test is
+  # idempotent and the scheduled run will retry on the next cron tick.
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default to the smallest WhisperKit model that produces a usable
+  # transcript. tiny.en is ~75 MB; CI cache absorbs it after the first
+  # run. Override via the `HERON_WHISPERKIT_MODEL_DOWNLOAD_URL` repo
+  # secret if a larger / different model is needed for accuracy work.
+  WHISPERKIT_MODEL_NAME: openai_whisper-tiny.en
+
+jobs:
+  real-pipeline:
+    name: real-pipeline (clio_full_pipeline)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain as `rust.yml`. `cache: false` so our explicit
+      # rust-cache step below is the only one in scope — the bundled
+      # cache uses a different shared-key namespace and would compete.
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: cargo registry + target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct key so the nightly's `--features real-pipeline`
+          # build artifacts don't fight the `rust.yml` `test-sherpa`
+          # cache slot (different feature set produces different
+          # `.fingerprint/` hashes; sharing would thrash both).
+          shared-key: nightly-real-pipeline
+          cache-directories: |
+            ~/Library/Caches/sherpa-rs
+
+      # Mirrors `rust.yml`. WhisperKit's transitive swift-jinja needs
+      # Swift 6 (Xcode 16+); the macos-14 runner ships 16.2 but
+      # defaults to 15.4.
+      - name: select Xcode 16 (Swift 6 toolchain)
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: install webrtc-audio-processing build deps (meson + ninja)
+        run: brew install meson ninja
+
+      # Cache the WhisperKit model directory so we don't pull
+      # ~75 MB from HuggingFace on every nightly tick. The cache key
+      # tracks the model name only; if a future change names a
+      # different model, the cache restores fresh.
+      - name: cache WhisperKit model
+        id: whisperkit-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Application Support/heron/models/whisperkit
+          key: whisperkit-model-${{ env.WHISPERKIT_MODEL_NAME }}-v1
+
+      - name: download WhisperKit model
+        if: steps.whisperkit-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          MODEL_DIR="$HOME/Library/Application Support/heron/models/whisperkit/${WHISPERKIT_MODEL_NAME}"
+          mkdir -p "$MODEL_DIR"
+          # argmaxinc/whisperkit-coreml ships pre-compiled .mlmodelc
+          # bundles per model name. `git clone --depth 1` with sparse
+          # checkout keeps the download to just the model we want.
+          REPO_URL="${HERON_WHISPERKIT_MODEL_DOWNLOAD_URL:-https://huggingface.co/argmaxinc/whisperkit-coreml}"
+          tmp=$(mktemp -d)
+          git -c lfs.fetchinclude="${WHISPERKIT_MODEL_NAME}/*" \
+              clone --depth 1 --filter=blob:none "$REPO_URL" "$tmp"
+          (cd "$tmp" && git lfs pull --include="${WHISPERKIT_MODEL_NAME}/*")
+          # WhisperKit expects the env var to point at the folder
+          # CONTAINING the *.mlmodelc bundles, not a parent.
+          cp -R "$tmp/${WHISPERKIT_MODEL_NAME}/." "$MODEL_DIR/"
+          rm -rf "$tmp"
+        env:
+          HERON_WHISPERKIT_MODEL_DOWNLOAD_URL: ${{ secrets.HERON_WHISPERKIT_MODEL_DOWNLOAD_URL }}
+
+      # The `clio_full_pipeline` test resolves the fixture via
+      # `HERON_REAL_PIPELINE_FIXTURE` (override) or the workspace-
+      # default `fixtures/audio/clio-smoke-90s.wav`. The latter is
+      # checked into the repo per issue #194; if that file is absent
+      # (deferred fixture generation per the issue's PR body), the
+      # test skips with a clear `eprintln!` rather than failing. Log
+      # presence here so a "test skipped" run reads cleanly.
+      - name: report fixture status
+        run: |
+          set -euo pipefail
+          fx="fixtures/audio/clio-smoke-90s.wav"
+          if [ -f "$fx" ]; then
+            sz=$(stat -f%z "$fx")
+            echo "::notice::fixture present: $fx ($sz bytes)"
+          else
+            echo "::warning::fixture $fx is absent — clio_full_pipeline will skip with HERON_REAL_PIPELINE_FIXTURE skip-message"
+          fi
+
+      # Workspace-features verification: the simple form
+      # `--features real-pipeline` propagates to every workspace
+      # member that declares it (heron-audio + heron-speech +
+      # heron-llm + herond all do, per their Cargo.toml updates).
+      # See the issue #194 PR body for the experiment that confirmed
+      # this is what cargo's feature unification rule does in
+      # workspaces. We pre-build to surface compile errors as a
+      # distinct step from the test phase.
+      - name: cargo build --features real-pipeline
+        run: cargo build --workspace --features real-pipeline --tests
+
+      - name: cargo test --include-ignored
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Belt-and-braces for the heron-audio real-device test:
+          # the env-var skip stays in place even with the feature
+          # gate, so unsetting this here keeps the audio test from
+          # reaching for TCC (which a CI runner doesn't have anyway,
+          # but explicit > implicit). The other two real-pipeline
+          # tests (heron-speech, heron-llm) gate on their own keys.
+          HERON_PROCESS_TAP_REAL: ""
+        run: |
+          set -euo pipefail
+          # `$HOME` here is the runner's home dir; assembling the
+          # path inside the run-step (rather than via the YAML `env`
+          # block) sidesteps the `${{ env.HOME }}` expansion that
+          # would otherwise resolve at template-time before the
+          # runner starts.
+          export HERON_WHISPERKIT_MODEL_DIR="$HOME/Library/Application Support/heron/models/whisperkit/${WHISPERKIT_MODEL_NAME}"
+          # `--include-ignored` runs the audio test that drops its
+          # `#[ignore]` only with `--features real-pipeline`. The
+          # `dyld` env mirrors `rust.yml`'s `cargo test` step so
+          # sherpa-rs's onnxruntime dylibs resolve.
+          roots=()
+          for root in "$HOME/Library/Caches/sherpa-rs" target/debug; do
+            [ -d "$root" ] && roots+=("$root")
+          done
+          dirs=""
+          if [ "${#roots[@]}" -gt 0 ]; then
+            dirs=$(find "${roots[@]}" -maxdepth 6 -name 'libonnxruntime*.dylib' \
+              -exec dirname {} \; 2>/dev/null | sort -u | paste -sd ':' -)
+          fi
+          if [ -z "$dirs" ]; then
+            echo "::error::no libonnxruntime*.dylib found under sherpa-rs cache or target/debug" >&2
+            exit 1
+          fi
+          DYLD_FALLBACK_LIBRARY_PATH="${dirs}:${DYLD_FALLBACK_LIBRARY_PATH:-}" \
+            cargo test --workspace --features real-pipeline -- --include-ignored
+
+  # Independent job: opens a tracking issue when nightly has failed
+  # three runs in a row. Three rules:
+  #
+  #   1. The streak window combines (a) the just-observed `failure()`
+  #      of the `real-pipeline` job in this run with (b) the last 2
+  #      *completed* prior nightly runs on `main`. Avoids racing the
+  #      runs-API replication lag that would make
+  #      `gh run list --limit 3` return the just-finished run as
+  #      `conclusion: null`.
+  #   2. Dedup via `gh issue list --label nightly-failure --state
+  #      open` so a sustained outage doesn't open N+1 issues.
+  #   3. `workflow_dispatch` skips the check so a maintainer
+  #      replaying a known-broken run does not trigger the alarm.
+  #
+  # The job only runs when `real-pipeline` failed; a recovering
+  # success leaves any previously-opened issue alone (the maintainer
+  # closes it manually once they've verified the recovery, which
+  # gates the next "fresh issue on a new streak" cycle).
+  three-strikes:
+    name: three-strikes failure tracker
+    needs: real-pipeline
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: check for three consecutive failures
+        id: streak
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The current run is reported by `gh run list` with
+        # `conclusion: null` until the entire workflow concludes —
+        # which it can't, because we're still inside it. So we
+        # query for the last 2 *completed* prior runs and combine
+        # with the just-observed local failure (the job's `if:
+        # failure()` already implies the current run failed).
+        run: |
+          set -euo pipefail
+          prior=$(gh run list \
+            --workflow nightly.yml \
+            --branch main \
+            --status completed \
+            --limit 2 \
+            --json conclusion \
+            --jq '[.[].conclusion]')
+          echo "last 2 prior conclusions: $prior"
+          prior_all_failed=$(echo "$prior" \
+            | jq 'length == 2 and all(. == "failure")')
+          if [ "$prior_all_failed" = "true" ]; then
+            echo "streak=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "streak=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: file or update tracking issue
+        if: steps.streak.outputs.streak == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Dedup: if a `nightly-failure`-labeled issue is already
+        # open, do nothing (don't comment — the maintainer is
+        # already subscribed to the tracking issue and notification
+        # spam on a sustained outage helps no one). When the
+        # maintainer closes the existing issue, a NEW streak after
+        # the close will open a fresh one.
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list \
+            --label nightly-failure \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            echo "::notice::issue #$existing already open — not opening a duplicate"
+            exit 0
+          fi
+          # Recreate the label if a maintainer accidentally deleted
+          # it. `gh label create` is idempotent on `--force` so a
+          # racing run that beat us to the create still succeeds.
+          gh label create nightly-failure \
+            --color B60205 \
+            --description "Auto-filed when the nightly real-pipeline workflow fails 3 days in a row" \
+            --force >/dev/null 2>&1 || true
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh issue create \
+            --title "Nightly real-pipeline run failed 3 days in a row" \
+            --label nightly-failure \
+            --body "$(cat <<EOF
+          The \`nightly\` workflow's \`real-pipeline\` job has failed
+          three consecutive scheduled runs on \`main\`. This issue is
+          opened by \`.github/workflows/nightly.yml\`'s
+          \`three-strikes\` job; it is dedup'd on the
+          \`nightly-failure\` label so a sustained outage does not
+          pile on duplicate issues.
+
+          Latest run: $run_url
+
+          To silence: close this issue. The next failure-streak that
+          starts AFTER the close will open a fresh issue.
+          EOF
+          )"

@@ -32,7 +32,10 @@ use heron_types::SessionId;
 use hound::WavReader;
 
 #[tokio::test]
-#[ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/archives/manual-test-matrix.md"]
+#[cfg_attr(
+    not(feature = "real-pipeline"),
+    ignore = "needs HERON_PROCESS_TAP_REAL=1 + TCC + a live meeting client; see docs/archives/manual-test-matrix.md. Pass `--features real-pipeline` (or run via the nightly workflow) to enable; the env-var skip below stays in place as a belt-and-braces gate so a real-pipeline build on a machine without TCC still skips cleanly."
+)]
 async fn end_to_end_session_writes_three_wavs() {
     if std::env::var_os("HERON_PROCESS_TAP_REAL").is_none() {
         eprintln!(

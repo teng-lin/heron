@@ -64,5 +64,12 @@ cpal = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 
+[features]
+# Opt-in gate for the nightly real-pipeline test set. Off by default so
+# `cargo test --workspace` on a contributor's machine never reaches for
+# TCC permissions, downloaded STT models, or paid LLM API keys. The
+# `nightly.yml` workflow is the canonical caller; see issue #194.
+real-pipeline = []
+
 [lints]
 workspace = true

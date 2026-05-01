@@ -47,6 +47,28 @@ http-body-util = { workspace = true }
 # bridge instance — that lands with the orchestrator-composition PR);
 # pulled in here at test scope so the contract is pinned today.
 heron-bridge = { workspace = true }
+# Real-pipeline nightly test (`tests/clio_full_pipeline.rs`) drives the
+# heron-cli session orchestrator with `skip_audio_capture: true` and a
+# pre-seeded WAV fixture so the STT → LLM → vault path runs end-to-end
+# against the real WhisperKit model + real Anthropic API. Gated behind
+# the `real-pipeline` feature so the dep is only pulled into test
+# builds that actually exercise it.
+heron-cli = { workspace = true }
+heron-llm = { workspace = true }
+heron-speech = { workspace = true }
+heron-vault = { workspace = true }
+heron-types = { workspace = true }
+heron-zoom = { workspace = true }
+hound = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = "3"
+
+[features]
+# Opt-in gate for the nightly real-pipeline test set. Off by default so
+# `cargo test --workspace` on a contributor's machine never reaches for
+# downloaded STT models or paid LLM API keys. The `nightly.yml`
+# workflow is the canonical caller; see issue #194.
+real-pipeline = []
 
 [lints]
 workspace = true
