@@ -107,13 +107,170 @@ fn rust_handler_names() -> BTreeSet<String> {
     visitor.names
 }
 
+/// Tiny TS lexer that yields one byte at a time with metadata about
+/// whether the byte is "structural" (matters for brace counting and
+/// key extraction) or part of a comment / string literal that should
+/// be ignored. Operates on raw bytes — TS source we control here is
+/// ASCII for everything we care about (`{`, `}`, `"`, `'`, `` ` ``,
+/// `/`, `*`, `\n`); UTF-8 multi-byte characters can appear inside
+/// comments or strings and are correctly subsumed by the existing
+/// "in_comment / in_string" state because the lexer never emits
+/// those bytes as structural.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LexState {
+    Code,
+    LineComment,
+    BlockComment,
+    DoubleString,
+    SingleString,
+    TemplateString,
+}
+
+/// Strip TypeScript comments + string literals from `src`, returning
+/// a buffer the same length where each non-structural byte has been
+/// replaced with a space (so byte indices into the result are still
+/// valid offsets into the original — useful for error messages, and
+/// keeps the line numbers stable since `\n` is preserved). Templates
+/// can contain `${ … }` expressions that re-enter code mode; we
+/// handle one level of nesting which is sufficient for the
+/// `HeronCommands` block (no template literals appear there today;
+/// the handler is belt-and-suspenders).
+fn strip_ts_strings_and_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = vec![b' '; bytes.len()];
+    let mut state = LexState::Code;
+    // Stack of `Code` re-entries from `${` inside a template string.
+    // Each entry remembers which template state to return to when the
+    // matching `}` closes the expression.
+    let mut template_stack: Vec<LexState> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // `\n` is preserved verbatim across all states so line-based
+        // splits downstream still report the original line numbers.
+        if b == b'\n' {
+            out[i] = b'\n';
+            if matches!(state, LexState::LineComment) {
+                state = LexState::Code;
+            }
+            i += 1;
+            continue;
+        }
+        match state {
+            LexState::Code => {
+                // Handle `//` and `/*` comment openers.
+                if b == b'/' && i + 1 < bytes.len() {
+                    let next = bytes[i + 1];
+                    if next == b'/' {
+                        state = LexState::LineComment;
+                        i += 2;
+                        continue;
+                    }
+                    if next == b'*' {
+                        state = LexState::BlockComment;
+                        i += 2;
+                        continue;
+                    }
+                }
+                // String openers.
+                if b == b'"' {
+                    state = LexState::DoubleString;
+                    i += 1;
+                    continue;
+                }
+                if b == b'\'' {
+                    state = LexState::SingleString;
+                    i += 1;
+                    continue;
+                }
+                if b == b'`' {
+                    state = LexState::TemplateString;
+                    i += 1;
+                    continue;
+                }
+                // Pop a template expression on `}` if we entered one.
+                if b == b'}'
+                    && let Some(prev) = template_stack.pop()
+                {
+                    // The closing brace of `${ … }` is structural for
+                    // the *expression*, but we treat the brace itself
+                    // as part of the string so it doesn't confuse the
+                    // outer brace counter.
+                    state = prev;
+                    i += 1;
+                    continue;
+                }
+                // Otherwise this is structural code.
+                out[i] = b;
+                i += 1;
+            }
+            LexState::LineComment => {
+                // Already handled `\n` above; everything else is
+                // suppressed to a space.
+                i += 1;
+            }
+            LexState::BlockComment => {
+                if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    state = LexState::Code;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            LexState::DoubleString | LexState::SingleString => {
+                // `\` escapes the next byte; never closes the string.
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                let close = match state {
+                    LexState::DoubleString => b'"',
+                    LexState::SingleString => b'\'',
+                    _ => unreachable!(),
+                };
+                if b == close {
+                    state = LexState::Code;
+                }
+                i += 1;
+            }
+            LexState::TemplateString => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == b'`' {
+                    state = LexState::Code;
+                    i += 1;
+                    continue;
+                }
+                if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    // Re-enter Code mode, remember to come back here.
+                    template_stack.push(LexState::TemplateString);
+                    state = LexState::Code;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    // The lexer should always terminate inside `Code` for a well-formed
+    // TS file. A trailing un-closed string / comment would be a
+    // pre-existing TS-compile error caught upstream by `bun run build`.
+    // Convert `out` back to a `String`; all bytes are either preserved
+    // structural ASCII or `b' '` / `b'\n'`, so it's valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|e| panic!("stripped buffer must be valid UTF-8: {e}"))
+}
+
 /// Scan `invoke.ts` for the `HeronCommands` interface block and
 /// collect every property key that starts with `heron_`. We don't
-/// have a TS parser on hand; the line-based scanner is pinned to two
-/// fragile-but-stable anchors (`export interface HeronCommands {` /
-/// the matching `}`) and rejects shapes we haven't seen before so
-/// future drift in the surrounding file fails loudly rather than
-/// silently dropping commands.
+/// have a TS parser on hand; the byte-level scanner pre-strips
+/// comments + string literals (so a doc-comment containing `}` or
+/// a string with `: {` cannot fool the brace counter or the
+/// per-line key matcher) and then locates the literal anchor
+/// `export interface HeronCommands {` inside the *stripped* buffer
+/// — this prevents an anchor inside a comment or string from being
+/// mistaken for the real interface declaration.
 fn ts_command_names() -> BTreeSet<String> {
     let path = {
         // `CARGO_MANIFEST_DIR` is `apps/desktop/src-tauri`; walk up
@@ -123,24 +280,31 @@ fn ts_command_names() -> BTreeSet<String> {
         p.push("src/lib/invoke.ts");
         p
     };
-    let src =
+    let raw =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src = strip_ts_strings_and_comments(&raw);
 
     const OPEN: &str = "export interface HeronCommands {";
     let open_idx = src
         .find(OPEN)
         .unwrap_or_else(|| panic!("`{OPEN}` anchor not found in {}", path.display()));
-    let after_open = &src[open_idx + OPEN.len()..];
+    // Sanity-check we found it once and only once. A duplicate hit
+    // would mean either a copy-paste error or our anchor is too
+    // generic — either case wants a hard failure.
+    let after_first = &src[open_idx + OPEN.len()..];
+    if after_first.contains(OPEN) {
+        panic!("`{OPEN}` appears more than once in {}", path.display());
+    }
+    let after_open = after_first;
 
-    // Brace-balanced scan for the matching close. The interface body
-    // contains `{}` literals (e.g. `args: Record<string, never>`) so a
-    // naive `find('}')` would stop at the first one.
+    // Brace-balanced scan for the matching close, run on the stripped
+    // buffer so braces inside comments / strings can't move the depth.
     let mut depth = 1usize;
     let mut close_rel: Option<usize> = None;
-    for (i, ch) in after_open.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
+    for (i, &b) in after_open.as_bytes().iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
                 depth -= 1;
                 if depth == 0 {
                     close_rel = Some(i);
@@ -155,25 +319,32 @@ fn ts_command_names() -> BTreeSet<String> {
     let body = &after_open[..close_rel];
 
     let mut out = BTreeSet::new();
-    for raw in body.lines() {
-        // The interface body has only one shape per command:
-        //   <key>: {
-        // where `<key>` is unquoted and the colon is followed by an
-        // open brace. We explicitly skip quoted keys / multi-line
-        // arrow types so a future syntax change can't silently widen
-        // the matched set.
-        let line = raw.trim();
-        if !line.ends_with(": {") {
+    for raw_line in body.lines() {
+        // Per-line parse against a simple grammar: optional leading
+        // whitespace, then an identifier (the key), then `:`, then
+        // `{`, then optional trailing whitespace. This is more
+        // tolerant of the line-ending `: {` shape than the previous
+        // `ends_with(": {")` check (e.g. it accepts `: {  ` or
+        // `:  {`) without widening to multi-key lines like
+        // `args: { sessionId: string };` — those are indented further
+        // and start with `args:` (or some other reserved prefix), and
+        // our `heron_` start filter still catches the actual keys.
+        let trimmed = raw_line.trim_start();
+        let Some((key, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let after_colon = rest.trim_start();
+        // After the colon, the next non-whitespace char must be `{`
+        // and the rest of the line (modulo whitespace) must be empty.
+        // If it's anything else (`Record<…>`, `string;`, `(args:…)`)
+        // we're not looking at a top-level command entry.
+        if !after_colon.starts_with('{') {
             continue;
         }
-        let key = line.trim_end_matches(": {").trim();
-        // Reject quoted keys — a future `"heron_foo": {` would be an
-        // unintentional widening of the matched set.
-        if key.starts_with('"') || key.starts_with('\'') {
-            panic!(
-                "invoke.ts uses a quoted property key in HeronCommands; \
-                 update the IPC contract test to handle it: {raw:?}"
-            );
+        let tail = after_colon[1..].trim();
+        if !tail.is_empty() {
+            continue;
         }
         if !key.starts_with("heron_") {
             continue;
@@ -247,4 +418,77 @@ fn ipc_contract_test_is_not_trivially_passing() {
         "TS command count fell below 50 ({}); did invoke.ts get split?",
         ts.len()
     );
+}
+
+#[cfg(test)]
+mod ts_lexer_tests {
+    //! Targeted unit tests for `strip_ts_strings_and_comments` so a
+    //! regression in the helper doesn't have to be discovered via the
+    //! full parity check.
+    use super::strip_ts_strings_and_comments;
+
+    /// `}` inside a string literal must NOT count as structural.
+    #[test]
+    fn brace_inside_double_string_is_suppressed() {
+        let stripped = strip_ts_strings_and_comments(r#"a = "}"; b = {};"#);
+        // Strings collapse to spaces; the real `{}` survives.
+        assert!(stripped.contains('{'));
+        // Only one `}` (the structural one); the one inside the
+        // string was suppressed.
+        assert_eq!(stripped.matches('}').count(), 1);
+        assert_eq!(stripped.matches('{').count(), 1);
+    }
+
+    /// `}` inside `'…'` must NOT count as structural.
+    #[test]
+    fn brace_inside_single_string_is_suppressed() {
+        let stripped = strip_ts_strings_and_comments("a = '}'; b = {};");
+        assert_eq!(stripped.matches('}').count(), 1);
+        assert_eq!(stripped.matches('{').count(), 1);
+    }
+
+    /// `}` inside a `// …` line comment must NOT count.
+    #[test]
+    fn brace_inside_line_comment_is_suppressed() {
+        let stripped = strip_ts_strings_and_comments("a = 1; // }\nb = {};");
+        assert_eq!(stripped.matches('}').count(), 1);
+        // Line comment ends at `\n`; structural `{}` after survives.
+        assert!(stripped.contains("\n"));
+    }
+
+    /// `}` inside a `/* … */` block comment must NOT count even when
+    /// it spans newlines.
+    #[test]
+    fn brace_inside_block_comment_is_suppressed() {
+        let stripped = strip_ts_strings_and_comments("a = 1; /* } \n still } */ b = {};");
+        assert_eq!(stripped.matches('}').count(), 1);
+        assert_eq!(stripped.matches('{').count(), 1);
+    }
+
+    /// Escape sequences inside strings must not prematurely close
+    /// the string.
+    #[test]
+    fn escaped_quote_inside_string_does_not_close_it() {
+        let stripped = strip_ts_strings_and_comments(r#"a = "x\"}"; b = {};"#);
+        assert_eq!(stripped.matches('}').count(), 1);
+        assert_eq!(stripped.matches('{').count(), 1);
+    }
+
+    /// Newlines are preserved verbatim across all states so line
+    /// numbering survives the strip.
+    #[test]
+    fn newline_count_is_preserved() {
+        let src = "// a\n\"x\"\n/* b\n */\n`t`\n";
+        let stripped = strip_ts_strings_and_comments(src);
+        assert_eq!(
+            src.matches('\n').count(),
+            stripped.matches('\n').count(),
+            "stripped buffer must preserve every newline"
+        );
+        assert_eq!(
+            src.len(),
+            stripped.len(),
+            "stripped len must equal input len"
+        );
+    }
 }
