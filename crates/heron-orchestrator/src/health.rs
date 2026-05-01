@@ -19,7 +19,9 @@
 use std::path::Path;
 
 use chrono::Utc;
-use heron_session::{ComponentState, HealthComponent, HealthComponents, HealthStatus};
+use heron_session::{ComponentState, Health, HealthComponent, HealthComponents, HealthStatus};
+
+use crate::LocalSessionOrchestrator;
 
 pub(crate) fn health_component(
     state: ComponentState,
@@ -154,5 +156,58 @@ pub(crate) fn vault_health_component(vault_root: Option<&Path>) -> HealthCompone
             ComponentState::Degraded,
             "vault root is not configured; persistence is disabled until one is set",
         ),
+    }
+}
+
+pub(crate) async fn current(orch: &LocalSessionOrchestrator) -> Health {
+    // Keep /health side-effect-free: no EventKit permission prompt,
+    // no model download, no hosted-LLM network request. The
+    // endpoint reports local orchestrator wiring and cheap backend
+    // availability; operation-specific failures still surface from
+    // the corresponding read/capture/summarize paths.
+    //
+    // The probes do touch the filesystem (`Path::exists`) and
+    // PATH (`which` inside `heron_llm::Availability::detect`),
+    // both blocking syscalls — run them on the blocking pool so
+    // an unlucky disk stall can't park the async runtime.
+    let vault_root = orch.vault_root.clone();
+    let stt_backend_name = orch.stt_backend_name.clone();
+    let llm_preference = orch.llm_preference;
+    let probe = tokio::task::spawn_blocking(move || {
+        let components = HealthComponents {
+            capture: capture_health_component(vault_root.as_deref()),
+            whisperkit: stt_health_component(&stt_backend_name),
+            vault: vault_health_component(vault_root.as_deref()),
+            eventkit: eventkit_health_component(),
+            llm: llm_health_component(llm_preference),
+        };
+        let status = aggregate_health_status(&components);
+        Health {
+            status,
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            components,
+        }
+    })
+    .await;
+    match probe {
+        Ok(health) => health,
+        // Probe functions don't panic and the runtime doesn't
+        // cancel us, so a `JoinError` here means a real bug —
+        // surface it as `Down` rather than panic, so a single
+        // bad health probe can't take the daemon down with it.
+        Err(err) => Health {
+            status: HealthStatus::Down,
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            components: HealthComponents {
+                capture: health_component(
+                    ComponentState::Down,
+                    format!("health probe task failed: {err}"),
+                ),
+                whisperkit: health_component(ComponentState::Down, "health probe task failed"),
+                vault: health_component(ComponentState::Down, "health probe task failed"),
+                eventkit: health_component(ComponentState::Down, "health probe task failed"),
+                llm: health_component(ComponentState::Down, "health probe task failed"),
+            },
+        },
     }
 }

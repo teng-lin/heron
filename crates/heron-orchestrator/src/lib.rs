@@ -83,20 +83,15 @@ use heron_pipeline::session::{
     SessionError as CliSessionError,
 };
 use heron_session::{
-    AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health, HealthComponents,
-    HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingCompletedData, MeetingId,
-    MeetingOutcome, MeetingStatus, Platform, PreMeetingContext, PreMeetingContextRequest,
-    PrepareContextRequest, SessionError, SessionEventBus, SessionOrchestrator,
-    SetEventAutoRecordRequest, StartCaptureArgs, Summary, SummaryLifecycle, Transcript,
-    TranscriptLifecycle,
+    AutoRecordList, CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery,
+    Meeting, MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Platform,
+    PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest, SessionError,
+    SessionEventBus, SessionOrchestrator, SetEventAutoRecordRequest, StartCaptureArgs, Summary,
+    SummaryLifecycle, Transcript, TranscriptLifecycle,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
 
 use crate::compose::{build_live_session_start_args, pre_meeting_briefing_for_v1};
-use crate::health::{
-    aggregate_health_status, capture_health_component, eventkit_health_component, health_component,
-    llm_health_component, stt_health_component, vault_health_component,
-};
 use crate::live_session::{DynLiveSession, LiveSessionFactory};
 use crate::pipeline_glue::{
     complete_pipeline_meeting, insert_finalized_meeting, pipeline_to_session_error,
@@ -1348,56 +1343,7 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     }
 
     async fn health(&self) -> Health {
-        // Keep /health side-effect-free: no EventKit permission prompt,
-        // no model download, no hosted-LLM network request. The
-        // endpoint reports local orchestrator wiring and cheap backend
-        // availability; operation-specific failures still surface from
-        // the corresponding read/capture/summarize paths.
-        //
-        // The probes do touch the filesystem (`Path::exists`) and
-        // PATH (`which` inside `heron_llm::Availability::detect`),
-        // both blocking syscalls — run them on the blocking pool so
-        // an unlucky disk stall can't park the async runtime.
-        let vault_root = self.vault_root.clone();
-        let stt_backend_name = self.stt_backend_name.clone();
-        let llm_preference = self.llm_preference;
-        let probe = tokio::task::spawn_blocking(move || {
-            let components = HealthComponents {
-                capture: capture_health_component(vault_root.as_deref()),
-                whisperkit: stt_health_component(&stt_backend_name),
-                vault: vault_health_component(vault_root.as_deref()),
-                eventkit: eventkit_health_component(),
-                llm: llm_health_component(llm_preference),
-            };
-            let status = aggregate_health_status(&components);
-            Health {
-                status,
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                components,
-            }
-        })
-        .await;
-        match probe {
-            Ok(health) => health,
-            // Probe functions don't panic and the runtime doesn't
-            // cancel us, so a `JoinError` here means a real bug —
-            // surface it as `Down` rather than panic, so a single
-            // bad health probe can't take the daemon down with it.
-            Err(err) => Health {
-                status: HealthStatus::Down,
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                components: HealthComponents {
-                    capture: health_component(
-                        ComponentState::Down,
-                        format!("health probe task failed: {err}"),
-                    ),
-                    whisperkit: health_component(ComponentState::Down, "health probe task failed"),
-                    vault: health_component(ComponentState::Down, "health probe task failed"),
-                    eventkit: health_component(ComponentState::Down, "health probe task failed"),
-                    llm: health_component(ComponentState::Down, "health probe task failed"),
-                },
-            },
-        }
+        health::current(self).await
     }
 
     fn event_bus(&self) -> SessionEventBus {
@@ -1430,8 +1376,11 @@ mod tests {
     use crate::validation::{MAX_CALENDAR_EVENT_ID_BYTES, MAX_PRE_MEETING_CONTEXT_BYTES};
     use heron_event::Envelope;
     use heron_session::{
-        HealthComponent, Meeting, MeetingStatus, Platform, SummaryLifecycle, TranscriptLifecycle,
+        ComponentState, HealthComponent, HealthComponents, HealthStatus, Meeting, MeetingStatus,
+        Platform, SummaryLifecycle, TranscriptLifecycle,
     };
+
+    use crate::health::aggregate_health_status;
     use std::time::{Duration, Instant};
 
     fn sample_envelope() -> Envelope<EventPayload> {
