@@ -104,7 +104,7 @@ use crate::pipeline_glue::{
 };
 use crate::platform::platform_target_bundle_id;
 use crate::state::{ActiveMeeting, CaptureRuntime, FinalizedMeeting, PendingContexts};
-use crate::validation::{normalize_calendar_event_id, validate_context_size};
+use crate::validation::normalize_calendar_event_id;
 use crate::vault_read::platform_from_meeting_url;
 use heron_vault::{CalendarReader, FileNamingPattern};
 use tokio::sync::broadcast::error::RecvError;
@@ -116,6 +116,7 @@ pub mod live_session;
 pub(crate) mod auto_record;
 mod builder;
 mod compose;
+mod context;
 mod health;
 mod metrics_names;
 mod pipeline_glue;
@@ -1301,70 +1302,11 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     }
 
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
-        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        let bytes = validate_context_size(&req.context)?;
-        let overwrote = self
-            .pending_contexts
-            .insert(calendar_event_id.clone(), req.context);
-        tracing::info!(
-            calendar_event_id = %calendar_event_id,
-            overwrote,
-            bytes,
-            "pre-meeting context attached",
-        );
-        Ok(())
+        context::attach_context(self, req).await
     }
 
     async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
-        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        // Today's synthesizer is intentionally minimal: lift the
-        // calendar event's attendees into `attendees_known` and leave
-        // the rest at default. Related-notes lookup needs vault
-        // search by attendee/title — that lands with the Ask-bar RAG
-        // infrastructure (Tier 6b in the UX redesign doc); until then
-        // the priming is enough to flip the rail's `primed` flag and
-        // give `start_capture` a non-empty staged entry to consume.
-        //
-        // Known limitation — synth-id drift: when the upstream
-        // calendar reader synthesizes ids from `(start, end, title)`
-        // (today's behavior, see `list_upcoming_calendar`), editing
-        // the event's title or time changes the id. The previously-
-        // staged context becomes orphaned in `pending_contexts` and a
-        // fresh `prepare_context` runs against the new id. The orphan
-        // ages out via the FIFO cap. Worth pruning explicitly once
-        // EventKit exposes a stable id.
-        let context = PreMeetingContext {
-            attendees_known: req.attendees,
-            ..PreMeetingContext::default()
-        };
-        // Re-use the same size guard as `attach_context` even though
-        // today's synthesized context is tiny — keeps the on-disk
-        // contract uniform and means a future synthesizer that grows
-        // the body fails loudly here rather than silently busting the
-        // cap.
-        let bytes = validate_context_size(&context)?;
-        // `insert_if_absent` is a single-mutex-acquisition check +
-        // insert: a concurrent `attach_context` for the same id
-        // racing this prepare cannot land between the existence
-        // probe and the insert (which would silently clobber the
-        // user's manual context). Prepare losers leave the prior
-        // entry untouched.
-        let inserted = self
-            .pending_contexts
-            .insert_if_absent(calendar_event_id.clone(), context);
-        if inserted {
-            tracing::info!(
-                calendar_event_id = %calendar_event_id,
-                bytes,
-                "pre-meeting context auto-prepared",
-            );
-        } else {
-            tracing::debug!(
-                calendar_event_id = %calendar_event_id,
-                "prepare_context: entry already staged, leaving as-is",
-            );
-        }
-        Ok(())
+        context::prepare_context(self, req).await
     }
 
     async fn set_event_auto_record(
