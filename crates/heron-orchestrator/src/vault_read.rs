@@ -31,11 +31,16 @@ use crate::MAX_TRANSCRIPT_LINE_BYTES;
 
 // Metric names from the #225 appendix. Convention validation runs in
 // `vault_read_metric_names_match_convention` below so a drifted literal
-// flunks `cargo test` before reaching production.
+// flunks `cargo test` before reaching production. Counters use
+// `validate_metric_name` (suffix required); histograms use the
+// `validate_histogram_base_name` carve-out from #237 because
+// Prometheus auto-appends `_bucket`/`_count`/`_sum` to histogram base
+// names — a `_count` suffix here would render `_count_count` on the
+// wire (the well-known anti-pattern).
 const VAULT_TRANSCRIPT_OVERSIZED_LINES_SKIPPED_TOTAL: &str =
     "vault_transcript_oversized_lines_skipped_total";
-const VAULT_TRANSCRIPT_SEGMENTS_COUNT: &str = "vault_transcript_segments_count";
-const VAULT_TRANSCRIPT_BYTES_READ_BYTES: &str = "vault_transcript_bytes_read_bytes";
+const VAULT_TRANSCRIPT_SEGMENTS: &str = "vault_transcript_segments";
+const VAULT_TRANSCRIPT_READ_BYTES: &str = "vault_transcript_read_bytes";
 const VAULT_PATH_RESOLVE_SYMLINK_REJECTED_TOTAL: &str = "vault_path_resolve_symlink_rejected_total";
 
 /// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
@@ -522,9 +527,9 @@ pub(crate) fn read_transcript_segments(
     let mut lineno = 0usize;
     // Track the running total of bytes drawn off the file (including
     // bytes drained from over-cap lines we skip) so the
-    // `bytes_read_bytes` histogram observation on return reflects the
-    // actual disk read size, not just the bytes that survived into
-    // `segments`.
+    // `vault_transcript_read_bytes` histogram observation on return
+    // reflects the actual disk read size, not just the bytes that
+    // survived into `segments`.
     let mut total_bytes_read = 0u64;
     // Issue #215 finding 3 — buffer is reused across iterations so
     // we don't re-allocate per line. `read_until` appends, so each
@@ -657,8 +662,8 @@ pub(crate) fn read_transcript_segments(
     // longer in use, so the `as f64` cast and metrics emission can't
     // affect buffer lifetime / reuse. Both observations are
     // O(1) — cheap, allocation-free.
-    metrics::histogram!(VAULT_TRANSCRIPT_SEGMENTS_COUNT).record(segments.len() as f64);
-    metrics::histogram!(VAULT_TRANSCRIPT_BYTES_READ_BYTES).record(total_bytes_read as f64);
+    metrics::histogram!(VAULT_TRANSCRIPT_SEGMENTS).record(segments.len() as f64);
+    metrics::histogram!(VAULT_TRANSCRIPT_READ_BYTES).record(total_bytes_read as f64);
     Ok(segments)
 }
 
@@ -919,14 +924,19 @@ mod tests {
     /// reaching production.
     #[test]
     fn vault_read_metric_names_match_convention() {
+        // Counters keep the strict suffix-required validator.
         for name in [
             VAULT_TRANSCRIPT_OVERSIZED_LINES_SKIPPED_TOTAL,
-            VAULT_TRANSCRIPT_SEGMENTS_COUNT,
-            VAULT_TRANSCRIPT_BYTES_READ_BYTES,
             VAULT_PATH_RESOLVE_SYMLINK_REJECTED_TOTAL,
         ] {
             heron_metrics::validate_metric_name(name)
                 .unwrap_or_else(|e| panic!("metric name {name:?} drifted: {e}"));
+        }
+        // Histograms use the #237 base-name validator that drops the
+        // suffix requirement (Prometheus auto-appends `_count`/`_sum`).
+        for name in [VAULT_TRANSCRIPT_SEGMENTS, VAULT_TRANSCRIPT_READ_BYTES] {
+            heron_metrics::validate_histogram_base_name(name)
+                .unwrap_or_else(|e| panic!("histogram base name {name:?} drifted: {e}"));
         }
     }
 
@@ -960,13 +970,16 @@ mod tests {
         assert_eq!(segments.len(), 2);
 
         let body = handle.render();
+        // Match the auto-appended `_sum` line so the assertion fails
+        // closed if the base name regresses to `*_count` (which would
+        // render `_count_count` and not match `_sum$`).
         assert!(
-            body.contains("vault_transcript_segments_count"),
+            body.contains("vault_transcript_segments_sum"),
             "segments histogram missing: {body}"
         );
         assert!(
-            body.contains("vault_transcript_bytes_read_bytes"),
-            "bytes_read histogram missing: {body}"
+            body.contains("vault_transcript_read_bytes_sum"),
+            "read_bytes histogram missing: {body}"
         );
     }
 
