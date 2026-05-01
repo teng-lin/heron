@@ -187,6 +187,16 @@ tauri = { version = "2", features = ["test"] }
 # adapter stays a dev-dep.
 heron-event-http = { workspace = true }
 
+# Issue #186 IPC payload snapshot tests. `insta` pins the JSON shape of
+# the high-traffic Tauri command request / response payloads so a future
+# `#[serde(rename = "...")]` (or any serde-shape regression) lands as a
+# visible snapshot diff during review. Snapshots live under
+# `tests/snapshots/`; the `cargo insta review` flow updates them after a
+# deliberate wire-format change. The `json` feature pulls in
+# `assert_json_snapshot!` (it lives behind that feature flag, not in the
+# base crate).
+insta = { version = "1.39", features = ["json"] }
+
 # macOS Keychain integration (PR-θ / phase 70). The crate is broadly
 # used (rustls, reqwest, cargo) and dual-licensed MIT/Apache-2.0 (already
 # in `deny.toml`'s allowlist via the existing transitive dep on it). The

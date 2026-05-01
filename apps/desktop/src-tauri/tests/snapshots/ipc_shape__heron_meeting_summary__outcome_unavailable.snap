@@ -1,0 +1,9 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 449
+expression: value
+---
+{
+  "detail": "404 Not Found",
+  "kind": "unavailable"
+}

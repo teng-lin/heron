@@ -1,0 +1,20 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 403
+expression: value
+---
+{
+  "action_items": [],
+  "calendar_event_id": null,
+  "duration_secs": null,
+  "ended_at": null,
+  "id": "mtg_00000000-0000-0000-0000-000000000000",
+  "participants": [],
+  "platform": "zoom",
+  "started_at": "2026-05-01T14:00:00Z",
+  "status": "recording",
+  "summary_status": "pending",
+  "tags": [],
+  "title": null,
+  "transcript_status": "partial"
+}

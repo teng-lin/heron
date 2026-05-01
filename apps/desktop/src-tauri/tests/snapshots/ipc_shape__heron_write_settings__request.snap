@@ -1,0 +1,43 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 154
+expression: value
+---
+{
+  "active_mode": "clio",
+  "audio_retention_days": 14,
+  "auto_detect_meeting_app": true,
+  "auto_summarize": true,
+  "crash_telemetry": false,
+  "file_naming_pattern": "date_slug",
+  "hotwords": [
+    "Heron",
+    "Athena"
+  ],
+  "llm_backend": "anthropic",
+  "min_free_disk_mib": 2048,
+  "onboarded": true,
+  "openai_model": "gpt-4o-mini",
+  "persona": {
+    "name": "Alex",
+    "role": "Engineer",
+    "working_on": "Tauri IPC snapshots"
+  },
+  "record_hotkey": "CmdOrCtrl+Shift+R",
+  "recover_on_launch": true,
+  "remind_interval_secs": 30,
+  "session_logging": true,
+  "shortcuts": {
+    "summarize_now": "CmdOrCtrl+Shift+S",
+    "toggle_recording": "CmdOrCtrl+Shift+R"
+  },
+  "show_tray_indicator": true,
+  "strip_names_before_summarization": true,
+  "stt_backend": "whisperkit",
+  "summary_retention_days": 90,
+  "target_bundle_ids": [
+    "us.zoom.xos",
+    "com.microsoft.teams2"
+  ],
+  "vault_root": "/Users/example/Vault"
+}

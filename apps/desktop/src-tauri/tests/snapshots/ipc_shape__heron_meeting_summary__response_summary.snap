@@ -1,0 +1,20 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+assertion_line: 345
+expression: value
+---
+{
+  "action_items": [
+    {
+      "due": "2026-05-15",
+      "id": "11111111-1111-7111-8111-111111111111",
+      "owner": "Alex",
+      "text": "Send the recap email"
+    }
+  ],
+  "generated_at": "2026-05-01T14:35:00Z",
+  "llm_model": "claude-sonnet-4-6",
+  "llm_provider": "anthropic",
+  "meeting_id": "mtg_00000000-0000-0000-0000-000000000000",
+  "text": "## Decisions\n\n- Ship the IPC snapshots PR.\n"
+}
