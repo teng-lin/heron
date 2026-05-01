@@ -35,7 +35,7 @@ export function GeneralTab() {
   }
 
   return (
-    <section className="space-y-6">
+    <section className="space-y-6" data-testid="settings-tab-general">
       <h2 className="text-lg font-medium">General</h2>
 
       <div className="space-y-2">

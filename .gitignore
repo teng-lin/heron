@@ -18,6 +18,11 @@ node_modules/
 .pnpm-store/
 .vite/
 
+# Playwright e2e artifacts (issue #191)
+apps/*/test-results/
+apps/*/playwright-report/
+apps/*/playwright/.cache/
+
 # Secrets / local config
 .env
 .env.local

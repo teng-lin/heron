@@ -8,7 +8,10 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "bun test"
+    "test": "bun test ./src",
+    "e2e": "playwright test --project=smoke",
+    "e2e:ui": "playwright test --project=smoke --ui",
+    "e2e:tauri": "playwright test --project=tauri"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",
@@ -40,6 +43,8 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@crabnebula/tauri-driver": "^2.0.9",
+    "@playwright/test": "^1.59.1",
     "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
