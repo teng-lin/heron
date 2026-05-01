@@ -1,0 +1,87 @@
+name: swift
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Per-package Swift test job. Matrix-ed so a failure in one helper
+  # surfaces independently in the GitHub UI without masking the others.
+  #
+  # whisperkit-helper resolves the upstream WhisperKit Swift package
+  # from GitHub on first build (network egress to github.com). The
+  # macos-14 runners allow this by default; if a future hardening pass
+  # locks the runner network down, vendor `.build/checkouts/` per the
+  # plan in `docs/testing-roadmap.md` "Swift XCTest" deferred entry.
+  test:
+    name: swift test (${{ matrix.helper }})
+    runs-on: macos-14
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        helper:
+          - eventkit-helper
+          - zoomax-helper
+          - whisperkit-helper
+    defaults:
+      run:
+        working-directory: swift/${{ matrix.helper }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # WhisperKit's transitive swift-jinja requires swift-tools-version
+      # 6.0+, which means Xcode 16+. macos-14's default is Xcode 15.4
+      # (Swift 5.10); 16.2 is preinstalled on the runner image, just
+      # not selected by default. Mirrors the same step in `rust.yml` so
+      # the toolchain matches across workflows and a Swift-version drift
+      # in one helper doesn't pass while the other fails.
+      - name: select Xcode 16 (Swift 6 toolchain)
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      # Cache the per-package `.build` directory. Skipping this
+      # re-compiles every Swift source on every run (slow on macos-14)
+      # and re-resolves WhisperKit's transitive deps from GitHub —
+      # leaving us at the mercy of a github.com outage on a quiet day.
+      #
+      # The cache key tracks both `Package.swift` (declared deps) and
+      # `Package.resolved` (the resolved revision) so a manual bump
+      # invalidates the cache. The Xcode version is mixed in too: a
+      # macos-14 image refresh that bumps Xcode_16.2 → 16.x would
+      # otherwise restore artifacts compiled against the old toolchain
+      # and surface as opaque link errors.
+      #
+      # `restore-keys` is intentionally absent: a stale `.build`
+      # restored across a Package.resolved bump or a Swift toolchain
+      # bump can produce confusing partial-recompile failures. A cold
+      # cache rebuilds in a few minutes; that's a cheaper failure mode
+      # than a poisoned restore.
+      - name: cache .build directory
+        uses: actions/cache@v4
+        with:
+          path: swift/${{ matrix.helper }}/.build
+          key: swift-build-${{ matrix.helper }}-${{ runner.os }}-Xcode_16.2-${{ hashFiles(format('swift/{0}/Package.resolved', matrix.helper), format('swift/{0}/Package.swift', matrix.helper)) }}
+
+      # Separate cache for the user-wide swiftpm checkout cache. All
+      # three matrix jobs would race on the same key with a shared
+      # cache; namespacing by helper avoids the race at the cost of
+      # ~3× storage. Acceptable: the resolved checkouts are small
+      # (< 100 MB) compared to the per-helper `.build` artifacts.
+      - name: cache swiftpm checkouts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+          key: swiftpm-checkouts-${{ matrix.helper }}-${{ runner.os }}-${{ hashFiles(format('swift/{0}/Package.resolved', matrix.helper)) }}
+
+      - name: swift test
+        run: swift test

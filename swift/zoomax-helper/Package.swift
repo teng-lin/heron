@@ -21,5 +21,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "ZoomAxHelper"),
+        .testTarget(
+            name: "ZoomAxHelperTests",
+            dependencies: ["ZoomAxHelper"]
+        ),
     ]
 )

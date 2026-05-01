@@ -42,12 +42,16 @@ import AppKit
 #endif
 
 // MARK: - Status codes (mirror ax_bridge.rs::AxStatus 1-for-1)
+//
+// `internal` (not `private`) so the XCTest target can import them via
+// `@testable import ZoomAxHelper` and assert returned codes by name
+// rather than re-declaring the constants in two places.
 
-private let AX_OK: Int32 = 0
-private let AX_NOT_IMPLEMENTED: Int32 = -1
-private let AX_PROCESS_NOT_RUNNING: Int32 = -2
-private let AX_NO_PERMISSION: Int32 = -3
-private let AX_INTERNAL: Int32 = -4
+internal let AX_OK: Int32 = 0
+internal let AX_NOT_IMPLEMENTED: Int32 = -1
+internal let AX_PROCESS_NOT_RUNNING: Int32 = -2
+internal let AX_NO_PERMISSION: Int32 = -3
+internal let AX_INTERNAL: Int32 = -4
 
 // MARK: - Tree-walk bounds
 //
@@ -63,7 +67,10 @@ private let POLL_INTERVAL_SECONDS: TimeInterval = 0.25
 // MARK: - Participant state
 
 /// Parsed contents of a participant tile's AXDescription.
-private struct ParticipantState: Equatable {
+///
+/// `internal` (not `private`) so the XCTest target can construct
+/// fixtures and compare parser output via `@testable import`.
+internal struct ParticipantState: Equatable {
     let muted: Bool
     /// `nil` when the AX description doesn't include video state.
     /// Zoom seems to only append `, Video off`/`, Video on` when the
@@ -138,7 +145,14 @@ private let tileDescriptionRegex: NSRegularExpression = {
 /// Parsed tile description. `nil` when the description doesn't match
 /// the known Zoom shape — the caller skips that tile silently. See
 /// the section comment above on the English-only assumption.
-private func parseTileDescription(_ s: String) -> (name: String, state: ParticipantState)? {
+///
+/// `internal` (not `private`) so XCTest can verify the regex against
+/// the fixture descriptions in `fixtures/zoom/spike-triple/`. The
+/// parser is the most drift-prone surface in the bridge — a Zoom
+/// localization or wording change silently degrades attribution
+/// without an exception, so a unit test on a known-good description
+/// is the early-warning signal.
+internal func parseTileDescription(_ s: String) -> (name: String, state: ParticipantState)? {
     // Capture groups: 1 = name, 2 = mute state, 3 = video state (optional).
     let nsRange = NSRange(s.startIndex..<s.endIndex, in: s)
     guard let match = tileDescriptionRegex.firstMatch(in: s, options: [], range: nsRange),
