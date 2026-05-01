@@ -56,21 +56,45 @@ use crate::settings::read_settings;
 /// Resolve the `<vault>/meetings/<basename>.md.bak` path the renderer
 /// is allowed to touch. Validation mirrors [`crate::notes::resolve_note_path`]
 /// (basename allowlist, canonicalize the vault, ensure containment) —
-/// only the file extension differs. `<basename>` strips the `mtg_`
-/// wire-form prefix so the `.bak` lives next to the bare-uuid `.md`
-/// the vault writer rotates.
+/// only the file extension differs.
+///
+/// The `.bak` lives next to its `.md` regardless of pattern. For a
+/// `Slug`/`DateSlug` capture the `.md` lives at
+/// `<vault>/meetings/<slug>.md` and the `.bak` lives at
+/// `<vault>/meetings/<slug>.md.bak`. We derive the bak path from the
+/// resolved `.md` (which handles the wire-id-to-slug-filename
+/// reverse lookup, issue #205) so the two surfaces agree on a single
+/// resolution pass. When the `.md` doesn't exist yet (e.g. pre-
+/// capture, or a stale wire id), we fall back to the lexical strip-
+/// derived path under the canonical `meetings/` — the subsequent
+/// `metadata` / `read` call surfaces NotFound which `check_backup` /
+/// `restore_backup` translate into "no backup" / a clear error.
 async fn resolve_bak_path(vault: &Path, session_id: &str) -> Result<PathBuf, String> {
+    // Defense-in-depth: validate the wire id even on the fallback path
+    // so a buggy renderer can't push `..` past the lexical strip below.
     let basename = validated_basename(session_id)?;
+
+    // Try the wire-id-aware resolver first. When the `.md` exists, its
+    // resolved (canonical) path determines the `.bak`'s parent and
+    // stem. This is what fixes the `Slug` / `DateSlug` flows.
+    if let Ok(note_path) = crate::notes::resolve_note_path(vault, session_id, true).await {
+        // `<note>.md.bak` — append `.bak` to the full filename rather
+        // than swapping the extension, since `Path::with_extension`
+        // would discard `.md` and produce `<stem>.bak`.
+        let mut name = note_path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".bak");
+        return Ok(note_path.with_file_name(name));
+    }
+
+    // Fallback path for pre-capture state (no `meetings/` yet) and the
+    // stale-wire-id case. Mirrors the original lexical layout so the
+    // existing tests (and the `bak`-lives-next-to-`md` invariant)
+    // hold.
     let canonical_vault = resolve_vault_path(vault).await?;
     let meetings = meetings_dir(&canonical_vault);
-    // Canonicalize `meetings/` and confirm it's still inside the
-    // vault — otherwise a symlinked `meetings/` would let a
-    // `.md.bak` read or delete escape. If `meetings/` is missing
-    // (pre-capture state), the `.md.bak` can't exist either; the
-    // lexical path under `canonical_vault` is safe because the
-    // basename is validated, and the subsequent metadata / read call
-    // surfaces NotFound which `check_backup` / `restore_backup`
-    // translate into "no backup" / a clear error.
     let parent = canonicalize_meetings_within(&meetings, &canonical_vault)
         .await?
         .unwrap_or(meetings);
@@ -737,5 +761,80 @@ cost: null\n\
         assert_eq!(persona.name, "Alice");
         assert_eq!(persona.role, "");
         assert_eq!(persona.working_on, "");
+    }
+
+    // -------- issue #205: bak-path resolution for Slug / DateSlug --------
+
+    /// Mirrors `notes::tests::wire_id_for` — synthesizes the wire-form
+    /// `MeetingId` a daemon would emit for `<vault>/meetings/<basename>.md`.
+    /// Kept local to this module so a future test refactor doesn't have
+    /// to thread the namespace UUID across two test scopes.
+    fn wire_id_for(vault: &Path, basename: &str) -> String {
+        use heron_orchestrator::MEETING_ID_NAMESPACE;
+        use uuid::Uuid;
+        let canonical = std::fs::canonicalize(vault).expect("canonicalize vault");
+        let path = canonical.join("meetings").join(format!("{basename}.md"));
+        let rel = path.strip_prefix(&canonical).expect("strip prefix");
+        let derived = Uuid::new_v5(&MEETING_ID_NAMESPACE, rel.as_os_str().as_encoded_bytes());
+        format!("mtg_{}", derived.as_hyphenated())
+    }
+
+    /// `check_backup` resolves a `<slug>.md.bak` next to a Slug-named
+    /// `.md` when the renderer hands it a `mtg_<uuid>` wire id. Without
+    /// the wire-id-aware bak resolver, the lexical strip would look for
+    /// `<wire-uuid>.md.bak`, miss, and report "no backup" even though
+    /// one exists — silently breaking the rollback path under Slug /
+    /// DateSlug patterns.
+    #[tokio::test]
+    async fn check_backup_resolves_slug_pattern_via_wire_id() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path();
+        let dir = meetings_dir(vault);
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        fs::write(dir.join("retro-q1.md"), "current\n")
+            .await
+            .expect("seed md");
+        fs::write(dir.join("retro-q1.md.bak"), "previous\n")
+            .await
+            .expect("seed bak");
+
+        let wire_id = wire_id_for(vault, "retro-q1");
+        let info = check_backup(vault, &wire_id)
+            .await
+            .expect("check")
+            .expect("expected Some");
+        assert!(info.created_at.contains('T'), "got: {}", info.created_at);
+    }
+
+    /// `restore_backup` round-trips a Slug-pattern note + bak via wire
+    /// id: read `<slug>.md.bak` → atomically write `<slug>.md` →
+    /// delete `<slug>.md.bak`. The post-condition is what the React
+    /// rollback toast promises ("backup applied"); without the bak-
+    /// path fix it was silently a no-op for non-Id users.
+    #[tokio::test]
+    async fn restore_backup_round_trips_slug_pattern_via_wire_id() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let vault = tmp.path();
+        let dir = meetings_dir(vault);
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        fs::write(dir.join("budget-review.md"), "current\n")
+            .await
+            .expect("seed md");
+        fs::write(dir.join("budget-review.md.bak"), "previous\n")
+            .await
+            .expect("seed bak");
+
+        let wire_id = wire_id_for(vault, "budget-review");
+        let restored = restore_backup(vault, &wire_id).await.expect("restore");
+        assert_eq!(restored, "previous\n");
+
+        let on_disk = fs::read_to_string(dir.join("budget-review.md"))
+            .await
+            .expect("read md");
+        assert_eq!(on_disk, "previous\n");
+        assert!(
+            !dir.join("budget-review.md.bak").exists(),
+            "expected .md.bak to be deleted"
+        );
     }
 }
