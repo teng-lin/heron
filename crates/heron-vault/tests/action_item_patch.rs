@@ -403,15 +403,40 @@ fn hostile_yaml_round_trips_through_patch_path() {
 
 // ---------- Vault-lock failure surface ----------
 
+/// RAII guard that restores a path's `Permissions` on `Drop`. Used by
+/// the vault-lock test below so a panic mid-test still leaves the
+/// tempdir cleanable. Mirrors the pattern recommended by
+/// gemini-code-assist on PR #203.
+#[cfg(unix)]
+struct PermsGuard {
+    path: PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for PermsGuard {
+    fn drop(&mut self) {
+        // Best-effort: if a panic is already unwinding, swallow the
+        // restore error rather than double-panicking. The tempdir
+        // cleanup will still run (and succeed once perms are back).
+        let _ = std::fs::set_permissions(&self.path, self.original.clone());
+    }
+}
+
 /// `update_action_item` does NOT retry today — an `EAGAIN`/`EACCES`
 /// from iCloud's lock surfaces immediately as `VaultError::Io` to the
-/// caller. This test pins that contract so a future retry-with-backoff
-/// implementation has a single test to update (rather than discovering
-/// silent behavior change at the IPC layer).
+/// caller. This test pins the *contract* (error type + on-disk
+/// invariance), not the timing — the latter would be flake-prone on a
+/// throttled CI runner per `CONTRIBUTING.md` ("prefer lower bounds
+/// over upper bounds"). When iCloud lock retry lands, the test gets a
+/// new sibling that asserts elapsed >= some_lower_bound; this one's
+/// invariants stay valid for the no-retry path that the renderer's
+/// optimistic-rollback envelope still depends on.
 ///
-/// Approach: chmod the meeting file's parent directory to deny writes,
-/// attempt the patch, observe the IO failure, restore permissions,
-/// confirm the on-disk note is the pre-patch content (no half-write).
+/// Approach: chmod the meeting file's parent directory to deny writes
+/// (via a `Drop` guard so a panic restores perms before tempdir
+/// cleanup), attempt the patch, observe the IO failure, confirm the
+/// on-disk note is the pre-patch content (no half-write).
 ///
 /// Unix-only: Windows + Tauri's mobile targets don't ship in v1, and
 /// the chmod technique relies on POSIX semantics.
@@ -420,21 +445,25 @@ fn hostile_yaml_round_trips_through_patch_path() {
 fn vault_lock_surface_propagates_io_error_without_retry() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::Instant;
 
     let tmp = tempfile::TempDir::new().expect("tmp");
     let writer = VaultWriter::new(tmp.path());
     let (path, id_a, _id_b) = seed_two(&writer);
 
     let pre = fs::read_to_string(&path).expect("read pre");
-    let parent = path.parent().expect("note parent dir");
-    let original_perms = fs::metadata(parent).expect("perms").permissions();
+    let parent = path.parent().expect("note parent dir").to_path_buf();
+    let original_perms = fs::metadata(&parent).expect("perms").permissions();
 
     // 0o500 = read+execute, no write. atomic_write's rename into the
-    // dir fails with PermissionDenied (mapped to VaultError::Io).
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).expect("clamp perms");
+    // dir fails with PermissionDenied (mapped to VaultError::Io). The
+    // guard's `Drop` restores perms whether the test panics or not, so
+    // the tempdir's cleanup never trips on a locked-down parent.
+    let perms_guard = PermsGuard {
+        path: parent.clone(),
+        original: original_perms,
+    };
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("clamp perms");
 
-    let started = Instant::now();
     let result = writer.update_action_item(
         &path,
         &id_a,
@@ -443,11 +472,6 @@ fn vault_lock_surface_propagates_io_error_without_retry() {
             ..ActionItemPatch::default()
         },
     );
-    let elapsed = started.elapsed();
-
-    // Restore perms BEFORE the assertions so a panic doesn't leave the
-    // tempdir un-cleanable.
-    fs::set_permissions(parent, original_perms).expect("restore perms");
 
     let err = result.expect_err("write must fail when parent dir is read-only");
     match err {
@@ -455,19 +479,13 @@ fn vault_lock_surface_propagates_io_error_without_retry() {
         other => panic!("expected VaultError::Io for EACCES, got {other:?}"),
     }
 
-    // No retry today: the failure surfaces fast. Lower-bound only —
-    // upper bounds on CI schedulers introduce flakes per CONTRIBUTING.md.
-    // 250ms is a generous ceiling that still catches a future
-    // exponential-backoff loop (which would burn at minimum ~seconds).
-    // When iCloud lock retry lands, this assertion gets inverted to
-    // `>= some_lower_bound` and the test renamed.
-    assert!(
-        elapsed.as_millis() < 250,
-        "no-retry path should fail fast; took {elapsed:?}",
-    );
-
     // The on-disk note is the pre-patch content — no half-written
-    // frontmatter from a partial atomic_write.
+    // frontmatter from a partial atomic_write. The Drop guard restores
+    // perms first; we read after that. We can't read while the dir is
+    // 0o500 from within this test because the read path needs traverse
+    // perms (which 0o500 retains) but the post-test fs::read also
+    // benefits from perms being restored, so we drop the guard first.
+    drop(perms_guard);
     let post = fs::read_to_string(&path).expect("read post");
     assert_eq!(post, pre, "failed write must not mutate the note on disk");
     let (fm, _) = read_note(&path).expect("re-parse");

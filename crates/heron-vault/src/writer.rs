@@ -679,10 +679,15 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     // which produced spurious `NotFound` failures when one thread's
     // `File::create` truncated the other's tmp before its rename
     // landed.
+    //
+    // `create_new(true)` is belt-and-suspenders: even on a 1-in-2^60
+    // uuid v7 collision, the OS-level O_CREAT|O_EXCL fails the second
+    // opener with `AlreadyExists` rather than truncating the first
+    // writer's tmp. Per gemini-code-assist on PR #203.
     let tmp = parent.join(format!(".{basename}.{}.tmp", Uuid::now_v7().as_simple(),));
 
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;
     }
