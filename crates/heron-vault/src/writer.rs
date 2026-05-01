@@ -671,9 +671,15 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no filename"))?
         .to_string_lossy();
-    let tmp = parent.join(format!(".{basename}.{}.tmp", Uuid::nil().simple()));
-    // Use a fresh uuid each call so concurrent writes don't collide.
-    let tmp = tmp.with_extension(format!("{}.tmp", Uuid::from_u128(rand_u128()).simple()));
+    // Use a fresh uuid v7 each call so concurrent writes don't
+    // collide on the tmp filename. v7's 62 random bits + 60ms-precision
+    // timestamp are well past the entropy needed for "two threads
+    // racing to rename onto the same path" — the prior nanosecond-clock
+    // homebrew rand could collide across threads on the same tick,
+    // which produced spurious `NotFound` failures when one thread's
+    // `File::create` truncated the other's tmp before its rename
+    // landed.
+    let tmp = parent.join(format!(".{basename}.{}.tmp", Uuid::now_v7().as_simple(),));
 
     {
         let mut f = File::create(&tmp)?;
@@ -861,23 +867,6 @@ fn reserve_unique_path(
     }
 }
 
-/// Tiny entropy source for the temp-file uuid. Uses the system
-/// nanosecond clock — collision-resistant enough for two concurrent
-/// writes on the same path (the rename is the actual atomicity
-/// guarantee). Avoids pulling in `rand` for one byte's worth of work.
-fn rand_u128() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // Mix in the thread id so two threads on the same nanosecond
-    // produce different uuids.
-    let tid = std::thread::current().id();
-    let tid_hash = format!("{tid:?}").len() as u128;
-    now ^ (tid_hash.wrapping_mul(0x9E3779B97F4A7C15))
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -1040,6 +1029,41 @@ mod tests {
         atomic_write(&path, b"v1").expect("v1");
         atomic_write(&path, b"v2").expect("v2");
         assert_eq!(fs::read(&path).expect("read"), b"v2");
+    }
+
+    /// Concurrent `atomic_write`s onto the same destination must each
+    /// succeed (last-writer-wins) without producing spurious
+    /// `NotFound` errors. The earlier homebrew rand_u128 mixed in a
+    /// thread-id string-length, which collided across threads on the
+    /// same nanosecond and let one writer's `File::create` truncate
+    /// the other's tmp before its rename landed. UUIDv7's per-call
+    /// randomness fixes that — pin the invariant so a future "let's
+    /// inline a cheaper rand" patch can't quietly reintroduce the
+    /// race.
+    #[test]
+    fn atomic_write_concurrent_writers_never_observe_not_found() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = std::sync::Arc::new(tmp.path().join("note.md"));
+        // Pre-create so renames target an existing file (the realistic
+        // shape — the writer always reads + writes onto an existing
+        // note).
+        atomic_write(&path, b"seed").expect("seed");
+
+        let mut handles = Vec::new();
+        for n in 0..16u32 {
+            let path = std::sync::Arc::clone(&path);
+            handles.push(std::thread::spawn(move || {
+                atomic_write(&path, format!("payload-{n}").as_bytes())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("join")
+                .expect("write must not surface NotFound under contention");
+        }
+        // Final state is some payload-N: the file exists and parses.
+        let final_bytes = fs::read(&*path).expect("read final");
+        assert!(final_bytes.starts_with(b"payload-"));
     }
 
     #[test]
