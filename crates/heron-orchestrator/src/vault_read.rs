@@ -121,17 +121,35 @@ pub(crate) fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>,
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| SessionError::VaultLocked {
-            detail: format!("read_dir({}): {e}", dir.display()),
-        })?
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                && e.path().extension().and_then(|s| s.to_str()) == Some("md")
-        })
-        .map(|e| e.path())
-        .collect();
+    let read_dir = std::fs::read_dir(&dir).map_err(|e| SessionError::VaultLocked {
+        detail: format!("read_dir({}): {e}", dir.display()),
+    })?;
+    // Surface per-entry IO errors instead of silently dropping them.
+    // Permission-denied or inode-corruption on a single entry now
+    // fails the whole listing rather than presenting a partial view
+    // that looks like "the meeting just isn't there." (Issue #215
+    // finding 5 — was `filter_map(Result::ok) + unwrap_or(false)`.)
+    //
+    // Filter on `file_name()` (no allocation) before paying for
+    // `entry.path()` so non-`.md` siblings — `.tmp` writer scratch
+    // files, hidden `.DS_Store`, etc. — don't allocate. (PR #228
+    // review, gemini.)
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|e| SessionError::VaultLocked {
+            detail: format!("read_dir entry({}): {e}", dir.display()),
+        })?;
+        let file_name = entry.file_name();
+        if Path::new(&file_name).extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|e| SessionError::VaultLocked {
+            detail: format!("file_type({}): {e}", entry.path().display()),
+        })?;
+        if file_type.is_file() {
+            entries.push(entry.path());
+        }
+    }
     // Deterministic input order only. `list_meetings_impl` sorts by
     // parsed frontmatter time after reading each note.
     entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
@@ -180,6 +198,21 @@ pub(crate) fn resolve_vault_path(
         .unwrap_or_else(|_| vault_root.to_path_buf());
     let safe_relative = normalize_no_traverse(candidate)?;
     let joined = root_canonical.join(&safe_relative);
+
+    // Issue #215 finding 1 — symlink directory escape. `starts_with`
+    // on canonical paths is a necessary but not sufficient check on
+    // its own: a single symlink along `safe_relative` whose target
+    // is outside `root_canonical` would canonicalize fine and pass
+    // the prefix check on some edge-case configurations (and even
+    // on platforms where canonicalize is robust, leaving this
+    // implicit invites future drift). Walk every joined component
+    // that already exists and reject any that is a symlink. The
+    // vault root itself is canonicalized above, so a user who
+    // intentionally symlinks their whole vault is unaffected — only
+    // intra-vault symlinks (which Obsidian itself does not create)
+    // are rejected.
+    reject_symlinked_components(&root_canonical, &joined, field)?;
+
     let resolved = if joined.exists() {
         joined
             .canonicalize()
@@ -195,6 +228,49 @@ pub(crate) fn resolve_vault_path(
         });
     }
     Ok(resolved)
+}
+
+/// Walk `joined`'s components below `root_canonical` and refuse any
+/// existing component that is itself a symlink. We check
+/// `symlink_metadata` (does NOT follow links) so a symlink whose
+/// target is inside the vault is still rejected — by construction,
+/// the safe answer is "no symlinks below the vault root," because
+/// there's no way to tell at validation time whether a symlink will
+/// be redirected later (TOCTOU on the resolve→open path).
+fn reject_symlinked_components(
+    root_canonical: &Path,
+    joined: &Path,
+    field: &'static str,
+) -> Result<(), SessionError> {
+    let Ok(rel) = joined.strip_prefix(root_canonical) else {
+        // The joined path is outside the canonical root; the
+        // downstream `starts_with` check will reject it. Nothing to
+        // walk.
+        return Ok(());
+    };
+    let mut current = root_canonical.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match current.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(SessionError::Validation {
+                    detail: format!("{field} path traverses a symlink"),
+                });
+            }
+            Ok(_) => {}
+            // ENOENT past this point is fine — a not-yet-existing
+            // leaf (e.g. a transcript pointer for a meeting whose
+            // file hasn't been written) is the documented "Failed"
+            // status branch upstream.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(SessionError::VaultLocked {
+                    detail: format!("symlink_metadata {field}: {e}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_no_traverse(path: &Path) -> Result<PathBuf, SessionError> {
@@ -413,8 +489,13 @@ pub(crate) fn read_transcript_segments(
     let mut reader = std::io::BufReader::new(file);
     let mut segments = Vec::new();
     let mut lineno = 0usize;
+    // Issue #215 finding 3 — buffer is reused across iterations so
+    // we don't re-allocate per line. `read_until` appends, so each
+    // iteration starts with `buf.clear()` to drop the previous
+    // line's bytes (the underlying capacity is retained).
+    let mut buf = Vec::with_capacity(256);
     loop {
-        let mut buf = Vec::with_capacity(256);
+        buf.clear();
         // Cap each read at MAX_TRANSCRIPT_LINE_BYTES so a malformed
         // transcript without newlines can't pull the whole file
         // into one allocation. Lines longer than the cap are
@@ -434,8 +515,41 @@ pub(crate) fn read_transcript_segments(
                 bytes = n,
                 "transcript line exceeds MAX_TRANSCRIPT_LINE_BYTES; skipping",
             );
-            buf.clear();
-            let _ = reader.read_until(b'\n', &mut buf);
+            // Issue #215 finding 2 — drain via `fill_buf` /
+            // `consume` so the rest of the over-cap line never
+            // touches an allocation. The pre-fix path called
+            // `read_until` after `buf.clear()`, which would happily
+            // grow `buf` to hold every byte up to the next newline
+            // (or EOF) — a malformed transcript without newlines
+            // could OOM the daemon.
+            //
+            // Skip the drain when `read_until` already consumed the
+            // terminating newline (the pathological case of a line
+            // exactly `MAX_TRANSCRIPT_LINE_BYTES + 1` bytes long
+            // including its `\n`). Without this guard the drain
+            // would `consume` the start of the *next* valid line.
+            // (PR #228 review, gemini.)
+            if buf.last() != Some(&b'\n') {
+                loop {
+                    let (done, used) = {
+                        let available =
+                            reader.fill_buf().map_err(|e| SessionError::VaultLocked {
+                                detail: format!("drain transcript line {lineno}: {e}"),
+                            })?;
+                        if available.is_empty() {
+                            (true, 0)
+                        } else if let Some(i) = available.iter().position(|&b| b == b'\n') {
+                            (true, i + 1)
+                        } else {
+                            (false, available.len())
+                        }
+                    };
+                    reader.consume(used);
+                    if done {
+                        break;
+                    }
+                }
+            }
             lineno += 1;
             continue;
         }
@@ -488,8 +602,14 @@ pub(crate) fn read_transcript_segments(
 
 pub(crate) fn vault_to_session_err(err: VaultError) -> SessionError {
     match err {
+        // Issue #215 finding 6 — don't echo the host filesystem path
+        // into the wire `NotFound` error. `audio_path` already
+        // follows this pattern (see `lib.rs`); now `read_summary` /
+        // `read_transcript` do too. Auth on the daemon is loopback
+        // only, but exfiling the user's vault layout via error
+        // strings is a leak we can close cheaply.
         VaultError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => SessionError::NotFound {
-            what: format!("vault file io: {e}"),
+            what: "vault file".to_owned(),
         },
         other => SessionError::VaultLocked {
             detail: other.to_string(),
@@ -499,4 +619,258 @@ pub(crate) fn vault_to_session_err(err: VaultError) -> SessionError {
 
 fn parse_iso_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! Issue #215 hardening tests.
+    //!
+    //! Each `#[test]` here pins one of the six findings the
+    //! `gemini-code-assist` / `coderabbitai` review on PR #214
+    //! flagged so a future refactor can't silently regress them.
+    //! Symlink tests are gated `#[cfg(unix)]` because Windows
+    //! requires a privileged token to create symlinks; the rest run
+    //! cross-platform.
+    use super::*;
+
+    /// Finding 1 — `resolve_vault_path` must reject a frontmatter
+    /// path that walks through a symlink whose target escapes the
+    /// vault. This is the gemini-flagged "starts_with-on-canonical
+    /// is necessary but not sufficient" case.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_vault_path_rejects_symlink_escape() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "stolen").unwrap();
+
+        let vault = tempfile::tempdir().expect("vault tempdir");
+        std::fs::create_dir_all(vault.path().join("transcripts")).unwrap();
+        // The leaf is a symlink whose target lives outside the vault.
+        // A naive `canonicalize().starts_with(root)` check is the
+        // *primary* defense, but on edge-case filesystem
+        // configurations canonicalization can fail to follow the
+        // link (we've also seen drift where canonicalize behavior
+        // differs across platforms). The hardened path rejects the
+        // symlink at the metadata layer first.
+        std::os::unix::fs::symlink(&secret, vault.path().join("transcripts/evil.jsonl")).unwrap();
+
+        let err = resolve_vault_path(
+            vault.path(),
+            Path::new("transcripts/evil.jsonl"),
+            "transcript",
+        )
+        .expect_err("must reject symlinked path");
+        assert!(
+            matches!(err, SessionError::Validation { .. }),
+            "expected Validation error, got {err:?}",
+        );
+    }
+
+    /// Finding 1 — also reject an *intermediate* directory symlink.
+    /// A user note pointing at `transcripts/foo.jsonl` where
+    /// `transcripts/` itself is a symlink to `/tmp/...` must not
+    /// open the file.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_vault_path_rejects_intermediate_dir_symlink() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::create_dir_all(outside.path().join("transcripts")).unwrap();
+        std::fs::write(outside.path().join("transcripts/foo.jsonl"), "[]").unwrap();
+
+        let vault = tempfile::tempdir().expect("vault tempdir");
+        std::os::unix::fs::symlink(
+            outside.path().join("transcripts"),
+            vault.path().join("transcripts"),
+        )
+        .unwrap();
+
+        let err = resolve_vault_path(
+            vault.path(),
+            Path::new("transcripts/foo.jsonl"),
+            "transcript",
+        )
+        .expect_err("must reject intermediate symlink");
+        assert!(
+            matches!(err, SessionError::Validation { .. }),
+            "expected Validation error, got {err:?}",
+        );
+    }
+
+    /// Finding 1 — a vault root that is itself a symlink (a common
+    /// Obsidian setup: vault is a symlink into iCloud Drive) must
+    /// keep working. Only intra-vault symlinks are rejected.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_vault_path_allows_symlinked_vault_root() {
+        let real = tempfile::tempdir().expect("real tempdir");
+        std::fs::create_dir_all(real.path().join("transcripts")).unwrap();
+        std::fs::write(real.path().join("transcripts/ok.jsonl"), "[]").unwrap();
+
+        let alias_parent = tempfile::tempdir().expect("alias parent");
+        let alias_root = alias_parent.path().join("vault");
+        std::os::unix::fs::symlink(real.path(), &alias_root).unwrap();
+
+        let resolved =
+            resolve_vault_path(&alias_root, Path::new("transcripts/ok.jsonl"), "transcript")
+                .expect("symlinked vault root must still resolve");
+        assert!(resolved.ends_with("transcripts/ok.jsonl"));
+    }
+
+    /// Finding 2 — a transcript file with no newlines longer than
+    /// `MAX_TRANSCRIPT_LINE_BYTES` must NOT pull the whole malformed
+    /// payload into a single buffer (OOM). The pre-fix drain path
+    /// did `buf.clear(); reader.read_until(b'\n', &mut buf);` which
+    /// would happily grow `buf` until EOF.
+    ///
+    /// The test writes a file that's twice the cap with NO newlines
+    /// at all, then asserts that:
+    ///   - the call returns successfully (no OOM, no error),
+    ///   - the returned `segments` is empty (the over-cap line was
+    ///     warn-skipped per the documented contract).
+    ///
+    /// We can't directly assert on peak allocation in stable Rust,
+    /// but the behavior contract — "doesn't grow `buf` past the
+    /// cap" — is what the production code's `fill_buf`/`consume`
+    /// drain enforces. If the fix regresses to `read_until` we'd
+    /// expect this test to either OOM or silently allocate the full
+    /// 2 MiB; both signal a problem.
+    #[test]
+    fn read_transcript_segments_caps_oversized_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("malformed.jsonl");
+        // 2 MiB of `x` with no newlines, then a final newline. The
+        // cap is 1 MiB, so this is the over-cap branch.
+        let bulk_size = MAX_TRANSCRIPT_LINE_BYTES * 2;
+        let mut payload = vec![b'x'; bulk_size];
+        payload.push(b'\n');
+        // Append a real, valid turn after the over-cap line to
+        // confirm the reader recovers and keeps streaming. The
+        // `channel` / `speaker_source` strings match the snake-case
+        // serde rename on `heron_types::Turn`.
+        payload.extend_from_slice(
+            br#"{"t0":0.0,"t1":1.0,"text":"hi","channel":"mic","speaker":"Ada","speaker_source":"self","confidence":1.0}"#,
+        );
+        payload.push(b'\n');
+        std::fs::write(&path, payload).unwrap();
+
+        let segs = read_transcript_segments(&path).expect("must not OOM");
+        assert_eq!(
+            segs.len(),
+            1,
+            "over-cap line skipped, valid turn after still parsed",
+        );
+        assert_eq!(segs[0].speaker.display_name, "Ada");
+    }
+
+    /// Finding 2 — corner case caught by gemini on PR #228. When an
+    /// over-cap line is *exactly* `MAX_TRANSCRIPT_LINE_BYTES + 1`
+    /// bytes long INCLUDING its terminating `\n`, `read_until` has
+    /// already consumed the newline. A naive drain that always runs
+    /// would `consume` the start of the next valid turn — silently
+    /// eating it.
+    ///
+    /// The fix gates the drain on `buf.last() != Some(&b'\n')`. If
+    /// regressed, this test would see 0 segments instead of 1.
+    #[test]
+    fn read_transcript_segments_oversize_line_with_trailing_newline_does_not_eat_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge.jsonl");
+        // Build a line whose total length (content + `\n`) is
+        // exactly MAX + 1 — i.e. content is MAX bytes, plus `\n`.
+        let mut payload = vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES];
+        payload.push(b'\n');
+        // Followed by a real, parseable turn that the reader MUST
+        // surface (regression check for the drain-eats-next bug).
+        payload.extend_from_slice(
+            br#"{"t0":0.0,"t1":1.0,"text":"hi","channel":"mic","speaker":"Ada","speaker_source":"self","confidence":1.0}"#,
+        );
+        payload.push(b'\n');
+        std::fs::write(&path, payload).unwrap();
+
+        let segs = read_transcript_segments(&path).expect("must not error");
+        assert_eq!(
+            segs.len(),
+            1,
+            "drain must not consume the next line when over-cap line ended in `\\n`",
+        );
+        assert_eq!(segs[0].speaker.display_name, "Ada");
+    }
+
+    /// Finding 5 — `note_paths_newest_first` must surface a real
+    /// IO failure rather than swallowing it. The legacy
+    /// `filter_map(Result::ok) + unwrap_or(false)` path made
+    /// permission-denied look like "no notes here," which is a
+    /// silent partial-success that's hard to debug.
+    ///
+    /// We trigger the failure by chmod-ing the meetings/ dir to
+    /// non-readable on Unix. Skipped on Windows (different ACL
+    /// model) and skipped when running as root (chmod doesn't
+    /// restrict root).
+    #[cfg(unix)]
+    #[test]
+    fn note_paths_surfaces_read_dir_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // RAII guard so a panic between chmod-down and chmod-up
+        // still restores perms (otherwise the tempdir cleanup trips
+        // EACCES and the failure cascades into a misleading Drop
+        // panic). PR #228 review, gemini.
+        struct PermGuard(PathBuf);
+        impl Drop for PermGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let vault = tempfile::tempdir().expect("vault tempdir");
+        let meetings = vault.path().join("meetings");
+        std::fs::create_dir_all(&meetings).unwrap();
+        // Drop all perms so `read_dir` returns Err on a non-root
+        // user. We confirm the chmod actually denied the calling
+        // process below — if it didn't (e.g. running as root, or a
+        // filesystem that ignores POSIX modes), skip the assertion
+        // rather than fail spuriously.
+        std::fs::set_permissions(&meetings, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = PermGuard(meetings.clone());
+        let chmod_works = std::fs::read_dir(&meetings).is_err();
+
+        let result = note_paths_newest_first(vault.path());
+
+        if !chmod_works {
+            // Running as root or on a permissive FS — the partial
+            // -success regression we're guarding against can't be
+            // reproduced here. Don't assert.
+            return;
+        }
+        let err = result.expect_err("must surface read_dir failure");
+        assert!(
+            matches!(err, SessionError::VaultLocked { .. }),
+            "expected VaultLocked, got {err:?}",
+        );
+    }
+
+    /// Finding 6 — `vault_to_session_err` mapping a NotFound IO
+    /// error must NOT include the host filesystem path in the
+    /// surfaced wire error. Path leaking via error strings is the
+    /// asymmetry CodeRabbit flagged against `audio_path`'s
+    /// already-correct phrasing.
+    #[test]
+    fn vault_to_session_err_does_not_leak_path() {
+        let host_path = "/Users/teng-lin/secret/vault/meetings/note.md";
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, host_path);
+        let mapped = vault_to_session_err(VaultError::Io(io_err));
+        let SessionError::NotFound { what } = mapped else {
+            panic!("expected NotFound, got {mapped:?}");
+        };
+        assert!(
+            !what.contains(host_path),
+            "wire error must not echo host path; got {what:?}",
+        );
+        assert!(
+            !what.contains("/Users/"),
+            "wire error must not echo any user dir; got {what:?}",
+        );
+    }
 }
