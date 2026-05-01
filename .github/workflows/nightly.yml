@@ -293,3 +293,86 @@ jobs:
           starts AFTER the close will open a fresh issue.
           EOF
           )"
+
+  # Issue #191's nightly tauri-driver lane. Builds the packaged
+  # `heron-desktop` binary, then runs the e2e `tauri` Playwright
+  # project against it via tauri-driver. The smoke (renderer-only)
+  # Playwright project runs on every PR in `desktop.yml`; this lane
+  # catches launch-blocking regressions the smoke lane can't see
+  # (CSP misconfig, broken IPC handler registration, asset-protocol
+  # failure, notarisation gate).
+  #
+  # Sibling job to `real-pipeline` rather than its own workflow file
+  # — they share the `nightly` schedule + `workflow_dispatch` knob,
+  # and combining keeps the cron + secrets surface to one place.
+  # Independent failure: a `real-pipeline` flake doesn't block this
+  # job (no `needs:`), and vice versa. The 3-strikes tracker above
+  # is intentionally scoped to `real-pipeline` only — adding this
+  # lane to that tracker would conflate two unrelated failure modes
+  # under the same auto-filed issue. A separate tracker for this
+  # lane ships when the first real failure surfaces (see PR #213's
+  # body).
+  tauri-driver:
+    name: tauri-driver (e2e)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: select Xcode 16 (Swift 6 toolchain)
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      # `webrtc-audio-processing` 2.x with the `bundled` feature
+      # compiles upstream C++ via meson + ninja. macos-14 ships
+      # neither by default — same step as `rust.yml`'s test job.
+      - name: install webrtc-audio-processing build deps
+        run: brew install meson ninja
+
+      - name: cargo registry + target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-tauri-driver
+          cache-directories: |
+            ~/Library/Caches/sherpa-rs
+
+      - name: install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: bun install (apps/desktop)
+        working-directory: apps/desktop
+        run: bun install --frozen-lockfile
+
+      # `tauri build --no-bundle` skips the .app/.dmg wrapping (and
+      # the codesign step we don't need for a launch smoke). The raw
+      # binary lands at `src-tauri/target/release/heron-desktop`.
+      - name: build packaged heron-desktop binary
+        working-directory: apps/desktop
+        run: |
+          bun run tauri build --no-bundle
+          ls -la src-tauri/target/release/heron-desktop
+
+      - name: install playwright browsers
+        working-directory: apps/desktop
+        run: bunx playwright install --with-deps chromium
+
+      - name: e2e — tauri-driver lane
+        working-directory: apps/desktop
+        env:
+          HERON_DESKTOP_BINARY: ${{ github.workspace }}/apps/desktop/src-tauri/target/release/heron-desktop
+          # Skip the `webServer` boot — the tauri lane talks to the
+          # packaged binary, not the Vite dev server.
+          PLAYWRIGHT_SKIP_WEBSERVER: "1"
+        run: bun run e2e:tauri
+
+      - name: upload playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-tauri-report
+          path: apps/desktop/playwright-report/
+          retention-days: 14

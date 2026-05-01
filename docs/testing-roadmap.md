@@ -75,13 +75,18 @@ Listed so they aren't lost; sequenced loosely by dependency.
 - **LLM dispatch.** wiremock for both backends + body-shape snapshot
   (catches "OpenAI shape sent to Anthropic"). Persona-injection
   surface.
-- **Desktop e2e.** Playwright + a Tauri webdriver. `npm view`
-  confirms the package is `@crabnebula/tauri-driver` (NOT
-  `@tauri-apps/tauri-driver`, which 404s). Mocking strategy needs
-  prototyping — the existing Bun pattern is
-  `mock.module("../lib/invoke", ...)` (see the `calendar.test.ts`
-  store tests for the precedent); whether a Vite alias can extend
-  that across import depths is an open question.
+- **Desktop e2e.** Shipped (issue #191). Playwright + tauri-driver
+  with two lanes: a renderer-only `smoke` project that mocks
+  `window.__TAURI_INTERNALS__.invoke` via `addInitScript` (no Vite
+  alias needed — the canonical Tauri pattern bypasses the import-graph
+  surgery `mock.module` does in Bun unit tests), and a `tauri`
+  project run nightly against the packaged `@crabnebula/tauri-driver`
+  binary (NOT `@tauri-apps/tauri-driver`, which 404s on npm). The
+  smoke lane covers `app-launch` + `settings-roundtrip`; the
+  remaining flows from the issue (`onboarding`, `recording`,
+  `review-rail`, `timezone`, `action-item-edit`, `salvage`) are
+  scheduled for follow-up issues — adding them all at once would
+  blow the ≤2 minute wall-time budget the issue spec sets.
 - **Real-pipeline nightly.** Synthetic ~3 MB audio fixture (no LFS
   needed at that size), a `real-pipeline` Cargo feature whose
   workspace propagation behavior needs experimental verification, and

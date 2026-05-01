@@ -44,5 +44,66 @@ jobs:
       - name: typecheck and build
         run: bun run build
 
+      # `bun run test` (not `bun test`) so the package.json script
+      # is the source of truth — the script scopes to `./src` so
+      # Bun's test runner doesn't hijack Playwright's `*.spec.ts`
+      # files under `e2e/` (which `test.describe` from a different
+      # test framework throws on).
       - name: bun test
-        run: bun test
+        run: bun run test
+
+  # Playwright e2e smoke (issue #191). Renderer-only — the test
+  # harness mocks `window.__TAURI_INTERNALS__.invoke` via
+  # `addInitScript`, so no Rust process is involved. The full-app
+  # WebDriver smoke runs in `nightly.yml`'s `tauri-driver` job
+  # because the binary build is too expensive for every PR.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: test
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      # Cache Playwright's downloaded browsers — the install step is
+      # ~120 MB cold and constant across runs; keying on the
+      # @playwright/test version (which is the only knob that can
+      # invalidate the cache) saves ~40 s per run.
+      - name: cache playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-browsers-${{ runner.os }}-${{ hashFiles('apps/desktop/bun.lock') }}
+
+      - name: install playwright browsers
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: bunx playwright install --with-deps chromium
+
+      - name: install playwright system deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: bunx playwright install-deps chromium
+
+      # `bun run e2e` invokes the smoke project only — the tauri
+      # project (real packaged app) is gated on a binary path env
+      # var the smoke lane never sets, so it skips cleanly.
+      - name: playwright e2e smoke
+        run: bun run e2e
+
+      - name: upload playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/desktop/playwright-report/
+          retention-days: 7

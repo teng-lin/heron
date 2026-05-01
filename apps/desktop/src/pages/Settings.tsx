@@ -135,7 +135,7 @@ export default function Settings() {
   }
 
   return (
-    <main className="p-6">
+    <main className="p-6" data-testid="settings-page">
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-semibold">Settings</h1>
         <Link to="/home" className="text-sm underline text-muted-foreground">
