@@ -172,6 +172,37 @@ macro_rules! metric_name {
     }};
 }
 
+/// First-call-validated histogram base name. Same first-call pattern
+/// as [`metric_name!`] but routes through [`validate_histogram_base_name`]
+/// — drops the unit-suffix requirement so dimensionless histogram
+/// base names (e.g. `vault_transcript_segments`) are accepted.
+///
+/// Use this for histograms whose base name describes WHAT is measured
+/// (a count, an event tally) rather than its unit. Histograms with a
+/// natural unit (`*_seconds`, `*_bytes`, `*_milliseconds`) can use
+/// either macro — both validators accept them.
+///
+/// Counters and gauges should NOT use this macro — their suffix
+/// (`_total`, `_pending`, `_ratio`, etc.) is semantically required.
+///
+/// ```
+/// # use heron_metrics::histogram_name;
+/// let name: &str = histogram_name!("vault_transcript_segments");
+/// assert_eq!(name, "vault_transcript_segments");
+/// ```
+#[macro_export]
+macro_rules! histogram_name {
+    ($lit:literal) => {{
+        match $crate::validate_histogram_base_name($lit) {
+            Ok(()) => $lit as &str,
+            Err(e) => panic!(
+                "histogram_name!() literal '{}' violates naming convention: {}",
+                $lit, e
+            ),
+        }
+    }};
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -309,5 +340,18 @@ mod tests {
             Err(InvalidMetricName::MissingUnitSuffix { .. }) => {}
             other => panic!("expected MissingUnitSuffix, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn histogram_name_macro_returns_validated_str() {
+        let name: &str = histogram_name!("vault_transcript_segments");
+        assert_eq!(name, "vault_transcript_segments");
+    }
+
+    #[test]
+    #[should_panic(expected = "violates naming convention")]
+    fn histogram_name_macro_panics_on_drifted_literal() {
+        // Charset rule still applies — capital letters are rejected.
+        let _ = histogram_name!("VaultTranscriptSegments");
     }
 }

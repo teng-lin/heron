@@ -55,9 +55,17 @@ Prometheus-style snake_case with the unit in the suffix.
   `llm_calls_total`, `vault_write_failures_total`. Without the
   suffix, Prometheus client libraries can't tell counter from
   gauge in dashboards.
-- **Histograms end in their unit.** `_seconds` for latency,
-  `_milliseconds` if a sub-second range is genuinely useful (rare;
-  prefer seconds), `_bytes` for size.
+- **Histograms end in their unit when one applies.** `_seconds` for
+  latency, `_milliseconds` if a sub-second range is genuinely useful
+  (rare; prefer seconds), `_bytes` for size. **Dimensionless
+  histograms** (e.g. a per-call segment count) use a bare plural-noun
+  base name and go through [`heron_metrics::validate_histogram_base_name`]
+  instead of the strict `validate_metric_name` — Prometheus
+  auto-appends `_bucket`/`_count`/`_sum` to histogram base names, so a
+  `_count` suffix here would render `_count_count` on the wire (the
+  well-known Prometheus naming anti-pattern). Counters and gauges
+  still use the strict suffix-required validator since their
+  suffixes carry semantic meaning.
 - **Gauges end in their unit or use `_count` / `_pending` /
   `_ratio`.** `replay_cache_depth_count`, `salvage_candidates_pending`,
   `aec_residual_ratio`.
