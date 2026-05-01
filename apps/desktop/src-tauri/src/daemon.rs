@@ -60,6 +60,7 @@ use heron_orchestrator::LocalSessionOrchestrator;
 use herond::auth::AuthConfig;
 use herond::{AppState, DEFAULT_BIND, build_app};
 use serde::Serialize;
+use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Manager, Runtime};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -118,10 +119,36 @@ pub struct DaemonHandle {
     /// `Mutex<Option<oneshot::Sender<()>>>` instead of
     /// `OnceCell<oneshot::Sender>` because `oneshot::Sender::send`
     /// consumes by value — we need the lock anyway to take ownership.
+    ///
+    /// Issue #206 (vault rebuild): the field is now mutated in place
+    /// by [`Self::replace_for_rebuild`] when the user changes
+    /// `Settings.vault_root` and the daemon must be re-bound onto a
+    /// freshly-built orchestrator. The `Mutex<Option<…>>` shape
+    /// already supports the take-and-replace pattern; the only
+    /// addition is the sibling `join_handle` slot below so the
+    /// rebuild path can `await` axum drain before re-binding the
+    /// port.
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// `Some` until the rebuild path takes it to `await` axum drain
+    /// (see [`Self::take_join_handle`]). Held in the same
+    /// `Mutex<Option<…>>` shape as `shutdown_tx` so the take/replace
+    /// semantics are uniform across the two coupled lifecycle
+    /// signals — they are always installed and removed together.
+    ///
+    /// `None` after construction in the bind-failure branch (no
+    /// axum task was spawned); also `None` between the rebuild
+    /// path's [`Self::take_join_handle`] and
+    /// [`Self::replace_for_rebuild`] calls.
+    join_handle: Mutex<Option<JoinHandle<()>>>,
     /// Shared with the daemon's [`AppState`]. Future Tauri commands
     /// that need to make authenticated calls to the daemon (i.e.
     /// every endpoint except `/health`) read the bearer from here.
+    ///
+    /// Constant across rebuilds: the bearer comes from
+    /// `~/.heron/cli-token` via [`herond::auth::load_or_mint`]
+    /// (idempotent on a populated file), so a vault swap doesn't
+    /// require minting a new token. Public so the meetings/calendar
+    /// command shims can clone it without going through a getter.
     pub auth: Arc<AuthConfig>,
 }
 
@@ -142,13 +169,12 @@ impl DaemonHandle {
     /// uses for its forwarder task (relies on Tauri-runtime
     /// teardown for the final join).
     pub fn signal_shutdown(&self) {
-        let mut guard = match self.shutdown_tx.lock() {
-            Ok(g) => g,
-            // Mutex poisoned by a previous panic — recover the inner
-            // value. We're sending a one-shot signal; the lock's
-            // invariant (an `Option`) is intact regardless.
-            Err(p) => p.into_inner(),
-        };
+        // Mutex poisoned by a previous panic — recover the inner
+        // value. We're sending a one-shot signal; the lock's
+        // invariant (an `Option`) is intact regardless. Same
+        // recover-on-poison rationale applies to the other locks
+        // in this file (`take_join_handle`, `replace_for_rebuild`).
+        let mut guard = lock_recover(&self.shutdown_tx);
         if let Some(tx) = guard.take() {
             // `send` returns Err when the receiver dropped (i.e. the
             // axum task already exited for another reason — bind
@@ -156,6 +182,70 @@ impl DaemonHandle {
             // "already shut down"; nothing to do.
             let _ = tx.send(());
         }
+    }
+
+    /// Issue #206: take the axum task's [`JoinHandle`] so the rebuild
+    /// path can `await` axum drain before binding a fresh listener
+    /// onto the same port. Returns `None` when the daemon was
+    /// installed in its bind-failure branch (no task spawned), or
+    /// when the rebuild path is mid-flight (after this call but
+    /// before the matching [`Self::replace_for_rebuild`]).
+    ///
+    /// Uniform `Mutex<Option<…>>` take-semantics with
+    /// [`Self::signal_shutdown`]: callers are expected to follow up
+    /// with [`Self::replace_for_rebuild`] (rebuild succeeded) so the
+    /// next rebuild has both signals installed again. A panic
+    /// between the two calls leaves the handle in the "no task"
+    /// shape, which is identical to the bind-failure boot state —
+    /// safe but means the next [`Self::signal_shutdown`] is a no-op.
+    pub fn take_join_handle(&self) -> Option<JoinHandle<()>> {
+        lock_recover(&self.join_handle).take()
+    }
+
+    /// Issue #206: install a freshly-spawned axum task's lifecycle
+    /// signals into this handle. Called exclusively by
+    /// [`bind_after_rebuild`] after the new listener bound and the
+    /// new task started. The
+    /// previous `shutdown_tx` / `join_handle` MUST already be
+    /// `None` — either from the bind-failure boot (no task ever
+    /// spawned) or because the rebuild path drained them via
+    /// [`Self::signal_shutdown`] + [`Self::take_join_handle`]. The
+    /// pairing is enforced by `debug_assert!` so a contract
+    /// violation surfaces in dev/test builds; production stays at
+    /// zero overhead. An errant production double-install would
+    /// otherwise silently lose the previous task's shutdown signal
+    /// — but the previous task already exited (rebuild only calls
+    /// us after its `await`), so the practical fallout is bounded
+    /// to the leaked sender being dropped harmlessly.
+    ///
+    /// Mirrors the take half: both fields swapped together so the
+    /// next [`Self::signal_shutdown`] / [`Self::take_join_handle`]
+    /// pair sees a consistent state.
+    fn replace_for_rebuild(&self, shutdown_tx: oneshot::Sender<()>, join_handle: JoinHandle<()>) {
+        let mut tx_guard = lock_recover(&self.shutdown_tx);
+        let mut jh_guard = lock_recover(&self.join_handle);
+        debug_assert!(
+            tx_guard.is_none(),
+            "replace_for_rebuild called with a live shutdown_tx; previous task's shutdown signal would be leaked"
+        );
+        debug_assert!(
+            jh_guard.is_none(),
+            "replace_for_rebuild called with a live join_handle; previous task's join handle would be dropped without abort/await"
+        );
+        *tx_guard = Some(shutdown_tx);
+        *jh_guard = Some(join_handle);
+    }
+}
+
+/// Recover-on-poison helper for the [`DaemonHandle`] mutexes. Each
+/// field is `Mutex<Option<T>>` and the only mutation is take/replace
+/// of the `Option`, so a poisoned guard is still safe to use — the
+/// `Option` invariant doesn't depend on what the panicking thread
+/// was doing.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
     }
 }
 
@@ -246,14 +336,6 @@ pub async fn install<R: Runtime>(
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = DaemonHandle {
-        shutdown_tx: Mutex::new(Some(shutdown_tx)),
-        auth: Arc::clone(&auth),
-    };
-
-    if !app.manage(handle) {
-        return Err(InstallError::AlreadyInstalled);
-    }
 
     // Build the same router `crates/herond/src/main.rs` builds. The
     // `Arc<dyn SessionOrchestrator>` upcast happens at the AppState
@@ -270,7 +352,7 @@ pub async fn install<R: Runtime>(
         .map_err(|e| InstallError::MetricsRecorder(e.to_string()))?;
     let state = AppState {
         orchestrator,
-        auth,
+        auth: Arc::clone(&auth),
         metrics,
     };
     let app_router = build_app(state);
@@ -280,13 +362,16 @@ pub async fn install<R: Runtime>(
     // (the caller `await`s us from the setup hook via
     // `tauri::async_runtime::block_on`). `EADDRINUSE` and other
     // bind errors flow into the soft-fail branch below.
-    match tokio::net::TcpListener::bind(DEFAULT_BIND).await {
+    let join_handle = match tokio::net::TcpListener::bind(DEFAULT_BIND).await {
         Ok(listener) => {
             tracing::info!(
                 bind = DEFAULT_BIND,
                 "in-process herond listening (Gap #7); shutdown via DaemonHandle::signal_shutdown",
             );
-            tauri::async_runtime::spawn(async move {
+            // Issue #206: capture the spawn handle so a future vault
+            // rebuild can `await` axum drain before re-binding the
+            // same port. Pre-#206 the handle was discarded.
+            Some(tauri::async_runtime::spawn(async move {
                 let server = axum::serve(listener, app_router).with_graceful_shutdown(async move {
                     // Receiver completes on either `send(())` from
                     // the Exit hook OR on the sender being dropped
@@ -299,7 +384,7 @@ pub async fn install<R: Runtime>(
                 } else {
                     tracing::debug!("in-process herond axum::serve exited cleanly");
                 }
-            });
+            }))
         }
         Err(e) => {
             // The most likely cause is that a separate `herond`
@@ -313,11 +398,211 @@ pub async fn install<R: Runtime>(
                 "could not bind in-process herond; another daemon may already own the port. \
                  Status probe will discover any external daemon at the same address.",
             );
+            None
         }
+    };
+
+    // Issue #206: install the handle *after* the bind branch so the
+    // join-handle slot reflects whether a task was actually spawned.
+    // Pre-#206 the handle was installed first (so `signal_shutdown`
+    // worked even on bind failure); preserving that contract — the
+    // shutdown_tx is installed unconditionally so the Exit hook
+    // remains a safe no-op call regardless of the bind outcome.
+    let handle = DaemonHandle {
+        shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        join_handle: Mutex::new(join_handle),
+        auth,
+    };
+
+    if !app.manage(handle) {
+        return Err(InstallError::AlreadyInstalled);
     }
 
     Ok(())
 }
+
+/// Issue #206: failure modes for [`shutdown_for_rebuild`] and
+/// [`bind_after_rebuild`]. Modeled as an enum so the caller
+/// (`heron_write_settings` via
+/// [`crate::heron_write_settings`]) can map each variant to a stable
+/// string form for the JS bridge without parsing a free-form message.
+#[derive(Debug, Error)]
+pub enum RebuildError {
+    /// [`shutdown_for_rebuild`] / [`bind_after_rebuild`] was called
+    /// before [`install`] ever ran. Programming bug — `setup` always
+    /// installs before any settings command can fire.
+    #[error("daemon rebuild called before daemon::install")]
+    NotInstalled,
+    /// Rebinding `127.0.0.1:7384` after the previous task drained
+    /// failed. Usually transient (TIME_WAIT, another process raced
+    /// the slot), but the user's vault swap will not take effect
+    /// until the next launch unless we report it.
+    #[error("could not rebind in-process herond after vault swap: {0}")]
+    Bind(#[source] std::io::Error),
+    /// Re-deriving the `Metrics` handle for the new `AppState`
+    /// failed. The underlying installer in `heron-metrics` is
+    /// idempotent (a no-op on the second call) so this should
+    /// effectively never fire after a successful boot install,
+    /// but we surface it as a distinct variant so a future
+    /// metrics-surface change can't masquerade as a `Bind` error.
+    #[error("re-derive Prometheus metrics handle for rebuilt daemon: {0}")]
+    Metrics(String),
+}
+
+/// Issue #206: signal the existing in-process axum task to stop,
+/// and `await` its drain. Pair with [`bind_after_rebuild`] — the
+/// caller (`heron_write_settings`'s rebuild path) sequences the
+/// orchestrator shutdown between the two so the old recorder task
+/// has finished by the time the new daemon serves a request.
+///
+/// Lifecycle:
+///
+/// 1. [`DaemonHandle::signal_shutdown`] fires the existing task's
+///    oneshot. axum stops accepting new connections and drains
+///    in-flight ones.
+/// 2. [`DaemonHandle::take_join_handle`] takes the spawn handle and
+///    we `await` it. Bounded by [`REBUILD_DRAIN_TIMEOUT`] so a
+///    wedged in-flight request can't deadlock the user's settings
+///    save.
+///
+/// On a drain timeout we abort the old task forcefully and wait
+/// briefly for the abort to land. This is required, not optional:
+/// `bind_after_rebuild` re-binds the same port, and an axum task
+/// still holding the LISTENING socket would refuse the new bind
+/// with `EADDRINUSE` (Linux/macOS `SO_REUSEADDR` permits TIME_WAIT
+/// reuse, not concurrent active listeners). Aborting drops the
+/// listener so the rebind in `bind_after_rebuild` can succeed.
+pub async fn shutdown_for_rebuild<R: Runtime>(app: &AppHandle<R>) -> Result<(), RebuildError> {
+    let Some(state) = app.try_state::<DaemonHandle>() else {
+        return Err(RebuildError::NotInstalled);
+    };
+    state.signal_shutdown();
+    let Some(handle) = state.take_join_handle() else {
+        return Ok(());
+    };
+    // `tokio::time::timeout(dur, &mut handle)` lets us keep
+    // ownership of `handle` past the timeout so we can `abort()`
+    // it. Calling `timeout(dur, handle)` would consume the handle
+    // on timeout, leaving the spawned task running with its
+    // LISTENING socket still bound — the next `bind` would fail
+    // with `EADDRINUSE`.
+    let mut handle = handle;
+    match tokio::time::timeout(REBUILD_DRAIN_TIMEOUT, &mut handle).await {
+        Ok(Ok(())) => {
+            tracing::debug!("rebuild: previous axum task drained cleanly");
+        }
+        Ok(Err(join_err)) => {
+            // Task panicked; the orchestrator is in an unknown
+            // state but we're discarding it anyway. Log + proceed.
+            tracing::warn!(
+                error = %join_err,
+                "rebuild: previous axum task join error; proceeding with rebind",
+            );
+        }
+        Err(_) => {
+            // Drain budget exceeded. Forcefully abort the task so
+            // its TCP listener drops and the rebind can succeed.
+            // The abort is best-effort: the kernel takes a moment
+            // to release the LISTENING socket; we await the join
+            // handle (which now resolves with a Cancelled join
+            // error) to flush that delay before returning.
+            tracing::warn!(
+                timeout_ms = REBUILD_DRAIN_TIMEOUT.as_millis() as u64,
+                "rebuild: previous axum task did not drain in time; aborting",
+            );
+            handle.abort();
+            // Bound the abort-await with a short timeout so a
+            // pathological task that ignores cancellation can't
+            // deadlock the rebuild. If the await still doesn't
+            // resolve, we proceed and let bind_after_rebuild's
+            // `EADDRINUSE` flow surface as a `RebuildError::Bind`.
+            let _ = tokio::time::timeout(REBUILD_ABORT_TIMEOUT, handle).await;
+        }
+    }
+    Ok(())
+}
+
+/// Issue #206: rebind `127.0.0.1:7384` onto a fresh axum task built
+/// against a new orchestrator. Pair with [`shutdown_for_rebuild`] —
+/// callers in the `heron_write_settings` rebuild path call
+/// `shutdown_for_rebuild` first, then `LocalSessionOrchestrator::shutdown`
+/// on the previous orchestrator (deterministic recorder teardown),
+/// then this function.
+///
+/// On a bind error the previous handle slots remain empty — safe
+/// (next [`DaemonHandle::signal_shutdown`] is a no-op until the
+/// next install) but means the user's vault swap leaves no daemon
+/// running until the next launch. The caller propagates the
+/// `RebuildError::Bind` to the renderer as a Sonner toast.
+pub async fn bind_after_rebuild<R: Runtime>(
+    app: &AppHandle<R>,
+    orchestrator: Arc<LocalSessionOrchestrator>,
+) -> Result<(), RebuildError> {
+    let Some(state) = app.try_state::<DaemonHandle>() else {
+        return Err(RebuildError::NotInstalled);
+    };
+    // Tokio's `TcpListener::bind` sets `SO_REUSEADDR` on Unix,
+    // which avoids the TIME_WAIT trap on macOS so the rebind
+    // succeeds even when the previous socket is still in the
+    // kernel's wait queue.
+    let listener = tokio::net::TcpListener::bind(DEFAULT_BIND)
+        .await
+        .map_err(RebuildError::Bind)?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    // `init_prometheus_recorder` is idempotent on the process-global
+    // metrics slot (see `heron_metrics::init_prometheus_recorder`
+    // docs), so this re-call after a vault swap is a cheap no-op
+    // that returns the same `Metrics` handle the boot install
+    // received. We re-derive it here rather than threading it
+    // through `RebuildSlotInner` so a future change to the metrics
+    // surface (e.g. multi-recorder) doesn't have to update the
+    // rebuild plumbing.
+    let metrics = heron_metrics::init_prometheus_recorder()
+        .map_err(|e| RebuildError::Metrics(e.to_string()))?;
+    let app_state = AppState {
+        orchestrator,
+        auth: Arc::clone(&state.auth),
+        metrics,
+    };
+    let app_router = build_app(app_state);
+    let join_handle = tauri::async_runtime::spawn(async move {
+        let server = axum::serve(listener, app_router).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        });
+        if let Err(e) = server.await {
+            tracing::error!(error = %e, "rebuild: in-process herond axum::serve exited with error");
+        } else {
+            tracing::debug!("rebuild: in-process herond axum::serve exited cleanly");
+        }
+    });
+    state.replace_for_rebuild(shutdown_tx, join_handle);
+    tracing::info!(
+        bind = DEFAULT_BIND,
+        "rebuild: in-process herond rebound onto fresh orchestrator (issue #206)",
+    );
+    Ok(())
+}
+
+/// Issue #206: how long [`shutdown_for_rebuild`] waits for an
+/// aborted axum task to release its TCP listener before letting the
+/// caller move on to bind. 200 ms is enough for the kernel to drop
+/// the LISTENING socket after the task panics out of its `select!`;
+/// `bind` with `SO_REUSEADDR` succeeds immediately afterwards. A
+/// pathological task that ignores cancellation past this budget
+/// surfaces as `RebuildError::Bind` (EADDRINUSE) on the next step,
+/// which the renderer toasts.
+const REBUILD_ABORT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Issue #206: bound on how long [`shutdown_for_rebuild`] waits for
+/// the previous axum task to drain in-flight requests before
+/// returning. 5 s is
+/// generous for the daemon's protected routes (none of them block
+/// on long I/O — the longest is `heron_meeting_audio` which streams
+/// the body chunked but completes the response headers fast) and
+/// cheap enough that a user clicking Save and getting a wedged
+/// request still sees their setting take effect.
+const REBUILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe the daemon's `/v1/health` against [`HEALTH_URL`]. Used by
 /// the `heron_daemon_status` Tauri command.

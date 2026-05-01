@@ -39,13 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use heron_orchestrator::Builder as OrchestratorBuilder;
-// `LocalSessionOrchestrator` is only referenced from doc-comments in
-// this file (Tier 4 #17 switched the boot path to use `Builder`
-// directly so we can seed `Settings::hotwords` at startup; Tier 4 #23
-// extends that path to also push `Settings::auto_detect_meeting_app`
-// into the same builder); kept imported under `allow(unused_imports)`
-// so rustdoc's intra-doc links resolve without warnings.
-#[allow(unused_imports)]
+// Issue #206: now used directly by `build_orchestrator_for_settings`,
+// which both the boot hook and the `heron_write_settings` rebuild
+// path call to mint a fresh orchestrator from `Settings`.
 use heron_orchestrator::LocalSessionOrchestrator;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -157,14 +153,279 @@ fn heron_default_settings_path() -> String {
 /// archival m4a files via `convertFileSrc` after the user moves their
 /// vault. Scope is additive — a user who switches vaults back and forth
 /// retains read access to both for the lifetime of the app process.
+///
+/// Issue #206: when `Settings.vault_root` changed compared to the
+/// previously-persisted value, also tear down and rebuild the
+/// in-process daemon's [`LocalSessionOrchestrator`] so subsequent
+/// captures land in the new vault and `heron_list_meetings` reads
+/// the new path. Rebuild is serialized behind [`RebuildSlot`] so two
+/// concurrent settings saves can't race the orchestrator swap. The
+/// `extend_for_vault` call composes with rebuild — the new path is
+/// allowed in the asset-protocol scope before any resolver lookup
+/// against it can fire from a freshly-spawned daemon task.
+///
+/// Wire shape preserved (issue #201's IPC contract test): same
+/// `settings_path: String, settings: Settings` request body, same
+/// `Result<(), String>` reply. `async fn` is transparent across the
+/// Tauri IPC bridge.
 #[tauri::command]
-fn heron_write_settings(
+async fn heron_write_settings(
     app: tauri::AppHandle,
     settings_path: String,
     settings: Settings,
 ) -> Result<(), String> {
-    write_settings(Path::new(&settings_path), &settings).map_err(|e| e.to_string())?;
+    let slot = app
+        .try_state::<RebuildSlot>()
+        .ok_or_else(|| "rebuild slot not installed (programming bug)".to_string())?;
+    // Hold the slot's mutex across the entire write+rebuild
+    // sequence. This serializes concurrent saves end-to-end, so
+    // two requests writing different vaults can't interleave their
+    // disk writes vs. their daemon rebinds — the last writer to
+    // acquire the lock is also the last to rebind, which keeps the
+    // on-disk `vault_root` and the daemon's `AppState` consistent.
+    // Pre-fix the lock was held only across the rebuild segment;
+    // Codex review caught the resulting race where save B's write
+    // could win on disk while save A's rebuild won at the daemon.
+    let mut current_guard = slot.0.lock().await;
+
+    let settings_path_buf = PathBuf::from(&settings_path);
+    let next_vault_trimmed = settings.vault_root.trim().to_owned();
+    // Compare against the slot's last-applied vault root rather
+    // than re-reading the disk: the slot reflects what the daemon
+    // is *actually* serving against, which is the right source of
+    // truth for "do we need to rebuild?" — disk could be ahead or
+    // behind if a previous save's rebuild failed mid-flight.
+    let vault_changed = current_guard.applied_vault_root != next_vault_trimmed;
+
+    write_settings(&settings_path_buf, &settings).map_err(|e| e.to_string())?;
     asset_scope::extend_for_vault(&app, &settings.vault_root);
+
+    if vault_changed {
+        rebuild_orchestrator_on_vault_change(&app, &settings, &mut current_guard).await?;
+    }
+    Ok(())
+}
+
+/// Issue #206: build a fresh [`LocalSessionOrchestrator`] from the
+/// supplied settings, applying the same vault-root precedence the
+/// boot path uses (configured non-empty `Settings.vault_root` wins,
+/// else fall back to [`resolve_vault_root`]).
+///
+/// Pulled out so the boot hook and the `heron_write_settings` rebuild
+/// path go through one function — a future Settings field that needs
+/// to flow into the orchestrator (next hotwords-style addition) only
+/// has to be plumbed here once. Returns a fresh `Arc` so callers can
+/// pass identical clones to the daemon's [`AppState`] and the
+/// orchestrator-shutdown bookkeeping.
+///
+/// # Panics
+///
+/// Same Tokio-runtime requirement as
+/// [`heron_orchestrator::Builder::build`] — must be called from
+/// inside a Tokio runtime context. The desktop's setup hook satisfies
+/// this via `tauri::async_runtime::block_on`; the
+/// `heron_write_settings` rebuild path satisfies it because Tauri
+/// `async fn` commands run on the Tauri-managed runtime.
+fn build_orchestrator_for_settings(settings: &Settings) -> Arc<LocalSessionOrchestrator> {
+    let vault_root = match settings.vault_root.trim() {
+        "" => resolve_vault_root(),
+        s => Some(PathBuf::from(s)),
+    };
+    let file_naming_pattern: heron_vault::FileNamingPattern = settings.file_naming_pattern.into();
+    let mut builder = OrchestratorBuilder::default()
+        .hotwords(settings.hotwords.clone())
+        .file_naming_pattern(file_naming_pattern)
+        .auto_detect_meeting_app(settings.auto_detect_meeting_app);
+    if let Some(root) = vault_root {
+        builder = builder.vault_root(root);
+    }
+    Arc::new(builder.build())
+}
+
+/// Issue #206: serialization lock + current-orchestrator slot for the
+/// [`heron_write_settings`] rebuild path. Stored as managed Tauri
+/// state so concurrent settings saves (e.g. the renderer's debounced
+/// auto-save firing while the user clicks Save in another tab)
+/// serialize the orchestrator swap instead of racing for the daemon's
+/// port.
+///
+/// The same `tokio::sync::Mutex` guards both pieces of state so the
+/// "lock and swap" sequence is one atomic critical section: the
+/// rebuild path can read the previous orchestrator, install the new
+/// one, and rebind the daemon without a sibling save observing the
+/// half-swapped state. `tokio::sync::Mutex` rather than
+/// `std::sync::Mutex` because the path holds the lock across a
+/// `.await` (axum drain + orchestrator shutdown + new bind).
+///
+/// The wrapped `Arc<LocalSessionOrchestrator>` is the orchestrator
+/// the daemon's [`AppState`] was last bound to. Boot installs it
+/// once; the rebuild path swaps it in place and `shutdown().await`s
+/// the previous value before binding the new daemon — the
+/// deterministic teardown the constraint in CLAUDE.md and the
+/// orchestrator's `shutdown_tx` field doc both call out.
+///
+/// `applied_vault_root` is the trimmed `Settings.vault_root` that
+/// produced the current orchestrator. Re-checking the renderer-
+/// supplied value against this *after* the lock is acquired
+/// suppresses the redundant-rebuild race two concurrent
+/// `heron_write_settings` calls would otherwise trip: both observe
+/// the same on-disk previous value, both queue a rebuild, the
+/// second one would otherwise rebuild a second time against the
+/// already-up-to-date orchestrator.
+pub(crate) struct RebuildSlot(pub(crate) tokio::sync::Mutex<RebuildSlotInner>);
+
+pub(crate) struct RebuildSlotInner {
+    pub(crate) orchestrator: Arc<LocalSessionOrchestrator>,
+    pub(crate) applied_vault_root: String,
+    /// Tier 5 #26 auto-record scheduler handle for the *current*
+    /// orchestrator. Tracked so the rebuild path can abort the
+    /// previous scheduler explicitly — the `event_bus::install_with`
+    /// path managed an `Arc<LocalSessionOrchestrator>` at boot that
+    /// keeps the previous orchestrator alive past the slot swap, so
+    /// the scheduler's `Weak::upgrade` would otherwise keep
+    /// returning `Some` and the old scheduler would tick against
+    /// the old vault concurrently with the new one. Codex review
+    /// caught this race.
+    pub(crate) auto_record_scheduler: tokio::task::JoinHandle<()>,
+}
+
+/// Issue #206: rebuild the in-process orchestrator and re-bind the
+/// daemon onto it. Called by `heron_write_settings` only when
+/// `Settings.vault_root` changed.
+///
+/// Lifecycle ordering (matters for correctness):
+///
+/// 1. Acquire the [`RebuildSlot`] lock. Concurrent settings saves
+///    serialize here so the daemon never sees a half-swapped state.
+/// 2. Build the new orchestrator with
+///    [`build_orchestrator_for_settings`] *before* tearing down the
+///    old one, so a build failure (e.g. auto-record-registry I/O
+///    panic) leaves the daemon serving the previous orchestrator
+///    unchanged.
+/// 3. [`daemon::shutdown_for_rebuild`] signals the old axum task's
+///    shutdown and awaits its drain (with timeout). axum is no
+///    longer accepting requests when this returns.
+/// 4. Call [`LocalSessionOrchestrator::shutdown`] on the previous
+///    orchestrator. This is the deterministic-teardown path the
+///    orchestrator's `shutdown_tx` field doc calls out: the
+///    recorder task exits cleanly here, before the new daemon
+///    starts serving requests against the new orchestrator. Errors
+///    are logged but proceed — `Drop` fires the same signal as a
+///    fallback per the orchestrator's docs.
+/// 5. [`daemon::bind_after_rebuild`] re-binds 7384 and spawns a
+///    fresh axum task against the new orchestrator. The daemon's
+///    `AppState` now points at the new vault.
+/// 6. Replace the slot's `Arc<LocalSessionOrchestrator>` and
+///    `applied_vault_root` with the new values, and abort the
+///    previous auto-record scheduler. Atomic with respect to
+///    step 4 because we hold the slot's mutex throughout — and
+///    only reached when the bind in step 5 succeeded.
+///
+/// Bind ordering (step 5 before step 6) is intentional: a bind
+/// failure must NOT update `applied_vault_root`, otherwise a
+/// retry of the same vault would observe a stale "already
+/// applied" state and skip the rebuild. Codex review caught the
+/// pre-fix bug where the slot was committed before the bind ran.
+///
+/// On any failure path between steps 3 and 5 the daemon ends up
+/// without a serving task — the user's settings save returns an
+/// error, the renderer surfaces it, and a retry with the same
+/// vault re-enters rebuild (slot's `applied_vault_root` is still
+/// the *previous* value because step 6 didn't run). On-disk
+/// settings still reflect the user's choice (written before this
+/// function fires), so a relaunch is a clean recovery too.
+async fn rebuild_orchestrator_on_vault_change(
+    app: &tauri::AppHandle,
+    settings: &Settings,
+    current_guard: &mut tokio::sync::MutexGuard<'_, RebuildSlotInner>,
+) -> Result<(), String> {
+    let next_vault_trimmed = settings.vault_root.trim();
+    let new_orchestrator = build_orchestrator_for_settings(settings);
+    // Tier 5 #26 parity: the boot path calls
+    // `spawn_auto_record_scheduler` on the freshly-built orchestrator
+    // so per-event auto-record fires off the calendar reader. The
+    // post-rebuild orchestrator needs the same scheduler running
+    // against the new vault — without it, a user who switches vaults
+    // mid-day would silently lose auto-record until restart. We
+    // capture the new scheduler's handle so it lives in the slot;
+    // the *previous* scheduler is aborted at step 6 once the new
+    // orchestrator is committed, so two schedulers can't tick
+    // concurrently against two vaults.
+    let new_auto_record_scheduler = new_orchestrator.spawn_auto_record_scheduler();
+
+    // Step 3: tear down the old daemon's axum task and await drain.
+    daemon::shutdown_for_rebuild(app)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Step 4: deterministic recorder teardown on the previous
+    // orchestrator. Cloning the Arc lets us call `shutdown` (which
+    // takes `&self` but consumes internal `oneshot::Sender`s under
+    // its own Mutex) without dropping the slot's reference yet —
+    // the swap in step 5 is what releases the previous Arc.
+    let previous = Arc::clone(&current_guard.orchestrator);
+    if let Err(e) = previous.shutdown().await {
+        // The orchestrator's `Drop` impl fires the same signal
+        // best-effort, so a join error here just means the recorder
+        // task panicked or was cancelled — the new orchestrator's
+        // recorder is independent and unaffected.
+        tracing::warn!(
+            error = %e,
+            "previous orchestrator shutdown errored; recorder task may exit via Drop fallback",
+        );
+    }
+    // Drop our extra clone before the swap so the slot holds the
+    // sole boot-time reference to the old orchestrator (about to
+    // be replaced).
+    drop(previous);
+
+    // Step 5: bind a fresh axum task against the new orchestrator.
+    // We do this *before* committing the slot swap so that a bind
+    // failure doesn't desync the slot from the actual daemon state
+    // (Codex review caught the bug: a bind failure after slot
+    // commit would update `applied_vault_root` to a vault the
+    // daemon never bound, and a retry with the same vault would be
+    // skipped as a no-op).
+    if let Err(e) = daemon::bind_after_rebuild(app, Arc::clone(&new_orchestrator)).await {
+        // The new orchestrator's scheduler is running but the
+        // daemon never bound to it — abort the scheduler so it
+        // doesn't tick against a vault no daemon serves. The
+        // recorder shutdown is best-effort via Drop on the
+        // upcoming `new_orchestrator` drop.
+        new_auto_record_scheduler.abort();
+        return Err(e.to_string());
+    }
+
+    // Step 6: install the new orchestrator + scheduler handle into
+    // the slot atomically with `applied_vault_root` so the next
+    // save sees a coherent (orchestrator, vault_root, scheduler)
+    // tuple. Only reached when the bind succeeded — a failed bind
+    // exits via `?` above and leaves the slot pointing at the
+    // previous orchestrator's `Arc`, which is now in the
+    // "shutdown-but-not-rebound" state. A subsequent retry of the
+    // same vault re-enters with `vault_changed = true` (slot's
+    // `applied_vault_root` is still the old value) and attempts
+    // the rebind again — the recovery path the user expects from
+    // a transient bind failure.
+    //
+    // Abort the previous scheduler before swapping the handle:
+    // the `event_bus::install_with` path managed an `Arc` that
+    // keeps the previous orchestrator alive past the slot swap,
+    // so the previous scheduler's `Weak::upgrade` would still
+    // succeed and the old vault would receive auto-record fires
+    // concurrent with the new one.
+    let old_scheduler = std::mem::replace(
+        &mut current_guard.auto_record_scheduler,
+        new_auto_record_scheduler,
+    );
+    old_scheduler.abort();
+    current_guard.orchestrator = new_orchestrator;
+    current_guard.applied_vault_root = next_vault_trimmed.to_owned();
+
+    tracing::info!(
+        vault_root = %settings.vault_root,
+        "in-process orchestrator rebuilt after vault_root change (issue #206)",
+    );
     Ok(())
 }
 
@@ -864,17 +1125,13 @@ pub fn run() {
             // orchestrator. A corrupt / missing `settings.json` is the
             // first-run state — fall back to defaults rather than
             // failing setup, mirroring `register_startup_hotkey`.
+            //
+            // Issue #206: the same boot settings flow into
+            // `build_orchestrator_for_settings`, which the
+            // `heron_write_settings` rebuild path also uses — so the
+            // boot orchestrator and a post-vault-swap rebuilt
+            // orchestrator are configured identically.
             let boot_settings = read_settings(&default_settings_path()).unwrap_or_default();
-            // The renderer reads/writes `Settings.vault_root`; if the
-            // in-process orchestrator pointed at the env / `~/heron-vault`
-            // default the daemon would write notes the renderer can never
-            // see. Prefer the configured vault when set (trimmed; empty
-            // = unset, same convention as `HERON_VAULT_ROOT`), else fall
-            // back to `resolve_vault_root`.
-            let vault_root = match boot_settings.vault_root.trim() {
-                "" => resolve_vault_root(),
-                s => Some(PathBuf::from(s)),
-            };
             // Issue #197: tighten the asset-protocol scope from `["**"]`
             // to exactly the directories the playback bar reads. Cache
             // covers `<cache>/sessions/<id>/{mic,tap}.raw` (salvage) and
@@ -882,42 +1139,66 @@ pub fn run() {
             // covers `<vault>/meetings/<basename>.m4a` (archival). The
             // `heron_write_settings` command extends scope when the user
             // moves their vault from Settings.
+            //
+            // Same vault-root precedence as `build_orchestrator_for_settings`:
+            // configured non-empty wins, else fall back to
+            // `resolve_vault_root`. Computed inline here because the
+            // orchestrator builder consumes the value but
+            // `install_initial_scope` only borrows.
+            let boot_vault_root = match boot_settings.vault_root.trim() {
+                "" => resolve_vault_root(),
+                s => Some(PathBuf::from(s)),
+            };
             asset_scope::install_initial_scope(
                 app.handle(),
                 &default_cache_root(),
-                vault_root.as_deref(),
+                boot_vault_root.as_deref(),
             );
-            let hotwords = boot_settings.hotwords;
-            let auto_detect_meeting_app = boot_settings.auto_detect_meeting_app;
-            let file_naming_pattern: heron_vault::FileNamingPattern =
-                boot_settings.file_naming_pattern.into();
             tauri::async_runtime::block_on(async move {
-                let mut builder = OrchestratorBuilder::default()
-                    .hotwords(hotwords)
-                    .file_naming_pattern(file_naming_pattern)
-                    .auto_detect_meeting_app(auto_detect_meeting_app);
-                if let Some(root) = vault_root {
+                let orchestrator = build_orchestrator_for_settings(&boot_settings);
+                if let Some(ref root) = boot_vault_root {
                     tracing::info!(
                         vault_root = %root.display(),
-                        ?file_naming_pattern,
-                        auto_detect_meeting_app,
+                        ?boot_settings.file_naming_pattern,
+                        auto_detect_meeting_app = boot_settings.auto_detect_meeting_app,
                         "in-process orchestrator: read-side wired against vault",
                     );
-                    builder = builder.vault_root(root);
                 } else {
                     // Sandboxed test runner / no home dir.
                     // Substrate-only — every read endpoint will
                     // return NotYetImplemented, which is the
                     // honest answer until a vault is configured.
                     tracing::warn!(
-                        auto_detect_meeting_app,
+                        auto_detect_meeting_app = boot_settings.auto_detect_meeting_app,
                         "no vault root resolvable; in-process orchestrator runs substrate-only",
                     );
                 }
-                let orchestrator = Arc::new(builder.build());
-                std::mem::drop(orchestrator.spawn_auto_record_scheduler());
+                let auto_record_scheduler = orchestrator.spawn_auto_record_scheduler();
                 event_bus::install_with(&app_handle, Arc::clone(&orchestrator))?;
-                daemon::install(&app_handle, orchestrator).await?;
+                daemon::install(&app_handle, Arc::clone(&orchestrator)).await?;
+                // Issue #206: stash the boot orchestrator under the
+                // rebuild slot so the `heron_write_settings` rebuild
+                // path can find it later, call `shutdown` on it
+                // (deterministic recorder teardown), and swap a fresh
+                // orchestrator into the slot atomically with the
+                // daemon rebind. The same managed state doubles as the
+                // rebuild lock — concurrent saves serialize on its
+                // `tokio::sync::Mutex`. Seed `applied_vault_root` with
+                // the trimmed boot value so the redundant-rebuild
+                // suppression in `rebuild_orchestrator_on_vault_change`
+                // recognizes a no-op save against the same vault.
+                // The auto-record scheduler handle is parked in the
+                // slot so the rebuild path can `abort()` it before
+                // spawning the new orchestrator's scheduler — the
+                // `event_bus::install_with` path managed an Arc that
+                // keeps the previous orchestrator alive and would
+                // otherwise let two schedulers tick concurrently
+                // against two different vaults.
+                app_handle.manage(RebuildSlot(tokio::sync::Mutex::new(RebuildSlotInner {
+                    orchestrator,
+                    applied_vault_root: boot_settings.vault_root.trim().to_owned(),
+                    auto_record_scheduler,
+                })));
                 // UI revamp PR 4: install the SSE bridge state slot.
                 // The bridge task itself is started by the
                 // `heron_subscribe_events` command on app mount.
@@ -1300,6 +1581,199 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.contains("not a directory"), "got: {err}");
+        }
+    }
+
+    /// Issue #206 integration coverage: pin that
+    /// [`build_orchestrator_for_settings`] produces an orchestrator
+    /// whose read endpoints scan the `Settings.vault_root` *we
+    /// supplied*, not whatever was wired at boot. This is the core
+    /// bug — pre-fix, the boot orchestrator's vault was frozen at
+    /// setup-time and a subsequent settings change left the daemon
+    /// reading from the old location while `heron_list_meetings` (the
+    /// renderer's HTTP proxy) read from the new one.
+    ///
+    /// The test simulates the full "user changed vault" path at the
+    /// orchestrator-rebuild seam:
+    /// 1. Drop a real meeting note into vault A via `VaultWriter::finalize_session`
+    ///    so the orchestrator's frontmatter parser has something to surface.
+    /// 2. Drop a *different* meeting into vault B.
+    /// 3. Build orchestrator from `Settings { vault_root: A }`; assert
+    ///    `list_meetings` returns A's meeting only.
+    /// 4. Build orchestrator from `Settings { vault_root: B }`; assert
+    ///    it returns B's meeting only.
+    ///
+    /// We don't go through `heron_write_settings` end-to-end because
+    /// that path also rebinds the in-process daemon onto port 7384 —
+    /// which would conflict with any concurrently-running test (or a
+    /// developer's local `herond`). The seam this test exercises is
+    /// the same `Arc<LocalSessionOrchestrator>` the rebuild path
+    /// eventually feeds into [`crate::daemon::bind_after_rebuild`]; a regression
+    /// that makes the helper ignore `Settings.vault_root` (e.g.
+    /// always falling back to `resolve_vault_root`) would surface
+    /// here exactly as it would surface in a manual repro.
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    mod orchestrator_rebuild_for_vault {
+        use super::*;
+        use heron_session::{ListMeetingsQuery, SessionOrchestrator};
+        use heron_types::{
+            Cost, DiarizeSource, Disclosure, DisclosureHow, Frontmatter, MeetingType,
+        };
+        use heron_vault::VaultWriter;
+        use std::path::PathBuf as StdPathBuf;
+        use tempfile::TempDir;
+
+        fn baseline_frontmatter(company: &str) -> Frontmatter {
+            Frontmatter {
+                date: chrono::NaiveDate::from_ymd_opt(2026, 4, 24).expect("date"),
+                start: "14:00".into(),
+                duration_min: 30,
+                company: Some(company.to_owned()),
+                attendees: vec![],
+                meeting_type: MeetingType::Client,
+                source_app: "us.zoom.xos".into(),
+                recording: StdPathBuf::from("recordings/2026-04-24-1400.m4a"),
+                transcript: StdPathBuf::from("transcripts/2026-04-24-1400.jsonl"),
+                diarize_source: DiarizeSource::Ax,
+                disclosed: Disclosure {
+                    stated: true,
+                    when: Some("00:14".into()),
+                    how: DisclosureHow::Verbal,
+                },
+                cost: Cost {
+                    summary_usd: 0.01,
+                    tokens_in: 100,
+                    tokens_out: 50,
+                    model: "test".into(),
+                },
+                action_items: vec![],
+                tags: vec![],
+                extra: serde_yaml::Mapping::default(),
+            }
+        }
+
+        fn seed_meeting(vault: &Path, slug: &str, company: &str) {
+            let writer = VaultWriter::new(vault);
+            writer
+                .finalize_session(
+                    "2026-04-24",
+                    "1400",
+                    slug,
+                    &baseline_frontmatter(company),
+                    "Body.\n",
+                )
+                .expect("finalize meeting note");
+        }
+
+        fn settings_with_vault(vault: &Path) -> Settings {
+            Settings {
+                vault_root: vault.to_string_lossy().into_owned(),
+                ..Settings::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn orchestrator_built_from_settings_reads_supplied_vault() {
+            // Vault A has a meeting from "Acme"; vault B has one from
+            // "Globex". The orchestrator's `list_meetings` surfaces the
+            // company name in `Meeting.title` (per
+            // `crates/heron-orchestrator/src/vault_read.rs::meeting_from_note`),
+            // so we can distinguish which vault the orchestrator is
+            // pointed at by inspecting the title — a far more robust
+            // assertion than count alone, since count would also pass
+            // if the orchestrator silently fell back to a third
+            // (empty) directory.
+            let vault_a = TempDir::new().expect("tmp vault A");
+            let vault_b = TempDir::new().expect("tmp vault B");
+            seed_meeting(vault_a.path(), "acme-pricing", "Acme");
+            seed_meeting(vault_b.path(), "globex-kickoff", "Globex");
+
+            // Orchestrator A — the boot equivalent.
+            let orch_a = build_orchestrator_for_settings(&settings_with_vault(vault_a.path()));
+            let page_a = orch_a
+                .list_meetings(ListMeetingsQuery::default())
+                .await
+                .expect("list_meetings on A");
+            assert_eq!(page_a.items.len(), 1, "expected one A-meeting");
+            assert_eq!(
+                page_a.items[0].title.as_deref(),
+                Some("Acme"),
+                "vault A orchestrator surfaced wrong title: {:?}",
+                page_a.items[0].title,
+            );
+
+            // Orchestrator B — the post-vault-swap rebuild equivalent.
+            // This is the core of issue #206: a fresh
+            // `build_orchestrator_for_settings` against *new* settings
+            // must read from the new vault, not the boot one.
+            let orch_b = build_orchestrator_for_settings(&settings_with_vault(vault_b.path()));
+            let page_b = orch_b
+                .list_meetings(ListMeetingsQuery::default())
+                .await
+                .expect("list_meetings on B");
+            assert_eq!(page_b.items.len(), 1, "expected one B-meeting");
+            assert_eq!(
+                page_b.items[0].title.as_deref(),
+                Some("Globex"),
+                "vault B orchestrator surfaced wrong title: {:?}",
+                page_b.items[0].title,
+            );
+
+            // Belt-and-suspenders: a meeting that lives in vault A is
+            // *not* visible from orchestrator B. A regression that
+            // accidentally shared a single vault root across rebuilt
+            // orchestrators (the pre-fix bug, in spirit) would let
+            // Acme leak through here.
+            assert!(
+                !page_b
+                    .items
+                    .iter()
+                    .any(|m| m.title.as_deref() == Some("Acme")),
+                "vault B orchestrator must not surface vault A's meetings",
+            );
+        }
+
+        /// An empty `Settings.vault_root` reverts to the
+        /// `resolve_vault_root` precedence (env var > `~/heron-vault`).
+        /// In the sandboxed test process, with `HERON_VAULT_ROOT`
+        /// unset and a resolvable home dir, the orchestrator points at
+        /// `~/heron-vault`; in CI without a home dir it's
+        /// substrate-only. Either way: a vault we just-seeded under a
+        /// fresh tempdir must NOT show up — confirming that an
+        /// "untrim me" wire value still rebuilds the orchestrator at
+        /// the documented fallback path.
+        #[tokio::test]
+        async fn orchestrator_built_with_empty_vault_root_does_not_read_arbitrary_vault() {
+            let unrelated_vault = TempDir::new().expect("tmp unrelated vault");
+            seed_meeting(unrelated_vault.path(), "decoy", "Decoy");
+
+            let orch = build_orchestrator_for_settings(&Settings {
+                vault_root: "   ".into(),
+                ..Settings::default()
+            });
+            // Either the orchestrator reads from `~/heron-vault` (and
+            // the decoy meeting is invisible because it's under a
+            // tempdir) or it's substrate-only (`NotYetImplemented`).
+            // Both are acceptable; the bug we're guarding against is
+            // "orchestrator silently picked up the renderer-supplied
+            // tempdir despite the empty-string sentinel", which would
+            // surface as the decoy title appearing in the page.
+            match orch.list_meetings(ListMeetingsQuery::default()).await {
+                Ok(page) => {
+                    assert!(
+                        !page
+                            .items
+                            .iter()
+                            .any(|m| m.title.as_deref() == Some("Decoy")),
+                        "empty vault_root must not leak the decoy tempdir into the orchestrator",
+                    );
+                }
+                Err(_) => {
+                    // Substrate-only / `NotYetImplemented` is the
+                    // honest answer when the home dir is unresolvable
+                    // and no captures are in flight. Acceptable.
+                }
+            }
         }
     }
 }
