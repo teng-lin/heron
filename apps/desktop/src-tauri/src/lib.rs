@@ -312,18 +312,28 @@ pub(crate) struct RebuildSlotInner {
 ///    starts serving requests against the new orchestrator. Errors
 ///    are logged but proceed — `Drop` fires the same signal as a
 ///    fallback per the orchestrator's docs.
-/// 5. Replace the slot's `Arc<LocalSessionOrchestrator>` with the
-///    new orchestrator. Atomic with respect to step 4 because
-///    we hold the slot's mutex throughout.
-/// 6. [`daemon::bind_after_rebuild`] re-binds 7384 and spawns a
+/// 5. [`daemon::bind_after_rebuild`] re-binds 7384 and spawns a
 ///    fresh axum task against the new orchestrator. The daemon's
 ///    `AppState` now points at the new vault.
+/// 6. Replace the slot's `Arc<LocalSessionOrchestrator>` and
+///    `applied_vault_root` with the new values, and abort the
+///    previous auto-record scheduler. Atomic with respect to
+///    step 4 because we hold the slot's mutex throughout — and
+///    only reached when the bind in step 5 succeeded.
 ///
-/// On any failure path between steps 3 and 6 the daemon ends up
+/// Bind ordering (step 5 before step 6) is intentional: a bind
+/// failure must NOT update `applied_vault_root`, otherwise a
+/// retry of the same vault would observe a stale "already
+/// applied" state and skip the rebuild. Codex review caught the
+/// pre-fix bug where the slot was committed before the bind ran.
+///
+/// On any failure path between steps 3 and 5 the daemon ends up
 /// without a serving task — the user's settings save returns an
-/// error, the renderer surfaces it, and a relaunch starts fresh
-/// with the new on-disk settings (which were already written by
-/// the caller before this function fires).
+/// error, the renderer surfaces it, and a retry with the same
+/// vault re-enters rebuild (slot's `applied_vault_root` is still
+/// the *previous* value because step 6 didn't run). On-disk
+/// settings still reflect the user's choice (written before this
+/// function fires), so a relaunch is a clean recovery too.
 async fn rebuild_orchestrator_on_vault_change(
     app: &tauri::AppHandle,
     settings: &Settings,
