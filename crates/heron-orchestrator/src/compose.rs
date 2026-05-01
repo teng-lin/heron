@@ -14,12 +14,19 @@ use heron_bot::{
     AttendeeContext as BotAttendeeContext, BotCreateArgs, DisclosureProfile, PersonaId,
     PreMeetingContext as BotPreMeetingContext,
 };
+use heron_metrics::redacted;
 use heron_policy::{EscalationMode, PolicyProfile};
 use heron_realtime::{SessionConfig as RealtimeSessionConfig, TurnDetection};
 use heron_session::{Meeting, MeetingId, Platform, PreMeetingContext};
 use uuid::Uuid;
 
 use crate::live_session::LiveSessionStartArgs;
+
+/// #225 appendix item 2 — counter at the `bot.context` render-fail
+/// drop site. Single-dimension `reason` keeps cardinality bounded; the
+/// only emitted value today is `too_large` (the `ContextError` variant
+/// `render_context` returns from `heron_bot`).
+const BOT_CONTEXT_RENDER_FAILED_TOTAL: &str = "bot_context_render_failed_total";
 
 /// Default disclosure template used when the orchestrator composes
 /// the v2 stack itself. The `{user_name}` and `{meeting_title}`
@@ -85,6 +92,11 @@ pub(crate) fn build_live_session_start_args(
                 error = %err,
                 "rendered context exceeds spec budget; dropping context from system prompt and bot args",
             );
+            metrics::counter!(
+                BOT_CONTEXT_RENDER_FAILED_TOTAL,
+                "reason" => redacted!("too_large").into_inner(),
+            )
+            .increment(1);
             bot_context = BotPreMeetingContext::default();
             String::new()
         }
@@ -208,6 +220,11 @@ pub(crate) fn pre_meeting_briefing_for_v1(
                 error = %err,
                 "v1 pre-meeting briefing exceeds spec budget; v1 summary will run without preamble",
             );
+            metrics::counter!(
+                BOT_CONTEXT_RENDER_FAILED_TOTAL,
+                "reason" => redacted!("too_large").into_inner(),
+            )
+            .increment(1);
             None
         }
     }

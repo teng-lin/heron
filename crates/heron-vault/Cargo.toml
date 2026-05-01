@@ -10,6 +10,8 @@ links = "EventKitHelper"
 
 [dependencies]
 heron-types = { workspace = true }
+heron-metrics = { workspace = true }
+metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -32,6 +34,7 @@ name = "validate-vault"
 path = "src/bin/validate-vault.rs"
 
 [dev-dependencies]
+heron-metrics = { workspace = true }
 tempfile = "3"
 
 [lints]

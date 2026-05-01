@@ -30,8 +30,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::content::parse_content_json;
+use crate::metrics_emit::{
+    LLM_CALL_DURATION_SECONDS, LLM_CALL_FAILURES_TOTAL, record_call_success,
+};
+use crate::metrics_labels::{backend_label, model_label};
 use crate::transcript::{build_user_content, read_transcript_capped, strip_speaker_names};
-use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
+use crate::{
+    Backend, LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt,
+};
 
 /// Default binary name resolved on `PATH`. The user can override via
 /// [`ClaudeCodeClientConfig::binary`] (e.g. for a `claude` install
@@ -100,6 +106,21 @@ impl ClaudeCodeClient {
 #[async_trait]
 impl Summarizer for ClaudeCodeClient {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
+        heron_metrics::timed_io_async(
+            LLM_CALL_DURATION_SECONDS,
+            LLM_CALL_FAILURES_TOTAL,
+            ("op", backend_label(Backend::ClaudeCodeCli)),
+            self.summarize_inner(input),
+        )
+        .await
+    }
+}
+
+impl ClaudeCodeClient {
+    async fn summarize_inner(
+        &self,
+        input: SummarizerInput<'_>,
+    ) -> Result<SummarizerOutput, LlmError> {
         let prompt = render_meeting_prompt(&input)?;
         let transcript_text = read_transcript_capped(input.transcript)?;
         // Tier 4 #21: pseudonymize speaker names for the LLM input.
@@ -109,7 +130,7 @@ impl Summarizer for ClaudeCodeClient {
             transcript_text
         };
         let user_content = build_user_content(&prompt, &transcript_for_llm);
-        run_cli_summarize(
+        let output = run_cli_summarize(
             &self.config.binary,
             &self.config.args,
             &self.config.model,
@@ -117,7 +138,19 @@ impl Summarizer for ClaudeCodeClient {
             &user_content,
             input.meeting_type,
         )
-        .await
+        .await?;
+        // The CLI cost record stamps a model breadcrumb but no token
+        // counts; emit zero-token counters for shape parity with the
+        // API backends — dashboards aggregating "total LLM tokens"
+        // across backends pick up the CLI rows as 0 contributions.
+        record_call_success(
+            backend_label(Backend::ClaudeCodeCli),
+            model_label(&output.cost.model),
+            output.cost.tokens_in,
+            output.cost.tokens_out,
+            output.cost.summary_usd,
+        );
+        Ok(output)
     }
 }
 

@@ -69,10 +69,12 @@
 mod label;
 mod naming;
 mod recorder;
+mod timed;
 
 pub use label::{InvalidLabel, RedactedLabel};
 pub use naming::{InvalidMetricName, validate_metric_name};
 pub use recorder::{MetricsHandle, init_prometheus_recorder};
+pub use timed::{ClassifyFailure, Outcome, timed_io_async, timed_io_sync};
 
 /// Canonical name of the smoke metric instrumented in
 /// `heron-orchestrator::start_capture`. Sub-issues #224 / #225 / #226

@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use heron_metrics::redacted;
 use heron_session::{
     IdentifierKind, ListMeetingsPage, ListMeetingsQuery, Meeting, MeetingId, MeetingStatus,
     Participant, Platform, SessionError, SummaryLifecycle, TranscriptLifecycle, TranscriptSegment,
@@ -27,6 +28,15 @@ use heron_vault::{VaultError, read_note};
 use uuid::Uuid;
 
 use crate::MAX_TRANSCRIPT_LINE_BYTES;
+
+// Metric names from the #225 appendix. Convention validation runs in
+// `vault_read_metric_names_match_convention` below so a drifted literal
+// flunks `cargo test` before reaching production.
+const VAULT_TRANSCRIPT_OVERSIZED_LINES_SKIPPED_TOTAL: &str =
+    "vault_transcript_oversized_lines_skipped_total";
+const VAULT_TRANSCRIPT_SEGMENTS_COUNT: &str = "vault_transcript_segments_count";
+const VAULT_TRANSCRIPT_BYTES_READ_BYTES: &str = "vault_transcript_bytes_read_bytes";
+const VAULT_PATH_RESOLVE_SYMLINK_REJECTED_TOTAL: &str = "vault_path_resolve_symlink_rejected_total";
 
 /// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
 /// a `MeetingId` from a vault-relative note path. The byte pattern
@@ -253,6 +263,27 @@ fn reject_symlinked_components(
         current.push(component);
         match current.symlink_metadata() {
             Ok(meta) if meta.file_type().is_symlink() => {
+                // #225 appendix item 4 — bounded label cardinality:
+                // `field` is a `&'static str` that ships exclusively
+                // from the call site (`"transcript"`, `"recording"`,
+                // …), so wrapping in `RedactedLabel::from_static` is
+                // safe. A future call site that passes a user-derived
+                // string would fail to compile against the `'static`
+                // bound — which is the privacy contract.
+                let field_label = match heron_metrics::RedactedLabel::from_static(field) {
+                    Ok(label) => label,
+                    // Defence-in-depth: a `'static` field that drifts
+                    // into transcript-shaped territory hits the
+                    // length/charset gate. Fall back to the bounded
+                    // `unknown_field` bucket rather than panic — this
+                    // metric is observability, not correctness.
+                    Err(_) => redacted!("unknown_field"),
+                };
+                metrics::counter!(
+                    VAULT_PATH_RESOLVE_SYMLINK_REJECTED_TOTAL,
+                    "field" => field_label.into_inner(),
+                )
+                .increment(1);
                 return Err(SessionError::Validation {
                     detail: format!("{field} path traverses a symlink"),
                 });
@@ -489,10 +520,24 @@ pub(crate) fn read_transcript_segments(
     let mut reader = std::io::BufReader::new(file);
     let mut segments = Vec::new();
     let mut lineno = 0usize;
+    // Track the running total of bytes drawn off the file (including
+    // bytes drained from over-cap lines we skip) so the
+    // `bytes_read_bytes` histogram observation on return reflects the
+    // actual disk read size, not just the bytes that survived into
+    // `segments`.
+    let mut total_bytes_read = 0u64;
     // Issue #215 finding 3 — buffer is reused across iterations so
     // we don't re-allocate per line. `read_until` appends, so each
     // iteration starts with `buf.clear()` to drop the previous
     // line's bytes (the underlying capacity is retained).
+    //
+    // PR #228 caveat (#225 appendix item 5) — keep `buf`'s lifetime
+    // bound to this function and DO NOT move `buf.clear()` into a
+    // nested block: any inner block scope (a metrics recording block,
+    // a defer-style guard) would either drop and re-allocate `buf` per
+    // iteration (the bug #228 fixed) OR shadow the outer binding,
+    // ditto. The `clear()` call below stays at the top of the loop
+    // body, exactly where #228 placed it.
     let mut buf = Vec::with_capacity(256);
     loop {
         buf.clear();
@@ -509,12 +554,21 @@ pub(crate) fn read_transcript_segments(
         if n == 0 {
             break;
         }
+        total_bytes_read = total_bytes_read.saturating_add(n as u64);
         if n > MAX_TRANSCRIPT_LINE_BYTES {
             tracing::warn!(
                 line = lineno,
                 bytes = n,
                 "transcript line exceeds MAX_TRANSCRIPT_LINE_BYTES; skipping",
             );
+            // #225 appendix item 1 — counter at the over-cap warn site so
+            // dashboards can see when malformed transcripts are silently
+            // dropped. No per-meeting label (would explode cardinality);
+            // the operator pivots on the matching `tracing::warn!` log
+            // line above when a spike fires. Constant counter increment
+            // is allocation-free, so the buffer-reuse contract from #228
+            // is unaffected.
+            metrics::counter!(VAULT_TRANSCRIPT_OVERSIZED_LINES_SKIPPED_TOTAL).increment(1);
             // Issue #215 finding 2 — drain via `fill_buf` /
             // `consume` so the rest of the over-cap line never
             // touches an allocation. The pre-fix path called
@@ -545,6 +599,7 @@ pub(crate) fn read_transcript_segments(
                         }
                     };
                     reader.consume(used);
+                    total_bytes_read = total_bytes_read.saturating_add(used as u64);
                     if done {
                         break;
                     }
@@ -597,6 +652,13 @@ pub(crate) fn read_transcript_segments(
         }
         lineno += 1;
     }
+    // #225 appendix item 3 — record per-call distributions of segment
+    // count + bytes read. The loop has terminated and `buf` is no
+    // longer in use, so the `as f64` cast and metrics emission can't
+    // affect buffer lifetime / reuse. Both observations are
+    // O(1) — cheap, allocation-free.
+    metrics::histogram!(VAULT_TRANSCRIPT_SEGMENTS_COUNT).record(segments.len() as f64);
+    metrics::histogram!(VAULT_TRANSCRIPT_BYTES_READ_BYTES).record(total_bytes_read as f64);
     Ok(segments)
 }
 
@@ -848,6 +910,118 @@ mod tests {
         assert!(
             matches!(err, SessionError::VaultLocked { .. }),
             "expected VaultLocked, got {err:?}",
+        );
+    }
+
+    /// Issue #225 — every metric name declared as a `const &str` in
+    /// this module satisfies the convention validator. Drift (a
+    /// missing `_total`, hyphen, uppercase) flunks here before
+    /// reaching production.
+    #[test]
+    fn vault_read_metric_names_match_convention() {
+        for name in [
+            VAULT_TRANSCRIPT_OVERSIZED_LINES_SKIPPED_TOTAL,
+            VAULT_TRANSCRIPT_SEGMENTS_COUNT,
+            VAULT_TRANSCRIPT_BYTES_READ_BYTES,
+            VAULT_PATH_RESOLVE_SYMLINK_REJECTED_TOTAL,
+        ] {
+            heron_metrics::validate_metric_name(name)
+                .unwrap_or_else(|e| panic!("metric name {name:?} drifted: {e}"));
+        }
+    }
+
+    /// Issue #225 — the appendix's segments + bytes histograms must
+    /// fire on the success return path. We run a real
+    /// `read_transcript_segments` against a synthesized JSONL fixture
+    /// and assert both metrics surface in the recorder's exposition
+    /// output. The over-cap counter is exercised by the existing
+    /// `read_transcript_segments_caps_oversized_line` test in this
+    /// module — adding the metric assertion there as well below.
+    #[test]
+    fn read_transcript_segments_emits_segments_and_bytes_histograms() {
+        use std::io::Write;
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        // Two valid JSONL turns + one empty line — exercises the
+        // segment-collecting happy path. Speakers / text are arbitrary
+        // since the test only cares about histogram emission.
+        writeln!(
+            f,
+            r#"{{"t0":0,"t1":1,"text":"hi","channel":"mic","speaker":"me","speaker_source":"self","confidence":0.9}}"#
+        ).expect("w1");
+        writeln!(
+            f,
+            r#"{{"t0":1,"t1":2,"text":"there","channel":"mic","speaker":"me","speaker_source":"self","confidence":0.9}}"#
+        ).expect("w2");
+        drop(f);
+        let segments = read_transcript_segments(&path).expect("ok");
+        assert_eq!(segments.len(), 2);
+
+        let body = handle.render();
+        assert!(
+            body.contains("vault_transcript_segments_count"),
+            "segments histogram missing: {body}"
+        );
+        assert!(
+            body.contains("vault_transcript_bytes_read_bytes"),
+            "bytes_read histogram missing: {body}"
+        );
+    }
+
+    /// Issue #225 appendix item 1 — the over-cap counter fires when
+    /// a single line exceeds `MAX_TRANSCRIPT_LINE_BYTES`. This pins
+    /// the counter site against the warn site so a refactor that
+    /// moves one without the other is caught here.
+    #[test]
+    fn read_transcript_segments_oversize_line_bumps_counter() {
+        use std::io::Write;
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        let oversize_line = vec![b'a'; MAX_TRANSCRIPT_LINE_BYTES + 100];
+        f.write_all(&oversize_line).expect("oversize");
+        f.write_all(b"\n").expect("nl");
+        f.write_all(b"{\"t0\":0,\"t1\":1,\"text\":\"keeper\",\"channel\":\"mic\",\"speaker\":\"me\",\"speaker_source\":\"self\",\"confidence\":0.9}\n").expect("keeper");
+        drop(f);
+        let _segments = read_transcript_segments(&path).expect("ok");
+        let body = handle.render();
+        assert!(
+            body.contains("vault_transcript_oversized_lines_skipped_total"),
+            "oversized counter missing: {body}"
+        );
+    }
+
+    /// Issue #225 appendix item 4 — the symlink-reject counter fires
+    /// at the rejection site. `field` is a `&'static str` from the
+    /// call site (`"transcript"`), so the label survives the
+    /// `RedactedLabel::from_static` charset gate.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_vault_path_emits_symlink_rejected_metric() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "stolen").unwrap();
+        let vault = tempfile::tempdir().expect("vault");
+        std::fs::create_dir_all(vault.path().join("transcripts")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            vault.path().join("transcripts/escape.jsonl"),
+        )
+        .unwrap();
+        let bad = std::path::PathBuf::from("transcripts/escape.jsonl");
+        let _err = resolve_vault_path(vault.path(), &bad, "transcript")
+            .expect_err("symlink must be rejected");
+        let body = handle.render();
+        assert!(
+            body.contains("vault_path_resolve_symlink_rejected_total"),
+            "symlink counter missing: {body}"
+        );
+        assert!(
+            body.contains("field=\"transcript\""),
+            "field label missing: {body}"
         );
     }
 

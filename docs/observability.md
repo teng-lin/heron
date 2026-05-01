@@ -244,6 +244,110 @@ The HTTP endpoint composes with both: a future Tauri command can
 call into the daemon, and a CLI subcommand can render the same
 endpoint.
 
+## LLM call metrics (#225)
+
+The LLM crate (`heron-llm`) instruments every `Summarizer::summarize`
+call with the shared timing helper [`heron_metrics::timed_io_async`].
+All four backends (`Anthropic`, `OpenAI`, `ClaudeCodeCli`, `CodexCli`)
+emit the same metric shape, distinguished by the `op` / `backend`
+labels:
+
+| Metric | Type | Labels | Notes |
+| --- | --- | --- | --- |
+| `llm_call_duration_seconds` | histogram | `op` (= backend slug) | Wall-clock duration of the summarize call, including transcript read + render. |
+| `llm_call_failures_total` | counter | `op`, `reason` | `reason` is enum-shaped — see [`LlmError::failure_reason`]. |
+| `llm_tokens_input_total` | counter | `backend`, `model` | Folds prompt-cache fields per §11.4. |
+| `llm_tokens_output_total` | counter | `backend`, `model` | Completion tokens. |
+| `llm_cost_usd_micro_total` | counter | `backend`, `model` | Integer micro-USD (USD × 10 000); see "LLM cost counter shape" below. |
+
+### LLM cost counter shape
+
+Fractional dollars don't fit a Prometheus counter cleanly: counters
+must be monotonic and integer-valued for `rate()` to make sense, but
+the per-call cost (e.g. `$0.0123`) has 4 decimal places of precision.
+We chose the **integer micro-USD counter** route over a histogram:
+
+- The counter accumulates `compute_cost(...).summary_usd × 10_000`,
+  rounded to the nearest integer. `compute_cost` already rounds to
+  4 decimal places (see `heron_llm::cost::round_cents`), so the
+  multiplication is exact-integer for every value the rate table
+  produces.
+- Dashboards recover USD by dividing the counter rate by 10_000:
+  `rate(llm_cost_usd_micro_total[5m]) / 10000`.
+- A histogram was rejected: `histogram_sum` is the only path to a
+  per-bucket cost total, and Prometheus client libraries don't
+  guarantee `_sum` is monotonic across cardinality changes (a label
+  drop resets the bucket). A counter is the right shape for "total
+  spend over time."
+
+Critical privacy invariants for LLM metrics:
+
+- **`backend` is a closed enum.** `anthropic` / `openai` /
+  `claude_code_cli` / `codex_cli` — see
+  [`heron_llm::metrics_labels::backend_label`].
+- **`model` is a bounded bucket.** Every model the rate table
+  recognizes maps to a `redacted!("…")` literal; an unknown model
+  collapses to `redacted!("unknown_model")` so dashboards see a
+  bounded label cardinality even if a future model ships before the
+  table is updated.
+- **No prompt text, persona text, response text, or transcript
+  excerpts** appear in any label. The pinning is type-level via
+  `RedactedLabel`; reviewers verifying this can grep the LLM crate
+  for `redacted!` and confirm every call site uses a string literal.
+
+## Vault I/O metrics (#225)
+
+The vault writer (`heron-vault::writer`) and the orchestrator's
+read-side projection (`heron-orchestrator::vault_read`) both
+instrument their disk-touching code paths.
+
+### Write side (`heron-vault`)
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `vault_write_duration_seconds` | histogram | `op` ∈ {`atomic_write`, `update_action_item`, `finalize`} |
+| `vault_write_failures_total` | counter | `op`, `reason` (= [`VaultError::failure_reason`]) |
+
+`finalize` and `update_action_item` emit a row at the high-level
+operation boundary; the inner `atomic_write` calls also emit their
+own rows under `op="atomic_write"` so a "what slowed down" panel can
+drill from finalize → write.
+
+### Read side (`heron-orchestrator::vault_read`)
+
+| Metric | Type | Labels | Site |
+| --- | --- | --- | --- |
+| `vault_transcript_oversized_lines_skipped_total` | counter | none | Over-cap-line warn site in `read_transcript_segments`. |
+| `vault_transcript_segments_count` | histogram | none | Per-call segment count on `read_transcript_segments` return. |
+| `vault_transcript_bytes_read_bytes` | histogram | none | Per-call total bytes drawn off the file (including drained over-cap tails). |
+| `vault_path_resolve_symlink_rejected_total` | counter | `field` ∈ {`transcript`, `recording`, …} | Symlink-reject site in `reject_symlinked_components`. |
+| `bot_context_render_failed_total` | counter | `reason="too_large"` | `compose.rs` render-fail drop site. |
+
+The read-side metrics share a privacy-sensitive design constraint
+with the write side: the over-cap counter has **no per-meeting
+label** because that would explode cardinality (one time series per
+meeting). Operators correlate a counter spike with the matching
+`tracing::warn!` log line.
+
+The buffer-reuse caveat from PR #228 is preserved: the
+`Vec::with_capacity(256)` allocation in `read_transcript_segments`
+and its `buf.clear()` reset stay tied to the function scope; no
+metrics-recording block wraps them.
+
+### Shared timing helper
+
+[`heron_metrics::timed_io_sync`] / [`heron_metrics::timed_io_async`]
+ship the canonical "external/IO call wrapped with timing + outcome"
+shape. Both LLM and vault write paths use it; the vault read paths
+use raw `metrics::counter!` / `metrics::histogram!` calls because
+their measurements (per-call segment count, oversize-line bumps) don't
+fit the timing-wrapper shape.
+
+The helper takes a `RedactedLabel` for the `op` dimension and
+delegates to a `ClassifyFailure` impl on the error type for the
+`reason` dimension on failures — both concrete types are pinned to
+enum-like values, never user input.
+
 ## Smoke metric
 
 `capture_started_total` is the canonical example sub-issues #224

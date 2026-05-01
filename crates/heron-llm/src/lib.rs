@@ -21,6 +21,8 @@ pub mod codex;
 mod content;
 pub mod cost;
 pub mod key_resolver;
+mod metrics_emit;
+mod metrics_labels;
 pub mod openai;
 pub mod select;
 pub mod transcript;

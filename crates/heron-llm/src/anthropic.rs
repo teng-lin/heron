@@ -32,8 +32,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::parse_content_json;
 use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
+use crate::metrics_emit::{
+    LLM_CALL_DURATION_SECONDS, LLM_CALL_FAILURES_TOTAL, record_call_success,
+};
+use crate::metrics_labels::{backend_label, model_label};
 use crate::transcript::{build_user_content, read_transcript_capped, strip_speaker_names};
-use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
+use crate::{
+    Backend, LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt,
+};
 
 // Re-export the transcript-cap constants at their historical names
 // so downstream callers (heron-cli status, the diagnostics tab) keep
@@ -165,6 +171,31 @@ impl AnthropicClient {
 #[async_trait]
 impl Summarizer for AnthropicClient {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
+        // Wrap the entire summarize path in the shared timing helper so
+        // duration + failure-reason metrics emit identically to the
+        // OpenAI / CLI backends. The label `op` dimension carries the
+        // backend so dashboards can pivot without label-set drift; the
+        // post-success token/cost counters add `backend, model` once the
+        // wire-side model identifier is known.
+        heron_metrics::timed_io_async(
+            LLM_CALL_DURATION_SECONDS,
+            LLM_CALL_FAILURES_TOTAL,
+            ("op", backend_label(Backend::Anthropic)),
+            self.summarize_inner(input),
+        )
+        .await
+    }
+}
+
+impl AnthropicClient {
+    /// Inner implementation split out from the [`Summarizer`] impl so
+    /// the shared `timed_io_async` wrapper can drive it without losing
+    /// the `&self` lifetime. Keeps the trait method's signature
+    /// minimal.
+    async fn summarize_inner(
+        &self,
+        input: SummarizerInput<'_>,
+    ) -> Result<SummarizerOutput, LlmError> {
         let prompt = render_meeting_prompt(&input)?;
         let transcript_text = read_transcript_capped(input.transcript)?;
         if (transcript_text.len() as u64) >= TRANSCRIPT_WARN_BYTES {
@@ -223,7 +254,19 @@ impl Summarizer for AnthropicClient {
             .json()
             .await
             .map_err(|e| LlmError::Backend(format!("response JSON parse: {e}")))?;
-        parse_messages_response(response, input.meeting_type)
+        let output = parse_messages_response(response, input.meeting_type)?;
+        // Emit token + cost counters once the wire model identifier is
+        // known. The model dimension passes through `model_label` which
+        // collapses prefix-matched API identifiers (date-suffixed
+        // releases) onto the family bucket — bounded cardinality.
+        record_call_success(
+            backend_label(Backend::Anthropic),
+            model_label(&output.cost.model),
+            output.cost.tokens_in,
+            output.cost.tokens_out,
+            output.cost.summary_usd,
+        );
+        Ok(output)
     }
 }
 

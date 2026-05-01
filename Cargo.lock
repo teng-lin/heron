@@ -2405,8 +2405,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "handlebars",
+ "heron-metrics",
  "heron-types",
  "insta",
+ "metrics",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2572,7 +2574,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "deunicode",
+ "heron-metrics",
  "heron-types",
+ "metrics",
  "pulldown-cmark",
  "serde",
  "serde_json",

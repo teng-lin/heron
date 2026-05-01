@@ -19,10 +19,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::parse_content_json;
 use crate::key_resolver::{EnvKeyResolver, KeyName, KeyResolveError, KeyResolver};
+use crate::metrics_emit::{
+    LLM_CALL_DURATION_SECONDS, LLM_CALL_FAILURES_TOTAL, record_call_success,
+};
+use crate::metrics_labels::{backend_label, model_label};
 use crate::transcript::{
     TRANSCRIPT_WARN_BYTES, build_user_content, read_transcript_capped, strip_speaker_names,
 };
-use crate::{LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt};
+use crate::{
+    Backend, LlmError, Summarizer, SummarizerInput, SummarizerOutput, render_meeting_prompt,
+};
 
 /// Default API origin. Tests inject a wiremock URL via
 /// [`OpenAIClientConfig::base_url`].
@@ -138,6 +144,24 @@ impl OpenAIClient {
 #[async_trait]
 impl Summarizer for OpenAIClient {
     async fn summarize(&self, input: SummarizerInput<'_>) -> Result<SummarizerOutput, LlmError> {
+        // Same shared-helper shape as the Anthropic client; see
+        // `anthropic.rs` for the full rationale on splitting into
+        // `summarize_inner`.
+        heron_metrics::timed_io_async(
+            LLM_CALL_DURATION_SECONDS,
+            LLM_CALL_FAILURES_TOTAL,
+            ("op", backend_label(Backend::OpenAI)),
+            self.summarize_inner(input),
+        )
+        .await
+    }
+}
+
+impl OpenAIClient {
+    async fn summarize_inner(
+        &self,
+        input: SummarizerInput<'_>,
+    ) -> Result<SummarizerOutput, LlmError> {
         let prompt = render_meeting_prompt(&input)?;
         let transcript_text = read_transcript_capped(input.transcript)?;
         if (transcript_text.len() as u64) >= TRANSCRIPT_WARN_BYTES {
@@ -215,7 +239,15 @@ impl Summarizer for OpenAIClient {
         let response: ChatCompletionsResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LlmError::Backend(format!("response JSON parse: {e}")))?;
 
-        parse_chat_completions_response(response, input.meeting_type)
+        let output = parse_chat_completions_response(response, input.meeting_type)?;
+        record_call_success(
+            backend_label(Backend::OpenAI),
+            model_label(&output.cost.model),
+            output.cost.tokens_in,
+            output.cost.tokens_out,
+            output.cost.summary_usd,
+        );
+        Ok(output)
     }
 }
 
