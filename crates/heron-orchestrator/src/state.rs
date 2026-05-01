@@ -26,7 +26,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
-use heron_cli::session::{SessionError as CliSessionError, SessionOutcome as CliSessionOutcome};
+use heron_pipeline::session::{
+    SessionError as CliSessionError, SessionOutcome as CliSessionOutcome,
+};
 use heron_session::{Meeting, PreMeetingContext};
 use heron_types::RecordingFsm;
 use tokio::sync::oneshot;

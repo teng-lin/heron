@@ -25,8 +25,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use heron_cli::session::{SessionError as CliSessionError, SessionOutcome as CliSessionOutcome};
 use heron_event::Envelope;
+use heron_pipeline::session::{
+    SessionError as CliSessionError, SessionOutcome as CliSessionOutcome,
+};
 use heron_session::{
     EventPayload, Meeting, MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus,
     SessionError, SessionEventBus, SummaryLifecycle, TranscriptLifecycle,

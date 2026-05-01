@@ -75,12 +75,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use heron_cli::session::{
+use heron_event::{EventBus, ReplayCache};
+use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
+use heron_pipeline::session::{
     Orchestrator as CliSessionOrchestrator, SessionConfig as CliSessionConfig,
     SessionError as CliSessionError,
 };
-use heron_event::{EventBus, ReplayCache};
-use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
 use heron_session::{
     AttendeeContext, AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health,
     HealthComponents, HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting,

@@ -15,7 +15,13 @@ heron-event-http = { workspace = true }
 heron-policy = { workspace = true }
 heron-realtime = { workspace = true }
 heron-speech = { workspace = true }
-heron-cli = { workspace = true }
+# Per issue #190: depend on `heron-pipeline` (the v1 FSM + audio →
+# STT → LLM → vault data flow) directly rather than on the CLI
+# binary crate. Inverting the old `heron-cli`-as-daemon-dep
+# direction was the original goal of the issue: the daemon runtime
+# should not pull clap, reqwest, the SSE client, etc. just to start
+# a capture.
+heron-pipeline = { workspace = true }
 heron-llm = { workspace = true }
 heron-session = { workspace = true }
 heron-types = { workspace = true }
