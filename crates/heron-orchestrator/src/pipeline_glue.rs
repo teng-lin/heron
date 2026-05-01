@@ -1,13 +1,13 @@
-//! Glue between `LocalSessionOrchestrator` and the `heron-cli` v1
-//! capture pipeline.
+//! Glue between `LocalSessionOrchestrator` and the `heron-pipeline`
+//! v1 capture pipeline.
 //!
-//! `start_capture` spawns the v1 [`heron_cli::session::Orchestrator`]
-//! on a dedicated blocking thread and returns once the FSM has
-//! transitioned to `Recording`; a background waiter calls
-//! [`complete_pipeline_meeting`] when the pipeline finalises so the
-//! orchestrator's bookkeeping (`finalized_meetings`, the bus
-//! `MeetingCompleted` event) lands without the HTTP request being
-//! held open.
+//! `start_capture` spawns the v1
+//! [`heron_pipeline::session::Orchestrator`] on a dedicated blocking
+//! thread and returns once the FSM has transitioned to `Recording`; a
+//! background waiter calls [`complete_pipeline_meeting`] when the
+//! pipeline finalises so the orchestrator's bookkeeping
+//! (`finalized_meetings`, the bus `MeetingCompleted` event) lands
+//! without the HTTP request being held open.
 //!
 //! The error-mapping helpers here ([`pipeline_to_session_error`],
 //! [`transition_to_session_error`]) translate the v1 pipeline's typed

@@ -38,14 +38,15 @@
 //!
 //! - **Capture lifecycle FSM.** [`SessionOrchestrator::start_capture`]
 //!   and [`SessionOrchestrator::end_meeting`] drive a
-//!   [`heron_types::RecordingFsm`] — the same FSM `heron-cli`'s
-//!   session orchestrator runs on the live audio path — and publish
-//!   `meeting.detected` / `meeting.armed` / `meeting.started` /
-//!   `meeting.ended` / `meeting.completed` envelopes onto the bus on
-//!   each transition.
+//!   [`heron_types::RecordingFsm`] — the same FSM
+//!   `heron-pipeline::session::Orchestrator` runs on the live audio
+//!   path — and publish `meeting.detected` / `meeting.armed` /
+//!   `meeting.started` / `meeting.ended` / `meeting.completed`
+//!   envelopes onto the bus on each transition.
 //! - **Vault-backed capture pipeline.** When a vault root is present,
-//!   `start_capture` spawns the `heron-cli` session pipeline on a
-//!   dedicated blocking thread with a current-thread Tokio runtime.
+//!   `start_capture` spawns the v1 capture pipeline (now in
+//!   `heron-pipeline`; `heron-cli` re-exports it) on a dedicated
+//!   blocking thread with a current-thread Tokio runtime.
 //!   `end_meeting` signals that pipeline to stop, publishes
 //!   `meeting.ended`, and returns without holding the HTTP request open
 //!   through STT/LLM work. A background waiter publishes
