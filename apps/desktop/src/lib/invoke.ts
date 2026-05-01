@@ -398,6 +398,57 @@ export interface ActionItemPatch {
 }
 
 /**
+ * Issue #226: closed enum of frontend error classes the
+ * `ErrorBoundary` may report. Mirrors the Rust
+ * `apps/desktop/src-tauri/src/frontend_error.rs::ErrorClass`'s
+ * `#[serde(rename_all = "snake_case")]` discriminants.
+ *
+ * Keeping this a closed union (rather than `string`) is the
+ * Prometheus-cardinality safeguard: the metric label dimension
+ * `error_class` only ever takes one of these four values. Adding a
+ * new variant is intentionally a Rust + TS edit so the wire surface
+ * stays auditable.
+ */
+export type FrontendErrorClass =
+  | "render_error"
+  | "lifecycle_error"
+  | "promise_rejection"
+  | "unknown";
+
+/**
+ * Issue #226: wire-format payload for `heron_report_frontend_error`.
+ * Mirrors the Rust `FrontendErrorReport` struct in `frontend_error.rs`.
+ *
+ * **Privacy contract:** the renderer must build this from explicit
+ * safe fields only — never `JSON.stringify(props)`, never
+ * `serialize(state)`. See `buildFrontendErrorReport` in
+ * `apps/desktop/src/lib/errorReport.ts` for the redactor and the
+ * unit tests that pin the no-leak guarantee.
+ *
+ * - `message` — `error.message` body, truncated + home-dir-redacted.
+ * - `component` — build-time component path (e.g. `"App.Recording"`).
+ *   NOT a filesystem path. Doubles as the `component` metric label
+ *   dimension after `RedactedLabel::hashed` on the Rust side.
+ * - `route` — react-router `pathname` at the time of the error.
+ *   Build-time strings only.
+ * - `app_version` / `app_build` — `__APP_VERSION__` / `__APP_BUILD__`
+ *   from `vite.config.ts`.
+ * - `stack` / `component_stack` — optional strings with home-dir
+ *   prefixes normalized to `~/`. The Rust side does NOT re-redact —
+ *   the renderer is the source of truth for "this is safe to log."
+ */
+export interface FrontendErrorReport {
+  error_class: FrontendErrorClass;
+  message: string;
+  component: string;
+  route: string;
+  app_version: string;
+  app_build: string;
+  stack: string | null;
+  component_stack: string | null;
+}
+
+/**
  * Day 8-10 write-back: post-merge action-item row returned from
  * `heron_update_action_item`. Mirrors
  * `apps/desktop/src-tauri/src/action_items.rs::ActionItemView`.
@@ -774,6 +825,26 @@ export interface HeronCommands {
   heron_disk_usage: {
     args: { vaultPath: string };
     returns: DiskUsage;
+  };
+  /**
+   * Issue #226: report a frontend render-time error to the daemon.
+   *
+   * Called by `ErrorBoundary` (and by the `unhandledrejection` handler)
+   * fire-and-forget. The Rust handler bumps
+   * `frontend_errors_total{component, error_class}` on the same
+   * Prometheus recorder #223 installed and logs the structured payload
+   * via `tracing::warn!`. The renderer constructs `report` from
+   * explicit safe fields only — see `lib/errorReport.ts` for the
+   * redactor and the no-leak unit test.
+   *
+   * Resolves to `void` on success. Errors are swallowed Rust-side and
+   * returned as a stringified rejection; callers should `.catch()` to
+   * a no-op so the ErrorBoundary UI keeps rendering when the daemon is
+   * down.
+   */
+  heron_report_frontend_error: {
+    args: { report: FrontendErrorReport };
+    returns: void;
   };
   /**
    * Phase 68 (PR-ζ): purge `.wav` / `.m4a` audio sidecars whose mtime

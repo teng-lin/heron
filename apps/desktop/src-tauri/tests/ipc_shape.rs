@@ -23,6 +23,10 @@
 //! - `heron_write_settings` — `Settings` request body.
 //! - `heron_prepare_context` — `PrepareContextRequest` body +
 //!   `AttachContextAck` response.
+//! - `heron_report_frontend_error` (issue #226) — `FrontendErrorReport`
+//!   request body, including a per-`ErrorClass`-variant snapshot so a
+//!   future `#[serde(rename)]` on a single variant lands as a per-
+//!   variant snap diff.
 //!
 //! ## Why round-trip?
 //!
@@ -65,6 +69,7 @@ use std::str::FromStr;
 use chrono::{NaiveDate, TimeZone, Utc};
 use heron_desktop_lib::Settings;
 use heron_desktop_lib::action_items::ActionItemView;
+use heron_desktop_lib::frontend_error::{ErrorClass, FrontendErrorReport};
 use heron_desktop_lib::meetings::{AttachContextAck, DaemonOutcome};
 use heron_desktop_lib::settings::{ActiveMode, FileNamingPattern, Persona};
 use heron_session::{
@@ -517,6 +522,88 @@ fn prepare_context_outcome_ok_shape_is_stable() {
     };
     let value = serde_json::to_value(&outcome).expect("serialize");
     assert_json_snapshot!("heron_prepare_context__outcome_ok", value);
+}
+
+// ── heron_report_frontend_error (issue #226) ──────────────────────────
+
+/// Build a fully-populated [`FrontendErrorReport`] so the snapshot
+/// covers every wire field, including the optional `stack` /
+/// `component_stack` populated branch. The `error_class` enum is
+/// covered separately by [`frontend_error_report_each_error_class_serializes`]
+/// below so a future variant rename (or wire-tag drift) lands as a
+/// per-variant snap diff rather than hiding inside one fixture.
+fn fixture_frontend_error_report() -> FrontendErrorReport {
+    FrontendErrorReport {
+        error_class: ErrorClass::RenderError,
+        message: "Cannot read property 'x' of undefined".to_owned(),
+        component: "App.Recording".to_owned(),
+        route: "/recording".to_owned(),
+        app_version: "0.1.0".to_owned(),
+        app_build: "2026-05-01".to_owned(),
+        stack: Some(
+            "TypeError: Cannot read property 'x' of undefined\n    at f (~/app.tsx:1:1)".to_owned(),
+        ),
+        component_stack: Some("\n    at App\n    at ErrorBoundary".to_owned()),
+    }
+}
+
+#[test]
+fn report_frontend_error_request_shape_is_stable() {
+    let report = fixture_frontend_error_report();
+    let value = assert_round_trips(&report);
+    assert_json_snapshot!("heron_report_frontend_error__request", value);
+}
+
+#[test]
+fn report_frontend_error_request_null_stacks_shape_is_stable() {
+    // The renderer's `extractStack` returns `null` when the thrown
+    // value is not an `Error` instance (e.g. `throw "boom"`). Pin
+    // that the wire form is `null` (not omission) — the Rust struct
+    // is `Option<String>` and serde defaults to emitting `null`,
+    // which the renderer's TS type matches as `string | null`.
+    let report = FrontendErrorReport {
+        error_class: ErrorClass::PromiseRejection,
+        message: "boom".to_owned(),
+        component: "Settings".to_owned(),
+        route: "/settings".to_owned(),
+        app_version: "0.1.0".to_owned(),
+        app_build: "2026-05-01".to_owned(),
+        stack: None,
+        component_stack: None,
+    };
+    let value = assert_round_trips(&report);
+    assert_json_snapshot!("heron_report_frontend_error__request_null_stacks", value);
+}
+
+#[test]
+fn frontend_error_report_each_error_class_serializes() {
+    // One snapshot per `ErrorClass` variant so a `#[serde(rename)]`
+    // drift on a single variant lands as a per-variant diff. Snapshots
+    // intentionally vary only the `error_class` field; the rest is
+    // identical to the base fixture so reviewing the diff is fast.
+    let base = fixture_frontend_error_report();
+    for class in [
+        ErrorClass::RenderError,
+        ErrorClass::LifecycleError,
+        ErrorClass::PromiseRejection,
+        ErrorClass::Unknown,
+    ] {
+        let report = FrontendErrorReport {
+            error_class: class,
+            ..base.clone()
+        };
+        let value = serde_json::to_value(&report).expect("serialize");
+        let class_label = match class {
+            ErrorClass::RenderError => "render_error",
+            ErrorClass::LifecycleError => "lifecycle_error",
+            ErrorClass::PromiseRejection => "promise_rejection",
+            ErrorClass::Unknown => "unknown",
+        };
+        assert_json_snapshot!(
+            format!("heron_report_frontend_error__class_{class_label}"),
+            value
+        );
+    }
 }
 
 // ── deserialize-from-partial: pin `#[serde(default)]` regression class ─
