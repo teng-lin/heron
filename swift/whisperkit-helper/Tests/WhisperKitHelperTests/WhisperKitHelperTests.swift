@@ -91,29 +91,25 @@ final class WhisperKitHelperTests: XCTestCase {
         XCTAssertEqual(result, WK_INTERNAL)
         // Out-pointer contract: bridge MUST write a malloc'd empty C
         // string on the error path (writeEmpty() in the bridge source).
-        // A non-empty buffer or a stale uninitialised pointer would be
-        // a real regression — the Rust wrapper passes the buffer to
-        // `String::from_utf8` and a non-empty error-path payload would
-        // poison the JSONL parse.
-        let buf = try? XCTUnwrap(out, "bridge wrote nil where empty C-string was expected")
-        defer { if let b = buf { wk_free_string(b) } }
-        if let b = buf {
-            XCTAssertEqual(strlen(b), 0, "error-path buffer must be empty")
-        }
+        // A nil pointer or a non-empty buffer would be a real
+        // regression — the Rust wrapper passes the buffer to
+        // `String::from_utf8` and either of those would poison the
+        // JSONL parse downstream.
+        let buf = try XCTUnwrap(out, "bridge wrote nil where empty C-string was expected")
+        defer { wk_free_string(buf) }
+        XCTAssertEqual(strlen(buf), 0, "error-path buffer must be empty")
     }
 
     /// `wk_transcribe(nil, …)` must return `WK_INTERNAL` and write a
     /// malloc'd empty buffer to `*out`. Defensive contract for the
     /// Rust wrapper.
-    func testTranscribeNullPathIsInternal() {
+    func testTranscribeNullPathIsInternal() throws {
         var out: UnsafeMutablePointer<CChar>? = nil
         let result = wk_transcribe(nil, nil, &out)
         XCTAssertEqual(result, WK_INTERNAL)
-        let buf = try? XCTUnwrap(out, "bridge wrote nil where empty C-string was expected")
-        defer { if let b = buf { wk_free_string(b) } }
-        if let b = buf {
-            XCTAssertEqual(strlen(b), 0, "error-path buffer must be empty")
-        }
+        let buf = try XCTUnwrap(out, "bridge wrote nil where empty C-string was expected")
+        defer { wk_free_string(buf) }
+        XCTAssertEqual(strlen(buf), 0, "error-path buffer must be empty")
     }
 
     /// `wk_fetch_model` with a NULL `dest_dir` must surface
