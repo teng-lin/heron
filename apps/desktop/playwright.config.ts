@@ -41,7 +41,12 @@ export default defineConfig({
   // The top-level `testDir` is a fallback only used when a project
   // doesn't override it.
   testDir: "./e2e",
-  fullyParallel: false,
+  // Smoke specs share one Vite dev server; running them in parallel
+  // workers would double-bind the pinned 1420 port. `fullyParallel:
+  // false` AND `workers: 1` would be redundant — keep `workers: 1`
+  // on CI as the authoritative single-worker gate, and let local
+  // runs default to Playwright's CPU-based pick (the dev server's
+  // `reuseExistingServer: true` makes parallel local runs work).
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   workers: process.env.CI ? 1 : undefined,
