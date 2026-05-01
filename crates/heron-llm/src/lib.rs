@@ -59,6 +59,54 @@ pub type Tag = String;
 const MEETING_TEMPLATE: &str = include_str!("../templates/meeting.hbs");
 const MEETING_TEMPLATE_NAME: &str = "meeting";
 
+/// Per-field byte cap on `Persona` text spliced into the rendered
+/// prompt. The `Settings.persona` inputs are user-controlled free-form
+/// text; a misconfigured (or hostile) settings.json could plant a
+/// 100 KB persona that would otherwise burn through the model's
+/// context window before the transcript even arrives. 4 KB per field
+/// keeps the cap comfortably above any reasonable name / role /
+/// working-on description while bounding the worst-case prompt size.
+///
+/// When a field exceeds the cap the renderer truncates at a UTF-8 char
+/// boundary and appends [`PERSONA_TRUNCATED_MARKER`] so the LLM (and
+/// any operator inspecting the prompt) can see the cap kicked in.
+pub const MAX_PERSONA_FIELD_BYTES: usize = 4 * 1024;
+
+/// Marker appended to a persona field that the renderer had to
+/// truncate. Public so tests can assert the cap fired without
+/// hard-coding the literal in multiple places.
+pub const PERSONA_TRUNCATED_MARKER: &str = "…[truncated]";
+
+/// Truncate `s` so the returned string's byte length is at most
+/// [`MAX_PERSONA_FIELD_BYTES`]. Cuts at a UTF-8 char boundary and
+/// appends [`PERSONA_TRUNCATED_MARKER`] when it fits in the remaining
+/// budget so the truncation is visible in the rendered prompt.
+/// Returns the input unchanged when it already fits.
+///
+/// The marker-fits-in-budget guard keeps the contract safe against a
+/// future constant tweak that shrinks the cap below the marker
+/// length: even in that pathological case the returned string still
+/// satisfies `len() <= MAX_PERSONA_FIELD_BYTES`. The default 4 KiB cap
+/// vs ~14-byte marker leaves enormous slack today; the guard is
+/// defence-in-depth for the constant-edit path that gemini's PR #202
+/// review flagged.
+fn truncate_persona_field(s: &str) -> String {
+    if s.len() <= MAX_PERSONA_FIELD_BYTES {
+        return s.to_owned();
+    }
+    let budget = MAX_PERSONA_FIELD_BYTES.saturating_sub(PERSONA_TRUNCATED_MARKER.len());
+    let mut cut = budget.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(MAX_PERSONA_FIELD_BYTES);
+    out.push_str(&s[..cut]);
+    if out.len() + PERSONA_TRUNCATED_MARKER.len() <= MAX_PERSONA_FIELD_BYTES {
+        out.push_str(PERSONA_TRUNCATED_MARKER);
+    }
+    out
+}
+
 /// Inputs to a single summarize call.
 ///
 /// On first summarize, `existing_action_items` and
@@ -251,11 +299,20 @@ pub fn render_meeting_prompt(input: &SummarizerInput<'_>) -> Result<String, LlmE
     // the rendered prompt stays byte-identical to the pre-Tier-4
     // baseline on the no-config path. Pinned by
     // `template_with_empty_persona_matches_no_persona_baseline`.
+    //
+    // Each field is truncated to MAX_PERSONA_FIELD_BYTES so a hostile
+    // / misconfigured settings.json with a 100 KB persona can't burn
+    // through the context window before the transcript arrives. The
+    // truncation kicks in only above the cap so under-cap fields stay
+    // byte-identical to the pre-cap render.
     let persona = input.persona.filter(|p| !p.is_empty()).map(|p| {
+        let name = truncate_persona_field(&p.name);
+        let role = truncate_persona_field(&p.role);
+        let working_on = truncate_persona_field(&p.working_on);
         serde_json::json!({
-            "name": p.name,
-            "role": p.role,
-            "working_on": p.working_on,
+            "name": name,
+            "role": role,
+            "working_on": working_on,
             "has_name": !p.name.is_empty(),
             "has_role": !p.role.is_empty(),
             "has_working_on": !p.working_on.is_empty(),
