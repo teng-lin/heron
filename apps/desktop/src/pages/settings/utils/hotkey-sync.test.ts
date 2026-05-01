@@ -21,7 +21,10 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { createHotkeySyncController } from "./hotkey-sync";
+import {
+  createHotkeySyncController,
+  createHotkeyTestController,
+} from "./hotkey-sync";
 
 interface Call {
   kind: "register" | "unregister";
@@ -185,5 +188,104 @@ describe("createHotkeySyncController", () => {
 
     // The latest sync wins.
     expect(c.getRegisteredCombo()).toBe("B");
+  });
+});
+
+describe("createHotkeyTestController", () => {
+  test("fires onResult with the IPC's `free` flag when combo still matches", async () => {
+    let currentCombo = "CmdOrCtrl+Shift+R";
+    const results: boolean[] = [];
+    const c = createHotkeyTestController({
+      checkHotkey: async () => true,
+      onResult: (free) => results.push(free),
+      getCurrentCombo: () => currentCombo,
+    });
+    await c.runCheck("CmdOrCtrl+Shift+R");
+    expect(results).toEqual([true]);
+  });
+
+  test("drops the result when the user changes the chord before IPC resolves", async () => {
+    // Issue #212 item 7 — the original code called
+    // `setConflict("free")` no matter what, so a late response for an
+    // abandoned chord poisoned the UI state for the new chord.
+    let currentCombo = "CmdOrCtrl+Shift+R";
+    let resolveCheck!: (free: boolean) => void;
+    const results: boolean[] = [];
+    const c = createHotkeyTestController({
+      checkHotkey: () =>
+        new Promise<boolean>((resolve) => {
+          resolveCheck = resolve;
+        }),
+      onResult: (free) => results.push(free),
+      getCurrentCombo: () => currentCombo,
+    });
+    const p = c.runCheck("CmdOrCtrl+Shift+R");
+    // User changes the chord while the IPC is still in flight.
+    currentCombo = "CmdOrCtrl+Shift+T";
+    resolveCheck(false);
+    await p;
+    expect(results).toEqual([]);
+  });
+
+  test("a newer runCheck supersedes the older even when they resolve out of order", async () => {
+    let currentCombo = "B";
+    const results: boolean[] = [];
+    let resolveA!: (free: boolean) => void;
+    let resolveB!: (free: boolean) => void;
+    const c = createHotkeyTestController({
+      checkHotkey: (combo) =>
+        new Promise<boolean>((resolve) => {
+          if (combo === "A") resolveA = resolve;
+          else resolveB = resolve;
+        }),
+      onResult: (free) => results.push(free),
+      getCurrentCombo: () => currentCombo,
+    });
+
+    // Issue runCheck("A") then runCheck("B"); B is the current combo.
+    // Even if A's IPC resolves first, the `getCurrentCombo` guard
+    // drops it; if A resolved last the generation counter drops it.
+    currentCombo = "A";
+    const pA = c.runCheck("A");
+    currentCombo = "B";
+    const pB = c.runCheck("B");
+
+    // A resolves first with `false` (conflict). It must be dropped —
+    // the user's current combo is B.
+    resolveA(false);
+    await pA;
+    expect(results).toEqual([]);
+
+    // B resolves with `true` (free). It's the latest combo + latest
+    // generation, so it's the result the UI should see.
+    resolveB(true);
+    await pB;
+    expect(results).toEqual([true]);
+  });
+
+  test("onError fires only when the captured combo still matches", async () => {
+    let currentCombo = "CmdOrCtrl+Shift+R";
+    const errors: string[] = [];
+    const c = createHotkeyTestController({
+      checkHotkey: async () => {
+        throw new Error("daemon down");
+      },
+      onResult: () => {},
+      onError: (m) => errors.push(m),
+      getCurrentCombo: () => currentCombo,
+    });
+
+    // Stale combo path — the user changed the chord before the error
+    // surfaced. No toast.
+    const p = c.runCheck("CmdOrCtrl+Shift+R");
+    currentCombo = "CmdOrCtrl+Shift+T";
+    await p;
+    expect(errors).toEqual([]);
+
+    // Live combo path — current matches the captured combo, error fires.
+    currentCombo = "CmdOrCtrl+Shift+R";
+    await c.runCheck("CmdOrCtrl+Shift+R");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("daemon down");
   });
 });

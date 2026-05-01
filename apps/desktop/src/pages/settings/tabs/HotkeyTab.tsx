@@ -8,7 +8,10 @@ import { Label } from "../../../components/ui/label";
 import { invoke } from "../../../lib/invoke";
 import { useSettingsStore } from "../../../store/settings";
 import { CustomShortcutsCard } from "../sections/CustomShortcutsCard";
-import { createHotkeySyncController } from "../utils/hotkey-sync";
+import {
+  createHotkeySyncController,
+  createHotkeyTestController,
+} from "../utils/hotkey-sync";
 import { normalizeKey } from "../utils/keys";
 
 /**
@@ -24,6 +27,14 @@ export function HotkeyTab() {
   const [capturing, setCapturing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const [conflict, setConflict] = useState<ConflictState>("unknown");
+  // Mirror of the saved chord, kept in a ref so the test controller's
+  // `getCurrentCombo` always reads the *latest* value rather than a
+  // stale closure capture. Issue #212 item 7 — without this, the
+  // late-response guard couldn't tell when the user had moved on.
+  const currentComboRef = useRef<string>(settings?.record_hotkey ?? "");
+  useEffect(() => {
+    currentComboRef.current = settings?.record_hotkey ?? "";
+  }, [settings?.record_hotkey]);
 
   // Pure state-machine controller for the OS-level hotkey registration.
   // The factory captures injectable IPC + a toast sink so the
@@ -40,6 +51,24 @@ export function HotkeyTab() {
           invoke("heron_unregister_hotkey", { combo }),
         onError: (message) =>
           toast.error(`Hotkey registration failed: ${message}`),
+      }),
+    [],
+  );
+
+  // Pure controller for the Test button's `heron_check_hotkey` flow.
+  // The controller's generation counter + capture-and-compare keeps a
+  // late response for an abandoned chord from surfacing a stale
+  // conflict toast. Issue #212 item 7.
+  const testController = useMemo(
+    () =>
+      createHotkeyTestController({
+        checkHotkey: (combo) => invoke("heron_check_hotkey", { combo }),
+        onResult: (free) => setConflict(free ? "free" : "conflict"),
+        onError: (message) => {
+          toast.error(`Could not test hotkey: ${message}`);
+          setConflict("unknown");
+        },
+        getCurrentCombo: () => currentComboRef.current,
       }),
     [],
   );
@@ -85,16 +114,7 @@ export function HotkeyTab() {
   async function runCheck() {
     if (settings === null) return;
     setConflict("checking");
-    try {
-      const free = await invoke("heron_check_hotkey", {
-        combo: settings.record_hotkey,
-      });
-      setConflict(free ? "free" : "conflict");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      toast.error(`Could not test hotkey: ${message}`);
-      setConflict("unknown");
-    }
+    await testController.runCheck(settings.record_hotkey);
   }
 
   return (

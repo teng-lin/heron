@@ -1,15 +1,14 @@
 /**
- * Pure state-machine controller for the Settings → Hotkey OS-level
- * registration sync.
+ * Pure state-machine controllers for the Settings → Hotkey tab.
  *
- * The `HotkeyTab` React effect was previously inlined in the
- * component. The two failure modes on issue #212 item 6 are easier to
- * pin with a Bun-only state-machine test — there's no jsdom in this
- * workspace (see `components/ActionItemsEditor.test.ts` for the same
- * pattern). The factory takes injectable IPC functions so the
- * controller can be exercised without React or Tauri.
+ * The `HotkeyTab` React effects were previously inlined in the
+ * component. The failure modes on issue #212 items 6 and 7 are easier
+ * to pin with a Bun-only state-machine test — there's no jsdom in
+ * this workspace (see `components/ActionItemsEditor.test.ts` for the
+ * same pattern). Each factory takes injectable IPC functions so the
+ * controllers can be exercised without React or Tauri.
  *
- * ## State the controller owns
+ * ## Sync controller (issue #212 item 6)
  *
  *   - `registeredCombo` — the chord currently registered with the OS.
  *     Mirrors `registeredComboRef` in the previous inlined effect.
@@ -18,12 +17,21 @@
  *     race each other. Only the latest generation is allowed to
  *     mutate `registeredCombo` or surface a toast.
  *
- * ## Sync ordering (issue #212 item 6)
- *
  * Register the new combo first, only then unregister the old. The
  * previous shape unregistered first — a failed register left the user
  * with no working hotkey. When `next === ""` (user cleared the
  * field), unregister the previous combo and clear `registeredCombo`.
+ *
+ * ## Test controller (issue #212 item 7)
+ *
+ *   - `testGen` — monotonic counter so a late `heron_check_hotkey`
+ *     response for an abandoned chord doesn't surface a stale
+ *     conflict toast.
+ *
+ * Each `runCheck` capture-and-compares against the caller's current
+ * combo (via `getCurrentCombo`). If the user changed the chord
+ * between firing the test and the IPC resolving, the result is
+ * dropped silently.
  */
 
 export interface HotkeySyncDeps {
@@ -42,6 +50,33 @@ export interface HotkeySyncController {
   sync(next: string): Promise<void>;
   /** Snapshot of the currently-registered combo. `null` before the first sync. */
   getRegisteredCombo(): string | null;
+}
+
+export interface HotkeyTestDeps {
+  checkHotkey: (combo: string) => Promise<boolean>;
+  /**
+   * Fires when the IPC resolves AND the captured combo still matches
+   * the caller's current combo (per `getCurrentCombo`). The argument
+   * is `true` when the chord is free, `false` on conflict.
+   */
+  onResult: (free: boolean) => void;
+  /** Optional error sink. Defaults to no-op. */
+  onError?: (message: string) => void;
+  /**
+   * The caller's source of truth for the *current* combo. The
+   * controller calls this after `checkHotkey` resolves so a late
+   * response for an abandoned chord doesn't surface a stale result.
+   */
+  getCurrentCombo: () => string;
+}
+
+export interface HotkeyTestController {
+  /**
+   * Run `checkHotkey` against `combo`. Late responses are dropped if
+   * the caller's `getCurrentCombo()` no longer matches the combo
+   * captured at request time.
+   */
+  runCheck(combo: string): Promise<void>;
 }
 
 export function createHotkeySyncController(
@@ -98,6 +133,33 @@ export function createHotkeySyncController(
         registeredCombo = next;
       } catch (err) {
         if (syncGen !== myGen) return;
+        onError(err instanceof Error ? err.message : String(err));
+      }
+    },
+  };
+}
+
+export function createHotkeyTestController(
+  deps: HotkeyTestDeps,
+): HotkeyTestController {
+  const onError = deps.onError ?? (() => {});
+  let testGen = 0;
+
+  return {
+    async runCheck(combo) {
+      const myGen = ++testGen;
+      const myCombo = combo;
+      try {
+        const free = await deps.checkHotkey(myCombo);
+        // Two guards: (1) a newer test ran while ours was in flight;
+        // (2) the user changed the chord without re-running Test.
+        // Either way, the result we have is stale. Issue #212 item 7.
+        if (testGen !== myGen) return;
+        if (deps.getCurrentCombo() !== myCombo) return;
+        deps.onResult(free);
+      } catch (err) {
+        if (testGen !== myGen) return;
+        if (deps.getCurrentCombo() !== myCombo) return;
         onError(err instanceof Error ? err.message : String(err));
       }
     },
