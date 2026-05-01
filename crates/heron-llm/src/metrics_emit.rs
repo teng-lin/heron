@@ -20,10 +20,11 @@ pub(crate) const LLM_CALL_DURATION_SECONDS: &str = "llm_call_duration_seconds";
 pub(crate) const LLM_CALL_FAILURES_TOTAL: &str = "llm_call_failures_total";
 pub(crate) const LLM_TOKENS_INPUT_TOTAL: &str = "llm_tokens_input_total";
 pub(crate) const LLM_TOKENS_OUTPUT_TOTAL: &str = "llm_tokens_output_total";
-/// Cost is reported as integer micro-USD (4-decimal-place USD ×
-/// 10_000) so a strictly-monotonic counter is well-defined. See
-/// `docs/observability.md` §"LLM cost counter shape" for rationale and
-/// dashboard division (divide by 10_000 to recover USD).
+/// Cost is reported as integer micro-USD (USD × 1_000_000) so a
+/// strictly-monotonic counter is well-defined and the unit prefix
+/// matches the metric name. See `docs/observability.md` §"LLM cost
+/// counter shape" for rationale and dashboard division (divide by
+/// 1_000_000 to recover USD).
 pub(crate) const LLM_COST_USD_MICRO_TOTAL: &str = "llm_cost_usd_micro_total";
 
 impl ClassifyFailure for LlmError {
@@ -42,7 +43,7 @@ impl ClassifyFailure for LlmError {
 /// Record post-success token counts + cost. Called from each backend's
 /// success path with the `RedactedLabel`s produced by
 /// [`crate::metrics_labels`]. The cost counter uses integer
-/// micro-USD (USD × 10_000) so it's monotonic and lossless for the
+/// micro-USD (USD × 1_000_000) so it's monotonic and lossless for the
 /// 4-decimal precision `cost::compute_cost` rounds to.
 pub(crate) fn record_call_success(
     backend: RedactedLabel,
@@ -63,12 +64,14 @@ pub(crate) fn record_call_success(
         "model" => model.clone().into_inner(),
     )
     .increment(tokens_out);
-    // 4-decimal USD → micro-USD by ×10_000. `compute_cost` already
+    // 4-decimal USD → micro-USD by ×1_000_000. `compute_cost` already
     // rounds to 4dp so the multiplication is exact-integer for the
     // values we observe; saturate to u64 as a final guard against
     // a future cost-model change introducing larger fractional
-    // values.
-    let micro_usd = (cost_usd * 10_000.0).round();
+    // values. The 1_000_000 factor matches the `_micro_` unit prefix
+    // (1 USD = 10^6 micro-USD) and gives extra fidelity for any
+    // future rate model that quotes beyond 4dp.
+    let micro_usd = (cost_usd * 1_000_000.0).round();
     let micro_usd_u64 = if micro_usd.is_finite() && micro_usd >= 0.0 {
         // Saturating cast: f64 → u64 saturates rather than wrapping
         // on overflow for `as u64` since Rust 1.45, so a NaN-or-inf

@@ -258,7 +258,7 @@ labels:
 | `llm_call_failures_total` | counter | `op`, `reason` | `reason` is enum-shaped — see [`LlmError::failure_reason`]. |
 | `llm_tokens_input_total` | counter | `backend`, `model` | Folds prompt-cache fields per §11.4. |
 | `llm_tokens_output_total` | counter | `backend`, `model` | Completion tokens. |
-| `llm_cost_usd_micro_total` | counter | `backend`, `model` | Integer micro-USD (USD × 10 000); see "LLM cost counter shape" below. |
+| `llm_cost_usd_micro_total` | counter | `backend`, `model` | Integer micro-USD (USD × 1 000 000); see "LLM cost counter shape" below. |
 
 ### LLM cost counter shape
 
@@ -267,13 +267,14 @@ must be monotonic and integer-valued for `rate()` to make sense, but
 the per-call cost (e.g. `$0.0123`) has 4 decimal places of precision.
 We chose the **integer micro-USD counter** route over a histogram:
 
-- The counter accumulates `compute_cost(...).summary_usd × 10_000`,
+- The counter accumulates `compute_cost(...).summary_usd × 1_000_000`,
   rounded to the nearest integer. `compute_cost` already rounds to
   4 decimal places (see `heron_llm::cost::round_cents`), so the
   multiplication is exact-integer for every value the rate table
-  produces.
-- Dashboards recover USD by dividing the counter rate by 10_000:
-  `rate(llm_cost_usd_micro_total[5m]) / 10000`.
+  produces. The 1_000_000 factor matches the `_micro_` unit prefix
+  (1 USD = 10^6 micro-USD).
+- Dashboards recover USD by dividing the counter rate by 1_000_000:
+  `rate(llm_cost_usd_micro_total[5m]) / 1000000`.
 - A histogram was rejected: `histogram_sum` is the only path to a
   per-bucket cost total, and Prometheus client libraries don't
   guarantee `_sum` is monotonic across cardinality changes (a label
