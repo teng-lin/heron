@@ -94,7 +94,7 @@ impl Summarizer for CodexClient {
         heron_metrics::timed_io_async(
             LLM_CALL_DURATION_SECONDS,
             LLM_CALL_FAILURES_TOTAL,
-            ("op", backend_label(Backend::CodexCli)),
+            ("backend", backend_label(Backend::CodexCli)),
             self.summarize_inner(input),
         )
         .await

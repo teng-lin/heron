@@ -150,7 +150,7 @@ impl Summarizer for OpenAIClient {
         heron_metrics::timed_io_async(
             LLM_CALL_DURATION_SECONDS,
             LLM_CALL_FAILURES_TOTAL,
-            ("op", backend_label(Backend::OpenAI)),
+            ("backend", backend_label(Backend::OpenAI)),
             self.summarize_inner(input),
         )
         .await

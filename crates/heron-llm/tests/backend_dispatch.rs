@@ -208,7 +208,7 @@ async fn anthropic_summarize_dispatches_expected_url_headers_and_body() {
 // ── Metric emission — happy path ─────────────────────────────────────────────
 
 /// On a successful Anthropic summarize, the renderer must observe:
-/// - `llm_call_duration_seconds{op="anthropic"}` (histogram)
+/// - `llm_call_duration_seconds{backend="anthropic"}` (histogram)
 /// - `llm_tokens_input_total{backend="anthropic", model=...}`
 /// - `llm_tokens_output_total{backend="anthropic", model=...}`
 /// - `llm_cost_usd_micro_total{backend="anthropic", model=...}`
@@ -216,6 +216,8 @@ async fn anthropic_summarize_dispatches_expected_url_headers_and_body() {
 /// The shape is the contract dashboards depend on — pinning it here
 /// catches a future "we lost the model dimension" / "backend name
 /// drifted from `anthropic` to `claude`" regression at build time.
+/// Per #239, the duration histogram now uses `backend=` instead of
+/// `op=` so the label key matches the #225 spec.
 #[tokio::test]
 async fn anthropic_emits_metrics_on_success() {
     let handle = init_prometheus_recorder().expect("recorder");
@@ -254,8 +256,8 @@ async fn anthropic_emits_metrics_on_success() {
         "duration histogram missing: {body}"
     );
     assert!(
-        body.contains("op=\"anthropic\""),
-        "backend op label missing: {body}"
+        body.contains("backend=\"anthropic\""),
+        "backend label missing: {body}"
     );
     assert!(
         body.contains("llm_tokens_input_total"),
@@ -286,9 +288,9 @@ async fn anthropic_emits_metrics_on_success() {
 }
 
 /// On a 4xx Anthropic response, the failure counter must record the
-/// `backend_error` reason + the `op` label. Pinning the reason makes
-/// "all our LLM call failures are bucketed as `unknown`" regressions
-/// visible.
+/// `backend_error` reason + the `backend` label. Pinning the reason
+/// makes "all our LLM call failures are bucketed as `unknown`"
+/// regressions visible.
 #[tokio::test]
 async fn anthropic_emits_failure_metric_on_4xx() {
     let handle = init_prometheus_recorder().expect("recorder");
@@ -327,8 +329,8 @@ async fn anthropic_emits_failure_metric_on_4xx() {
         "failure counter missing: {body}"
     );
     assert!(
-        body.contains("op=\"anthropic\""),
-        "op label missing on failure: {body}"
+        body.contains("backend=\"anthropic\""),
+        "backend label missing on failure: {body}"
     );
     assert!(
         body.contains("reason=\"backend_error\""),
@@ -449,10 +451,6 @@ async fn openai_emits_metrics_on_success() {
         "duration histogram missing: {body}"
     );
     assert!(
-        body.contains("op=\"openai\""),
-        "openai op label missing: {body}"
-    );
-    assert!(
         body.contains("backend=\"openai\""),
         "openai backend label missing: {body}"
     );
@@ -505,8 +503,8 @@ async fn openai_emits_failure_metric_on_5xx() {
         "failure counter missing: {body}"
     );
     assert!(
-        body.contains("op=\"openai\""),
-        "openai op label missing on failure: {body}"
+        body.contains("backend=\"openai\""),
+        "openai backend label missing on failure: {body}"
     );
     assert!(
         body.contains("reason=\"backend_error\""),

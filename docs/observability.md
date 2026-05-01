@@ -31,7 +31,7 @@ not a workspace-wide search-and-replace.
 
 | Kind | When to use | Example |
 | --- | --- | --- |
-| Counter | Monotonic event count. | `capture_started_total`, `llm_calls_total`, `vault_write_failures_total`. |
+| Counter | Monotonic event count. | `capture_started_total`, `llm_calls_total`, `vault_failures_total`. |
 | Histogram | Latency or size distribution. | `llm_call_duration_seconds`, `vault_note_size_bytes`. |
 | Gauge | Point-in-time state. | `salvage_candidates_pending`, `replay_cache_depth`, `active_captures_count`. |
 
@@ -52,7 +52,7 @@ metrics::counter!(
 Prometheus-style snake_case with the unit in the suffix.
 
 - **Counters end in `_total`.** `capture_started_total`,
-  `llm_calls_total`, `vault_write_failures_total`. Without the
+  `llm_calls_total`, `vault_failures_total`. Without the
   suffix, Prometheus client libraries can't tell counter from
   gauge in dashboards.
 - **Histograms end in their unit.** `_seconds` for latency,
@@ -249,13 +249,12 @@ endpoint.
 The LLM crate (`heron-llm`) instruments every `Summarizer::summarize`
 call with the shared timing helper [`heron_metrics::timed_io_async`].
 All four backends (`Anthropic`, `OpenAI`, `ClaudeCodeCli`, `CodexCli`)
-emit the same metric shape, distinguished by the `op` / `backend`
-labels:
+emit the same metric shape, distinguished by the `backend` label:
 
 | Metric | Type | Labels | Notes |
 | --- | --- | --- | --- |
-| `llm_call_duration_seconds` | histogram | `op` (= backend slug) | Wall-clock duration of the summarize call, including transcript read + render. |
-| `llm_call_failures_total` | counter | `op`, `reason` | `reason` is enum-shaped — see [`LlmError::failure_reason`]. |
+| `llm_call_duration_seconds` | histogram | `backend` | Wall-clock duration of the summarize call, including transcript read + render. The `model` dimension is missing today (#239 deferred — needs `timed_io_async` redesign). |
+| `llm_call_failures_total` | counter | `backend`, `reason` | `reason` is enum-shaped — see [`LlmError::failure_reason`]. `model` deferred per #239. |
 | `llm_tokens_input_total` | counter | `backend`, `model` | Folds prompt-cache fields per §11.4. |
 | `llm_tokens_output_total` | counter | `backend`, `model` | Completion tokens. |
 | `llm_cost_usd_micro_total` | counter | `backend`, `model` | Integer micro-USD (USD × 1 000 000); see "LLM cost counter shape" below. |
@@ -306,13 +305,19 @@ instrument their disk-touching code paths.
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `vault_write_duration_seconds` | histogram | `op` ∈ {`atomic_write`, `update_action_item`, `finalize`} |
-| `vault_write_failures_total` | counter | `op`, `reason` (= [`VaultError::failure_reason`]) |
+| `vault_write_duration_seconds` | histogram | `op` ∈ {`atomic_write`, `update_action_item`, `finalize`, `re_summarize`} |
+| `vault_failures_total` | counter | `op`, `reason` (= [`VaultError::failure_reason`]) |
 
-`finalize` and `update_action_item` emit a row at the high-level
-operation boundary; the inner `atomic_write` calls also emit their
-own rows under `op="atomic_write"` so a "what slowed down" panel can
-drill from finalize → write.
+`finalize`, `update_action_item`, and `re_summarize` emit a row at
+the high-level operation boundary; the inner `atomic_write` calls
+also emit their own rows under `op="atomic_write"` so a "what slowed
+down" panel can drill from finalize → write.
+
+Failures land on a single `vault_failures_total{op, reason}` series
+(unified per #239) so dashboards see "any vault op failed" without
+having to UNION two metrics. The read-side path will emit on the
+same series once read instrumentation lands; today the read-side
+crate uses bespoke transcript counters/histograms.
 
 ### Read side (`heron-orchestrator::vault_read`)
 
