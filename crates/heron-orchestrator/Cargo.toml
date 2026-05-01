@@ -23,10 +23,12 @@ heron-speech = { workspace = true }
 # a capture.
 heron-pipeline = { workspace = true }
 heron-llm = { workspace = true }
+heron-metrics = { workspace = true }
 heron-session = { workspace = true }
 heron-types = { workspace = true }
 heron-vault = { workspace = true }
 async-trait = { workspace = true }
+metrics = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 serde = { workspace = true }

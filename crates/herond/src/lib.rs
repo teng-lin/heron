@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use heron_metrics::MetricsHandle;
 use heron_session::SessionOrchestrator;
 
 pub mod auth;
@@ -39,8 +40,9 @@ pub use error::{WireError, status_for};
 /// requires a separate auth model (mTLS / pairing).
 pub const DEFAULT_BIND: &str = "127.0.0.1:7384";
 
-/// Shared state injected into every handler. Cheap to clone — both
-/// fields are `Arc`-backed.
+/// Shared state injected into every handler. Cheap to clone — every
+/// field is `Arc`-backed (or, in `MetricsHandle`'s case, internally
+/// `Arc`-shared by the `metrics-exporter-prometheus` crate).
 #[derive(Clone)]
 pub struct AppState {
     /// The orchestrator the daemon projects. `Arc<dyn …>` so the same
@@ -51,6 +53,10 @@ pub struct AppState {
     /// can borrow without forcing every handler to clone the token
     /// string.
     pub auth: Arc<AuthConfig>,
+    /// Handle to the process-global Prometheus recorder. Powers
+    /// `GET /v1/__metrics`. See `crates/heron-metrics` and
+    /// `docs/observability.md`.
+    pub metrics: MetricsHandle,
 }
 
 /// API version prefix. The OpenAPI server URL is
@@ -75,7 +81,8 @@ pub fn build_app(state: AppState) -> Router {
     let v1 = Router::new()
         .merge(routes::health::router())
         .merge(routes::events::router())
-        .merge(routes::meetings::router());
+        .merge(routes::meetings::router())
+        .merge(routes::metrics::router());
     Router::new()
         .nest(API_PREFIX, v1)
         .layer(axum::middleware::from_fn_with_state(

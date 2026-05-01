@@ -21,6 +21,19 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Observability primitives — see `crates/heron-metrics` and
+# `docs/observability.md`. The `metrics` crate is a facade; concrete
+# call sites (`metrics::counter!`) decouple from the exporter so
+# swapping in StatsD / OTLP later is a single wiring change rather
+# than a workspace-wide rewrite. `metrics-exporter-prometheus` is the
+# initial recorder and powers the daemon's `GET /v1/__metrics` route.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# `once_cell` is already in the transitive tree (cidre, deunicode);
+# surfacing it here makes `heron-metrics`'s recorder install path's
+# dep obvious instead of hidden.
+once_cell = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -99,6 +112,7 @@ strsim = "0.11"
 deunicode = "1.6"
 
 heron-types = { path = "crates/heron-types" }
+heron-metrics = { path = "crates/heron-metrics" }
 heron-audio = { path = "crates/heron-audio" }
 heron-speech = { path = "crates/heron-speech" }
 heron-zoom = { path = "crates/heron-zoom" }

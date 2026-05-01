@@ -95,6 +95,12 @@ pub enum InstallError {
     /// a recoverable runtime condition.
     #[error("daemon::install called twice on the same AppHandle")]
     AlreadyInstalled,
+    /// The process-global Prometheus metrics recorder failed to
+    /// install. The installer in `heron-metrics` is idempotent, so
+    /// in practice this only fires if the underlying
+    /// `metrics-exporter-prometheus` builder rejects the config.
+    #[error("install Prometheus metrics recorder: {0}")]
+    MetricsRecorder(String),
 }
 
 /// Stashed in Tauri's state map by [`install`] for the lifetime of
@@ -254,7 +260,19 @@ pub async fn install<R: Runtime>(
     // boundary — the trait bound on `AppState::orchestrator` is
     // `Arc<dyn SessionOrchestrator>`, and `LocalSessionOrchestrator`
     // implements that trait, so the Arc::clone re-types implicitly.
-    let state = AppState { orchestrator, auth };
+    //
+    // The Tauri-embedded daemon shares the same process-global
+    // Prometheus recorder as the standalone `herond` binary; the
+    // installer is idempotent so a desktop launch that brings up
+    // the embedded daemon doesn't fight a future side-by-side
+    // CLI daemon over the global slot.
+    let metrics = heron_metrics::init_prometheus_recorder()
+        .map_err(|e| InstallError::MetricsRecorder(e.to_string()))?;
+    let state = AppState {
+        orchestrator,
+        auth,
+        metrics,
+    };
     let app_router = build_app(state);
 
     // Bind on the OpenAPI-pinned port. `tokio::net::TcpListener::bind`
@@ -397,6 +415,8 @@ mod tests {
             auth: Arc::new(AuthConfig {
                 bearer: "test".to_owned(),
             }),
+            metrics: heron_metrics::init_prometheus_recorder()
+                .expect("install Prometheus recorder for test state"),
         };
         let router = build_app(state);
         // Bind 127.0.0.1:0 to get an ephemeral free port. Avoids
