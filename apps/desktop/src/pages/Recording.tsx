@@ -21,6 +21,9 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { DaemonDownBanner } from "../components/DaemonDownBanner";
+import { ParticipantsRail } from "../components/recording/participants-rail";
+import { PrivacyCallout } from "../components/recording/privacy-callout";
+import { StatusChecklist } from "../components/recording/status-checklist";
 import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
 import { invoke } from "../lib/invoke";
@@ -125,6 +128,15 @@ export default function Recording() {
     recordingMeetingId ?? activeMeeting?.id ?? null;
   const activeSpeaker = useSpeakerStore((s) =>
     liveMeetingId ? (s.activeByMeeting[liveMeetingId] ?? null) : null,
+  );
+  // Lift this selector ABOVE the `if (!isLive) return …` below so the
+  // hook count stays stable across the not-live → live transition.
+  // Calling it inside the live branch only would violate the rules of
+  // hooks the moment the user starts a recording — React would see a
+  // different number of hooks between renders and throw "Rendered
+  // more hooks than during the previous render."
+  const audioLevels = useAudioLevelStore((s) =>
+    liveMeetingId ? (s.latestByMeeting[liveMeetingId] ?? null) : null,
   );
 
   const elapsedMs =
@@ -267,98 +279,233 @@ export default function Recording() {
     );
   }
 
+  // Driver booleans for the right-rail StatusChecklist. `audioCaptured`
+  // is true while either channel has a recent envelope and we're not
+  // paused; `transcribed` is true once at least one segment has landed.
+  // `audioLevels` is read above (hoisted to keep the hook count
+  // stable across not-live → live).
+  const audioCaptured =
+    !paused &&
+    audioLevels !== null &&
+    (audioLevels.mic_clean !== null || audioLevels.tap !== null);
+  const transcribed = segments.length > 0;
+
   return (
-    <>
+    <div className="flex h-full flex-col">
+      {/*
+        DaemonDownBanner is a flex sibling rather than a sibling of
+        the column container — keeping it outside would push the
+        right-rail and the scroll region below the visible viewport
+        when the banner renders, the same gotcha Home.tsx hit.
+      */}
       <DaemonDownBanner />
-      <main className="mx-auto w-full max-w-5xl px-8 py-8">
-        <header className="mb-6 flex items-end justify-between">
-          <div>
-            <p
-              className="font-mono text-xs uppercase tracking-[0.12em]"
-              style={{ color: "var(--color-ink-3)" }}
-            >
-              Live · {paused ? "Paused" : "Recording"}
-            </p>
-            <h1
-              className="mt-1 font-serif text-[28px] leading-tight"
-              style={{ color: "var(--color-ink)", letterSpacing: "-0.02em" }}
-            >
-              {activeMeeting?.title ?? "Untitled meeting"}
-            </h1>
-            {activeSpeaker !== null && (
-              <NowSpeakingPill name={activeSpeaker} />
+      <div className="flex min-h-0 flex-1">
+        {/* Main column. Header strip is shrink-0; the meter + transcript
+            scroll inside `flex-1 min-h-0 overflow-auto` so the header
+            stays pinned to the top while the user scrolls captions. */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <RecordingHeader
+            title={activeMeeting?.title ?? "Untitled meeting"}
+            paused={paused}
+            elapsedMs={elapsedMs}
+            participantCount={activeMeeting?.participants.length ?? 0}
+            platform={activeMeeting?.platform ?? null}
+            startedAt={activeMeeting?.started_at ?? null}
+            activeSpeaker={activeSpeaker}
+            stopTargetId={stopTargetId}
+            stopping={stopping}
+            pauseToggling={pauseToggling}
+            onTogglePause={() => void handleTogglePause()}
+            onStop={() => void handleStop()}
+          />
+
+          <div className="min-h-0 flex-1 overflow-auto px-8 py-6">
+            {liveMeetingId !== null && (
+              <LiveMeterPanel meetingId={liveMeetingId} paused={paused} />
             )}
+            <TranscriptPane segments={segments} />
           </div>
-          <div
-            className="font-mono text-3xl tabular-nums"
-            style={{ color: "var(--color-ink-2)" }}
-            aria-label={`Elapsed time ${formatElapsed(elapsedMs)}`}
-          >
-            {formatElapsed(elapsedMs)}
-          </div>
-        </header>
-
-        {activeMeeting && activeMeeting.participants.length > 0 && (
-          <section className="mb-6">
-            <p
-              className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em]"
-              style={{ color: "var(--color-ink-3)" }}
-            >
-              In the room
-            </p>
-            <div className="flex flex-wrap items-center gap-3">
-              {activeMeeting.participants.map((p) => (
-                <span
-                  key={p.display_name}
-                  className="inline-flex items-center gap-2 rounded-full border px-2 py-0.5 text-xs"
-                  style={{
-                    background: "var(--color-paper-2)",
-                    borderColor: "var(--color-rule)",
-                    color: "var(--color-ink-2)",
-                  }}
-                >
-                  <Avatar name={p.display_name} size={16} />
-                  {p.display_name}
-                </span>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {liveMeetingId !== null && (
-          <LiveMeterPanel meetingId={liveMeetingId} paused={paused} />
-        )}
-
-        <TranscriptPane segments={segments} />
-
-        <div className="mt-6 flex gap-3">
-          <Button
-            variant="outline"
-            onClick={() => void handleTogglePause()}
-            aria-pressed={paused}
-            disabled={pauseToggling || stopTargetId === null}
-            aria-busy={pauseToggling}
-          >
-            {pauseToggling
-              ? paused
-                ? "Resuming…"
-                : "Pausing…"
-              : paused
-                ? "Resume"
-                : "Pause"}
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => void handleStop()}
-            disabled={stopping || stopTargetId === null}
-            aria-busy={stopping}
-          >
-            {stopping ? "Stopping…" : "Stop & save"}
-          </Button>
         </div>
-      </main>
-    </>
+
+        {/* Right rail. Width matches the prototype's 280 px column;
+            `overflow-auto` lets the rail scroll independently when the
+            participant list grows. */}
+        <aside
+          className="flex w-72 shrink-0 flex-col gap-6 overflow-auto border-l px-5 py-5"
+          style={{
+            background: "var(--color-paper-2)",
+            borderColor: "var(--color-rule)",
+          }}
+        >
+          {activeMeeting && activeMeeting.participants.length > 0 && (
+            <ParticipantsRail
+              participants={activeMeeting.participants}
+              activeSpeaker={activeSpeaker}
+            />
+          )}
+          <StatusChecklist
+            audioCaptured={audioCaptured}
+            transcribed={transcribed}
+          />
+          <PrivacyCallout />
+        </aside>
+      </div>
+    </div>
   );
+}
+
+/**
+ * Header strip for the live recording — pulse dot · eyebrow + title +
+ * meta · elapsed · Pause/Stop buttons. The buttons sit in the header
+ * (rather than after the transcript like the previous layout) so they
+ * stay reachable as captions scroll.
+ */
+function RecordingHeader({
+  title,
+  paused,
+  elapsedMs,
+  participantCount,
+  platform,
+  startedAt,
+  activeSpeaker,
+  stopTargetId,
+  stopping,
+  pauseToggling,
+  onTogglePause,
+  onStop,
+}: {
+  title: string;
+  paused: boolean;
+  elapsedMs: number;
+  participantCount: number;
+  platform: string | null;
+  startedAt: string | null;
+  activeSpeaker: string | null;
+  stopTargetId: MeetingId | null;
+  stopping: boolean;
+  pauseToggling: boolean;
+  onTogglePause: () => void;
+  onStop: () => void;
+}) {
+  const elapsed = formatElapsed(elapsedMs);
+  return (
+    <header
+      className="flex shrink-0 flex-wrap items-center gap-4 border-b px-8 py-5"
+      style={{
+        background: "var(--color-paper)",
+        borderColor: "var(--color-rule)",
+      }}
+    >
+      {/* Pulse dot — kept on a separate inline-block so the
+          `pulse-rec` opacity animation doesn't fight the elapsed
+          timer's tabular-nums layout. */}
+      <span
+        aria-hidden="true"
+        className="inline-block animate-[pulse-rec_1.4s_ease-in-out_infinite]"
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: "50%",
+          background: paused ? "var(--color-warn)" : "var(--color-rec)",
+          flexShrink: 0,
+        }}
+      />
+      <div className="min-w-0 flex-1 basis-[220px]">
+        <p
+          className="font-mono text-[10.5px] uppercase tracking-[0.12em]"
+          style={{
+            color: paused ? "var(--color-warn)" : "var(--color-rec)",
+          }}
+        >
+          {paused ? "Paused" : "Recording"} · Clio
+        </p>
+        <h1
+          className="m-0 mt-0.5 truncate font-serif text-[19px] font-normal leading-tight"
+          style={{ color: "var(--color-ink)" }}
+        >
+          {title}
+        </h1>
+        <p
+          className="mt-1 font-mono text-[11px]"
+          style={{ color: "var(--color-ink-3)" }}
+        >
+          {composeMeta(platform, participantCount, startedAt)}
+        </p>
+        {activeSpeaker !== null && <NowSpeakingPill name={activeSpeaker} />}
+      </div>
+      <div
+        className="font-mono tabular-nums"
+        style={{
+          color: "var(--color-ink)",
+          fontSize: 28,
+          letterSpacing: "-0.02em",
+        }}
+        aria-label={`Elapsed time ${elapsed}`}
+      >
+        {elapsed}
+      </div>
+      <div className="flex gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onTogglePause}
+          aria-pressed={paused}
+          disabled={pauseToggling || stopTargetId === null}
+          aria-busy={pauseToggling}
+        >
+          {pauseToggling
+            ? paused
+              ? "Resuming…"
+              : "Pausing…"
+            : paused
+              ? "Resume"
+              : "Pause"}
+        </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={onStop}
+          disabled={stopping || stopTargetId === null}
+          aria-busy={stopping}
+        >
+          {stopping ? "Stopping…" : "Stop & save"}
+        </Button>
+      </div>
+    </header>
+  );
+}
+
+const PLATFORM_LABEL: Record<string, string> = {
+  zoom: "Zoom",
+  google_meet: "Google Meet",
+  microsoft_teams: "Teams",
+  webex: "Webex",
+};
+
+const STARTED_AT_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+function composeMeta(
+  platform: string | null,
+  participantCount: number,
+  startedAt: string | null,
+): string {
+  const parts: string[] = [];
+  if (platform) parts.push(PLATFORM_LABEL[platform] ?? platform);
+  if (participantCount > 0) {
+    parts.push(
+      `${participantCount} ${participantCount === 1 ? "participant" : "participants"}`,
+    );
+  }
+  if (startedAt) {
+    const started = new Date(startedAt);
+    if (!Number.isNaN(started.getTime())) {
+      parts.push(`started ${STARTED_AT_FORMATTER.format(started)}`);
+    }
+  }
+  return parts.join(" · ");
 }
 
 function TranscriptPane({ segments }: { segments: TranscriptSegment[] }) {

@@ -11,6 +11,9 @@ import { AskBar } from "../components/home/ask-bar";
 import { HeroBand } from "../components/home/hero-band";
 import { HomeFooterNote } from "../components/home/footer-note";
 import { SpacesStrip } from "../components/home/spaces-strip";
+import { ParticipantsRail } from "../components/recording/participants-rail";
+import { PrivacyCallout } from "../components/recording/privacy-callout";
+import { StatusChecklist } from "../components/recording/status-checklist";
 import { Avatar } from "../components/ui/avatar";
 import { Button } from "../components/ui/button";
 import { HeronMark } from "../components/ui/heron-mark";
@@ -197,6 +200,44 @@ export default function Styleguide() {
           ].map((tok) => (
             <Swatch key={tok} token={tok} />
           ))}
+        </div>
+      </Section>
+
+      <Section title="Recording — right rail">
+        <p className="mb-4 text-xs" style={{ color: "var(--color-ink-3)" }}>
+          The right-rail components mounted on /recording while a meeting
+          is live. Active-speaker preview cycles through participants;
+          status booleans are wired so the dot states are visible.
+        </p>
+        <div
+          className="flex w-72 flex-col gap-6 rounded border px-5 py-5"
+          style={{
+            background: "var(--color-paper-2)",
+            borderColor: "var(--color-rule)",
+          }}
+        >
+          <ParticipantsRail
+            participants={[
+              {
+                display_name: "You",
+                identifier_kind: "mic",
+                is_user: true,
+              },
+              {
+                display_name: "Jonas Weil",
+                identifier_kind: "ax_tree",
+                is_user: false,
+              },
+              {
+                display_name: "Iris Chen",
+                identifier_kind: "ax_tree",
+                is_user: false,
+              },
+            ]}
+            activeSpeaker="Jonas Weil"
+          />
+          <StatusChecklist audioCaptured transcribed />
+          <PrivacyCallout />
         </div>
       </Section>
 
