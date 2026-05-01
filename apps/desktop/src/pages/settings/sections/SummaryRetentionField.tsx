@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Input } from "../../../components/ui/input";
 import { useSettingsStore } from "../../../store/settings";
@@ -13,9 +13,20 @@ import { DEFAULT_RETENTION_DAYS } from "../constants";
 export function SummaryRetentionField() {
   const settings = useSettingsStore((s) => s.settings);
   const update = useSettingsStore((s) => s.update);
+  const savedDays = settings?.summary_retention_days;
   const [draft, setDraft] = useState<number>(
-    settings?.summary_retention_days ?? DEFAULT_RETENTION_DAYS,
+    savedDays ?? DEFAULT_RETENTION_DAYS,
   );
+
+  // Re-seed `draft` when a load resolves (or another tab edits the
+  // saved value). Without this, mounting before `load()` resolves
+  // locks the draft at `DEFAULT_RETENTION_DAYS`, and the next radio
+  // toggle to "purge" overwrites the user's real saved value.
+  useEffect(() => {
+    if (typeof savedDays === "number") {
+      setDraft(savedDays);
+    }
+  }, [savedDays]);
 
   if (settings === null) return null;
 
@@ -63,9 +74,12 @@ export function SummaryRetentionField() {
               value={draft}
               onChange={(e) => {
                 const raw = e.target.valueAsNumber;
+                // Clamp to the same `min` / `max` the input declares —
+                // the upper bound was missing, so a paste like
+                // "10000" would persist verbatim despite `max={3650}`.
                 const next = Number.isNaN(raw)
                   ? DEFAULT_RETENTION_DAYS
-                  : Math.max(1, Math.floor(raw));
+                  : Math.min(3650, Math.max(1, Math.floor(raw)));
                 setDraft(next);
                 if (mode === "purge") {
                   update({ summary_retention_days: next });
