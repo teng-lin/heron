@@ -257,6 +257,9 @@ mod tests {
         install_initial_scope(app.handle(), &cache, None);
         extend_for_vault(app.handle(), &f.to_string_lossy());
         let scope = app.handle().asset_protocol_scope();
-        assert!(!scope.is_allowed(&f), "file path must not be allowed as a directory scope");
+        assert!(
+            !scope.is_allowed(&f),
+            "file path must not be allowed as a directory scope"
+        );
     }
 }
