@@ -2229,7 +2229,6 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "heron-audio",
- "heron-event",
  "heron-llm",
  "heron-pipeline",
  "heron-session",
