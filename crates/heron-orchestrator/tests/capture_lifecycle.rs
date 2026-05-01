@@ -42,17 +42,27 @@ async fn drain_at_least(
     let mut events: Vec<Envelope<EventPayload>> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
     while events.len() < n {
-        if Instant::now() > deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             let kinds: Vec<&str> = events.iter().map(|e| e.payload.event_type()).collect();
             panic!(
                 "expected at least {n} envelopes; got {} ({kinds:?})",
                 events.len(),
             );
         }
-        if let Ok(env) = rx.try_recv() {
-            events.push(env);
-        } else {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        // tokio::time::timeout yields the executor while waiting on
+        // the bus instead of busy-polling — eliminates the 1ms-sleep
+        // loop gemini flagged on #242.
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(env)) => events.push(env),
+            Ok(Err(e)) => panic!("bus channel closed mid-drain: {e}"),
+            Err(_) => {
+                let kinds: Vec<&str> = events.iter().map(|e| e.payload.event_type()).collect();
+                panic!(
+                    "expected at least {n} envelopes; got {} ({kinds:?})",
+                    events.len(),
+                );
+            }
         }
     }
     events
@@ -288,15 +298,20 @@ async fn pause_capture_then_resume_capture_round_trips_fsm() {
 
     // Replay cache pins the bus history regardless of pause/resume:
     // detected, armed, started, ended, completed = 5 entries.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while orch.cache_len() < 5 {
-        if Instant::now() > deadline {
-            panic!(
-                "recorder never reached 5 entries (cur={}); pause/resume must not drop bus events",
-                orch.cache_len(),
-            );
+    // Wait via tokio::time::timeout instead of a busy-poll loop —
+    // the cache writer task lives on the same runtime, so yielding
+    // lets it advance deterministically. Per gemini review on #242.
+    let waited = tokio::time::timeout(Duration::from_secs(2), async {
+        while orch.cache_len() < 5 {
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    })
+    .await;
+    if waited.is_err() {
+        panic!(
+            "recorder never reached 5 entries (cur={}); pause/resume must not drop bus events",
+            orch.cache_len(),
+        );
     }
     assert_eq!(orch.cache_len(), 5);
 }
