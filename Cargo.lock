@@ -2326,6 +2326,7 @@ dependencies = [
  "herond",
  "insta",
  "libc",
+ "metrics",
  "reqwest 0.12.28",
  "security-framework",
  "serde",

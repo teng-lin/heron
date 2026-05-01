@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod disk;
 pub mod event_bus;
 pub mod events_bridge;
+pub mod frontend_error;
 pub mod keychain;
 pub mod keychain_resolver;
 pub mod meetings;
@@ -57,6 +58,7 @@ pub use diagnostics::{DiagnosticsError, DiagnosticsView, SessionLog, read_diagno
 pub use disk::{
     DiskError, DiskUsage, disk_usage, purge_audio_older_than, purge_summaries_older_than,
 };
+pub use frontend_error::{ErrorClass, FRONTEND_ERRORS_TOTAL, FrontendErrorReport};
 pub use onboarding::{
     TestOutcome, test_accessibility, test_accessibility_async, test_audio_tap,
     test_audio_tap_async, test_calendar, test_calendar_async, test_daemon, test_daemon_async,
@@ -389,6 +391,36 @@ fn heron_unregister_hotkey(app: tauri::AppHandle, combo: String) -> Result<(), S
     manager
         .unregister(combo.as_str())
         .map_err(|e| e.to_string())
+}
+
+/// Tauri command (issue #226): record a frontend render-time error.
+///
+/// Called by the renderer's `ErrorBoundary` (and by the
+/// `unhandledrejection` handler) when a React subtree throws. The
+/// renderer constructs a redacted [`FrontendErrorReport`] from explicit
+/// safe fields — never `JSON.stringify(props)` — and fires this
+/// command without awaiting; see `apps/desktop/src/lib/errorReport.ts`.
+///
+/// The handler:
+///   1. Bumps the `frontend_errors_total{component, error_class}`
+///      Prometheus counter on the same recorder
+///      [`heron_metrics::init_prometheus_recorder`] installs at daemon
+///      startup. The component label flows through
+///      [`heron_metrics::RedactedLabel::hashed`] for cardinality
+///      safety; `error_class` is a closed enum with snake_case
+///      discriminants.
+///   2. Logs the structured payload via `tracing::warn!` so the full
+///      report (message + stack + route) lands in the daemon's normal
+///      log stream and the diagnostics bundle.
+///
+/// Returns `Result<(), String>` for parity with the other commands;
+/// every code path resolves `Ok(())`. The renderer treats this as
+/// fire-and-forget — the ErrorBoundary UI must not block on the IPC
+/// (the daemon may be down).
+#[tauri::command]
+fn heron_report_frontend_error(report: FrontendErrorReport) -> Result<(), String> {
+    frontend_error::report_frontend_error(report);
+    Ok(())
 }
 
 /// Tauri command: vault disk-usage gauge for the Audio tab.
@@ -994,6 +1026,13 @@ pub fn run() {
             // the webview was listening.
             heron_take_pending_shortcut_conflicts,
             heron_disk_usage,
+            // Issue #226: frontend error reporting + ErrorBoundary
+            // instrumentation. The renderer's ErrorBoundary fires
+            // this fire-and-forget on `componentDidCatch`; the handler
+            // bumps `frontend_errors_total{component, error_class}` on
+            // the same Prometheus recorder #223 installed and logs the
+            // structured payload via `tracing::warn!`.
+            heron_report_frontend_error,
             heron_purge_audio_older_than,
             // Tier 4 #20 — summary retention sweeper. Sibling of the
             // audio sweeper above; consumes `Settings.summary_retention_days`.

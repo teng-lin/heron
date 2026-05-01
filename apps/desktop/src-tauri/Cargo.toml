@@ -86,6 +86,12 @@ heron-event-tauri = { workspace = true }
 # means a desktop launch can co-exist with a separate `herond`
 # binary without fighting over the global slot.
 heron-metrics = { workspace = true }
+# Issue #226: `heron_report_frontend_error` (frontend_error.rs) calls
+# `metrics::counter!` directly to bump `frontend_errors_total` on the
+# same Prometheus recorder `heron-metrics` installs. The facade crate
+# is workspace-pinned so the desktop emits onto the same registry as
+# the daemon's other instrumentation sites.
+metrics = { workspace = true }
 heron-orchestrator = { workspace = true }
 heron-session = { workspace = true }
 # Gap #7: the desktop shell launches `herond` in-process (rather than

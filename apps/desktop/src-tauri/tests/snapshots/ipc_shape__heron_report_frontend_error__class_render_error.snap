@@ -1,0 +1,14 @@
+---
+source: apps/desktop/src-tauri/tests/ipc_shape.rs
+expression: value
+---
+{
+  "app_build": "2026-05-01",
+  "app_version": "0.1.0",
+  "component": "App.Recording",
+  "component_stack": "\n    at App\n    at ErrorBoundary",
+  "error_class": "render_error",
+  "message": "Cannot read property 'x' of undefined",
+  "route": "/recording",
+  "stack": "TypeError: Cannot read property 'x' of undefined\n    at f (~/app.tsx:1:1)"
+}
