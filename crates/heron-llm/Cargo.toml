@@ -28,5 +28,12 @@ wiremock = "0.6"
 # published crate's dep graph.
 insta = { version = "1", features = ["json"] }
 
+[features]
+# Opt-in gate for the nightly real-pipeline test set. Off by default so
+# `cargo test --workspace` on a contributor's machine never reaches for
+# the live Anthropic / OpenAI APIs or paid CLI quota. The
+# `nightly.yml` workflow is the canonical caller; see issue #194.
+real-pipeline = []
+
 [lints]
 workspace = true
