@@ -354,17 +354,37 @@ async fn find_note_path_by_wire_id(
         .await
         .map_err(|e| format!("readdir {}: {}", meetings.display(), e))?
     {
-        let path = entry.path();
-        let ft = match entry.file_type().await {
-            Ok(t) => t,
+        // Filter on the file_name's extension before allocating a
+        // full `PathBuf` via `entry.path()`. Cheaper on big vaults
+        // (skips e.g. every `.md.bak` rotation file without paying
+        // the join cost). `OsStr::to_str` returns `None` for non-
+        // UTF-8 names, which we treat as a non-match.
+        let name = entry.file_name();
+        let is_md = Path::new(&name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext == "md");
+        if !is_md {
+            continue;
+        }
+        // Reject the entry if it's itself a symlink — the
+        // path-derived `MeetingId` is computed over the vault-
+        // relative bytes, so a symlinked `<slug>.md` whose target
+        // lives outside the vault would otherwise hash to a wire id
+        // an attacker controls. `symlink_metadata` examines the
+        // entry without following links; a real file passes.
+        // Defense in depth: the post-match canonicalize +
+        // `starts_with` below ALSO catches escapes.
+        let lmeta = match fs::symlink_metadata(meetings.join(&name)).await {
+            Ok(m) => m,
             Err(_) => continue,
         };
-        if !ft.is_file() {
+        if !lmeta.file_type().is_file() {
+            // Skip directories, symlinks, sockets, etc. The
+            // recorder only finalizes regular files.
             continue;
         }
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
+        let path = meetings.join(&name);
         // Derive the meeting id from the vault-relative LEXICAL bytes
         // — `meetings/<file>.md`. Mirrors
         // `heron_orchestrator::vault_read::derive_meeting_id`'s shape
@@ -373,11 +393,10 @@ async fn find_note_path_by_wire_id(
         let rel = path.strip_prefix(canonical_vault).unwrap_or(&path);
         let derived = Uuid::new_v5(&MEETING_ID_NAMESPACE, rel.as_os_str().as_encoded_bytes());
         if derived == wire_uuid {
-            // Canonicalize so symlink-escape rejection still applies
-            // even on the fallback path. A `meetings/<file>.md` whose
-            // *file* is a symlink to outside the vault would otherwise
-            // be returnable (the dir is in-vault, but the file points
-            // out).
+            // Canonicalize + containment check is the same belt
+            // `list_sessions` and `resolve_note_path` apply; keep
+            // this site in lockstep with the rest of the file's
+            // vault-escape posture.
             let canonical = fs::canonicalize(&path)
                 .await
                 .map_err(|e| format!("canonicalize {}: {}", path.display(), e))?;
