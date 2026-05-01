@@ -29,14 +29,35 @@
 //! Without this, a route bug or compromised webview would have
 //! arbitrary local-file capability.
 //!
-//! The `mtg_` strip is exact for `FileNamingPattern::Id` (on-disk
-//! file is `<uuid>.md`). For `Slug` / `DateSlug` patterns the
-//! on-disk basename is `<slug>.md` / `<YYYY-MM-DD>-<slug>.md` and
-//! bears no relation to the `mtg_<uuid>` wire id; those flows must
-//! resolve the basename via the orchestrator (`note_path_for_read`)
-//! or the `list_sessions` round-trip rather than relying on this
-//! strip. Currently every renderer caller passes a basename produced
-//! by `list_sessions` or a wire id matching `Id` pattern.
+//! ## Wire-id resolution (issue #205)
+//!
+//! [`resolve_note_path`] handles three input shapes:
+//!
+//! 1. A bare basename produced by [`list_sessions`] / the sidebar
+//!    (e.g. `2026-04-26-standup`). Strip-and-join finds the file
+//!    directly — basename matches the on-disk filename for every
+//!    [`heron_vault::FileNamingPattern`] variant.
+//! 2. A wire id `mtg_<uuid>` for a [`heron_vault::FileNamingPattern::Id`]-
+//!    written note. The strip discards the prefix and the bare uuid
+//!    is the on-disk basename, so step 1's strip-and-join finds the
+//!    file.
+//! 3. A wire id `mtg_<uuid>` for a `Slug` / `DateSlug`-written note.
+//!    The on-disk file is `<slug>.md` / `<YYYY-MM-DD>-<slug>.md` —
+//!    *not* the bare-uuid basename. When step 2's strip-and-join
+//!    misses, [`find_note_path_by_wire_id`] scans `<vault>/meetings`
+//!    and reverse-looks-up the file whose path-derived `MeetingId`
+//!    (UUIDv5 over the vault-relative bytes, matching
+//!    `heron_orchestrator::vault_read::derive_meeting_id`) equals
+//!    the wire id's UUID. The same derivation the daemon uses to
+//!    answer per-id reads — so the renderer's read / write hits the
+//!    exact note the daemon's `Meeting.id` points at.
+//!
+//! The scan is `O(notes_in_vault)` per resolution. For a typical user
+//! vault (hundreds to low-thousands of notes) and a one-off-per-Review-
+//! page-load access pattern, that's well under the IO floor of the
+//! `read_to_string` it gates. If a future hot path needs to resolve
+//! every meeting in one render, hoist the scan into a per-vault index
+//! (the orchestrator builds the same index on its read endpoints).
 //!
 //! Errors surface as `String` to match the existing `lib.rs` pattern
 //! (`AssetError::to_string`, `SettingsError::to_string`) — the React
@@ -44,6 +65,7 @@
 
 use std::path::{Path, PathBuf};
 
+use heron_orchestrator::MEETING_ID_NAMESPACE;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use uuid::{NoContext, Timestamp, Uuid};
@@ -165,6 +187,13 @@ pub(crate) fn validated_basename(session_id: &str) -> Result<&str, String> {
 /// canonicalize step requires the file to exist on read; for write we
 /// canonicalize the *parent* and re-attach the basename so a brand-new
 /// note still passes.
+///
+/// **Wire-id fallback (issue #205):** if the strip-derived basename
+/// has no `.md` on disk and `session_id` is a `mtg_<uuid>` wire id,
+/// scans `meetings/` for a file whose path-derived `MeetingId` matches
+/// the wire id. This is the path that resolves `Slug` / `DateSlug`
+/// captures the daemon surfaced via `Meeting.id`. Module-level docs
+/// have the full input-shape table.
 pub(crate) async fn resolve_note_path(
     vault: &Path,
     session_id: &str,
@@ -176,17 +205,38 @@ pub(crate) async fn resolve_note_path(
     let candidate = meetings.join(format!("{basename}.md"));
 
     if must_exist {
-        let canonical = fs::canonicalize(&candidate)
-            .await
-            .map_err(|e| format!("canonicalize {}: {}", candidate.display(), e))?;
-        if !canonical.starts_with(&canonical_vault) {
-            return Err(format!(
-                "resolved path {} escapes vault {}",
-                canonical.display(),
-                canonical_vault.display()
-            ));
+        match fs::canonicalize(&candidate).await {
+            Ok(canonical) => {
+                if !canonical.starts_with(&canonical_vault) {
+                    return Err(format!(
+                        "resolved path {} escapes vault {}",
+                        canonical.display(),
+                        canonical_vault.display()
+                    ));
+                }
+                Ok(canonical)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Strip-and-join missed. For a `mtg_<uuid>` wire id,
+                // fall back to a meetings/ scan so `Slug` / `DateSlug`
+                // captures resolve. For a bare basename the renderer
+                // got from `list_sessions`, the scan can't help (no
+                // wire id to match), so we surface the original error.
+                let Some(wire_uuid) = parse_meeting_wire_id(session_id) else {
+                    return Err(format!("canonicalize {}: {}", candidate.display(), e));
+                };
+                find_note_path_by_wire_id(&canonical_vault, wire_uuid)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "no note in {} matches meeting id {}",
+                            meetings.display(),
+                            session_id
+                        )
+                    })
+            }
+            Err(e) => Err(format!("canonicalize {}: {}", candidate.display(), e)),
         }
-        Ok(canonical)
     } else {
         // For write we ensure the meetings/ subdir exists (the vault
         // writer creates it on first capture; the renderer-only Save
@@ -211,8 +261,137 @@ pub(crate) async fn resolve_note_path(
                     meetings.display()
                 )
             })?;
-        Ok(canonical_meetings.join(format!("{basename}.md")))
+        // Wire-id fallback for write: the renderer's Save path always
+        // overwrites a note it just read, so the `Slug` / `DateSlug`
+        // file already exists. Without this lookup, a `mtg_<uuid>`
+        // save would create a sibling `<uuid>.md` next to the real
+        // `<slug>.md` and silently fork user content. Strip-and-join
+        // wins when the file *does* live at the bare-basename path
+        // (the `Id` pattern, or a fresh capture under any pattern
+        // whose first save races the writer's finalize — vanishingly
+        // rare since the editor only mounts after `heron_read_note`
+        // succeeds).
+        let strip_target = canonical_meetings.join(format!("{basename}.md"));
+        if fs::metadata(&strip_target).await.is_ok() {
+            return Ok(strip_target);
+        }
+        if let Some(wire_uuid) = parse_meeting_wire_id(session_id)
+            && let Some(existing) = find_note_path_by_wire_id(&canonical_vault, wire_uuid).await?
+        {
+            return Ok(existing);
+        }
+        Ok(strip_target)
     }
+}
+
+/// Parse `mtg_<uuid>` into the inner UUID, or return `None` for any
+/// other input shape. Matches the wire form `heron_types::MeetingId`
+/// emits via `Display` — but kept as a free function (not
+/// `MeetingId::from_str`) so an invalid UUID payload short-circuits to
+/// `None` (treat as "not a wire id, no fallback") rather than bubbling
+/// a parse error into the renderer's `read` envelope. The strict
+/// `from_str` path lives in the `meetings.rs` daemon proxies, which
+/// guard the daemon's URL space; here we're picking an in-vault file.
+fn parse_meeting_wire_id(session_id: &str) -> Option<Uuid> {
+    let rest = session_id.strip_prefix("mtg_")?;
+    Uuid::parse_str(rest).ok()
+}
+
+/// Scan `<canonical_vault>/meetings/*.md` for the file whose path-
+/// derived `MeetingId` (UUIDv5 over the vault-relative bytes — same
+/// namespace `heron_orchestrator::vault_read::derive_meeting_id` uses
+/// on the daemon side) equals `wire_uuid`. Returns the canonical path
+/// of the match, or `None` when no file matches (the empty-vault and
+/// stale-wire-id cases).
+///
+/// Symmetric with the orchestrator's `find_note_path_by_id` so the
+/// renderer's read / write lands on the exact note the daemon's
+/// `Meeting.id` referred to. We deliberately don't share that function
+/// — it's `pub(crate)` in the orchestrator and exposing it would widen
+/// the orchestrator's surface for one consumer; the deriving formula is
+/// stable per the namespace's `MEETING_ID_NAMESPACE` doc, which is
+/// already `pub use`'d.
+///
+/// **Symlink-aware UUID derivation.** The orchestrator iterates
+/// `vault_root.join("meetings")` lexically (without resolving the
+/// symlink) and hashes `meetings/<file>.md` for each entry — even
+/// when `meetings/` is itself a symlink to another in-vault directory.
+/// We have to mirror that exact lexical shape, *not* the canonical
+/// shape, or an in-vault symlink (e.g. `meetings/` → `data/`) yields
+/// a different UUIDv5 on the renderer side and a valid wire id stops
+/// resolving. We still pre-canonicalize to enforce the
+/// "no symlink escape outside the vault" invariant, then fall back to
+/// the lexical path for iteration.
+async fn find_note_path_by_wire_id(
+    canonical_vault: &Path,
+    wire_uuid: Uuid,
+) -> Result<Option<PathBuf>, String> {
+    let meetings = meetings_dir(canonical_vault);
+    // Containment pre-check: a symlinked `meetings/` pointing OUTSIDE
+    // the vault is rejected here — the orchestrator's own
+    // `note_paths_newest_first` would happily follow such a link, but
+    // the desktop's vault-containment posture is stricter. Inside the
+    // vault is fine, so this returns `Some(canonical)` for the in-
+    // vault-symlink case and `None` for the pre-capture
+    // (`meetings/` doesn't exist yet) case.
+    if canonicalize_meetings_within(&meetings, canonical_vault)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    // Iterate via the lexical `meetings/` path. Reading from a
+    // symlinked dir transparently follows the symlink, but the entry
+    // paths the iterator yields are `<canonical_vault>/meetings/<file>`
+    // — exactly the shape the orchestrator's `derive_meeting_id`
+    // hashes (`meetings/<file>` after stripping the vault root). If
+    // the lexical dir doesn't exist, we returned `None` above.
+    let mut rd = fs::read_dir(&meetings)
+        .await
+        .map_err(|e| format!("readdir {}: {}", meetings.display(), e))?;
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|e| format!("readdir {}: {}", meetings.display(), e))?
+    {
+        let path = entry.path();
+        let ft = match entry.file_type().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        // Derive the meeting id from the vault-relative LEXICAL bytes
+        // — `meetings/<file>.md`. Mirrors
+        // `heron_orchestrator::vault_read::derive_meeting_id`'s shape
+        // exactly, including the in-vault-symlink case the canonical-
+        // path version of this scan would silently miss.
+        let rel = path.strip_prefix(canonical_vault).unwrap_or(&path);
+        let derived = Uuid::new_v5(&MEETING_ID_NAMESPACE, rel.as_os_str().as_encoded_bytes());
+        if derived == wire_uuid {
+            // Canonicalize so symlink-escape rejection still applies
+            // even on the fallback path. A `meetings/<file>.md` whose
+            // *file* is a symlink to outside the vault would otherwise
+            // be returnable (the dir is in-vault, but the file points
+            // out).
+            let canonical = fs::canonicalize(&path)
+                .await
+                .map_err(|e| format!("canonicalize {}: {}", path.display(), e))?;
+            if !canonical.starts_with(canonical_vault) {
+                return Err(format!(
+                    "resolved path {} escapes vault {}",
+                    canonical.display(),
+                    canonical_vault.display()
+                ));
+            }
+            return Ok(Some(canonical));
+        }
+    }
+    Ok(None)
 }
 
 /// Read `<vault>/meetings/<basename>.md` (where `<basename>` strips
@@ -678,5 +857,221 @@ mod tests {
             .await
             .expect_err("symlinked meetings/ must be rejected");
         assert!(err.contains("escapes vault"), "got: {err}");
+    }
+
+    // -------- issue #205: Slug / DateSlug wire-id resolution --------
+
+    /// Derive the wire-form `MeetingId` string a daemon configured
+    /// against `vault` would emit for a finalized note at
+    /// `<vault>/meetings/<basename>.md`. Mirrors
+    /// `heron_orchestrator::vault_read::derive_meeting_id` — the test
+    /// re-implements rather than imports the helper because it's
+    /// `pub(crate)` in the orchestrator.
+    ///
+    /// **Caveat:** because both sides re-implement the same formula,
+    /// these tests don't catch a drift where the orchestrator's
+    /// derivation changes shape (e.g. switching to a hash over a
+    /// different path component). The pinned cross-crate contract is
+    /// the `MEETING_ID_NAMESPACE` constant (already `pub use`'d) plus
+    /// the formula documented at the namespace declaration. Any
+    /// would-be drift should land as a coordinated cross-crate edit
+    /// against both `vault_read.rs` and this module — there is no
+    /// stable public function to wire an end-to-end parity test
+    /// through today.
+    fn wire_id_for(vault: &Path, basename: &str) -> String {
+        let canonical = std::fs::canonicalize(vault).expect("canonicalize vault");
+        let path = canonical.join("meetings").join(format!("{basename}.md"));
+        let rel = path.strip_prefix(&canonical).expect("strip prefix");
+        let derived = Uuid::new_v5(&MEETING_ID_NAMESPACE, rel.as_os_str().as_encoded_bytes());
+        format!("mtg_{}", derived.as_hyphenated())
+    }
+
+    /// Seed a `Slug`-pattern note at `<vault>/meetings/<slug>.md` and
+    /// confirm `heron_read_note(vault, mtg_<wire-id>)` resolves it. The
+    /// strip-and-join lookup misses (no `<wire-uuid>.md`), so the
+    /// fallback scan must find the file via path-derived id match.
+    #[tokio::test]
+    async fn read_note_resolves_slug_pattern_via_wire_id() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        let body = "# Slug pattern note\n";
+        fs::write(dir.join("team-standup.md"), body)
+            .await
+            .expect("seed slug note");
+
+        let wire_id = wire_id_for(tmp.path(), "team-standup");
+        let read = read_note(tmp.path(), &wire_id)
+            .await
+            .expect("read via wire id");
+        assert_eq!(read, body);
+    }
+
+    /// Seed a `DateSlug`-pattern note at
+    /// `<vault>/meetings/<date>-<slug>.md` and confirm wire-id
+    /// resolution reaches it. Same fallback path as the Slug test —
+    /// the two patterns differ only in the on-disk basename shape.
+    #[tokio::test]
+    async fn read_note_resolves_date_slug_pattern_via_wire_id() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        let body = "# Date-slug pattern note\n";
+        let basename = "2026-04-26-team-standup";
+        fs::write(dir.join(format!("{basename}.md")), body)
+            .await
+            .expect("seed date-slug note");
+
+        let wire_id = wire_id_for(tmp.path(), basename);
+        let read = read_note(tmp.path(), &wire_id)
+            .await
+            .expect("read via wire id");
+        assert_eq!(read, body);
+    }
+
+    /// `Id`-pattern remains a strip-and-join fast path. A `mtg_<uuid>`
+    /// wire id where the file is `<uuid>.md` must NOT trigger a
+    /// fallback scan (it would still work, but slowly).
+    #[tokio::test]
+    async fn read_note_resolves_id_pattern_via_strip_fast_path() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let id = "019ddcda-831c-72f0-927b-8b894466902c";
+        let body = "# Id pattern note\n";
+        write_note_atomic(tmp.path(), &format!("mtg_{id}"), body)
+            .await
+            .expect("write");
+        let on_disk = meetings_dir(tmp.path()).join(format!("{id}.md"));
+        assert!(on_disk.exists(), "Id pattern writes <uuid>.md directly");
+        let read = read_note(tmp.path(), &format!("mtg_{id}"))
+            .await
+            .expect("read");
+        assert_eq!(read, body);
+    }
+
+    /// Write-through-wire-id: when the on-disk note is `<slug>.md`,
+    /// `write_note_atomic(vault, mtg_<wire-id>, body)` must overwrite
+    /// it in place — not create a sibling `<wire-uuid>.md` next to
+    /// the slug file. Without this, an editor save under Slug /
+    /// DateSlug silently forks the user's note.
+    #[tokio::test]
+    async fn write_note_via_wire_id_overwrites_slug_file_in_place() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        fs::write(dir.join("project-kickoff.md"), "v1\n")
+            .await
+            .expect("seed");
+
+        let wire_id = wire_id_for(tmp.path(), "project-kickoff");
+        write_note_atomic(tmp.path(), &wire_id, "v2\n")
+            .await
+            .expect("write via wire id");
+
+        // Single file remains: the slug-named one, with v2 contents.
+        let mut rd = fs::read_dir(&dir).await.expect("readdir");
+        let mut names: Vec<String> = Vec::new();
+        while let Some(e) = rd.next_entry().await.expect("entry") {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        assert_eq!(names, vec!["project-kickoff.md".to_string()]);
+        let read = fs::read_to_string(dir.join("project-kickoff.md"))
+            .await
+            .expect("read");
+        assert_eq!(read, "v2\n");
+    }
+
+    /// A `mtg_<uuid>` wire id with no matching on-disk note errors
+    /// with the meeting id in the message — distinct from the
+    /// strip-and-join NotFound the `Id` flow surfaces. Without this,
+    /// a stale renderer cache (the daemon reaped a meeting but the
+    /// React tree hasn't refreshed) would dump a confusing
+    /// "canonicalize <vault>/meetings/<wire-uuid>.md" toast.
+    #[tokio::test]
+    async fn read_note_unknown_wire_id_errors_with_meeting_context() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        // A stale wire id that doesn't match any seeded file.
+        let stale = "mtg_00000000-0000-7000-8000-000000000000";
+        let err = read_note(tmp.path(), stale)
+            .await
+            .expect_err("expected error");
+        assert!(
+            err.contains("matches meeting id") || err.contains(stale),
+            "got: {err}"
+        );
+    }
+
+    /// A bare basename input (the sidebar / `list_sessions` path)
+    /// must still hit the strip-and-join fast path for slug-named
+    /// files — no scan, no `mtg_` prefix. Pins that the fallback
+    /// only triggers for wire-id input shapes.
+    #[tokio::test]
+    async fn read_note_resolves_bare_basename_for_slug_files() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = meetings_dir(tmp.path());
+        fs::create_dir_all(&dir).await.expect("mkdir meetings");
+        let body = "# bare basename\n";
+        fs::write(dir.join("ad-hoc-chat.md"), body)
+            .await
+            .expect("seed");
+
+        // Sidebar passes the bare basename, not the wire id.
+        let read = read_note(tmp.path(), "ad-hoc-chat")
+            .await
+            .expect("read by basename");
+        assert_eq!(read, body);
+    }
+
+    /// In-vault symlink-meetings: when the user's `meetings/` is a
+    /// symlink to another directory inside the vault (e.g. they're
+    /// migrating a Dropbox layout), the orchestrator's
+    /// `derive_meeting_id` hashes `meetings/<file>.md` lexically —
+    /// it never resolves the symlink. The renderer's wire-id scan
+    /// must mirror that exactly or a valid daemon-issued wire id
+    /// stops resolving. Anchors the lexical-iteration choice in
+    /// [`find_note_path_by_wire_id`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_note_via_wire_id_through_in_vault_meetings_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        // Stand the vault up as `<tmp>/vault` so `<tmp>/data` is a
+        // sibling, not a parent — both are inside the canonical
+        // vault root after the symlink resolves.
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir(&vault).expect("mkdir vault");
+        let real_meetings = vault.join("data");
+        std::fs::create_dir(&real_meetings).expect("mkdir data");
+        symlink(&real_meetings, vault.join("meetings")).expect("symlink meetings -> data");
+
+        let body = "# in-vault symlink target\n";
+        fs::write(real_meetings.join("kickoff-notes.md"), body)
+            .await
+            .expect("seed note");
+
+        let wire_id = wire_id_for(&vault, "kickoff-notes");
+        let read = read_note(&vault, &wire_id)
+            .await
+            .expect("read via wire id through in-vault symlink");
+        assert_eq!(read, body);
+    }
+
+    /// `parse_meeting_wire_id` accepts only `mtg_<valid-uuid>`. A
+    /// non-prefixed input or a malformed UUID returns `None` so the
+    /// caller's NotFound error surfaces rather than the parse error
+    /// (the renderer doesn't distinguish, and "no such note" is the
+    /// correct semantic).
+    #[test]
+    fn parse_meeting_wire_id_strict() {
+        assert!(parse_meeting_wire_id("019ddcda-831c-72f0-927b-8b894466902c").is_none());
+        assert!(parse_meeting_wire_id("ad-hoc-chat").is_none());
+        assert!(parse_meeting_wire_id("mtg_not-a-uuid").is_none());
+        assert!(parse_meeting_wire_id("mtg_").is_none());
+        assert!(
+            parse_meeting_wire_id("mtg_019ddcda-831c-72f0-927b-8b894466902c").is_some(),
+            "valid wire id must parse",
+        );
     }
 }
