@@ -106,21 +106,29 @@ fn openai_ok_body() -> serde_json::Value {
     })
 }
 
-/// Lift the transcript-derived `messages[].content` onto a pinned
-/// placeholder before a snapshot. The user-message content embeds the
-/// rendered prompt + transcript text (with the transcript's tempfile
-/// path), so snapshotting it raw would diff on every test run. The
-/// shape we actually want to pin is the *envelope* — model,
-/// max_tokens, response_format, role names, message structure — which
-/// is exactly what would catch "OpenAI shape sent to Anthropic".
+/// Lift the transcript-derived `messages[role=user].content` onto a
+/// pinned placeholder before a snapshot. The user-message content
+/// embeds the rendered prompt + transcript text (with the transcript's
+/// tempfile path), so snapshotting it raw would diff on every test
+/// run. The system message OpenAI sends is static, so we leave it in
+/// place — that lets the snapshot pin the literal instructions the
+/// summarizer dispatches and would loudly fail if the system-prompt
+/// text drifts. Anthropic doesn't dispatch a system role today; the
+/// snapshot still captures the user-message envelope (role, position).
+///
+/// The shape we want to pin is the *envelope* — model, max_tokens,
+/// response_format, role names, message structure, plus the static
+/// system instructions for OpenAI — which is what would catch "OpenAI
+/// shape sent to Anthropic" and "system prompt silently rewritten".
 fn redact_messages_content(body: &mut serde_json::Value) {
     let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
         return;
     };
     for msg in messages {
-        if let Some(content) = msg.get_mut("content")
-            && content.is_string()
-        {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        if let Some(content) = msg.get_mut("content").filter(|v| v.is_string()) {
             *content = serde_json::Value::String("<REDACTED:user-content>".to_owned());
         }
     }

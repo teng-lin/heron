@@ -6,7 +6,7 @@ expression: body
   "max_tokens": 4096,
   "messages": [
     {
-      "content": "<REDACTED:user-content>",
+      "content": "You are a meeting summarizer. Output only valid JSON matching the requested schema.",
       "role": "system"
     },
     {

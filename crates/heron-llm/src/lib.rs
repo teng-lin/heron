@@ -79,9 +79,17 @@ pub const PERSONA_TRUNCATED_MARKER: &str = "…[truncated]";
 
 /// Truncate `s` so the returned string's byte length is at most
 /// [`MAX_PERSONA_FIELD_BYTES`]. Cuts at a UTF-8 char boundary and
-/// appends [`PERSONA_TRUNCATED_MARKER`] so the truncation is visible
-/// in the rendered prompt. Returns the input unchanged when it
-/// already fits.
+/// appends [`PERSONA_TRUNCATED_MARKER`] when it fits in the remaining
+/// budget so the truncation is visible in the rendered prompt.
+/// Returns the input unchanged when it already fits.
+///
+/// The marker-fits-in-budget guard keeps the contract safe against a
+/// future constant tweak that shrinks the cap below the marker
+/// length: even in that pathological case the returned string still
+/// satisfies `len() <= MAX_PERSONA_FIELD_BYTES`. The default 4 KiB cap
+/// vs ~14-byte marker leaves enormous slack today; the guard is
+/// defence-in-depth for the constant-edit path that gemini's PR #202
+/// review flagged.
 fn truncate_persona_field(s: &str) -> String {
     if s.len() <= MAX_PERSONA_FIELD_BYTES {
         return s.to_owned();
@@ -91,9 +99,11 @@ fn truncate_persona_field(s: &str) -> String {
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    let mut out = String::with_capacity(cut + PERSONA_TRUNCATED_MARKER.len());
+    let mut out = String::with_capacity(MAX_PERSONA_FIELD_BYTES);
     out.push_str(&s[..cut]);
-    out.push_str(PERSONA_TRUNCATED_MARKER);
+    if out.len() + PERSONA_TRUNCATED_MARKER.len() <= MAX_PERSONA_FIELD_BYTES {
+        out.push_str(PERSONA_TRUNCATED_MARKER);
+    }
     out
 }
 
