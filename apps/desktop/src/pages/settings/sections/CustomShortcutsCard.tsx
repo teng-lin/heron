@@ -45,9 +45,15 @@ export function CustomShortcutsCard() {
   function commit(next: [string, string][]) {
     setEditor(next);
     const ids = next.map(([id]) => id.trim());
+    const accels = next.map(([, accel]) => accel.trim());
     const hasEmpty = ids.some((id) => id === "");
     const hasDupe = ids.length !== new Set(ids).size;
-    if (hasEmpty || hasDupe) return;
+    // Empty accelerators are "in-progress" rows — don't promote them to
+    // the store. `addRow(v)` seeds `[v, ""]`, and clearing an existing
+    // accelerator passes through `setRow`; in both cases persisting the
+    // half-written row would temporarily wipe a working shortcut.
+    const hasEmptyAccel = accels.some((a) => a === "");
+    if (hasEmpty || hasDupe || hasEmptyAccel) return;
     const map: Record<string, string> = {};
     for (const [id, accel] of next) {
       map[id.trim()] = accel.trim();
