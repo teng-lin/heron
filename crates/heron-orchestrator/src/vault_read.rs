@@ -129,17 +129,25 @@ pub(crate) fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>,
     // fails the whole listing rather than presenting a partial view
     // that looks like "the meeting just isn't there." (Issue #215
     // finding 5 — was `filter_map(Result::ok) + unwrap_or(false)`.)
+    //
+    // Filter on `file_name()` (no allocation) before paying for
+    // `entry.path()` so non-`.md` siblings — `.tmp` writer scratch
+    // files, hidden `.DS_Store`, etc. — don't allocate. (PR #228
+    // review, gemini.)
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in read_dir {
         let entry = entry.map_err(|e| SessionError::VaultLocked {
             detail: format!("read_dir entry({}): {e}", dir.display()),
         })?;
+        let file_name = entry.file_name();
+        if Path::new(&file_name).extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
         let file_type = entry.file_type().map_err(|e| SessionError::VaultLocked {
             detail: format!("file_type({}): {e}", entry.path().display()),
         })?;
-        let path = entry.path();
-        if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-            entries.push(path);
+        if file_type.is_file() {
+            entries.push(entry.path());
         }
     }
     // Deterministic input order only. `list_meetings_impl` sorts by
@@ -514,22 +522,32 @@ pub(crate) fn read_transcript_segments(
             // grow `buf` to hold every byte up to the next newline
             // (or EOF) — a malformed transcript without newlines
             // could OOM the daemon.
-            loop {
-                let (done, used) = {
-                    let available = reader.fill_buf().map_err(|e| SessionError::VaultLocked {
-                        detail: format!("drain transcript line {lineno}: {e}"),
-                    })?;
-                    if available.is_empty() {
-                        (true, 0)
-                    } else if let Some(i) = available.iter().position(|&b| b == b'\n') {
-                        (true, i + 1)
-                    } else {
-                        (false, available.len())
+            //
+            // Skip the drain when `read_until` already consumed the
+            // terminating newline (the pathological case of a line
+            // exactly `MAX_TRANSCRIPT_LINE_BYTES + 1` bytes long
+            // including its `\n`). Without this guard the drain
+            // would `consume` the start of the *next* valid line.
+            // (PR #228 review, gemini.)
+            if buf.last() != Some(&b'\n') {
+                loop {
+                    let (done, used) = {
+                        let available =
+                            reader.fill_buf().map_err(|e| SessionError::VaultLocked {
+                                detail: format!("drain transcript line {lineno}: {e}"),
+                            })?;
+                        if available.is_empty() {
+                            (true, 0)
+                        } else if let Some(i) = available.iter().position(|&b| b == b'\n') {
+                            (true, i + 1)
+                        } else {
+                            (false, available.len())
+                        }
+                    };
+                    reader.consume(used);
+                    if done {
+                        break;
                     }
-                };
-                reader.consume(used);
-                if done {
-                    break;
                 }
             }
             lineno += 1;
@@ -746,6 +764,40 @@ mod tests {
         assert_eq!(segs[0].speaker.display_name, "Ada");
     }
 
+    /// Finding 2 — corner case caught by gemini on PR #228. When an
+    /// over-cap line is *exactly* `MAX_TRANSCRIPT_LINE_BYTES + 1`
+    /// bytes long INCLUDING its terminating `\n`, `read_until` has
+    /// already consumed the newline. A naive drain that always runs
+    /// would `consume` the start of the next valid turn — silently
+    /// eating it.
+    ///
+    /// The fix gates the drain on `buf.last() != Some(&b'\n')`. If
+    /// regressed, this test would see 0 segments instead of 1.
+    #[test]
+    fn read_transcript_segments_oversize_line_with_trailing_newline_does_not_eat_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge.jsonl");
+        // Build a line whose total length (content + `\n`) is
+        // exactly MAX + 1 — i.e. content is MAX bytes, plus `\n`.
+        let mut payload = vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES];
+        payload.push(b'\n');
+        // Followed by a real, parseable turn that the reader MUST
+        // surface (regression check for the drain-eats-next bug).
+        payload.extend_from_slice(
+            br#"{"t0":0.0,"t1":1.0,"text":"hi","channel":"mic","speaker":"Ada","speaker_source":"self","confidence":1.0}"#,
+        );
+        payload.push(b'\n');
+        std::fs::write(&path, payload).unwrap();
+
+        let segs = read_transcript_segments(&path).expect("must not error");
+        assert_eq!(
+            segs.len(),
+            1,
+            "drain must not consume the next line when over-cap line ended in `\\n`",
+        );
+        assert_eq!(segs[0].speaker.display_name, "Ada");
+    }
+
     /// Finding 5 — `note_paths_newest_first` must surface a real
     /// IO failure rather than swallowing it. The legacy
     /// `filter_map(Result::ok) + unwrap_or(false)` path made
@@ -761,6 +813,17 @@ mod tests {
     fn note_paths_surfaces_read_dir_errors() {
         use std::os::unix::fs::PermissionsExt;
 
+        // RAII guard so a panic between chmod-down and chmod-up
+        // still restores perms (otherwise the tempdir cleanup trips
+        // EACCES and the failure cascades into a misleading Drop
+        // panic). PR #228 review, gemini.
+        struct PermGuard(PathBuf);
+        impl Drop for PermGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
         let vault = tempfile::tempdir().expect("vault tempdir");
         let meetings = vault.path().join("meetings");
         std::fs::create_dir_all(&meetings).unwrap();
@@ -770,13 +833,10 @@ mod tests {
         // filesystem that ignores POSIX modes), skip the assertion
         // rather than fail spuriously.
         std::fs::set_permissions(&meetings, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = PermGuard(meetings.clone());
         let chmod_works = std::fs::read_dir(&meetings).is_err();
 
         let result = note_paths_newest_first(vault.path());
-
-        // Restore perms before asserting so the tempdir cleanup
-        // doesn't trip the same EACCES.
-        let _ = std::fs::set_permissions(&meetings, std::fs::Permissions::from_mode(0o755));
 
         if !chmod_works {
             // Running as root or on a permissive FS — the partial
