@@ -66,7 +66,7 @@
 //!   daemon restart loses in-flight captures and the path-derived vault
 //!   IDs become the read-side source of truth.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -74,60 +74,66 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
-use heron_bot::{
-    AttendeeContext as BotAttendeeContext, BotCreateArgs, DisclosureProfile, PersonaId,
-    PreMeetingContext as BotPreMeetingContext,
-};
+use chrono::{DateTime, Utc};
 use heron_cli::session::{
     Orchestrator as CliSessionOrchestrator, SessionConfig as CliSessionConfig,
-    SessionError as CliSessionError, SessionOutcome as CliSessionOutcome,
+    SessionError as CliSessionError,
 };
-use heron_event::{Envelope, EventBus, ReplayCache};
+use heron_event::{EventBus, ReplayCache};
 use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
-use heron_policy::{EscalationMode, PolicyProfile};
-use heron_realtime::{SessionConfig as RealtimeSessionConfig, TurnDetection};
 use heron_session::{
     AttendeeContext, AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health,
-    HealthComponent, HealthComponents, HealthStatus, IdentifierKind, ListMeetingsPage,
-    ListMeetingsQuery, Meeting, MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus,
-    Participant, Platform, PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest,
-    SessionError, SessionEventBus, SessionOrchestrator, SetEventAutoRecordRequest,
-    StartCaptureArgs, Summary, SummaryLifecycle, Transcript, TranscriptLifecycle,
-    TranscriptSegment,
+    HealthComponents, HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting,
+    MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Platform, PreMeetingContext,
+    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
+    SessionOrchestrator, SetEventAutoRecordRequest, StartCaptureArgs, Summary, SummaryLifecycle,
+    Transcript, TranscriptLifecycle,
 };
 use heron_types::{RecordingFsm, SummaryOutcome};
 
-use crate::live_session::{DynLiveSession, LiveSessionFactory, LiveSessionStartArgs};
+use crate::compose::{build_live_session_start_args, pre_meeting_briefing_for_v1};
+use crate::health::{
+    aggregate_health_status, capture_health_component, eventkit_health_component, health_component,
+    llm_health_component, stt_health_component, vault_health_component,
+};
+use crate::live_session::{DynLiveSession, LiveSessionFactory};
+use crate::pipeline_glue::{
+    complete_pipeline_meeting, insert_finalized_meeting, pipeline_to_session_error,
+    publish_meeting_event, push_pruned_finalizer, transition_to_session_error,
+};
+use crate::platform::platform_target_bundle_id;
+use crate::state::{ActiveMeeting, CaptureRuntime, FinalizedMeeting, PendingContexts};
+use crate::validation::{normalize_calendar_event_id, validate_context_size};
+use crate::vault_read::{
+    action_items_from_frontmatter, find_note_path_by_id, list_meetings_impl, meeting_from_note,
+    platform_from_meeting_url, read_transcript_segments, resolve_vault_path,
+    started_at_from_frontmatter, vault_to_session_err,
+};
 use heron_vault::{
-    CalendarReader, EventKitCalendarReader, FileNamingPattern, VaultError, epoch_seconds_to_utc,
-    read_note,
+    CalendarReader, EventKitCalendarReader, FileNamingPattern, epoch_seconds_to_utc, read_note,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 pub mod live_session;
 
 pub(crate) mod auto_record;
+mod compose;
+mod health;
+mod pipeline_glue;
+mod platform;
+mod state;
+mod validation;
+mod vault_read;
 
-/// Namespace UUID seeded into [`uuid::Uuid::new_v5`] when deriving
-/// a `MeetingId` from a vault-relative note path. The byte pattern
-/// is arbitrary but FIXED — changing it would re-key every meeting
-/// in every consumer cache and break `Last-Event-ID` resume
-/// expectations. If a future change really needs a different
-/// derivation, bump it AND emit a synthetic `daemon.error` so
-/// consumers know to invalidate their caches.
-pub const MEETING_ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x68, 0x65, 0x72, 0x6f, 0x6e, 0x6d, 0x74, 0x67, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21,
-]);
+pub use vault_read::MEETING_ID_NAMESPACE;
 
 /// Cap on a single JSONL transcript line. A turn is a few hundred
 /// bytes typically; 1 MiB bounds the OOM blast radius for a
 /// malformed transcript that lost its newlines and presents as one
 /// gigantic line.
-const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
 
 /// How close to the calendar start time an auto-record event must be
 /// before the scheduler fires capture.
@@ -151,29 +157,6 @@ const AUTO_RECORD_TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// that, EventKit reads start to dominate per-tick latency.
 const AUTO_RECORD_EVENT_LIMIT: u32 = 100;
 
-/// Cap on the calendar event identifier `attach_context` accepts.
-/// EventKit ids are short opaque strings and the synthetic ids
-/// `list_upcoming_calendar` mints are bounded by `(start, end, title)`
-/// — 4 KiB is well past the largest realistic input.
-const MAX_CALENDAR_EVENT_ID_BYTES: usize = 4 * 1024;
-
-/// Cap on the JSON-serialized `PreMeetingContext` payload
-/// `attach_context` accepts. Spec-shape contexts (agenda, attendees,
-/// related notes, briefing) are kilobytes; 256 KiB tolerates a long
-/// briefing without letting one caller wedge daemon memory by
-/// uploading a megabyte-scale payload per calendar event id.
-const MAX_PRE_MEETING_CONTEXT_BYTES: usize = 256 * 1024;
-
-/// Cap on the number of `PreMeetingContext` entries the in-memory
-/// staging map holds. Per-entry caps don't bound map size — a
-/// caller spraying unique `calendar_event_id`s without ever calling
-/// `start_capture` would otherwise grow the map without bound. At
-/// the cap a fresh `attach_context` evicts the oldest entry first
-/// (insertion-order FIFO via the `PendingContextsInner::order`
-/// queue). 1024 covers ~weeks of upcoming-calendar events and is
-/// orders of magnitude larger than any realistic working set.
-const MAX_PENDING_CONTEXTS: usize = 1024;
-
 /// Default broadcast bus capacity. 1024 covers a long meeting's
 /// worth of `transcript.partial` deltas without dropping for any
 /// realistic subscriber count. Override via [`Builder`] when load
@@ -189,12 +172,6 @@ pub const DEFAULT_BUS_CAPACITY: usize = 1024;
 /// `replay_since` collapse to `WindowExceeded` (that's the only
 /// honest answer once the cache has a hole).
 pub const DEFAULT_CACHE_CAPACITY: usize = 4096;
-
-/// Maximum number of completed daemon-issued IDs retained in memory
-/// for post-finalization `Location` continuity. Vault notes remain
-/// the durable source of truth; this only prevents a long-running
-/// daemon from growing an unbounded compatibility index.
-const FINALIZED_MEETING_INDEX_CAP: usize = 512;
 
 /// In-process orchestrator. Owns one shared bus + replay cache for
 /// the lifetime of the daemon.
@@ -325,157 +302,6 @@ pub struct LocalSessionOrchestrator {
     /// to `false` when the user has unchecked Settings → Recording
     /// → "Auto-detect meeting apps".
     auto_detect_meeting_app: bool,
-}
-
-/// Per-meeting state tracked while a capture is in flight. The
-/// [`RecordingFsm`] is the same one `heron-cli`'s session orchestrator
-/// drives in the live audio path; here it provides the legality check
-/// for every transition `start_capture` / `end_meeting` triggers, and
-/// the `meeting` snapshot is the latest copy that has been published
-/// on the bus. `applied_context` carries the `PreMeetingContext`
-/// (agenda / persona / briefing) that was staged via
-/// `attach_context` and consumed at `start_capture`-time; the bot /
-/// realtime / policy wiring will read it when those layers compose.
-struct ActiveMeeting {
-    fsm: RecordingFsm,
-    meeting: Meeting,
-    runtime: CaptureRuntime,
-    applied_context: Option<PreMeetingContext>,
-    /// Live v2 stack (bot + realtime + bridge + policy controller)
-    /// when the orchestrator is configured with a
-    /// [`LiveSessionFactory`] AND the factory accepted the start
-    /// args. `None` means either no factory was installed (vault-
-    /// only mode) or the factory call failed and `start_capture`
-    /// fell back to the v1 path. `end_meeting` shuts this down in
-    /// dependency order before — and independently of — the v1
-    /// pipeline finalizer.
-    live_session: Option<Box<dyn DynLiveSession>>,
-    /// Tier 3 #16 pause flag. The orchestrator owns the flag; the
-    /// pipeline reads it via a clone passed through `SessionConfig`.
-    /// `pause_capture` flips it to `true` (alongside the FSM transition
-    /// to `Paused`); `resume_capture` flips it back. Capture-pipeline
-    /// WAV writers and the AX collector check it on every frame /
-    /// event and drop on the floor when set. Synthetic captures keep a
-    /// flag too so the orchestrator's pause/resume contract is uniform
-    /// across runtime variants — the synthetic path just has no
-    /// pipeline to read it.
-    pause_flag: Arc<AtomicBool>,
-}
-
-/// Runtime backing for an active capture.
-enum CaptureRuntime {
-    /// Vault-less constructors keep the historical FSM-only behavior
-    /// for substrate tests and for callers that intentionally build
-    /// without a writable vault.
-    Synthetic,
-    /// Vault-backed daemon sessions run the same audio → STT → LLM →
-    /// vault pipeline used by `heron record`.
-    Pipeline {
-        stop_tx: oneshot::Sender<()>,
-        handle: JoinHandle<Result<CliSessionOutcome, CliSessionError>>,
-    },
-}
-
-struct FinalizedMeeting {
-    meeting: Meeting,
-    note_path: Option<PathBuf>,
-}
-
-/// Bounded staging map for `attach_context`. Pairs a `HashMap` with
-/// a FIFO `VecDeque` so the cap-eviction order is "oldest insertion
-/// drops first" rather than HashMap's iteration-order
-/// non-determinism. The `Mutex` wrapper holds both fields together
-/// so no caller can ever observe one being mutated without the
-/// other.
-struct PendingContexts {
-    inner: Mutex<PendingContextsInner>,
-}
-
-struct PendingContextsInner {
-    map: HashMap<String, PreMeetingContext>,
-    /// Insertion order of keys currently in `map`. On overwrite of
-    /// an existing key the queue is left unchanged (the key keeps
-    /// its original FIFO position) — that matches the spec's
-    /// "latest call wins" without resetting the eviction clock for
-    /// callers that re-attach the same id.
-    order: VecDeque<String>,
-}
-
-impl PendingContexts {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(PendingContextsInner {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-            }),
-        }
-    }
-
-    /// Insert or overwrite. Returns whether an existing entry for
-    /// `key` was overwritten. Caps the map at `MAX_PENDING_CONTEXTS`
-    /// by evicting the oldest unrelated entry FIFO when a new key
-    /// would push past the cap.
-    fn insert(&self, key: String, value: PreMeetingContext) -> bool {
-        let mut g = lock_or_recover(&self.inner);
-        let overwrote = g.map.insert(key.clone(), value).is_some();
-        if !overwrote {
-            g.order.push_back(key);
-            while g.order.len() > MAX_PENDING_CONTEXTS {
-                if let Some(oldest) = g.order.pop_front() {
-                    g.map.remove(&oldest);
-                }
-            }
-        }
-        overwrote
-    }
-
-    /// Remove and return the entry for `key`, if any. Used by
-    /// `start_capture` to consume a staged context once the FSM has
-    /// committed to materializing the session.
-    fn remove(&self, key: &str) -> Option<PreMeetingContext> {
-        let mut g = lock_or_recover(&self.inner);
-        let value = g.map.remove(key)?;
-        if let Some(pos) = g.order.iter().position(|k| k == key) {
-            g.order.remove(pos);
-        }
-        Some(value)
-    }
-
-    /// Snapshot the entry for `key` without consuming it. Diagnostic
-    /// only — production callers consume via `remove`.
-    fn get_cloned(&self, key: &str) -> Option<PreMeetingContext> {
-        lock_or_recover(&self.inner).map.get(key).cloned()
-    }
-
-    /// Whether an entry exists for `key`. Cheaper than `get_cloned`
-    /// (no clone of the context body) — used by
-    /// `list_upcoming_calendar` to mirror the `primed` flag onto each
-    /// returned event without dragging the full context across.
-    fn contains_key(&self, key: &str) -> bool {
-        lock_or_recover(&self.inner).map.contains_key(key)
-    }
-
-    /// Insert only when no entry exists for `key`. Returns `true` when
-    /// the insert happened, `false` when an existing entry preserved
-    /// the staged context. Atomic across the check + insert (single
-    /// lock acquisition) so a concurrent `insert` (manual
-    /// `attach_context`) racing with this call cannot land between a
-    /// `contains_key` probe and the insert and silently get clobbered.
-    /// Same FIFO cap discipline as [`insert`](Self::insert).
-    fn insert_if_absent(&self, key: String, value: PreMeetingContext) -> bool {
-        let mut g = lock_or_recover(&self.inner);
-        if g.map.contains_key(&key) {
-            return false;
-        }
-        g.map.insert(key.clone(), value);
-        g.order.push_back(key);
-        while g.order.len() > MAX_PENDING_CONTEXTS {
-            if let Some(oldest) = g.order.pop_front() {
-                g.map.remove(&oldest);
-            }
-        }
-        true
-    }
 }
 
 /// Builder for [`LocalSessionOrchestrator`] — exposed so the daemon
@@ -1124,334 +950,11 @@ fn spawn_recorder(
     })
 }
 
-/// Wrap an [`EventPayload`] in an [`Envelope`] scoped to `meeting_id`
-/// and publish it on the bus. Helper so every transition site picks
-/// up the same `with_meeting` framing without each one re-stringifying
-/// the id (the consistency contract on `Envelope::meeting_id` requires
-/// it match the meeting carried in the payload).
-fn publish_meeting_event(bus: &SessionEventBus, payload: EventPayload, meeting_id: MeetingId) {
-    bus.publish(Envelope::new(payload).with_meeting(meeting_id.to_string()));
-}
-
-fn platform_target_bundle_id(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Zoom => "us.zoom.xos",
-        Platform::GoogleMeet => "com.google.Chrome",
-        Platform::MicrosoftTeams => "com.microsoft.teams2",
-        Platform::Webex => "Cisco-Systems.Spark",
-    }
-}
-
-/// Default disclosure template used when the orchestrator composes
-/// the v2 stack itself. The `{user_name}` and `{meeting_title}`
-/// placeholders that `render_disclosure` understands are deliberately
-/// omitted: the bot driver currently substitutes a literal
-/// `"the user"` for `{user_name}` (see
-/// `crates/heron-bot/src/recall/mod.rs:391`), so referencing the
-/// placeholder would imply a real name will appear when it does
-/// not. A persona-authored template lands alongside the persona
-/// settings UI; for alpha this is enough to satisfy `bot_create`'s
-/// no-empty-disclosure invariant (Spec §4 Invariant 6).
-const DEFAULT_DISCLOSURE_TEMPLATE: &str = "Heron is recording and assisting in this meeting.";
-
-/// Default OpenAI Realtime voice. `alloy` is the documented sane
-/// default; the orchestrator will surface this as a settings field
-/// when persona authoring lands.
-const DEFAULT_REALTIME_VOICE: &str = "alloy";
-
-/// Default persona prompt used as the system-prompt prefix when no
-/// persona is configured. The persona authoring UI will replace
-/// this; for alpha it ensures the realtime backend has a non-empty
-/// `system_prompt` (validated by `heron_realtime::validate`).
-const DEFAULT_PERSONA_PROMPT: &str = "You are a concise meeting assistant.";
-
-/// Translate the orchestrator's per-capture inputs into the
-/// [`LiveSessionStartArgs`] the [`LiveSessionFactory`] consumes.
-///
-/// This is the consumer hand-off for the pre-meeting-context gap:
-/// when `applied_context` is `Some`, its agenda / attendees /
-/// briefing are rendered into the realtime session's system prompt
-/// AND threaded through to the bot driver so persona-aware behaviour
-/// is available from turn one.
-fn build_live_session_start_args(
-    meeting_id: MeetingId,
-    platform: Platform,
-    meeting: &Meeting,
-    applied_context: Option<&PreMeetingContext>,
-) -> LiveSessionStartArgs {
-    let bot_context = applied_context
-        .map(translate_to_bot_context)
-        .unwrap_or_default();
-
-    // Render the system prompt as `<persona>\n\n<context>` when a
-    // context is present, else fall back to the persona prompt
-    // alone. `heron_bot::render_context` enforces the 48 KiB cap
-    // from spec Invariant 10 — on overflow we drop the rendered
-    // context (the persona prompt by itself is still a valid
-    // session config) and log so an operator can correlate with the
-    // attach-context call that staged a too-large payload.
-    let rendered_context = heron_bot::render_context(&bot_context).unwrap_or_else(|err| {
-        tracing::warn!(
-            meeting_id = %meeting_id,
-            error = %err,
-            "rendered context exceeds spec budget; dropping context from system prompt",
-        );
-        String::new()
-    });
-    let system_prompt = if rendered_context.is_empty() {
-        DEFAULT_PERSONA_PROMPT.to_owned()
-    } else {
-        format!("{DEFAULT_PERSONA_PROMPT}\n\n{rendered_context}")
-    };
-
-    // The hint is the closest thing to a meeting URL the
-    // orchestrator currently has. EventKit-sourced meetings carry a
-    // real URL on `CalendarEvent::meeting_url`; until that flows
-    // through `StartCaptureArgs`, we forward the hint and let the
-    // bot driver reject malformed inputs at `bot_create` time.
-    let meeting_url = meeting.title.clone().unwrap_or_default();
-
-    LiveSessionStartArgs {
-        meeting_id,
-        bot: BotCreateArgs {
-            meeting_url,
-            // PersonaId::nil() would be rejected by RecallDriver
-            // (Spec §4 Invariant 8). Mint a fresh per-capture id
-            // until persona authoring lands; identical to how the
-            // existing `live_session::tests::start_args` builds one.
-            persona_id: PersonaId::now_v7(),
-            disclosure: DisclosureProfile {
-                text_template: DEFAULT_DISCLOSURE_TEMPLATE.to_owned(),
-                objection_patterns: Vec::new(),
-                objection_timeout_secs: 30,
-                re_announce_on_join: false,
-            },
-            context: bot_context,
-            metadata: serde_json::json!({
-                "meeting_id": meeting_id.to_string(),
-                "platform": format!("{platform:?}"),
-            }),
-            // Minted fresh per `start_capture` because the
-            // orchestrator does not retry. If retry is added later,
-            // this MUST become a stable value derived from
-            // `meeting_id` so the bot driver's vendor-side
-            // idempotency holds (Spec §11 Invariant 14).
-            idempotency_key: Uuid::now_v7(),
-        },
-        realtime: RealtimeSessionConfig {
-            system_prompt,
-            tools: Vec::new(),
-            turn_detection: TurnDetection {
-                vad_threshold: 0.5,
-                prefix_padding_ms: 300,
-                silence_duration_ms: 500,
-                interrupt_response: true,
-                // OpenAiRealtime requires this to be `false` so the
-                // controller mints response IDs explicitly. See
-                // `crates/heron-realtime/src/openai.rs:117-122`.
-                auto_create_response: false,
-            },
-            voice: DEFAULT_REALTIME_VOICE.to_owned(),
-        },
-        policy: PolicyProfile {
-            allow_topics: Vec::new(),
-            // Conservative defaults until a settings surface lands.
-            // `mute: false` keeps the agent able to speak; deny
-            // list is empty (tighter rules belong in user-facing
-            // settings, not the orchestrator default). Escalation
-            // is `None` because there's no destination configured.
-            deny_topics: Vec::new(),
-            mute: false,
-            escalation: EscalationMode::None,
-        },
-    }
-}
-
-/// The bot driver carries its own typed `PreMeetingContext` shape
-/// (subset of the orchestrator-side one — no `prior_decisions`).
-/// Translate field-by-field rather than re-using a serde round trip
-/// so a missing field is a compile error, not a silent drop.
-fn translate_to_bot_context(ctx: &PreMeetingContext) -> BotPreMeetingContext {
-    BotPreMeetingContext {
-        agenda: ctx.agenda.clone(),
-        attendees_known: ctx
-            .attendees_known
-            .iter()
-            .map(|a| BotAttendeeContext {
-                name: a.name.clone(),
-                email: a.email.clone(),
-                last_seen_in: a.last_seen_in,
-                relationship: a.relationship.clone(),
-                notes: a.notes.clone(),
-            })
-            .collect(),
-        related_notes: ctx.related_notes.clone(),
-        user_briefing: ctx.user_briefing.clone(),
-    }
-}
-
-/// Render the staged pre-meeting context into a markdown preamble for
-/// the v1 LLM summarizer prompt. Mirrors what
-/// [`build_live_session_start_args`] does for the v2 system prompt
-/// (`heron_bot::render_context` with its 48 KiB cap from spec
-/// Invariant 10) so v1 and v2 agents see the same briefing copy when
-/// both paths run.
-///
-/// Returns `None` when no context is staged, when render fails (e.g.
-/// the rendered text would exceed the cap), or when the rendered
-/// output is empty whitespace. The summarizer prompt template
-/// suppresses its `## Pre-meeting context` block on `None`, so capture
-/// continues normally either way — context is a hint, not a
-/// precondition.
-fn pre_meeting_briefing_for_v1(
-    applied_context: Option<&PreMeetingContext>,
-    meeting_id: MeetingId,
-) -> Option<String> {
-    let bot_context = translate_to_bot_context(applied_context?);
-    match heron_bot::render_context(&bot_context) {
-        Ok(rendered) if !rendered.trim().is_empty() => Some(rendered),
-        Ok(_) => None,
-        Err(err) => {
-            tracing::warn!(
-                meeting_id = %meeting_id,
-                error = %err,
-                "v1 pre-meeting briefing exceeds spec budget; v1 summary will run without preamble",
-            );
-            None
-        }
-    }
-}
-
 fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("heron")
         .join("daemon")
-}
-
-fn pipeline_to_session_error(err: CliSessionError) -> SessionError {
-    match err {
-        CliSessionError::Audio(e) => SessionError::Validation {
-            detail: format!("audio capture failed: {e}"),
-        },
-        CliSessionError::Stt(e) => SessionError::Validation {
-            detail: format!("STT failed: {e}"),
-        },
-        CliSessionError::Llm(e) => SessionError::LlmProviderFailed {
-            provider: "auto".to_owned(),
-            detail: e.to_string(),
-        },
-        CliSessionError::Vault(e) => SessionError::VaultLocked {
-            detail: e.to_string(),
-        },
-        CliSessionError::Transition(e) => transition_to_session_error(e),
-        other => SessionError::Validation {
-            detail: format!("capture pipeline failed: {other}"),
-        },
-    }
-}
-
-fn complete_pipeline_meeting(
-    bus: &SessionEventBus,
-    finalized_meetings: &Mutex<HashMap<MeetingId, FinalizedMeeting>>,
-    id: MeetingId,
-    mut fsm: RecordingFsm,
-    mut meeting: Meeting,
-    result: Result<CliSessionOutcome, SessionError>,
-) {
-    let (note_path, failure_reason) = match result {
-        Ok(outcome) => {
-            let note_path = outcome.note_path;
-            let summary = if note_path.is_some() {
-                SummaryOutcome::Done
-            } else {
-                SummaryOutcome::Failed
-            };
-            if let Err(err) = fsm
-                .on_transcribe_done()
-                .and_then(|_| fsm.on_summary(summary))
-            {
-                let reason = format!("FSM rejected pipeline completion: {err}");
-                (None, Some(reason))
-            } else {
-                (note_path, None)
-            }
-        }
-        Err(err) => {
-            let reason = err.to_string();
-            let _ = fsm.on_transcribe_done();
-            let _ = fsm.on_summary(SummaryOutcome::Failed);
-            (None, Some(reason))
-        }
-    };
-    let success = note_path.is_some();
-    meeting.status = if success {
-        MeetingStatus::Done
-    } else {
-        MeetingStatus::Failed
-    };
-    meeting.transcript_status = if success {
-        TranscriptLifecycle::Complete
-    } else {
-        TranscriptLifecycle::Failed
-    };
-    meeting.summary_status = if success {
-        SummaryLifecycle::Ready
-    } else {
-        SummaryLifecycle::Failed
-    };
-    insert_finalized_meeting(
-        finalized_meetings,
-        id,
-        FinalizedMeeting {
-            meeting: meeting.clone(),
-            note_path,
-        },
-    );
-    publish_meeting_event(
-        bus,
-        EventPayload::MeetingCompleted(MeetingCompletedData {
-            meeting,
-            outcome: if success {
-                MeetingOutcome::Success
-            } else {
-                MeetingOutcome::Failed
-            },
-            failure_reason,
-        }),
-        id,
-    );
-}
-
-/// Drop already-completed handles from the finalizers list and
-/// push `handle`. Without this prune, a long-running daemon
-/// would accumulate one `JoinHandle` per ended meeting until
-/// `shutdown()` was called. Tasks that have not yet finished are
-/// retained: `shutdown()` still needs to drain them so terminal
-/// events make it into the replay cache before the recorder
-/// stops.
-fn push_pruned_finalizer(finalizers: &Mutex<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
-    let mut guard = lock_or_recover(finalizers);
-    guard.retain(|h| !h.is_finished());
-    guard.push(handle);
-}
-
-fn insert_finalized_meeting(
-    finalized_meetings: &Mutex<HashMap<MeetingId, FinalizedMeeting>>,
-    id: MeetingId,
-    finalized: FinalizedMeeting,
-) {
-    let mut index = lock_or_recover(finalized_meetings);
-    if !index.contains_key(&id)
-        && index.len() >= FINALIZED_MEETING_INDEX_CAP
-        && let Some(oldest_id) = index
-            .iter()
-            .min_by_key(|(_, item)| item.meeting.started_at)
-            .map(|(id, _)| *id)
-    {
-        index.remove(&oldest_id);
-    }
-    index.insert(id, finalized);
 }
 
 /// Snapshot active captures matching a [`ListMeetingsQuery`]'s filters
@@ -1473,191 +976,6 @@ fn collect_active_for_query(
     // serialize them), so a strict-cmp on started_at is enough.
     items.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     items
-}
-
-/// Map a [`heron_types::TransitionError`] to the closest
-/// [`SessionError`] for the HTTP projection. A transition error from
-/// the orchestrator's own FSM walks is "shouldn't happen" — it would
-/// mean the FSM disagrees with the orchestrator's own bookkeeping —
-/// so map to `Validation` and surface the FSM's diagnostic so a real
-/// occurrence can be investigated.
-fn transition_to_session_error(err: heron_types::TransitionError) -> SessionError {
-    SessionError::Validation {
-        detail: format!("FSM rejected internal transition: {err}"),
-    }
-}
-
-/// Trim and length-validate a `calendar_event_id`. Used by both
-/// `attach_context` (where it gates persistence) and `start_capture`
-/// (where it gates correlation against the staged map and what gets
-/// stamped on `Meeting.calendar_event_id`). Centralising here keeps
-/// the trim/cap rules symmetric — without this, a caller padding
-/// either side of the id with whitespace would silently miss the
-/// context they themselves attached.
-fn normalize_calendar_event_id(raw: &str) -> Result<String, SessionError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(SessionError::Validation {
-            detail: "calendar_event_id must not be empty".to_owned(),
-        });
-    }
-    if trimmed.len() > MAX_CALENDAR_EVENT_ID_BYTES {
-        return Err(SessionError::Validation {
-            detail: format!("calendar_event_id exceeds {MAX_CALENDAR_EVENT_ID_BYTES} bytes"),
-        });
-    }
-    Ok(trimmed.to_owned())
-}
-
-/// Serialize-then-size-check the context body. Shared by
-/// `attach_context` and `prepare_context` so the on-disk size
-/// contract is enforced uniformly: a future persistence layer (or
-/// HTTP echo) observes the same byte boundary, and a non-serializable
-/// payload bails before mutating any state. Returns the serialized
-/// length so the caller can stamp it on the trace event.
-fn validate_context_size(context: &PreMeetingContext) -> Result<usize, SessionError> {
-    let serialized = serde_json::to_vec(context).map_err(|e| SessionError::Validation {
-        detail: format!("context serialization failed: {e}"),
-    })?;
-    if serialized.len() > MAX_PRE_MEETING_CONTEXT_BYTES {
-        return Err(SessionError::Validation {
-            detail: format!("context payload exceeds {MAX_PRE_MEETING_CONTEXT_BYTES} bytes"),
-        });
-    }
-    Ok(serialized.len())
-}
-
-fn health_component(state: ComponentState, message: impl Into<String>) -> HealthComponent {
-    HealthComponent {
-        state,
-        message: Some(message.into()),
-        last_check: Some(Utc::now()),
-    }
-}
-
-fn aggregate_health_status(components: &HealthComponents) -> HealthStatus {
-    // Destructure so the compiler errors on a new `HealthComponents`
-    // field that this aggregator forgets — otherwise a broken new
-    // component could silently never flip `/health` to `Down`
-    // (`aggregate_health_status_truth_table` only pins the components
-    // currently listed).
-    let HealthComponents {
-        capture,
-        whisperkit,
-        vault,
-        eventkit,
-        llm,
-    } = components;
-    let mut degraded = false;
-    for component in [capture, whisperkit, vault, eventkit, llm] {
-        match component.state {
-            ComponentState::Down | ComponentState::PermissionMissing => return HealthStatus::Down,
-            ComponentState::Degraded => degraded = true,
-            ComponentState::Ok => {}
-        }
-    }
-    if degraded {
-        HealthStatus::Degraded
-    } else {
-        HealthStatus::Ok
-    }
-}
-
-fn stt_health_component(backend_name: &str) -> HealthComponent {
-    match heron_speech::build_backend(backend_name, &[]) {
-        Ok(backend) if backend.is_available() => health_component(
-            ComponentState::Ok,
-            format!("STT backend configured: {}", backend.name()),
-        ),
-        Ok(backend) => health_component(
-            ComponentState::Down,
-            format!("STT backend configured but unavailable: {}", backend.name()),
-        ),
-        Err(err) => health_component(
-            ComponentState::Down,
-            format!("STT backend configuration failed for {backend_name}: {err}"),
-        ),
-    }
-}
-
-fn llm_health_component(preference: heron_llm::Preference) -> HealthComponent {
-    let availability = heron_llm::Availability::detect();
-    match heron_llm::select_backend(preference, &availability) {
-        Ok((backend, reason)) => {
-            let reason_msg = match &reason {
-                heron_llm::SelectionReason::PreferredBackendAvailable(_) => "preferred".to_owned(),
-                heron_llm::SelectionReason::FellBackTo { because, .. } => {
-                    format!("fell back: {because}")
-                }
-            };
-            health_component(
-                ComponentState::Ok,
-                format!("LLM backend selected: {backend:?} ({reason_msg})"),
-            )
-        }
-        Err(err) => health_component(
-            ComponentState::Down,
-            format!("no LLM backend available for {preference:?}: {err}"),
-        ),
-    }
-}
-
-fn eventkit_health_component() -> HealthComponent {
-    // Avoid calling EventKit from /health: on a fresh macOS install
-    // the permission prompt blocks the caller. The read endpoint
-    // reports PermissionMissing/Timeout with the real TCC result.
-    health_component(
-        ComponentState::Ok,
-        "calendar reader configured; EventKit permission is checked on read",
-    )
-}
-
-fn capture_health_component(vault_root: Option<&Path>) -> HealthComponent {
-    match vault_root {
-        Some(root) if root.exists() => health_component(
-            ComponentState::Ok,
-            format!(
-                "capture pipeline configured with vault root: {}",
-                root.display()
-            ),
-        ),
-        Some(root) => health_component(
-            ComponentState::Degraded,
-            format!(
-                "capture pipeline configured, but vault root does not exist yet: {}",
-                root.display(),
-            ),
-        ),
-        None => health_component(
-            ComponentState::Degraded,
-            "synthetic capture available; configure a vault for persisted audio/transcript/summary",
-        ),
-    }
-}
-
-fn vault_health_component(vault_root: Option<&Path>) -> HealthComponent {
-    match vault_root {
-        Some(root) if root.exists() => health_component(
-            ComponentState::Ok,
-            format!("vault root: {}", root.display()),
-        ),
-        Some(root) => health_component(
-            ComponentState::Down,
-            format!(
-                "configured vault root does not exist on disk: {}",
-                root.display(),
-            ),
-        ),
-        // Unconfigured vault keeps the daemon usable via synthetic
-        // capture (see `capture_health_component`); reporting `Down`
-        // here would flip `/health` to `Down` for what is really a
-        // soft, recoverable misconfig — operators expect `Down` to
-        // mean "broken", not "not yet pointed at a directory".
-        None => health_component(
-            ComponentState::Degraded,
-            "vault root is not configured; persistence is disabled until one is set",
-        ),
-    }
 }
 
 #[async_trait]
@@ -2505,465 +1823,6 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     }
 }
 
-// ── vault read helpers ────────────────────────────────────────────────
-
-fn list_meetings_impl(
-    vault_root: &Path,
-    q: ListMeetingsQuery,
-) -> Result<ListMeetingsPage, SessionError> {
-    let paths = note_paths_newest_first(vault_root)?;
-    let limit = q.limit.unwrap_or(50).min(200) as usize;
-    let after = q.cursor.as_deref();
-    let mut started_after = after.is_none();
-    let mut items = Vec::with_capacity(limit);
-    let mut next_cursor: Option<String> = None;
-    let mut last_kept_cursor: Option<String> = None;
-    let mut listed = Vec::new();
-    for path in paths {
-        let rel = path
-            .strip_prefix(vault_root)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| path.clone());
-        let rel_str = rel.to_string_lossy().to_string();
-        let meeting = match meeting_from_note(vault_root, &path) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "skipping malformed note in list_meetings",
-                );
-                continue;
-            }
-        };
-        if let Some(since) = q.since
-            && meeting.started_at < since
-        {
-            continue;
-        }
-        if let Some(status) = q.status
-            && meeting.status != status
-        {
-            continue;
-        }
-        if let Some(platform) = q.platform
-            && meeting.platform != platform
-        {
-            continue;
-        }
-        listed.push((rel_str, meeting));
-    }
-    // Pattern-based filenames (`slug.md`, `YYYY-MM-DD-slug.md`, or
-    // `<uuid>.md`) are not a reliable chronology. Sort by parsed
-    // frontmatter time first, then by relative path for deterministic
-    // pagination when two notes share the same minute.
-    listed.sort_by(|(a_rel, a), (b_rel, b)| {
-        b.started_at
-            .cmp(&a.started_at)
-            .then_with(|| b_rel.cmp(a_rel))
-    });
-    for (rel_str, meeting) in listed {
-        let cursor = meeting_list_cursor(&rel_str, &meeting);
-        if !started_after {
-            if Some(cursor.as_str()) == after || Some(rel_str.as_str()) == after {
-                started_after = true;
-            }
-            continue;
-        }
-        if items.len() == limit {
-            next_cursor = last_kept_cursor.clone();
-            break;
-        }
-        items.push(meeting);
-        last_kept_cursor = Some(cursor);
-    }
-    Ok(ListMeetingsPage { items, next_cursor })
-}
-
-fn meeting_list_cursor(rel_path: &str, meeting: &Meeting) -> String {
-    format!("{}|{rel_path}", meeting.started_at.timestamp_millis())
-}
-
-fn note_paths_newest_first(vault_root: &Path) -> Result<Vec<PathBuf>, SessionError> {
-    let dir = vault_root.join("meetings");
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| SessionError::VaultLocked {
-            detail: format!("read_dir({}): {e}", dir.display()),
-        })?
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                && e.path().extension().and_then(|s| s.to_str()) == Some("md")
-        })
-        .map(|e| e.path())
-        .collect();
-    // Deterministic input order only. `list_meetings_impl` sorts by
-    // parsed frontmatter time after reading each note.
-    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    Ok(entries)
-}
-
-/// Linear scan for the note whose derived `MeetingId` matches `id`.
-/// Used by every per-meeting read endpoint. Replaceable with an
-/// in-memory index when capture lifecycle ships and the bus starts
-/// publishing events (the index is the natural piggyback on the
-/// recorder).
-fn find_note_path_by_id(vault_root: &Path, id: &MeetingId) -> Result<PathBuf, SessionError> {
-    note_paths_newest_first(vault_root)?
-        .into_iter()
-        .find(|p| derive_meeting_id(vault_root, p) == *id)
-        .ok_or_else(|| SessionError::NotFound {
-            what: format!("meeting {id}"),
-        })
-}
-
-/// Resolve a frontmatter path field against the vault root,
-/// rejecting absolute paths and `..` traversal. Without this
-/// `read_transcript` and `audio_path` are file-read primitives over
-/// loopback-auth.
-fn resolve_vault_path(
-    vault_root: &Path,
-    candidate: &Path,
-    field: &'static str,
-) -> Result<PathBuf, SessionError> {
-    if candidate.is_absolute() {
-        return Err(SessionError::Validation {
-            detail: format!("{field} path must be vault-relative"),
-        });
-    }
-    // Canonicalize the vault root FIRST so the prefix check below
-    // compares apples to apples — on macOS, `/var/...` canonicalizes
-    // to `/private/var/...` (system symlink). Without this, a non-
-    // canonical vault_root + non-canonical candidate would fail the
-    // canonical prefix check, mistakenly rejecting a perfectly-
-    // relative path.
-    let root_canonical = vault_root
-        .canonicalize()
-        .unwrap_or_else(|_| vault_root.to_path_buf());
-    let safe_relative = normalize_no_traverse(candidate)?;
-    let joined = root_canonical.join(&safe_relative);
-    let resolved = if joined.exists() {
-        joined
-            .canonicalize()
-            .map_err(|e| SessionError::VaultLocked {
-                detail: format!("canonicalize {field}: {e}"),
-            })?
-    } else {
-        joined
-    };
-    if !resolved.starts_with(&root_canonical) {
-        return Err(SessionError::Validation {
-            detail: format!("{field} path escapes vault"),
-        });
-    }
-    Ok(resolved)
-}
-
-fn normalize_no_traverse(path: &Path) -> Result<PathBuf, SessionError> {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::ParentDir => {
-                return Err(SessionError::Validation {
-                    detail: "path contains '..' which is forbidden".to_owned(),
-                });
-            }
-            Component::Normal(_)
-            | Component::RootDir
-            | Component::Prefix(_)
-            | Component::CurDir => {
-                out.push(c.as_os_str());
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn derive_meeting_id(vault_root: &Path, note_path: &Path) -> MeetingId {
-    let rel = note_path.strip_prefix(vault_root).unwrap_or(note_path);
-    let bytes = rel.as_os_str().as_encoded_bytes();
-    MeetingId(Uuid::new_v5(&MEETING_ID_NAMESPACE, bytes))
-}
-
-fn meeting_from_note(vault_root: &Path, path: &Path) -> Result<Meeting, SessionError> {
-    let (fm, body) = read_note(path).map_err(vault_to_session_err)?;
-    let id = derive_meeting_id(vault_root, path);
-    let started_at = started_at_from_frontmatter(&fm);
-    let ended_at = Some(started_at + chrono::Duration::minutes(fm.duration_min as i64));
-    let participants = fm
-        .attendees
-        .iter()
-        .map(|a| Participant {
-            display_name: a.name.clone(),
-            identifier_kind: IdentifierKind::Fallback,
-            is_user: false,
-        })
-        .collect();
-    let transcript_resolved = resolve_vault_path(vault_root, &fm.transcript, "transcript").ok();
-    let transcript_status = match transcript_resolved {
-        Some(p) if p.exists() => TranscriptLifecycle::Complete,
-        _ => TranscriptLifecycle::Failed,
-    };
-    let summary_status = if body.trim().is_empty() {
-        SummaryLifecycle::Pending
-    } else {
-        SummaryLifecycle::Ready
-    };
-    let processing = meeting_processing_from_cost(&fm.cost);
-    let action_items = action_items_from_frontmatter(&fm.action_items);
-    Ok(Meeting {
-        id,
-        // Notes are only finalized for completed meetings, so the
-        // status is always `Done`. A meeting still in `Recording`
-        // doesn't have a finalized note on disk for us to surface.
-        status: MeetingStatus::Done,
-        platform: platform_from_source_app(&fm.source_app),
-        title: fm.company.clone(),
-        calendar_event_id: None,
-        started_at,
-        ended_at,
-        duration_secs: Some((fm.duration_min as u64) * 60),
-        participants,
-        transcript_status,
-        summary_status,
-        // Surface LLM-inferred tags so the frontend can render chips
-        // without a second read into the note's frontmatter.
-        tags: fm.tags.clone(),
-        processing,
-        action_items,
-    })
-}
-
-/// Project `Frontmatter.cost` into the wire `MeetingProcessing`.
-///
-/// Returns `None` when the cost looks unpopulated — the integration
-/// test fixtures and pre-Tier-0-#2 vault notes wrote zero tokens and
-/// an empty model string, which the desktop "Processing" panel can't
-/// render usefully ("Summarized by ", "Tokens in: 0"). Treating that
-/// shape as `None` keeps the panel hidden until a real summarize has
-/// run, rather than rendering a misleading "$0.00 by `<empty>`" row.
-///
-/// All-zero-but-real-model and all-real-but-zero-tokens are
-/// vanishingly unlikely (the summarizer always pays for at least the
-/// system prompt), but we still surface them as `Some` — the
-/// emptiness gate is the conjunction, so a real-but-cheap call is
-/// honestly reported.
-fn meeting_processing_from_cost(
-    cost: &heron_types::Cost,
-) -> Option<heron_session::MeetingProcessing> {
-    if cost.model.is_empty()
-        && cost.tokens_in == 0
-        && cost.tokens_out == 0
-        && cost.summary_usd == 0.0
-    {
-        None
-    } else {
-        Some(heron_session::MeetingProcessing {
-            summary_usd: cost.summary_usd,
-            tokens_in: cost.tokens_in,
-            tokens_out: cost.tokens_out,
-            model: cost.model.clone(),
-        })
-    }
-}
-
-/// Project `Frontmatter.action_items` (typed rows with stable
-/// [`heron_types::ItemId`]) into the wire `heron_session::ActionItem`.
-///
-/// Tier 0 #3 of the UX redesign: surface structured rows on the
-/// `Meeting` and `Summary` IPC types so the desktop's Review tab can
-/// render assignees + due dates without re-parsing the markdown body
-/// with a bullet-extracting regex. Read path only — write-back stays
-/// markdown-flavoured for now (`docs/ux-redesign-backend-prerequisites.md`).
-///
-/// Empty `owner` strings on disk become `None` on the wire — the
-/// vault writer materializes an empty string when the LLM emitted no
-/// owner, but the wire type is "owner is optional," so `""` is the
-/// honest projection of "no owner."
-fn action_items_from_frontmatter(
-    items: &[heron_types::ActionItem],
-) -> Vec<heron_session::ActionItem> {
-    items
-        .iter()
-        .map(|a| heron_session::ActionItem {
-            id: a.id,
-            text: a.text.clone(),
-            owner: (!a.owner.is_empty()).then(|| a.owner.clone()),
-            due: a.due.as_deref().and_then(parse_iso_date),
-        })
-        .collect()
-}
-
-fn platform_from_source_app(source_app: &str) -> Platform {
-    let s = source_app.to_ascii_lowercase();
-    if s.contains("zoom") {
-        Platform::Zoom
-    } else if s.contains("meet.google") || s.contains("googlemeet") || s.contains("google_meet") {
-        Platform::GoogleMeet
-    } else if s.contains("teams") || s.contains("microsoft") {
-        Platform::MicrosoftTeams
-    } else if s.contains("webex") {
-        Platform::Webex
-    } else {
-        if !source_app.is_empty() {
-            tracing::warn!(
-                source_app,
-                "unrecognized source_app; defaulting to Platform::Zoom"
-            );
-        }
-        Platform::Zoom
-    }
-}
-
-fn platform_from_meeting_url(meeting_url: Option<&str>) -> Option<Platform> {
-    let url = meeting_url?.to_ascii_lowercase();
-    if url.contains("zoom.us") || url.contains("zoomgov.com") {
-        Some(Platform::Zoom)
-    } else if url.contains("meet.google.com") {
-        Some(Platform::GoogleMeet)
-    } else if url.contains("teams.microsoft.com") || url.contains("teams.live.com") {
-        Some(Platform::MicrosoftTeams)
-    } else if url.contains("webex.com") {
-        Some(Platform::Webex)
-    } else {
-        None
-    }
-}
-
-fn started_at_from_frontmatter(fm: &heron_types::Frontmatter) -> DateTime<Utc> {
-    let date: NaiveDate = fm.date;
-    let time = NaiveTime::parse_from_str(&fm.start, "%H:%M")
-        .or_else(|_| NaiveTime::parse_from_str(&fm.start, "%H:%M:%S"))
-        .unwrap_or_else(|_| NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default());
-    let naive = date.and_time(time);
-    // Frontmatter has no explicit timezone field. The vault writer
-    // records meetings in the user's local clock (the
-    // `YYYY-MM-DD-HHMM` filename matches the user's wall clock at
-    // capture time), so the API contract is "local time projected
-    // to UTC." Earliest mapping wins on the autumn DST overlap;
-    // the gap (spring) falls back to naive-as-UTC with a warn so a
-    // single missing-hour frontmatter doesn't fail the whole list.
-    use chrono::Local;
-    use chrono::offset::LocalResult;
-    match Local.from_local_datetime(&naive) {
-        LocalResult::Single(local) => local.with_timezone(&Utc),
-        LocalResult::Ambiguous(earliest, _latest) => earliest.with_timezone(&Utc),
-        LocalResult::None => {
-            tracing::warn!(
-                date = %fm.date,
-                start = %fm.start,
-                "frontmatter datetime in DST gap; treating naive value as UTC",
-            );
-            Utc.from_utc_datetime(&naive)
-        }
-    }
-}
-
-fn read_transcript_segments(path: &Path) -> Result<Vec<TranscriptSegment>, SessionError> {
-    use std::io::{BufRead, Read};
-    if !path.exists() {
-        return Err(SessionError::NotFound {
-            what: format!("transcript file: {}", path.display()),
-        });
-    }
-    let file = std::fs::File::open(path).map_err(|e| SessionError::VaultLocked {
-        detail: format!("open transcript {}: {e}", path.display()),
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut segments = Vec::new();
-    let mut lineno = 0usize;
-    loop {
-        let mut buf = Vec::with_capacity(256);
-        // Cap each read at MAX_TRANSCRIPT_LINE_BYTES so a malformed
-        // transcript without newlines can't pull the whole file
-        // into one allocation. Lines longer than the cap are
-        // warn-skipped — corrupt entries don't stall the rest.
-        let n = (&mut reader)
-            .take(MAX_TRANSCRIPT_LINE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| SessionError::VaultLocked {
-                detail: format!("read transcript line {lineno}: {e}"),
-            })?;
-        if n == 0 {
-            break;
-        }
-        if n > MAX_TRANSCRIPT_LINE_BYTES {
-            tracing::warn!(
-                line = lineno,
-                bytes = n,
-                "transcript line exceeds MAX_TRANSCRIPT_LINE_BYTES; skipping",
-            );
-            buf.clear();
-            let _ = reader.read_until(b'\n', &mut buf);
-            lineno += 1;
-            continue;
-        }
-        let line = match std::str::from_utf8(&buf) {
-            Ok(s) => s.trim_end_matches('\n').trim_end_matches('\r').to_owned(),
-            Err(_) => {
-                tracing::warn!(line = lineno, "non-utf8 transcript line; skipping");
-                lineno += 1;
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            lineno += 1;
-            continue;
-        }
-        match serde_json::from_str::<heron_types::Turn>(&line) {
-            Ok(turn) => {
-                let is_user = matches!(turn.speaker_source, heron_types::SpeakerSource::Self_);
-                let identifier_kind = match turn.speaker_source {
-                    heron_types::SpeakerSource::Self_ => IdentifierKind::Mic,
-                    heron_types::SpeakerSource::Ax => IdentifierKind::AxTree,
-                    heron_types::SpeakerSource::Channel => IdentifierKind::Fallback,
-                    heron_types::SpeakerSource::Cluster => IdentifierKind::Fallback,
-                };
-                let confidence = match turn.confidence {
-                    Some(c) if c >= 0.7 => heron_session::Confidence::High,
-                    _ => heron_session::Confidence::Low,
-                };
-                segments.push(TranscriptSegment {
-                    speaker: Participant {
-                        display_name: turn.speaker,
-                        identifier_kind,
-                        is_user,
-                    },
-                    text: turn.text,
-                    start_secs: turn.t0,
-                    end_secs: turn.t1,
-                    confidence,
-                    is_final: true,
-                });
-            }
-            Err(e) => {
-                tracing::warn!(line = lineno, error = %e, "skipping malformed turn");
-            }
-        }
-        lineno += 1;
-    }
-    Ok(segments)
-}
-
-fn vault_to_session_err(err: VaultError) -> SessionError {
-    match err {
-        VaultError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => SessionError::NotFound {
-            what: format!("vault file io: {e}"),
-        },
-        other => SessionError::VaultLocked {
-            detail: other.to_string(),
-        },
-    }
-}
-
-fn parse_iso_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2979,8 +1838,13 @@ mod tests {
     //! shape herond and the SSE projection see end-to-end.
 
     use super::*;
+    use crate::live_session::LiveSessionStartArgs;
+    use crate::state::MAX_PENDING_CONTEXTS;
+    use crate::validation::{MAX_CALENDAR_EVENT_ID_BYTES, MAX_PRE_MEETING_CONTEXT_BYTES};
     use heron_event::Envelope;
-    use heron_session::{Meeting, MeetingStatus, Platform, SummaryLifecycle, TranscriptLifecycle};
+    use heron_session::{
+        HealthComponent, Meeting, MeetingStatus, Platform, SummaryLifecycle, TranscriptLifecycle,
+    };
     use std::time::{Duration, Instant};
 
     fn sample_envelope() -> Envelope<EventPayload> {
