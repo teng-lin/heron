@@ -28,6 +28,12 @@ heron-vault = { workspace = true }
 # structs that would drift on every OpenAPI change.
 heron-session = { workspace = true }
 heron-event = { workspace = true }
+# Per issue #190: the v1 capture pipeline now lives in `heron-pipeline`
+# so `heron-orchestrator` can depend on it without pulling the CLI's
+# clap/reqwest/daemon-client surface into the daemon runtime graph.
+# `heron-cli::session` and `heron-cli::pipeline` re-export
+# `heron-pipeline::session` and `heron-pipeline::pipeline` verbatim.
+heron-pipeline = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

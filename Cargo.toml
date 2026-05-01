@@ -105,6 +105,12 @@ heron-zoom = { path = "crates/heron-zoom" }
 heron-llm = { path = "crates/heron-llm" }
 heron-vault = { path = "crates/heron-vault" }
 heron-cli = { path = "crates/heron-cli" }
+# Per issue #190: v1 capture pipeline (FSM + audio→STT→LLM→vault data
+# flow) lives here so `heron-orchestrator` can depend on it without
+# pulling the CLI binary's clap/reqwest/daemon-client surface into the
+# daemon runtime graph. `heron-cli::session` and `heron-cli::pipeline`
+# re-export from this crate verbatim.
+heron-pipeline = { path = "crates/heron-pipeline" }
 heron-doctor = { path = "crates/heron-doctor" }
 # v2 trait sketches per docs/archives/api-design-spec.md §13. Not yet wired
 # into heron-cli; they ship trait surfaces only until the spike.
