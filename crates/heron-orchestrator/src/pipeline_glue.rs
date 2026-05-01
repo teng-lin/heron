@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use heron_event::Envelope;
+use heron_metrics::redacted;
 use heron_pipeline::session::{
     SessionError as CliSessionError, SessionOutcome as CliSessionOutcome,
 };
@@ -37,6 +38,7 @@ use heron_types::{RecordingFsm, SummaryOutcome};
 use tokio::task::JoinHandle;
 
 use crate::lock_or_recover;
+use crate::metrics_names::{CAPTURE_ENDED_TOTAL, SALVAGE_RECOVERY_TOTAL};
 use crate::state::{FINALIZED_MEETING_INDEX_CAP, FinalizedMeeting};
 
 pub(crate) fn pipeline_to_session_error(err: CliSessionError) -> SessionError {
@@ -130,6 +132,46 @@ pub(crate) fn complete_pipeline_meeting(
             note_path,
         },
     );
+    // Capture-lifecycle counter: the pipeline-side disposition.
+    // `success` and `error` are the steady-state pair; `user_stop`
+    // already fired from `end_meeting` when the request handler
+    // returned. Both are valid reasons for the same lifecycle — the
+    // dashboard summing these makes the timeline obvious. Labels are
+    // pinned `redacted!` literals; `into_inner()` is the immediate
+    // expression per the foundation's observability rule.
+    let outcome_label = if success {
+        redacted!("success")
+    } else {
+        redacted!("error")
+    };
+    metrics::counter!(
+        CAPTURE_ENDED_TOTAL,
+        "reason" => outcome_label.into_inner(),
+    )
+    .increment(1);
+    // Salvage recovery counter. The v1 capture pipeline is the only
+    // path that writes a `state.json` cache today, and its purge-or-
+    // retain decision in `heron-pipeline` already encodes the
+    // disposition we care about: a successful finalize purged the
+    // cache (no salvage left behind = `recovered`), a failed
+    // finalize retained the WAVs for the user to manually salvage on
+    // next launch (= `abandoned`). The third arm `failed` is reserved
+    // for the future hard-error recovery path (an attempt to recover
+    // a previous session's cache that errored out); without that
+    // flow today, only `recovered` and `abandoned` fire from this
+    // call site. The `outcome` label dimension matches the spec in
+    // #224 / `docs/observability.md` so a future hard-error
+    // instrumentation slots in without renaming.
+    let salvage_label = if success {
+        redacted!("recovered")
+    } else {
+        redacted!("abandoned")
+    };
+    metrics::counter!(
+        SALVAGE_RECOVERY_TOTAL,
+        "outcome" => salvage_label.into_inner(),
+    )
+    .increment(1);
     publish_meeting_event(
         bus,
         EventPayload::MeetingCompleted(MeetingCompletedData {

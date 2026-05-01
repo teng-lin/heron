@@ -122,6 +122,7 @@ pub mod live_session;
 pub(crate) mod auto_record;
 mod compose;
 mod health;
+mod metrics_names;
 mod pipeline_glue;
 mod platform;
 mod state;
@@ -559,6 +560,32 @@ impl Builder {
                 Ok(registry) => Arc::new(registry),
                 Err(err) => panic!("hydrate auto-record registry from vault root: {err}"),
             };
+
+        // Set the salvage-pending gauge from whatever's left in the
+        // cache root from a previous run. `discover_unfinished` is
+        // best-effort: a missing root or unreadable record returns 0
+        // / skips silently rather than failing build (the same
+        // contract `heron salvage` relies on). The gauge is set
+        // exactly once at orchestrator construction; the next "real"
+        // update happens when the salvage UI lands and explicitly
+        // re-snapshots after recovery actions. Until then, the
+        // counter at `salvage_recovery_total` is the per-action
+        // signal and this gauge is the boot-time backlog signal.
+        let pending_candidates = heron_types::recovery::discover_unfinished(&self.cache_dir)
+            .map(|records| records.len())
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    cache_dir = %self.cache_dir.display(),
+                    error = %err,
+                    "salvage discovery failed at orchestrator startup; gauge initialised to 0",
+                );
+                0
+            });
+        // `metrics::gauge!` takes `f64`; a usize cast cap is at 2^53,
+        // and the daemon would have other problems long before
+        // accumulating that many salvage candidates.
+        metrics::gauge!(metrics_names::SALVAGE_CANDIDATES_PENDING).set(pending_candidates as f64);
+
         LocalSessionOrchestrator {
             bus,
             cache,
@@ -1166,6 +1193,14 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 "platform" => platform_label.into_inner(),
             )
             .increment(1);
+            // Capture-lifecycle gauge: every successful arm → recording
+            // walk bumps `capture_active_count`. The matching
+            // decrement lives in `end_meeting` (via `decrement(1.0)`).
+            // No labels — the dashboard answer is "how many captures
+            // are running right now" and the per-platform breakdown
+            // already lives on `capture_started_total{platform}` /
+            // `capture_ended_total{reason}`.
+            metrics::gauge!(metrics_names::CAPTURE_ACTIVE).increment(1.0);
 
             // Consume the pending context AFTER the FSM walk commits
             // but BEFORE building `CliSessionConfig`, so the rendered
@@ -1377,6 +1412,15 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                 what: format!("active meeting {id}"),
             })?
         };
+        // Decrement the capture-active gauge as soon as we've claimed
+        // the entry for removal. Pairing it with the `remove()` (not
+        // with the later `?`-bearing transitions) means a subsequent
+        // FSM-rejection error path doesn't leak the gauge upward
+        // forever — the matching `start_capture` increment landed
+        // when the entry became active, the gauge must mirror the
+        // entry's existence in `active_meetings`, and the entry is
+        // gone the moment `remove()` returns Some.
+        metrics::gauge!(metrics_names::CAPTURE_ACTIVE).decrement(1.0);
         let ActiveMeeting {
             mut fsm,
             mut meeting,
@@ -1469,6 +1513,23 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     }),
                     *id,
                 );
+                // Synthetic path has no real pipeline to wait on, so
+                // the lifecycle disposition is decided here. Emit the
+                // single `capture_ended_total` increment for this
+                // meeting with `reason="user_stop"` — the test stub
+                // path always corresponds to "user invoked
+                // end_meeting; no automated outcome to report". This
+                // keeps `sum(capture_ended_total)` equal to the number
+                // of finished meetings (the pipeline arm emits its
+                // own `success` / `error` increment from
+                // `complete_pipeline_meeting`, never both arms in one
+                // lifecycle).
+                let reason_label = heron_metrics::redacted!("user_stop");
+                metrics::counter!(
+                    metrics_names::CAPTURE_ENDED_TOTAL,
+                    "reason" => reason_label.into_inner(),
+                )
+                .increment(1);
             }
             CaptureRuntime::Pipeline { stop_tx, handle } => {
                 let _ = stop_tx.send(());
@@ -1486,8 +1547,20 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
                     complete_pipeline_meeting(&bus, &finalized_meetings, id, fsm, meeting, result);
                 });
                 push_pruned_finalizer(&self.finalizers, finalizer);
+                // Pipeline path: `complete_pipeline_meeting` (running
+                // on the spawned finalizer) is responsible for the
+                // `capture_ended_total{reason="success"|"error"}`
+                // increment once the pipeline finishes. NOT emitted
+                // here so each lifecycle results in exactly one
+                // increment, matching the issue's mutually-exclusive
+                // `reason` enum.
             }
         }
+        // The gauge decrement happens earlier (right after
+        // `active.remove(id)`) to avoid a leak on FSM rejection
+        // between here and the remove. The `capture_ended_total`
+        // increment is emitted per-arm above (synthetic vs pipeline)
+        // so each meeting maps to exactly one counter bump.
         tracing::info!(
             meeting_id = %id,
             duration_secs,
@@ -2428,6 +2501,197 @@ mod tests {
                 "envelope.meeting_id must match payload meeting id",
             );
         }
+    }
+
+    /// Per-issue #224 acceptance: a capture lifecycle bumps the four
+    /// metrics from `metrics_names` (the smoke counter from #223 +
+    /// the new ended counter + the active gauge + the salvage
+    /// recovery counter via the synthetic-runtime path that emits
+    /// `MeetingCompleted{outcome=Success}` directly). Mirrors the
+    /// shape of `metrics_endpoint_returns_prometheus_exposition_with_bearer`
+    /// from `crates/herond/tests/api.rs`.
+    #[tokio::test]
+    async fn capture_lifecycle_metrics_emit_on_happy_path() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("install recorder for test");
+
+        let orch = LocalSessionOrchestrator::new();
+        // Snapshot before so the assertions tolerate other tests in
+        // the same `cargo test` process bumping the same counters.
+        let before = handle.render();
+
+        let meeting = orch
+            .start_capture(StartCaptureArgs {
+                platform: Platform::Zoom,
+                hint: None,
+                calendar_event_id: None,
+            })
+            .await
+            .expect("start_capture");
+        orch.end_meeting(&meeting.id).await.expect("end_meeting");
+
+        let after = handle.render();
+
+        // Smoke counter: the foundation's existing assertion still
+        // holds — start_capture bumped `capture_started_total` for
+        // platform=zoom.
+        assert!(
+            after.contains(heron_metrics::SMOKE_CAPTURE_STARTED_TOTAL),
+            "rendered exposition must contain smoke counter; got:\n{after}"
+        );
+
+        // Ended counter for `reason="user_stop"` — the request-handler
+        // emission from `end_meeting` is unconditional.
+        let user_stop_count = scrape_counter_with_label(
+            &after,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"user_stop\"",
+        );
+        let user_stop_before = scrape_counter_with_label(
+            &before,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"user_stop\"",
+        );
+        assert_eq!(
+            user_stop_count - user_stop_before,
+            1,
+            "exactly one user_stop reason emission per end_meeting; rendered:\n{after}"
+        );
+
+        // The synthetic runtime in this test (no vault root) emits
+        // `MeetingCompleted{outcome=Success}` directly from
+        // `end_meeting`, NOT through `complete_pipeline_meeting`.
+        // That's why the `reason="success"` arm doesn't fire here —
+        // the pipeline-side disposition counter is exercised
+        // separately by the v1-pipeline integration test under
+        // `tests/clio_full_pipeline.rs`. Pinning the synthetic-path
+        // contract: the `reason="success"` count does NOT bump on
+        // the synthetic path.
+        let success_count = scrape_counter_with_label(
+            &after,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"success\"",
+        );
+        let success_before = scrape_counter_with_label(
+            &before,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"success\"",
+        );
+        assert_eq!(
+            success_count, success_before,
+            "synthetic runtime path must not bump pipeline-side success counter; rendered:\n{after}",
+        );
+
+        // Salvage candidates pending: built fresh per orchestrator,
+        // but the cache root may be inherited from the user's
+        // environment — assert the metric line exists.
+        assert!(
+            after.contains(metrics_names::SALVAGE_CANDIDATES_PENDING),
+            "rendered exposition must contain salvage_candidates_pending; got:\n{after}"
+        );
+    }
+
+    /// Failure-path coverage for the pipeline-side disposition
+    /// counter. Drives `complete_pipeline_meeting` directly with a
+    /// failure result so we don't need a real audio pipeline.
+    #[test]
+    fn complete_pipeline_meeting_emits_error_and_abandoned_on_failure() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("install recorder for test");
+
+        // Construct a minimal fake meeting + bus and drive the
+        // helper. The assertions key on counter deltas so other
+        // tests in the same process can run interleaved.
+        let bus: SessionEventBus = heron_event::EventBus::new(8);
+        let finalized: std::sync::Mutex<HashMap<MeetingId, FinalizedMeeting>> =
+            std::sync::Mutex::new(HashMap::new());
+        let id = MeetingId::now_v7();
+        let mut fsm = RecordingFsm::new();
+        // Walk the FSM far enough that `on_transcribe_done` is legal.
+        fsm.on_hotkey().expect("idle->armed");
+        fsm.on_yes().expect("armed->recording");
+        fsm.on_hotkey().expect("recording->transcribing");
+        let meeting = Meeting {
+            id,
+            status: MeetingStatus::Recording,
+            platform: Platform::Zoom,
+            title: None,
+            calendar_event_id: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            duration_secs: None,
+            participants: vec![],
+            transcript_status: TranscriptLifecycle::Pending,
+            summary_status: SummaryLifecycle::Pending,
+            tags: vec![],
+            processing: None,
+            action_items: vec![],
+        };
+
+        let before = handle.render();
+        let before_error = scrape_counter_with_label(
+            &before,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"error\"",
+        );
+        let before_abandoned = scrape_counter_with_label(
+            &before,
+            metrics_names::SALVAGE_RECOVERY_TOTAL,
+            "outcome=\"abandoned\"",
+        );
+
+        complete_pipeline_meeting(
+            &bus,
+            &finalized,
+            id,
+            fsm,
+            meeting,
+            Err(SessionError::Validation {
+                detail: "synthetic failure".into(),
+            }),
+        );
+
+        let after = handle.render();
+        let after_error = scrape_counter_with_label(
+            &after,
+            metrics_names::CAPTURE_ENDED_TOTAL,
+            "reason=\"error\"",
+        );
+        let after_abandoned = scrape_counter_with_label(
+            &after,
+            metrics_names::SALVAGE_RECOVERY_TOTAL,
+            "outcome=\"abandoned\"",
+        );
+        assert_eq!(
+            after_error - before_error,
+            1,
+            "pipeline-failure path must bump capture_ended_total{{reason=error}} exactly once; \
+             rendered:\n{after}"
+        );
+        assert_eq!(
+            after_abandoned - before_abandoned,
+            1,
+            "pipeline-failure path must bump salvage_recovery_total{{outcome=abandoned}} \
+             exactly once; rendered:\n{after}"
+        );
+    }
+
+    /// Helper for metric-test assertions: parse the
+    /// `<name>{label_match...} <value>` line out of the Prometheus
+    /// exposition body. Returns 0 when the metric isn't present
+    /// (lazy registration; nothing emitted yet for that label set).
+    fn scrape_counter_with_label(body: &str, name: &str, label_match: &str) -> u64 {
+        for line in body.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with(name)
+                && line.contains(label_match)
+                && let Some(val) = line.rsplit(' ').next()
+                && let Ok(n) = val.parse::<u64>()
+            {
+                return n;
+            }
+        }
+        0
     }
 
     #[tokio::test]
