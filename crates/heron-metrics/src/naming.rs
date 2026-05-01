@@ -79,9 +79,6 @@ impl std::error::Error for InvalidMetricName {}
 /// [`metric_name!`] macro (compile-foldable in `const fn` callers) and
 /// by [`crate::recorder::register`] at runtime.
 pub fn validate_metric_name(name: &str) -> Result<(), InvalidMetricName> {
-    if name.is_empty() {
-        return Err(InvalidMetricName::Empty);
-    }
     if name.len() > MAX_METRIC_NAME_LEN {
         return Err(InvalidMetricName::TooLong {
             len: name.len(),
@@ -89,6 +86,8 @@ pub fn validate_metric_name(name: &str) -> Result<(), InvalidMetricName> {
         });
     }
     let mut chars = name.chars();
+    // The `None` arm handles the empty-name case; no separate
+    // `is_empty()` short-circuit needed.
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() => {}
         Some(c) if c.is_ascii_digit() => return Err(InvalidMetricName::LeadsWithDigit),
