@@ -204,6 +204,83 @@ async fn metrics_endpoint_returns_prometheus_exposition_with_bearer() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_surfaces_capture_lifecycle_names() {
+    // End-to-end #224 acceptance: drive a real `LocalSessionOrchestrator`
+    // capture lifecycle (synthetic mode — no audio, no STT, no vault)
+    // through `start_capture` + `end_meeting`, then hit
+    // `GET /v1/__metrics` and assert every category from #224 is
+    // present in the exposition output.
+    //
+    // The synthetic runtime is sufficient for this assertion because
+    // the foundation's #223 metric (`capture_started_total`) and the
+    // new lifecycle metrics in `heron-orchestrator` (`capture_active`,
+    // `capture_ended_total`, `salvage_candidates_pending`) all fire
+    // on the synthetic path. Pipeline-only metrics
+    // (`stt_*`, `audio_*`, `salvage_recovery_total{outcome=*}`) get
+    // their own crate-level unit tests in `heron-speech`,
+    // `heron-audio`, and `heron-orchestrator` respectively, and the
+    // nightly `clio_full_pipeline` test exercises them end-to-end.
+    //
+    // Test-ordering invariant: the metric facade is a no-op if no
+    // recorder is installed, so emissions before the first
+    // `init_prometheus_recorder()` call are silently dropped.
+    // Install the recorder BEFORE driving the lifecycle so this test
+    // doesn't depend on another test having installed it first
+    // (`cargo test` test ordering is non-deterministic).
+    let _handle =
+        heron_metrics::init_prometheus_recorder().expect("install recorder before lifecycle");
+    let orch = Arc::new(heron_orchestrator::LocalSessionOrchestrator::new());
+    let meeting = orch
+        .start_capture(StartCaptureArgs {
+            platform: heron_session::Platform::Zoom,
+            hint: None,
+            calendar_event_id: None,
+        })
+        .await
+        .expect("start_capture");
+    orch.end_meeting(&meeting.id).await.expect("end_meeting");
+
+    let app = build_app(test_state(orch));
+    let res = app
+        .oneshot(
+            Request::get("/v1/__metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // The four metric names introduced by #224 (plus the smoke counter
+    // from #223 which the foundation test already pins). The exposition
+    // contains both the bare counter line and the labelled variant; we
+    // grep for the bare name which appears in `# TYPE` annotations and
+    // the value lines alike.
+    for name in [
+        "capture_started_total",
+        "capture_ended_total",
+        "capture_active_count",
+        "salvage_candidates_pending",
+    ] {
+        assert!(
+            body.contains(name),
+            "rendered exposition must contain '{name}'; got:\n{body}"
+        );
+    }
+
+    // Spot-check the `reason="user_stop"` label on the ended counter
+    // — proving the redaction-checked literal flowed through to the
+    // wire, not just that the counter name registered.
+    assert!(
+        body.contains("reason=\"user_stop\""),
+        "rendered exposition must contain reason=\"user_stop\" label; got:\n{body}"
+    );
+}
+
+#[tokio::test]
 async fn stub_orchestrator_endpoints_all_return_501() {
     // The herond test suite uses `StubOrchestrator`, which returns
     // `NotYetImplemented` for every operation. With the v1 routes

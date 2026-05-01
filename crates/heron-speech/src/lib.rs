@@ -22,6 +22,7 @@ use thiserror::Error;
 #[cfg(target_vendor = "apple")]
 use tokio::sync::OnceCell;
 
+pub mod metrics_names;
 pub mod partial_writer;
 pub mod selection;
 pub mod sherpa;
@@ -104,6 +105,120 @@ pub trait SttBackend: Send + Sync {
     /// backend. WhisperKit returns `false` on Intel macs / pre-14;
     /// Sherpa is always `true` since it bundles an ONNX runtime.
     fn is_available(&self) -> bool;
+}
+
+/// Wrap a [`SttBackend::transcribe`] call with the
+/// `stt_duration_seconds` histogram + `stt_failures_total{reason}`
+/// counter from `docs/observability.md`. Consumers (today
+/// `heron-pipeline::pipeline::run_stt`) should call through this
+/// wrapper rather than calling `backend.transcribe` directly so
+/// every backend (WhisperKit, Sherpa, the stub) is covered at one
+/// site.
+///
+/// **Backend label.** The `backend` dimension is mapped from
+/// `backend.name()` to a pinned `redacted!` literal — free-form
+/// `String` labels are forbidden by the foundation's privacy
+/// posture, so an unknown name falls through to the `unknown`
+/// bucket rather than smuggling a user-provided string into the
+/// time series. Today the closed set is `{"whisperkit", "sherpa",
+/// "whisperkit_stub", "unknown"}`; adding a new backend means
+/// growing the match arm here.
+///
+/// **Failure-reason label.** Each [`SttError`] variant maps to a
+/// pinned `redacted!` literal per the documented closed set. An
+/// empty-transcript success (zero turns) is recorded as a separate
+/// `stt_failures_total{reason="transcription_empty"}` bump even
+/// though `transcribe` returned `Ok` — the consumer's existing
+/// soft-fail behaviour is preserved (the wrapper still returns
+/// `Ok(summary)`), and the metric surfaces the silent-empty case to
+/// dashboards.
+pub async fn transcribe_with_metrics(
+    backend: &dyn SttBackend,
+    wav_path: &Path,
+    channel: Channel,
+    session_id: SessionId,
+    partial_jsonl_path: &Path,
+    on_turn: TurnFn,
+) -> Result<TranscribeSummary, SttError> {
+    let backend_name = backend.name();
+    let started = std::time::Instant::now();
+    let result = backend
+        .transcribe(wav_path, channel, session_id, partial_jsonl_path, on_turn)
+        .await;
+    let elapsed_secs = started.elapsed().as_secs_f64();
+
+    // The histogram is recorded on BOTH the success and failure
+    // paths — a backend that hangs and returns a typed error after
+    // 30s should still show up in the latency distribution.
+    metrics::histogram!(
+        metrics_names::STT_DURATION_SECONDS,
+        "backend" => backend_name_to_label(backend_name).into_inner(),
+    )
+    .record(elapsed_secs);
+
+    match &result {
+        Ok(summary) if summary.turns == 0 => {
+            // Soft-fail bucket: the backend produced no turns. The
+            // consumer treats this as success (and writes an empty
+            // transcript), but the dashboard answer "are we silently
+            // producing empty transcripts?" is load-bearing.
+            // The `backend` label mirrors the histogram's dimension
+            // so a failure-rate-per-backend dashboard query can
+            // `sum by (backend)` cleanly.
+            metrics::counter!(
+                metrics_names::STT_FAILURES_TOTAL,
+                "backend" => backend_name_to_label(backend_name).into_inner(),
+                "reason" => heron_metrics::redacted!("transcription_empty").into_inner(),
+            )
+            .increment(1);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            let reason = stt_error_to_reason_label(err);
+            metrics::counter!(
+                metrics_names::STT_FAILURES_TOTAL,
+                "backend" => backend_name_to_label(backend_name).into_inner(),
+                "reason" => reason.into_inner(),
+            )
+            .increment(1);
+        }
+    }
+
+    result
+}
+
+/// Map a backend's `name()` string to a pinned `redacted!` literal.
+/// Free-form labels would violate the privacy posture; an unknown
+/// name falls through to the `unknown` bucket rather than smuggling
+/// a user-provided string into the time series.
+fn backend_name_to_label(name: &str) -> heron_metrics::RedactedLabel {
+    match name {
+        "whisperkit" => heron_metrics::redacted!("whisperkit"),
+        "sherpa" => heron_metrics::redacted!("sherpa"),
+        "whisperkit_stub" => heron_metrics::redacted!("whisperkit_stub"),
+        _ => heron_metrics::redacted!("unknown"),
+    }
+}
+
+/// Map an [`SttError`] to a pinned `redacted!` reason label.
+/// Free-form error text would smuggle the model path / file path /
+/// vendor diagnostic into the metric label; the matching
+/// `tracing::warn!` at the call site keeps the human-readable text
+/// in the log layer where it belongs.
+fn stt_error_to_reason_label(err: &SttError) -> heron_metrics::RedactedLabel {
+    match err {
+        // `NotYetImplemented` only fires from the off-Apple WhisperKit
+        // stub today; semantically it's "no real backend usable on
+        // this host", which collapses into the same operator signal
+        // as `ModelMissing` / `Unavailable`. Keeping the bucket count
+        // small keeps the dashboard readable; the matching
+        // `tracing::warn!` carries the exact variant for log triage.
+        SttError::NotYetImplemented => heron_metrics::redacted!("model_unavailable"),
+        SttError::ModelMissing(_) => heron_metrics::redacted!("model_unavailable"),
+        SttError::Unavailable(_) => heron_metrics::redacted!("model_unavailable"),
+        SttError::Failed(_) => heron_metrics::redacted!("failed"),
+        SttError::Io(_) => heron_metrics::redacted!("io"),
+    }
 }
 
 /// Build a [`SttBackend`] by name. Selection per §8.6 is left to the
@@ -531,9 +646,10 @@ pub(crate) mod stub {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::metrics_names::{STT_DURATION_SECONDS, STT_FAILURES_TOTAL};
 
     #[tokio::test]
     async fn whisperkit_backend_with_missing_model_dir_errors() {
@@ -767,5 +883,287 @@ mod tests {
         progress(0.5);
         progress(1.0);
         assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    /// Test backend that hands the wrapper a configurable result so
+    /// `transcribe_with_metrics` can be exercised on the success,
+    /// empty-transcript, and failure paths without dragging in
+    /// WhisperKit / Sherpa.
+    struct StubMetricsBackend {
+        name: &'static str,
+        outcome: StubOutcome,
+    }
+
+    enum StubOutcome {
+        Ok(usize),
+        Failed,
+        ModelMissing,
+    }
+
+    #[async_trait]
+    impl SttBackend for StubMetricsBackend {
+        async fn ensure_model(&self, _on_progress: ProgressFn) -> Result<(), SttError> {
+            Ok(())
+        }
+        async fn transcribe(
+            &self,
+            _wav_path: &Path,
+            _channel: Channel,
+            _session_id: SessionId,
+            _partial_jsonl_path: &Path,
+            _on_turn: TurnFn,
+        ) -> Result<TranscribeSummary, SttError> {
+            match self.outcome {
+                StubOutcome::Ok(turns) => Ok(TranscribeSummary {
+                    turns,
+                    low_confidence_turns: 0,
+                    model: "test-stub".into(),
+                    elapsed_secs: 0.0,
+                }),
+                StubOutcome::Failed => Err(SttError::Failed("synthetic failure".into())),
+                StubOutcome::ModelMissing => {
+                    Err(SttError::ModelMissing("stub model missing".into()))
+                }
+            }
+        }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Helper: parse the labelled `<name>{...} <value>` line out of
+    /// the Prometheus exposition body. Counter-or-gauge value, not
+    /// histogram (histograms surface as `<name>_bucket{...le="..."}`,
+    /// `<name>_sum`, `<name>_count` — see `histogram_*` helpers).
+    fn scrape_counter_with_label(body: &str, name: &str, label_match: &str) -> u64 {
+        for line in body.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with(name)
+                && line.contains(label_match)
+                && let Some(val) = line.rsplit(' ').next()
+                && let Ok(n) = val.parse::<u64>()
+            {
+                return n;
+            }
+        }
+        0
+    }
+
+    fn scrape_histogram_count(body: &str, name: &str, label_match: &str) -> u64 {
+        let key = format!("{name}_count");
+        for line in body.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with(&key)
+                && line.contains(label_match)
+                && let Some(val) = line.rsplit(' ').next()
+                && let Ok(n) = val.parse::<u64>()
+            {
+                return n;
+            }
+        }
+        0
+    }
+
+    /// Happy path: a backend that returns 3 turns bumps the histogram
+    /// `_count` series for the matching backend label by one and
+    /// does NOT bump `stt_failures_total{reason="transcription_empty"}`.
+    ///
+    /// Test-isolation note: the recorder is process-global and tests
+    /// run in parallel by default, so each metric-emission test below
+    /// uses a *distinct* backend name so the per-label time series
+    /// are non-overlapping. This test uses `sherpa`; see the failure /
+    /// empty-transcript / model-missing tests for the other choices.
+    #[tokio::test]
+    async fn transcribe_with_metrics_records_duration_on_success() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let backend = StubMetricsBackend {
+            name: "sherpa",
+            outcome: StubOutcome::Ok(3),
+        };
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let wav = tmp.path().join("in.wav");
+        let partial = tmp.path().join("p.jsonl");
+        // Need a real WAV so `read_partial_jsonl` doesn't fail
+        // upstream (the stub doesn't write anything; the wrapper
+        // only times the call, so we don't actually need partial
+        // contents for this assertion).
+        std::fs::write(&wav, b"fake").expect("write");
+
+        // Test isolation: the recorder is process-global. We use the
+        // `sherpa` backend bucket which no other metrics-emission
+        // unit test in this crate touches, so the histogram-count
+        // delta is exact under parallel execution. (The
+        // `reason="transcription_empty"` invariant is exercised by
+        // `transcribe_with_metrics_flags_empty_transcript` instead —
+        // a "must not bump" assertion here would race with that test.)
+        let before = handle.render();
+        let before_count = scrape_histogram_count(&before, STT_DURATION_SECONDS, "sherpa");
+
+        let _ = transcribe_with_metrics(
+            &backend,
+            &wav,
+            Channel::Mic,
+            SessionId::nil(),
+            &partial,
+            Box::new(|_| {}),
+        )
+        .await
+        .expect("ok");
+
+        let after = handle.render();
+        let after_count = scrape_histogram_count(&after, STT_DURATION_SECONDS, "sherpa");
+        assert_eq!(
+            after_count - before_count,
+            1,
+            "happy-path call must bump the histogram count exactly once; got {} vs {} \
+             from rendered exposition:\n{after}",
+            after_count,
+            before_count,
+        );
+    }
+
+    /// Empty-transcript path: the wrapper still returns Ok (preserving
+    /// the consumer's soft-fail contract), but bumps
+    /// `stt_failures_total{reason="transcription_empty"}` exactly once.
+    #[tokio::test]
+    async fn transcribe_with_metrics_flags_empty_transcript() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let backend = StubMetricsBackend {
+            name: "whisperkit",
+            outcome: StubOutcome::Ok(0),
+        };
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let wav = tmp.path().join("in.wav");
+        let partial = tmp.path().join("p.jsonl");
+        std::fs::write(&wav, b"fake").expect("write");
+
+        let before = handle.render();
+        let before_empty = scrape_counter_with_label(
+            &before,
+            STT_FAILURES_TOTAL,
+            "reason=\"transcription_empty\"",
+        );
+
+        let summary = transcribe_with_metrics(
+            &backend,
+            &wav,
+            Channel::Mic,
+            SessionId::nil(),
+            &partial,
+            Box::new(|_| {}),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(summary.turns, 0);
+
+        let after = handle.render();
+        let after_empty =
+            scrape_counter_with_label(&after, STT_FAILURES_TOTAL, "reason=\"transcription_empty\"");
+        assert_eq!(
+            after_empty - before_empty,
+            1,
+            "empty-transcript success path must bump the counter exactly once; got {} vs {} \
+             from rendered exposition:\n{after}",
+            after_empty,
+            before_empty,
+        );
+    }
+
+    /// Failure path: a backend returning `SttError::Failed` bumps
+    /// `stt_failures_total{reason="failed"}` AND records the
+    /// histogram (a long-tail timeout still wants its latency
+    /// observed). The error propagates verbatim.
+    ///
+    /// Uses the `whisperkit_stub` label so the histogram time series
+    /// here doesn't overlap with the success-path test running in
+    /// parallel against `backend="sherpa"`.
+    #[tokio::test]
+    async fn transcribe_with_metrics_records_failure_reason() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let backend = StubMetricsBackend {
+            name: "whisperkit_stub",
+            outcome: StubOutcome::Failed,
+        };
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let wav = tmp.path().join("in.wav");
+        let partial = tmp.path().join("p.jsonl");
+        std::fs::write(&wav, b"fake").expect("write");
+
+        let before = handle.render();
+        let before_failed =
+            scrape_counter_with_label(&before, STT_FAILURES_TOTAL, "reason=\"failed\"");
+        let before_count = scrape_histogram_count(&before, STT_DURATION_SECONDS, "whisperkit_stub");
+
+        let result = transcribe_with_metrics(
+            &backend,
+            &wav,
+            Channel::Mic,
+            SessionId::nil(),
+            &partial,
+            Box::new(|_| {}),
+        )
+        .await;
+        assert!(matches!(result, Err(SttError::Failed(_))));
+
+        let after = handle.render();
+        let after_failed =
+            scrape_counter_with_label(&after, STT_FAILURES_TOTAL, "reason=\"failed\"");
+        let after_count = scrape_histogram_count(&after, STT_DURATION_SECONDS, "whisperkit_stub");
+        assert_eq!(
+            after_failed - before_failed,
+            1,
+            "failure path must bump stt_failures_total{{reason=failed}} exactly once",
+        );
+        assert_eq!(
+            after_count - before_count,
+            1,
+            "failure path must still record duration so latency dashboards see timeout outliers",
+        );
+    }
+
+    /// `ModelMissing` and `Unavailable` both map to the
+    /// `model_unavailable` reason bucket — same operator action
+    /// (download / install the model), one dashboard signal.
+    #[tokio::test]
+    async fn transcribe_with_metrics_collapses_model_errors_to_one_bucket() {
+        let handle = heron_metrics::init_prometheus_recorder().expect("recorder");
+        let backend = StubMetricsBackend {
+            name: "whisperkit",
+            outcome: StubOutcome::ModelMissing,
+        };
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let wav = tmp.path().join("in.wav");
+        let partial = tmp.path().join("p.jsonl");
+        std::fs::write(&wav, b"fake").expect("write");
+
+        let before = handle.render();
+        let before_unavailable =
+            scrape_counter_with_label(&before, STT_FAILURES_TOTAL, "reason=\"model_unavailable\"");
+
+        let _ = transcribe_with_metrics(
+            &backend,
+            &wav,
+            Channel::Mic,
+            SessionId::nil(),
+            &partial,
+            Box::new(|_| {}),
+        )
+        .await;
+
+        let after = handle.render();
+        let after_unavailable =
+            scrape_counter_with_label(&after, STT_FAILURES_TOTAL, "reason=\"model_unavailable\"");
+        assert_eq!(
+            after_unavailable - before_unavailable,
+            1,
+            "ModelMissing must bump the model_unavailable bucket exactly once",
+        );
     }
 }

@@ -892,9 +892,22 @@ async fn run_stt(
         tracing::info!(path = %wav.display(), ?channel, "WAV missing; skipping STT pass");
         return Ok(Vec::new());
     }
-    let _summary = stt
-        .transcribe(wav, channel, session_id, partial_jsonl, Box::new(|_| {}))
-        .await?;
+    // Route through the metrics wrapper so `stt_duration_seconds`
+    // and `stt_failures_total{reason}` cover every backend at one
+    // call site. The wrapper preserves the existing return shape
+    // (and the consumer's soft-fail-on-error contract) byte-for-byte
+    // — see `crates/heron-speech/src/lib.rs` for the labelling
+    // rules. The `tracing::warn!` at the call site upstream of this
+    // is unchanged; metrics co-emit, they don't replace logs.
+    let _summary = heron_speech::transcribe_with_metrics(
+        stt,
+        wav,
+        channel,
+        session_id,
+        partial_jsonl,
+        Box::new(|_| {}),
+    )
+    .await?;
     let turns = heron_speech::read_partial_jsonl(partial_jsonl)?;
     Ok(turns)
 }

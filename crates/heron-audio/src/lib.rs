@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 pub mod aec;
 pub mod backpressure;
 pub mod disk;
+pub mod metrics_names;
 pub mod mic_capture;
 #[cfg(target_os = "macos")]
 pub mod process_tap;
