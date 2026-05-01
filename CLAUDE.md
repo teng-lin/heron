@@ -23,5 +23,7 @@ The same gates `CONTRIBUTING.md` §"Per-PR checklist" item 4 enforces — runnin
 - `cargo test --workspace` passes
 - `cargo clippy --workspace --all-targets -- -D warnings` clean
 - `cargo fmt --all -- --check` clean
+- `bun run build` in `apps/desktop/` passes (tsc + vite build; tsc IS the TS lint — no ESLint configured)
+- `bun test` in `apps/desktop/` passes
 
 **Known local exception:** `heron-cli`'s test binary fails to load `libonnxruntime.1.17.1.dylib` on this machine, surfacing as a `dyld` SIGABRT in `cargo test --workspace` runs. This is environmental, not a code bug. If your change touches `heron-cli` directly, fix the dylib path (or test in CI). Otherwise, treat that single failure as preexisting and confirm the rest of the workspace is green.

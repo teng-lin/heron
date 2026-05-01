@@ -46,12 +46,14 @@ Every PR runs through the same pipeline:
 3. **Apply** the substantive findings; defend the others in the PR
    reply thread. Skip the noise (style nits the formatter handles,
    over-engineering proposals).
-4. **Local acceptance**:
+4. **Local acceptance** — five gates, all must pass:
    ```sh
-   cargo build --workspace
    cargo test --workspace
    cargo clippy --workspace --all-targets -- -D warnings
    cargo fmt --all -- --check
+   # desktop renderer (tsc IS the TS lint — no ESLint configured)
+   (cd apps/desktop && bun run build)
+   (cd apps/desktop && bun test)
    ```
 5. **Open the PR** with the standard body (Summary / Polish findings
    applied / Acceptance / Test plan).
