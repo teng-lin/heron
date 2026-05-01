@@ -53,16 +53,17 @@ pub(crate) const SALVAGE_CANDIDATES_PENDING: &str = "salvage_candidates_pending"
 ///
 /// - `recovered` — pipeline finished cleanly, cache was purged (no
 ///   salvage candidate left behind for the next launch).
-/// - `abandoned` — pipeline finished with an error so the WAV cache
-///   is retained for the user to recover from. Each occurrence bumps
-///   the candidate set that `salvage_candidates_pending` will count on
-///   the next boot. Today this is the only failure-case outcome the
-///   call site emits — see follow-up issue #238 for splitting it into
-///   pre-STT vs post-STT failure modes.
-/// - `failed` — reserved for a future hard-error recovery path (an
-///   attempt to recover a previous session's cache that itself errored
-///   out). Currently never emitted; declared here so the dimension is
-///   stable when the recovery flow lands.
+/// - `abandoned` — **post-STT failure.** Transcription completed but
+///   summary or finalize failed (LLM provider failed, vault lock
+///   during finalize, FSM rejection on the transcribe→summary edge,
+///   etc.). The transcript is on disk and the user can retry
+///   summarisation without re-recording.
+/// - `failed` — **pre-STT failure.** Capture errored before reaching
+///   transcription (permission missing, validation error,
+///   capture-in-progress conflict, etc.). No transcript yet; retry
+///   means re-record. The classification is owned by
+///   `complete_pipeline_meeting`'s `pre_stt_failure` branch, which
+///   matches on `SessionError` variants known to fire pre-STT.
 pub(crate) const SALVAGE_RECOVERY_TOTAL: &str = "salvage_recovery_total";
 
 #[cfg(test)]
