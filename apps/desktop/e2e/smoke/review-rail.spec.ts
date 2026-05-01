@@ -8,7 +8,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { getCalls, mockIpc } from "./_fixture";
+import { DEFAULT_SETTINGS, getCalls, mockIpc } from "./_fixture";
 
 const SESSION_ID = "mtg_01jegrev-7000-0000-0000-000000000001";
 
@@ -101,7 +101,22 @@ test.describe("review rail", () => {
     await expect(page.getByRole("button", { name: /due.*2026/i })).toBeVisible();
 
     const calls = await getCalls(page);
-    expect(calls.some((c) => c.cmd === "heron_get_meeting")).toBe(true);
-    expect(calls.some((c) => c.cmd === "heron_read_note")).toBe(true);
+    const getMeeting = calls.find((c) => c.cmd === "heron_get_meeting");
+    const readNote = calls.find((c) => c.cmd === "heron_read_note");
+    expect(getMeeting).toBeDefined();
+    expect(readNote).toBeDefined();
+    // Pin the IPC arg shapes so a regression sourcing the meeting id
+    // from somewhere else surfaces here. `heron_get_meeting` takes
+    // only `meetingId` (no vault path — the daemon resolves vault by
+    // session); `heron_read_note` carries `vaultPath` from settings,
+    // which is what the gemini review wanted us to assert.
+    const getMeetingArgs = getMeeting!.args as { meetingId: string };
+    expect(getMeetingArgs.meetingId).toBe(SESSION_ID);
+    const readNoteArgs = readNote!.args as {
+      vaultPath: string;
+      sessionId: string;
+    };
+    expect(readNoteArgs.vaultPath).toBe(DEFAULT_SETTINGS.vault_root);
+    expect(readNoteArgs.sessionId).toBe(SESSION_ID);
   });
 });

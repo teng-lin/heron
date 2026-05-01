@@ -22,7 +22,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { drainCalls, getCalls, mockIpc } from "./_fixture";
+import { DEFAULT_SETTINGS, drainCalls, getCalls, mockIpc } from "./_fixture";
 
 const STRANDED_SESSION_ID = "mtg_01jegslv-7000-0000-0000-000000000001";
 
@@ -43,7 +43,7 @@ test.describe("salvage", () => {
       // page doesn't read the value (it just navigates to /review/<id>),
       // but the promise needs to resolve, not reject, for the success
       // path to fire.
-      heron_recover_session: "/tmp/heron-e2e-vault/recovered.md",
+      heron_recover_session: `${DEFAULT_SETTINGS.vault_root}/recovered.md`,
     });
 
     await page.goto("/salvage");
@@ -84,8 +84,10 @@ test.describe("salvage", () => {
     expect(call).toBeDefined();
     const args = call!.args as { sessionId: string; vaultPath: string };
     expect(args.sessionId).toBe(STRANDED_SESSION_ID);
-    // `vaultPath` is sourced from `_fixture.ts`'s DEFAULT_SETTINGS.
-    expect(args.vaultPath).toBe("/tmp/heron-e2e-vault");
+    // `vaultPath` is sourced from `_fixture.ts`'s DEFAULT_SETTINGS;
+    // pin the same constant so a regression that hardcodes a stale
+    // path or sources from a different store would surface here.
+    expect(args.vaultPath).toBe(DEFAULT_SETTINGS.vault_root);
 
     // Successful recovery navigates to /review/<id>. Confirm the
     // post-recover redirect landed.

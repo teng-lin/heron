@@ -16,7 +16,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { drainCalls, getCalls, mockIpc } from "./_fixture";
+import { DEFAULT_SETTINGS, drainCalls, getCalls, mockIpc } from "./_fixture";
 
 const SESSION_ID = "mtg_01jegedt-7000-0000-0000-000000000001";
 
@@ -126,5 +126,8 @@ test.describe("action item edit", () => {
     expect(args.meetingId).toBe(SESSION_ID);
     expect(args.itemId).toBe(ACTION_ITEM_ID);
     expect(args.patch.done).toBe(true);
+    // Pin the vault path to DEFAULT_SETTINGS so a regression that
+    // sources the path from a stale store would surface here.
+    expect(args.vaultPath).toBe(DEFAULT_SETTINGS.vault_root);
   });
 });
