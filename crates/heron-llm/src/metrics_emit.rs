@@ -178,18 +178,33 @@ mod tests {
         // Defence-in-depth: a NaN / infinite cost (which compute_cost
         // doesn't produce today, but a future calibration tweak might
         // accidentally) must not panic and must not poison the counter
-        // with an enormous value.
+        // with an enormous value. Use a unique backend label so prior
+        // tests in the same process can't pollute the assertion.
         let handle = init_prometheus_recorder().expect("recorder");
         record_call_success(
-            redacted!("openai"),
-            redacted!("gpt_4o_mini"),
+            redacted!("nan_test_backend"),
+            redacted!("nan_test_model"),
             10,
             10,
             f64::NAN,
         );
-        // No panic = pass. The micro counter for this label set should
-        // still be 0 — the dashboard would show this as no data
-        // rather than a poison-pill value.
-        let _body = handle.render();
+        let body = handle.render();
+        // The cost counter MUST report 0 for a NaN input, not a
+        // wrapped/saturated huge value. Pin the exact line so any
+        // future tweak to the saturation logic that re-introduces a
+        // poisoned sample fails closed.
+        let cost_line = body
+            .lines()
+            .find(|l| {
+                l.starts_with("llm_cost_usd_micro_total{")
+                    && l.contains("backend=\"nan_test_backend\"")
+            })
+            .unwrap_or_else(|| panic!("missing cost counter line:\n{body}"));
+        let value: u64 = cost_line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("malformed cost counter line: {cost_line}"));
+        assert_eq!(value, 0, "NaN cost must clamp to zero, got {value}");
     }
 }
