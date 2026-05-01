@@ -34,6 +34,36 @@
 //! stub for `LocalSessionOrchestrator` in `herond`'s `AppState` is
 //! the cutover; routes don't change.
 //!
+//! ## Module layout
+//!
+//! The `impl SessionOrchestrator for LocalSessionOrchestrator` block
+//! in this file is the canonical "table of contents" of public
+//! orchestrator methods. Each entry is a one-line delegation to a
+//! `pub(crate) async fn` in a per-concern module; Rust forbids
+//! splitting trait impls across files, but free-function bodies can
+//! live anywhere. Per-concern modules (all `pub(crate)`):
+//!
+//! - `capture` — `start_capture`, `end_meeting`, `pause_capture`,
+//!   `resume_capture` (the largest single concern).
+//! - `read_side` — `list_meetings`, `get_meeting`, `read_transcript`,
+//!   `read_summary`, `audio_path`, `list_upcoming_calendar`.
+//! - `context` — `attach_context`, `prepare_context`.
+//! - `auto_record` — the per-event auto-record registry plus the
+//!   tick scheduler called by the inherent `auto_record_tick`.
+//! - `health` — the `/health` projection (`current()`).
+//! - `builder` — inherent + trait impls for the [`Builder`] struct
+//!   (the struct itself stays in this file to preserve its public
+//!   path).
+//! - `compose`, `pipeline_glue`, `platform`, `state`, `validation`,
+//!   `vault_read` — shared helpers and state types.
+//!
+//! Capture and read-side share live state (`active_meetings`,
+//! `finalized_meetings`, `vault_root`); those fields stay on
+//! [`LocalSessionOrchestrator`] rather than being bundled into a
+//! per-concern struct, which would force the other concern to
+//! dereference through it for no clarity gain. Each concern module
+//! takes `&LocalSessionOrchestrator` directly.
+//!
 //! What's wired today:
 //!
 //! - **Capture lifecycle FSM.** [`SessionOrchestrator::start_capture`]
@@ -427,7 +457,7 @@ impl LocalSessionOrchestrator {
     /// number of fires this tick triggered — exposed for tests so
     /// they can drive the scheduler deterministically without
     /// orchestrating real time. Production callers go through
-    /// [`spawn_auto_record_scheduler`].
+    /// [`Self::spawn_auto_record_scheduler`].
     ///
     /// Errors from `start_capture` (`CaptureInProgress`,
     /// `PermissionMissing`, …) are logged at warn level and counted
