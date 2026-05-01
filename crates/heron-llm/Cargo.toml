@@ -21,6 +21,12 @@ tracing = { workspace = true }
 tempfile = "3"
 which = "6"
 wiremock = "0.6"
+# Snapshot-based body-shape pinning for the wiremock dispatch tests.
+# `json` feature normalizes serde_json::Value through a stable
+# representation so a key-order shuffle in the wire types doesn't
+# produce a spurious snapshot diff. Dev-only — does not enter the
+# published crate's dep graph.
+insta = { version = "1", features = ["json"] }
 
 [lints]
 workspace = true

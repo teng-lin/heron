@@ -1,0 +1,22 @@
+---
+source: crates/heron-llm/tests/backend_dispatch.rs
+expression: body
+---
+{
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "<REDACTED:user-content>",
+      "role": "system"
+    },
+    {
+      "content": "<REDACTED:user-content>",
+      "role": "user"
+    }
+  ],
+  "model": "gpt-4o-mini",
+  "response_format": {
+    "type": "json_object"
+  },
+  "temperature": 0.0
+}
