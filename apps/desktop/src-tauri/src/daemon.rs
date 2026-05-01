@@ -209,19 +209,31 @@ impl DaemonHandle {
     /// previous `shutdown_tx` / `join_handle` MUST already be
     /// `None` — either from the bind-failure boot (no task ever
     /// spawned) or because the rebuild path drained them via
-    /// [`Self::signal_shutdown`] + [`Self::take_join_handle`]. We
-    /// don't enforce this with an assert because the rebuild path
-    /// is the only caller and is always paired correctly; an
-    /// errant double-install would silently lose the previous
-    /// task's shutdown signal, but the previous task already
-    /// exited (rebuild only calls us after its `await`).
+    /// [`Self::signal_shutdown`] + [`Self::take_join_handle`]. The
+    /// pairing is enforced by `debug_assert!` so a contract
+    /// violation surfaces in dev/test builds; production stays at
+    /// zero overhead. An errant production double-install would
+    /// otherwise silently lose the previous task's shutdown signal
+    /// — but the previous task already exited (rebuild only calls
+    /// us after its `await`), so the practical fallout is bounded
+    /// to the leaked sender being dropped harmlessly.
     ///
     /// Mirrors the take half: both fields swapped together so the
     /// next [`Self::signal_shutdown`] / [`Self::take_join_handle`]
     /// pair sees a consistent state.
     fn replace_for_rebuild(&self, shutdown_tx: oneshot::Sender<()>, join_handle: JoinHandle<()>) {
-        *lock_recover(&self.shutdown_tx) = Some(shutdown_tx);
-        *lock_recover(&self.join_handle) = Some(join_handle);
+        let mut tx_guard = lock_recover(&self.shutdown_tx);
+        let mut jh_guard = lock_recover(&self.join_handle);
+        debug_assert!(
+            tx_guard.is_none(),
+            "replace_for_rebuild called with a live shutdown_tx; previous task's shutdown signal would be leaked"
+        );
+        debug_assert!(
+            jh_guard.is_none(),
+            "replace_for_rebuild called with a live join_handle; previous task's join handle would be dropped without abort/await"
+        );
+        *tx_guard = Some(shutdown_tx);
+        *jh_guard = Some(join_handle);
     }
 }
 
