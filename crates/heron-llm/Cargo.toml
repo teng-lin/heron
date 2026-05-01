@@ -8,8 +8,10 @@ publish.workspace = true
 
 [dependencies]
 heron-types = { workspace = true }
+heron-metrics = { workspace = true }
 async-trait = { workspace = true }
 handlebars = { workspace = true }
+metrics = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,6 +20,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `heron-metrics` is a normal dep above, but the integration test crate
+# (`tests/backend_dispatch.rs`) reaches `init_prometheus_recorder()` to
+# render exposition output for metric-emission assertions. Re-listing
+# here lets the test crate import it without an explicit `pub use` from
+# the library.
+heron-metrics = { workspace = true }
 tempfile = "3"
 which = "6"
 wiremock = "0.6"

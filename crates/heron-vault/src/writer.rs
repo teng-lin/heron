@@ -27,6 +27,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::merge::{MergeInputs, MergeOutcome, merge};
+use crate::metrics_emit::{
+    IoErrorReason, VAULT_WRITE_DURATION_SECONDS, VAULT_WRITE_FAILURES_TOTAL, op_atomic_write,
+    op_finalize, op_update_action_item,
+};
 
 const FRONTMATTER_FENCE: &str = "---\n";
 
@@ -185,6 +189,26 @@ impl VaultWriter {
         frontmatter: &Frontmatter,
         body: &str,
     ) -> Result<PathBuf, VaultError> {
+        // The whole finalize call is one logical "op" from a
+        // dashboarding perspective; the inner `atomic_write`s emit
+        // their own per-write rows under `op="atomic_write"` so a
+        // "what slowed down" panel can drill from finalize → write.
+        heron_metrics::timed_io_sync(
+            VAULT_WRITE_DURATION_SECONDS,
+            VAULT_WRITE_FAILURES_TOTAL,
+            ("op", op_finalize()),
+            || self.finalize_session_inner(date_str, start_hhmm, slug, frontmatter, body),
+        )
+    }
+
+    fn finalize_session_inner(
+        &self,
+        date_str: &str,
+        start_hhmm: &str,
+        slug: &str,
+        frontmatter: &Frontmatter,
+        body: &str,
+    ) -> Result<PathBuf, VaultError> {
         let path = self.note_path(date_str, start_hhmm, slug);
         let parent = path.parent().unwrap_or(&self.vault_root);
         fs::create_dir_all(parent)?;
@@ -238,6 +262,32 @@ impl VaultWriter {
         frontmatter: &Frontmatter,
         body: &str,
     ) -> Result<PathBuf, VaultError> {
+        heron_metrics::timed_io_sync(
+            VAULT_WRITE_DURATION_SECONDS,
+            VAULT_WRITE_FAILURES_TOTAL,
+            ("op", op_finalize()),
+            || {
+                self.finalize_with_pattern_inner(
+                    pattern,
+                    meeting_id,
+                    title,
+                    date,
+                    frontmatter,
+                    body,
+                )
+            },
+        )
+    }
+
+    fn finalize_with_pattern_inner(
+        &self,
+        pattern: FileNamingPattern,
+        meeting_id: Uuid,
+        title: &str,
+        date: NaiveDate,
+        frontmatter: &Frontmatter,
+        body: &str,
+    ) -> Result<PathBuf, VaultError> {
         let meetings_dir = self.vault_root.join("meetings");
         fs::create_dir_all(&meetings_dir)?;
 
@@ -265,7 +315,10 @@ impl VaultWriter {
                 meeting_id = %meeting_id,
                 "title slugified to empty; falling back to Id pattern for this meeting",
             );
-            return self.finalize_with_pattern(
+            // Use `_inner` for the recursive fallback so the outer
+            // wrapper from `finalize_with_pattern` doesn't double-count
+            // this call as a second `op="finalize"` emission.
+            return self.finalize_with_pattern_inner(
                 FileNamingPattern::Id,
                 meeting_id,
                 title,
@@ -341,6 +394,20 @@ impl VaultWriter {
     /// - [`VaultError::Io`] / [`VaultError::Yaml`] for filesystem /
     ///   serialize failures (iCloud eviction, permission errors, etc.).
     pub fn update_action_item(
+        &self,
+        meeting_path: &Path,
+        item_id: &ItemId,
+        patch: ActionItemPatch,
+    ) -> Result<ActionItem, VaultError> {
+        heron_metrics::timed_io_sync(
+            VAULT_WRITE_DURATION_SECONDS,
+            VAULT_WRITE_FAILURES_TOTAL,
+            ("op", op_update_action_item()),
+            || self.update_action_item_inner(meeting_path, item_id, patch),
+        )
+    }
+
+    fn update_action_item_inner(
         &self,
         meeting_path: &Path,
         item_id: &ItemId,
@@ -664,6 +731,22 @@ fn parse_note(input: &str, path: &Path) -> Result<(Frontmatter, String), VaultEr
 /// path, `fsync`, then `rename` over the destination. Final mode is
 /// `0600` (readable/writable by the user only).
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // Wrap the write path in the shared timing helper so duration +
+    // failure metrics emit alongside `update_action_item` / `finalize`
+    // with the same `op` dimension shape. The `IoErrorReason` newtype
+    // wraps the bare `io::Error` for the helper's `ClassifyFailure`
+    // bound; we unwrap it back to `io::Result<()>` at the boundary
+    // so callers see no API change.
+    heron_metrics::timed_io_sync(
+        VAULT_WRITE_DURATION_SECONDS,
+        VAULT_WRITE_FAILURES_TOTAL,
+        ("op", op_atomic_write()),
+        || atomic_write_inner(path, contents).map_err(IoErrorReason),
+    )
+    .map_err(|wrapped| wrapped.0)
+}
+
+fn atomic_write_inner(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("path has no parent dir"))?;

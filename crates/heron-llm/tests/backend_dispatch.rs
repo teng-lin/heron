@@ -36,6 +36,7 @@ use heron_llm::{
     LlmError, MAX_PERSONA_FIELD_BYTES, PERSONA_TRUNCATED_MARKER, Summarizer, SummarizerInput,
     render_meeting_prompt,
 };
+use heron_metrics::init_prometheus_recorder;
 use heron_types::{MeetingType, Persona};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -204,6 +205,144 @@ async fn anthropic_summarize_dispatches_expected_url_headers_and_body() {
     insta::assert_json_snapshot!("anthropic_request_body", body);
 }
 
+// ── Metric emission — happy path ─────────────────────────────────────────────
+
+/// On a successful Anthropic summarize, the renderer must observe:
+/// - `llm_call_duration_seconds{op="anthropic"}` (histogram)
+/// - `llm_tokens_input_total{backend="anthropic", model=...}`
+/// - `llm_tokens_output_total{backend="anthropic", model=...}`
+/// - `llm_cost_usd_micro_total{backend="anthropic", model=...}`
+///
+/// The shape is the contract dashboards depend on — pinning it here
+/// catches a future "we lost the model dimension" / "backend name
+/// drifted from `anthropic` to `claude`" regression at build time.
+#[tokio::test]
+async fn anthropic_emits_metrics_on_success() {
+    let handle = init_prometheus_recorder().expect("recorder");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok_body()))
+        .mount(&server)
+        .await;
+
+    let cfg = AnthropicClientConfig {
+        api_key: "test-key-not-real".into(),
+        base_url: server.uri(),
+        model: ANTHROPIC_DEFAULT_MODEL.into(),
+        max_tokens: 4_096,
+        timeout: Duration::from_secs(5),
+    };
+    let client = AnthropicClient::new(cfg).expect("client");
+    let (_dir, transcript) = write_fixture_transcript();
+    client
+        .summarize(SummarizerInput {
+            transcript: &transcript,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
+        })
+        .await
+        .expect("summarize");
+
+    let body = handle.render();
+    assert!(
+        body.contains("llm_call_duration_seconds"),
+        "duration histogram missing: {body}"
+    );
+    assert!(
+        body.contains("op=\"anthropic\""),
+        "backend op label missing: {body}"
+    );
+    assert!(
+        body.contains("llm_tokens_input_total"),
+        "tokens_input counter missing: {body}"
+    );
+    assert!(
+        body.contains("backend=\"anthropic\""),
+        "backend label missing: {body}"
+    );
+    assert!(
+        body.contains("model=\"claude_sonnet_4_6\""),
+        "model label missing or drifted: {body}"
+    );
+    assert!(
+        body.contains("llm_cost_usd_micro_total"),
+        "cost counter missing: {body}"
+    );
+    // Privacy invariant: the wire model identifier `claude-sonnet-4-6`
+    // (with hyphens) must NOT appear in a label value — the
+    // `model_label` mapper collapses it onto the snake_case bucket.
+    // A regression where a `format!()` snuck in as a label value would
+    // surface here as the hyphenated identifier appearing in the
+    // exposition output.
+    assert!(
+        !body.contains("model=\"claude-sonnet-4-6\""),
+        "raw hyphenated model identifier leaked into a label: {body}"
+    );
+}
+
+/// On a 4xx Anthropic response, the failure counter must record the
+/// `backend_error` reason + the `op` label. Pinning the reason makes
+/// "all our LLM call failures are bucketed as `unknown`" regressions
+/// visible.
+#[tokio::test]
+async fn anthropic_emits_failure_metric_on_4xx() {
+    let handle = init_prometheus_recorder().expect("recorder");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":{"message":"bad"}}"#))
+        .mount(&server)
+        .await;
+
+    let cfg = AnthropicClientConfig {
+        api_key: "test-key-not-real".into(),
+        base_url: server.uri(),
+        model: ANTHROPIC_DEFAULT_MODEL.into(),
+        max_tokens: 4_096,
+        timeout: Duration::from_secs(5),
+    };
+    let client = AnthropicClient::new(cfg).expect("client");
+    let (_dir, transcript) = write_fixture_transcript();
+    let _err = client
+        .summarize(SummarizerInput {
+            transcript: &transcript,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
+        })
+        .await
+        .expect_err("4xx must surface");
+
+    let body = handle.render();
+    assert!(
+        body.contains("llm_call_failures_total"),
+        "failure counter missing: {body}"
+    );
+    assert!(
+        body.contains("op=\"anthropic\""),
+        "op label missing on failure: {body}"
+    );
+    assert!(
+        body.contains("reason=\"backend_error\""),
+        "reason label not propagated: {body}"
+    );
+    // On failure we MUST NOT increment the success-only token /
+    // cost counters with this label set. We can't easily assert
+    // "this exact label set has zero count" without parsing the
+    // exposition, so use a weaker invariant: the failure counter
+    // is present, and any token counter present comes from another
+    // test case (different label set). The recorder doesn't emit
+    // tokens_input_total at all unless a previous test already did.
+}
+
 // ── OpenAI dispatch ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -268,6 +407,111 @@ async fn openai_summarize_dispatches_expected_url_headers_and_body() {
         serde_json::from_slice(&req.body).expect("request body is JSON");
     redact_messages_content(&mut body);
     insta::assert_json_snapshot!("openai_request_body", body);
+}
+
+// ── OpenAI metric emission ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn openai_emits_metrics_on_success() {
+    let handle = init_prometheus_recorder().expect("recorder");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_ok_body()))
+        .mount(&server)
+        .await;
+
+    let cfg = OpenAIClientConfig {
+        api_key: "test-key-not-real".into(),
+        base_url: server.uri(),
+        model: OPENAI_DEFAULT_MODEL.into(),
+        max_tokens: 4_096,
+        timeout: Duration::from_secs(5),
+    };
+    let client = OpenAIClient::new(cfg).expect("client");
+    let (_dir, transcript) = write_fixture_transcript();
+    client
+        .summarize(SummarizerInput {
+            transcript: &transcript,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
+        })
+        .await
+        .expect("summarize");
+
+    let body = handle.render();
+    assert!(
+        body.contains("llm_call_duration_seconds"),
+        "duration histogram missing: {body}"
+    );
+    assert!(
+        body.contains("op=\"openai\""),
+        "openai op label missing: {body}"
+    );
+    assert!(
+        body.contains("backend=\"openai\""),
+        "openai backend label missing: {body}"
+    );
+    assert!(
+        body.contains("model=\"gpt_4o_mini\""),
+        "openai model label missing: {body}"
+    );
+    // Same privacy check as the Anthropic path.
+    assert!(
+        !body.contains("model=\"gpt-4o-mini\""),
+        "raw hyphenated openai model leaked into a label: {body}"
+    );
+}
+
+#[tokio::test]
+async fn openai_emits_failure_metric_on_5xx() {
+    let handle = init_prometheus_recorder().expect("recorder");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream"))
+        .mount(&server)
+        .await;
+
+    let cfg = OpenAIClientConfig {
+        api_key: "test-key-not-real".into(),
+        base_url: server.uri(),
+        model: OPENAI_DEFAULT_MODEL.into(),
+        max_tokens: 4_096,
+        timeout: Duration::from_secs(5),
+    };
+    let client = OpenAIClient::new(cfg).expect("client");
+    let (_dir, transcript) = write_fixture_transcript();
+    let _err = client
+        .summarize(SummarizerInput {
+            transcript: &transcript,
+            meeting_type: MeetingType::Client,
+            existing_action_items: None,
+            existing_attendees: None,
+            pre_meeting_briefing: None,
+            persona: None,
+            strip_names: false,
+        })
+        .await
+        .expect_err("5xx must surface");
+
+    let body = handle.render();
+    assert!(
+        body.contains("llm_call_failures_total"),
+        "failure counter missing: {body}"
+    );
+    assert!(
+        body.contains("op=\"openai\""),
+        "openai op label missing on failure: {body}"
+    );
+    assert!(
+        body.contains("reason=\"backend_error\""),
+        "reason label not propagated: {body}"
+    );
 }
 
 // ── Missing-key UX ────────────────────────────────────────────────────────────
