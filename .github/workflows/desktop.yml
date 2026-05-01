@@ -1,0 +1,48 @@
+name: desktop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      # No Rust touched in this job — the renderer is OS-agnostic
+      # (bun + tsc + Vite). The libonnxruntime dyld workaround in
+      # rust.yml is intentionally NOT duplicated here. If a future
+      # contributor adds `cargo build` to this job, port that
+      # workaround.
+      #
+      # Bun is pinned to the version the lockfile was generated with so
+      # an upstream Bun release can't break CI on a quiet day. Bump
+      # deliberately; Renovate can take that over once it's wired up.
+      - name: install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      # `bun run build` is `tsc && vite build` per package.json.
+      # The tsc pass IS the TypeScript lint — no ESLint configured.
+      - name: typecheck and build
+        run: bun run build
+
+      - name: bun test
+        run: bun test
