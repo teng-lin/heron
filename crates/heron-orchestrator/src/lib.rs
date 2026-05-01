@@ -1146,6 +1146,27 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
             meeting.status = MeetingStatus::Recording;
             publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
 
+            // Smoke metric — the canonical example sub-issues #224 /
+            // #225 / #226 copy. The label MUST flow through
+            // `redacted!` (compile-time literal-only) or
+            // `RedactedLabel::from_static`; see
+            // `docs/observability.md` for the rule. `Platform` is a
+            // closed enum with snake_case discriminants → safe as
+            // literals. Any fields with user-content shape
+            // (meeting_id, hint, calendar_event_id) are NEVER
+            // attached as labels.
+            let platform_label: heron_metrics::RedactedLabel = match args.platform {
+                Platform::Zoom => heron_metrics::redacted!("zoom"),
+                Platform::GoogleMeet => heron_metrics::redacted!("google_meet"),
+                Platform::MicrosoftTeams => heron_metrics::redacted!("microsoft_teams"),
+                Platform::Webex => heron_metrics::redacted!("webex"),
+            };
+            metrics::counter!(
+                heron_metrics::SMOKE_CAPTURE_STARTED_TOTAL,
+                "platform" => platform_label.into_inner(),
+            )
+            .increment(1);
+
             // Consume the pending context AFTER the FSM walk commits
             // but BEFORE building `CliSessionConfig`, so the rendered
             // briefing can feed both v1

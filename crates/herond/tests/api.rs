@@ -39,6 +39,12 @@ fn test_state(orch: Arc<dyn SessionOrchestrator>) -> AppState {
         auth: Arc::new(AuthConfig {
             bearer: TEST_BEARER.to_owned(),
         }),
+        // Tests share the process-global recorder via the
+        // idempotent installer. `cargo test` runs in one process,
+        // so the second-and-onward callers get a clone of the
+        // already-installed handle.
+        metrics: heron_metrics::init_prometheus_recorder()
+            .expect("install Prometheus recorder for test state"),
     }
 }
 
@@ -145,6 +151,56 @@ async fn origin_header_is_rejected_even_for_health() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let body = body_json(res).await;
     assert_eq!(body["code"], "HERON_E_ORIGIN_DENIED");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_requires_bearer() {
+    // `/v1/__metrics` is a debug endpoint, not in the public OpenAPI.
+    // The auth middleware allowlists ONLY /v1/health; everything
+    // else (including this) must carry the bearer.
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(Request::get("/v1/__metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_exposition_with_bearer() {
+    // End-to-end smoke for the local-exposure mechanism: drive the
+    // smoke metric, hit `GET /v1/__metrics`, assert the rendered
+    // exposition contains the metric name. This is the assertion the
+    // PR's test plan documents the curl invocation against.
+    metrics::counter!(heron_metrics::SMOKE_CAPTURE_STARTED_TOTAL).increment(1);
+
+    let app = build_app(stub_state());
+    let res = app
+        .oneshot(
+            Request::get("/v1/__metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        ct.starts_with("text/plain"),
+        "expected Prometheus text exposition Content-Type, got {ct}"
+    );
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains(heron_metrics::SMOKE_CAPTURE_STARTED_TOTAL),
+        "rendered exposition must contain the smoke metric. Got:\n{body}"
+    );
 }
 
 #[tokio::test]

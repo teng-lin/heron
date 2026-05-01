@@ -42,6 +42,8 @@ fn live_state() -> (AppState, Arc<LocalSessionOrchestrator>) {
         auth: Arc::new(AuthConfig {
             bearer: TEST_BEARER.to_owned(),
         }),
+        metrics: heron_metrics::init_prometheus_recorder()
+            .expect("install Prometheus recorder for test state"),
     };
     (state, orch)
 }

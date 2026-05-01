@@ -81,6 +81,11 @@ heron-llm = { workspace = true }
 # herond's HTTP/SSE; this is the in-process side.
 heron-event = { workspace = true }
 heron-event-tauri = { workspace = true }
+# Issue #223: install the process-global Prometheus recorder when
+# the desktop launches the embedded daemon. Idempotent installer
+# means a desktop launch can co-exist with a separate `herond`
+# binary without fighting over the global slot.
+heron-metrics = { workspace = true }
 heron-orchestrator = { workspace = true }
 heron-session = { workspace = true }
 # Gap #7: the desktop shell launches `herond` in-process (rather than

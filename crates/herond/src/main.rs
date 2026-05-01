@@ -40,6 +40,10 @@ async fn main() -> Result<()> {
         "bearer token loaded; rotate by deleting the file and restarting"
     );
 
+    let metrics = heron_metrics::init_prometheus_recorder()
+        .context("installing process-global Prometheus metrics recorder")?;
+    tracing::info!("metrics recorder installed (Prometheus exposition at /v1/__metrics)");
+
     let vault_root = resolve_vault_root().context("resolving vault root")?;
     tracing::info!(
         vault_root = %vault_root.display(),
@@ -51,6 +55,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         orchestrator,
         auth: Arc::new(auth),
+        metrics,
     };
     let app = build_app(state);
 

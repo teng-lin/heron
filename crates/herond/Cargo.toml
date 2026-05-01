@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 heron-event = { workspace = true }
 heron-event-http = { workspace = true }
+heron-metrics = { workspace = true }
 heron-orchestrator = { workspace = true }
 heron-session = { workspace = true }
 heron-types = { workspace = true }
@@ -40,7 +41,9 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]
+heron-metrics = { workspace = true }
 http-body-util = { workspace = true }
+metrics = { workspace = true }
 # Cross-crate v2 integration tests in `tests/v2_lifecycle.rs` and
 # `tests/v2_bridge_health.rs` exercise the bridge → daemon doctor.warning
 # contract. Bridge isn't a runtime dep (the daemon doesn't yet own a
