@@ -75,6 +75,16 @@ export const DEFAULT_SETTINGS = {
  * fail on a sibling page's IPC call that the spec doesn't care
  * about. Specs that DO care should override that command via the
  * `routes` arg and assert.
+ *
+ * **`routes` values must be JSON-serializable.** `addInitScript`'s
+ * argument is serialized via `JSON.stringify` before injection into
+ * the page context, so functions, `Date`, `Map`, etc. are stripped or
+ * lossy-converted. Pass plain JSON values (object / array / string /
+ * number / boolean / null). A spec that needs dynamic per-call
+ * behavior should fire `page.evaluate` after `goto` to install a
+ * function-valued route directly on `window.__heron_e2e_routes__` —
+ * but every smoke spec landed today is happy with literals and that
+ * keeps the harness dead simple.
  */
 export async function mockIpc(
   page: Page,
@@ -93,12 +103,18 @@ export async function mockIpc(
 
     // Mirror @tauri-apps/api/mocks::mockInternals — initialise the
     // globals the bundle reads. Set BOTH internals globals so the
-    // event plugin shim below is reachable.
+    // event plugin shim below is reachable. `__heron_e2e_listeners__`
+    // is exposed on window so a spec running in the Playwright
+    // context can `page.evaluate(() => window.__heron_e2e_listeners__.get(...))`
+    // to introspect or fire events that the renderer registered via
+    // `@tauri-apps/api/event::listen`.
     const w = window as unknown as {
       __TAURI_INTERNALS__?: Record<string, unknown>;
       __TAURI_EVENT_PLUGIN_INTERNALS__?: Record<string, unknown>;
       __heron_e2e_routes__?: Record<string, unknown>;
       __heron_e2e_calls__?: Array<{ cmd: string; args: unknown }>;
+      __heron_e2e_listeners__?: Map<string, Set<number>>;
+      __heron_e2e_callbacks__?: Map<number, (data: unknown) => void>;
     };
     w.__TAURI_INTERNALS__ = w.__TAURI_INTERNALS__ ?? {};
     w.__TAURI_EVENT_PLUGIN_INTERNALS__ = w.__TAURI_EVENT_PLUGIN_INTERNALS__ ?? {};
@@ -107,6 +123,8 @@ export async function mockIpc(
 
     const eventListeners = new Map<string, Set<number>>();
     const callbacks = new Map<number, (data: unknown) => void>();
+    w.__heron_e2e_listeners__ = eventListeners;
+    w.__heron_e2e_callbacks__ = callbacks;
 
     function transformCallback(
       cb: ((data: unknown) => void) | undefined,
@@ -234,5 +252,21 @@ export async function drainCalls(
     const log = w.__heron_e2e_calls__ ?? [];
     w.__heron_e2e_calls__ = [];
     return log;
+  });
+}
+
+/**
+ * Read the call log without resetting it. Useful for `expect.poll`
+ * assertions that re-evaluate the log every tick — `drainCalls`
+ * would lose entries between polls.
+ */
+export async function getCalls(
+  page: Page,
+): Promise<Array<{ cmd: string; args: unknown }>> {
+  return page.evaluate(() => {
+    const w = window as unknown as {
+      __heron_e2e_calls__?: Array<{ cmd: string; args: unknown }>;
+    };
+    return w.__heron_e2e_calls__ ?? [];
   });
 }

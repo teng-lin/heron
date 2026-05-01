@@ -20,7 +20,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { drainCalls, mockIpc, DEFAULT_SETTINGS } from "./_fixture";
+import { drainCalls, getCalls, mockIpc, DEFAULT_SETTINGS } from "./_fixture";
 
 test.describe("settings round-trip", () => {
   test("toggling Recover on launch fires heron_write_settings with the new value", async ({
@@ -53,16 +53,13 @@ test.describe("settings round-trip", () => {
     await expect(toggle).toHaveAttribute("data-state", "checked");
 
     // The autosave debounce is 500 ms; give Playwright generous
-    // headroom (3 s) so a slow CI runner doesn't false-fail.
+    // headroom (3 s) so a slow CI runner doesn't false-fail. `getCalls`
+    // (non-draining) keeps polled retries idempotent — `drainCalls`
+    // would lose the entry between polls.
     await expect
       .poll(
         async () => {
-          const calls = await page.evaluate(() => {
-            const w = window as unknown as {
-              __heron_e2e_calls__?: Array<{ cmd: string; args: unknown }>;
-            };
-            return w.__heron_e2e_calls__ ?? [];
-          });
+          const calls = await getCalls(page);
           return calls.find((c) => c.cmd === "heron_write_settings");
         },
         { timeout: 3_000 },
