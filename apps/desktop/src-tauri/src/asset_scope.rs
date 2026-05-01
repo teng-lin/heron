@@ -29,6 +29,13 @@ use tauri::scope::fs::Scope;
 /// `<vault_root>`, both recursively. Called once from the Tauri `setup`
 /// hook with the boot-time roots.
 ///
+/// `cache_root` is `mkdir -p`'d first because Tauri's `allow_directory`
+/// calls `canonicalize_parent` internally, and a fresh-install machine
+/// where `~/Library/Caches/com.heronnote.heron` does not yet exist
+/// would otherwise resolve scope only against the user-cache parent —
+/// which is not what we want once the daemon writes to the bundle-id
+/// subdir later in the session. Same rationale for `vault_root`.
+///
 /// Never returns `Err`: a glob-pattern failure on a user-configured path
 /// is logged and swallowed so a malformed vault path can't block app
 /// launch — the rest of the app already tolerates a missing vault.
@@ -37,10 +44,17 @@ pub fn install_initial_scope<R: tauri::Runtime, M: Manager<R>>(
     cache_root: &Path,
     vault_root: Option<&Path>,
 ) {
+    if let Err(e) = std::fs::create_dir_all(cache_root) {
+        tracing::warn!(
+            cache_root = %cache_root.display(),
+            error = %e,
+            "asset_scope: cache mkdir failed; scope may not match descendants until the daemon creates the dir",
+        );
+    }
     let scope = manager.asset_protocol_scope();
     allow_directory(&scope, cache_root, "cache_root");
     if let Some(vault) = vault_root {
-        allow_directory(&scope, vault, "vault_root");
+        allow_vault(&scope, vault, "vault_root (boot)");
     }
 }
 
@@ -56,6 +70,8 @@ pub fn install_initial_scope<R: tauri::Runtime, M: Manager<R>>(
 /// - empty / whitespace-only (the "unset" sentinel)
 /// - does not exist on disk
 /// - exists but is not a directory
+/// - is itself a symlink (a renderer-controlled symlink-leaf could
+///   otherwise widen scope to the symlink target)
 /// - canonicalizes to a filesystem root with no parent
 ///
 /// Errors are logged via `tracing::warn`, never propagated: an
@@ -66,12 +82,45 @@ pub fn extend_for_vault<R: tauri::Runtime, M: Manager<R>>(manager: &M, vault_roo
     if trimmed.is_empty() {
         return;
     }
-    let path = Path::new(trimmed);
-    let canonical = match std::fs::canonicalize(path) {
+    let scope = manager.asset_protocol_scope();
+    allow_vault(&scope, Path::new(trimmed), "vault_root (settings)");
+}
+
+/// Validate `vault` and call `Scope::allow_directory` if it passes.
+/// Shared between [`install_initial_scope`] and [`extend_for_vault`] so
+/// the boot-time vault and the settings-pane vault go through the same
+/// gauntlet — symlink-leaf rejection and filesystem-root rejection.
+fn allow_vault(scope: &Scope, vault: &Path, label: &'static str) {
+    // Reject a symlink-leaf vault path before canonicalize would
+    // silently follow it. `symlink_metadata` does not traverse the
+    // final component, so we see the symlink rather than the target.
+    // A failing stat is treated the same as "doesn't exist" — rejected.
+    let lstat = match std::fs::symlink_metadata(vault) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                kind = label,
+                vault = %vault.display(),
+                error = %e,
+                "asset_scope: vault stat failed; not extending scope",
+            );
+            return;
+        }
+    };
+    if lstat.file_type().is_symlink() {
+        tracing::warn!(
+            kind = label,
+            vault = %vault.display(),
+            "asset_scope: vault path is a symlink; refusing to allow (would widen scope to the symlink target)",
+        );
+        return;
+    }
+    let canonical = match std::fs::canonicalize(vault) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
-                vault_root = %path.display(),
+                kind = label,
+                vault = %vault.display(),
                 error = %e,
                 "asset_scope: vault canonicalize failed; not extending scope",
             );
@@ -80,20 +129,21 @@ pub fn extend_for_vault<R: tauri::Runtime, M: Manager<R>>(manager: &M, vault_roo
     };
     if !canonical.is_dir() {
         tracing::warn!(
-            vault_root = %canonical.display(),
+            kind = label,
+            vault = %canonical.display(),
             "asset_scope: vault path is not a directory; not extending scope",
         );
         return;
     }
     if canonical.parent().is_none() {
         tracing::warn!(
-            vault_root = %canonical.display(),
+            kind = label,
+            vault = %canonical.display(),
             "asset_scope: refusing to allow filesystem root as vault scope",
         );
         return;
     }
-    let scope = manager.asset_protocol_scope();
-    allow_directory(&scope, &canonical, "vault_root");
+    allow_directory(scope, &canonical, label);
 }
 
 fn allow_directory(scope: &Scope, path: &Path, label: &'static str) {
@@ -243,6 +293,35 @@ mod tests {
         let probe = Path::new("/nonexistent/heron/vault/cannot-exist-7c3a91d2/meetings/x.m4a");
         let scope = app.handle().asset_protocol_scope();
         assert!(!scope.is_allowed(probe));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extend_for_vault_rejects_symlink_leaf() {
+        // Defense-in-depth: a renderer-controlled `vault_root` that
+        // points at a symlink whose target is `/etc` (or any other
+        // sensitive dir) must not widen scope. We reject the symlink
+        // before canonicalize would follow it.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let cache = tmp.path().join("cache");
+        let real_dir = tmp.path().join("real");
+        let link_path = tmp.path().join("link");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&cache).expect("mkdir cache");
+        fs::create_dir_all(&real_dir).expect("mkdir real");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        std::os::unix::fs::symlink(&outside, &link_path).expect("symlink");
+        let secret = outside.join("secret.txt");
+        fs::write(&secret, b"nope").expect("seed secret");
+
+        let app = fresh_app();
+        install_initial_scope(app.handle(), &cache, None);
+        extend_for_vault(app.handle(), &link_path.to_string_lossy());
+        let scope = app.handle().asset_protocol_scope();
+        assert!(
+            !scope.is_allowed(&secret),
+            "symlink-leaf vault path must not widen scope to the symlink target",
+        );
     }
 
     #[test]
