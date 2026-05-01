@@ -319,8 +319,8 @@ drill from finalize → write.
 | Metric | Type | Labels | Site |
 | --- | --- | --- | --- |
 | `vault_transcript_oversized_lines_skipped_total` | counter | none | Over-cap-line warn site in `read_transcript_segments`. |
-| `vault_transcript_segments_count` | histogram | none | Per-call segment count on `read_transcript_segments` return. |
-| `vault_transcript_bytes_read_bytes` | histogram | none | Per-call total bytes drawn off the file (including drained over-cap tails). |
+| `vault_transcript_segments` | histogram | none | Per-call segment count on `read_transcript_segments` return. |
+| `vault_transcript_read_bytes` | histogram | none | Per-call total bytes drawn off the file (including drained over-cap tails). |
 | `vault_path_resolve_symlink_rejected_total` | counter | `field` ∈ {`transcript`, `recording`, …} | Symlink-reject site in `reject_symlinked_components`. |
 | `bot_context_render_failed_total` | counter | `reason="too_large"` | `compose.rs` render-fail drop site. |
 

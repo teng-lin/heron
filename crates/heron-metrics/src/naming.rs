@@ -79,6 +79,34 @@ impl std::error::Error for InvalidMetricName {}
 /// [`metric_name!`] macro (compile-foldable in `const fn` callers) and
 /// by [`crate::recorder::register`] at runtime.
 pub fn validate_metric_name(name: &str) -> Result<(), InvalidMetricName> {
+    validate_charset(name)?;
+    if !VALID_SUFFIXES.iter().any(|sfx| name.ends_with(sfx)) {
+        return Err(InvalidMetricName::MissingUnitSuffix {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a histogram base name. Same charset / length / leading-letter
+/// rules as [`validate_metric_name`] but the unit-suffix requirement is
+/// dropped — Prometheus auto-appends `_bucket`, `_count`, `_sum` to the
+/// base name when rendering histograms, so a name like
+/// `vault_transcript_segments_count` would render as
+/// `vault_transcript_segments_count_count` on the wire (the well-known
+/// Prometheus naming anti-pattern). For dimensionless histograms a bare
+/// plural noun is the correct shape.
+///
+/// Counters and gauges still go through [`validate_metric_name`] — their
+/// suffix carries semantic meaning (`_total` ≠ `_pending` ≠ `_ratio`).
+pub fn validate_histogram_base_name(name: &str) -> Result<(), InvalidMetricName> {
+    validate_charset(name)
+}
+
+/// Shared charset / length / leading-letter checks. Both
+/// [`validate_metric_name`] and [`validate_histogram_base_name`]
+/// run this first.
+fn validate_charset(name: &str) -> Result<(), InvalidMetricName> {
     if name.len() > MAX_METRIC_NAME_LEN {
         return Err(InvalidMetricName::TooLong {
             len: name.len(),
@@ -98,11 +126,6 @@ pub fn validate_metric_name(name: &str) -> Result<(), InvalidMetricName> {
         if !is_metric_name_char(ch) {
             return Err(InvalidMetricName::DisallowedChar { ch });
         }
-    }
-    if !VALID_SUFFIXES.iter().any(|sfx| name.ends_with(sfx)) {
-        return Err(InvalidMetricName::MissingUnitSuffix {
-            name: name.to_owned(),
-        });
     }
     Ok(())
 }
@@ -240,5 +263,51 @@ mod tests {
         // `lib.rs` is the value sub-issues copy. If a future rename
         // breaks the convention, this test catches it.
         assert!(validate_metric_name(crate::SMOKE_CAPTURE_STARTED_TOTAL).is_ok());
+    }
+
+    #[test]
+    fn histogram_base_name_accepts_unit_less_plural_noun() {
+        // Issue #237: histograms whose base name describes what's
+        // measured (not its unit) need a separate validator. Counters
+        // and gauges still require a suffix via `validate_metric_name`.
+        assert!(validate_histogram_base_name("vault_transcript_segments").is_ok());
+    }
+
+    #[test]
+    fn histogram_base_name_still_enforces_charset() {
+        assert!(matches!(
+            validate_histogram_base_name("VaultTranscriptSegments"),
+            Err(InvalidMetricName::DisallowedChar { ch: 'V' })
+        ));
+        assert_eq!(
+            validate_histogram_base_name(""),
+            Err(InvalidMetricName::Empty)
+        );
+        assert_eq!(
+            validate_histogram_base_name("1_segments"),
+            Err(InvalidMetricName::LeadsWithDigit)
+        );
+    }
+
+    #[test]
+    fn histogram_base_name_does_not_accept_counter_only_suffix() {
+        // Negative-shape: `_total` is reserved for counters; a
+        // histogram should not be named `*_total`. The validator
+        // doesn't enforce this directly (it only rejects bad
+        // charsets), but documenting via test that the function
+        // accepts `*_total` (because charset is fine) — the
+        // *call-site discipline* is what keeps counters and
+        // histograms separate, not this validator.
+        assert!(validate_histogram_base_name("capture_started_total").is_ok());
+    }
+
+    #[test]
+    fn validate_metric_name_still_rejects_unit_less_name() {
+        // Regression guard: the histogram-base-name carve-out must
+        // NOT loosen the strict counter/gauge validator.
+        match validate_metric_name("vault_transcript_segments") {
+            Err(InvalidMetricName::MissingUnitSuffix { .. }) => {}
+            other => panic!("expected MissingUnitSuffix, got {other:?}"),
+        }
     }
 }

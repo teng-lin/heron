@@ -72,7 +72,7 @@ mod recorder;
 mod timed;
 
 pub use label::{InvalidLabel, RedactedLabel};
-pub use naming::{InvalidMetricName, validate_metric_name};
+pub use naming::{InvalidMetricName, validate_histogram_base_name, validate_metric_name};
 pub use recorder::{MetricsHandle, init_prometheus_recorder};
 pub use timed::{ClassifyFailure, Outcome, timed_io_async, timed_io_sync};
 
