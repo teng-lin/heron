@@ -34,6 +34,36 @@
 //! stub for `LocalSessionOrchestrator` in `herond`'s `AppState` is
 //! the cutover; routes don't change.
 //!
+//! ## Module layout
+//!
+//! The `impl SessionOrchestrator for LocalSessionOrchestrator` block
+//! in this file is the canonical "table of contents" of public
+//! orchestrator methods. Each entry is a one-line delegation to a
+//! `pub(crate) async fn` in a per-concern module; Rust forbids
+//! splitting trait impls across files, but free-function bodies can
+//! live anywhere. Per-concern modules (all `pub(crate)`):
+//!
+//! - `capture` — `start_capture`, `end_meeting`, `pause_capture`,
+//!   `resume_capture` (the largest single concern).
+//! - `read_side` — `list_meetings`, `get_meeting`, `read_transcript`,
+//!   `read_summary`, `audio_path`, `list_upcoming_calendar`.
+//! - `context` — `attach_context`, `prepare_context`.
+//! - `auto_record` — the per-event auto-record registry plus the
+//!   tick scheduler called by the inherent `auto_record_tick`.
+//! - `health` — the `/health` projection (`current()`).
+//! - `builder` — inherent + trait impls for the [`Builder`] struct
+//!   (the struct itself stays in this file to preserve its public
+//!   path).
+//! - `compose`, `pipeline_glue`, `platform`, `state`, `validation`,
+//!   `vault_read` — shared helpers and state types.
+//!
+//! Capture and read-side share live state (`active_meetings`,
+//! `finalized_meetings`, `vault_root`); those fields stay on
+//! [`LocalSessionOrchestrator`] rather than being bundled into a
+//! per-concern struct, which would force the other concern to
+//! dereference through it for no clarity gain. Each concern module
+//! takes `&LocalSessionOrchestrator` directly.
+//!
 //! What's wired today:
 //!
 //! - **Capture lifecycle FSM.** [`SessionOrchestrator::start_capture`]
@@ -68,51 +98,25 @@
 //!   IDs become the read-side source of truth.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use heron_event::{EventBus, ReplayCache};
-use heron_event_http::{DEFAULT_REPLAY_WINDOW, InMemoryReplayCache};
-use heron_pipeline::session::{
-    Orchestrator as CliSessionOrchestrator, SessionConfig as CliSessionConfig,
-    SessionError as CliSessionError,
-};
+use heron_event::ReplayCache;
+use heron_event_http::InMemoryReplayCache;
 use heron_session::{
-    AttendeeContext, AutoRecordList, CalendarEvent, ComponentState, EventPayload, Health,
-    HealthComponents, HealthStatus, ListMeetingsPage, ListMeetingsQuery, Meeting,
-    MeetingCompletedData, MeetingId, MeetingOutcome, MeetingStatus, Platform, PreMeetingContext,
-    PreMeetingContextRequest, PrepareContextRequest, SessionError, SessionEventBus,
-    SessionOrchestrator, SetEventAutoRecordRequest, StartCaptureArgs, Summary, SummaryLifecycle,
-    Transcript, TranscriptLifecycle,
+    AutoRecordList, CalendarEvent, EventPayload, Health, ListMeetingsPage, ListMeetingsQuery,
+    Meeting, MeetingId, PreMeetingContext, PreMeetingContextRequest, PrepareContextRequest,
+    SessionError, SessionEventBus, SessionOrchestrator, SetEventAutoRecordRequest,
+    StartCaptureArgs, Summary, Transcript,
 };
-use heron_types::{RecordingFsm, SummaryOutcome};
 
-use crate::compose::{build_live_session_start_args, pre_meeting_briefing_for_v1};
-use crate::health::{
-    aggregate_health_status, capture_health_component, eventkit_health_component, health_component,
-    llm_health_component, stt_health_component, vault_health_component,
-};
-use crate::live_session::{DynLiveSession, LiveSessionFactory};
-use crate::pipeline_glue::{
-    complete_pipeline_meeting, insert_finalized_meeting, pipeline_to_session_error,
-    publish_meeting_event, push_pruned_finalizer, transition_to_session_error,
-};
-use crate::platform::platform_target_bundle_id;
-use crate::state::{ActiveMeeting, CaptureRuntime, FinalizedMeeting, PendingContexts};
-use crate::validation::{normalize_calendar_event_id, validate_context_size};
-use crate::vault_read::{
-    action_items_from_frontmatter, find_note_path_by_id, list_meetings_impl, meeting_from_note,
-    platform_from_meeting_url, read_transcript_segments, resolve_vault_path,
-    started_at_from_frontmatter, vault_to_session_err,
-};
-use heron_vault::{
-    CalendarReader, EventKitCalendarReader, FileNamingPattern, epoch_seconds_to_utc, read_note,
-};
+use crate::live_session::LiveSessionFactory;
+use crate::state::{ActiveMeeting, FinalizedMeeting, PendingContexts};
+use heron_vault::{CalendarReader, FileNamingPattern};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -120,11 +124,15 @@ use tokio::task::JoinHandle;
 pub mod live_session;
 
 pub(crate) mod auto_record;
+mod builder;
+mod capture;
 mod compose;
+mod context;
 mod health;
 mod metrics_names;
 mod pipeline_glue;
 mod platform;
+mod read_side;
 mod state;
 mod validation;
 mod vault_read;
@@ -335,281 +343,6 @@ pub struct Builder {
     auto_detect_meeting_app: bool,
 }
 
-impl std::fmt::Debug for Builder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Builder")
-            .field("bus_capacity", &self.bus_capacity)
-            .field("cache_capacity", &self.cache_capacity)
-            .field("cache_window", &self.cache_window)
-            .field("vault_root", &self.vault_root)
-            .field("calendar", &"<Arc<dyn CalendarReader>>")
-            .field("cache_dir", &self.cache_dir)
-            .field("stt_backend_name", &self.stt_backend_name)
-            .field("hotwords", &self.hotwords)
-            .field("llm_preference", &self.llm_preference)
-            .field("file_naming_pattern", &self.file_naming_pattern)
-            .field(
-                "live_session_factory",
-                &self
-                    .live_session_factory
-                    .as_ref()
-                    .map(|_| "<Arc<dyn LiveSessionFactory>>"),
-            )
-            .field("auto_detect_meeting_app", &self.auto_detect_meeting_app)
-            .finish()
-    }
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self {
-            bus_capacity: DEFAULT_BUS_CAPACITY,
-            cache_capacity: DEFAULT_CACHE_CAPACITY,
-            cache_window: DEFAULT_REPLAY_WINDOW,
-            vault_root: None,
-            calendar: None,
-            cache_dir: default_cache_dir(),
-            stt_backend_name: "sherpa".to_owned(),
-            hotwords: Vec::new(),
-            llm_preference: heron_llm::Preference::Auto,
-            file_naming_pattern: FileNamingPattern::Id,
-            live_session_factory: None,
-            // Default `true` matches the pre-Tier-4 behavior so an
-            // existing detector loop (when one lands) auto-arms by
-            // default. The desktop shell flips this when the user has
-            // unchecked Settings → Recording → "Auto-detect meeting
-            // apps".
-            auto_detect_meeting_app: true,
-        }
-    }
-}
-
-impl Builder {
-    /// Override the broadcast bus capacity. Must be > 0
-    /// (see [`heron_event::EventBus::new`]).
-    pub fn bus_capacity(mut self, capacity: usize) -> Self {
-        self.bus_capacity = capacity;
-        self
-    }
-
-    /// Override the replay cache capacity. Must be > 0
-    /// (see [`heron_event_http::InMemoryReplayCache::new`]).
-    pub fn cache_capacity(mut self, capacity: usize) -> Self {
-        self.cache_capacity = capacity;
-        self
-    }
-
-    /// Override the replay cache retention window. Surfaced via
-    /// `ReplayCache::window` and copied into the
-    /// `X-Heron-Replay-Window-Seconds` header by the SSE projection.
-    /// Default is 3600s (matches the OpenAPI doc); call this when
-    /// running with a different `?since_event_id` budget.
-    pub fn cache_window(mut self, window: Duration) -> Self {
-        self.cache_window = window;
-        self
-    }
-
-    /// Configure the on-disk vault root that the read endpoints
-    /// (`list_meetings` / `get_meeting` / `read_transcript` /
-    /// `read_summary` / `audio_path`) scan for `<vault>/meetings/*.md`
-    /// notes. Without this, every read method returns
-    /// `NotYetImplemented` (the substrate-only behavior).
-    pub fn vault_root(mut self, root: PathBuf) -> Self {
-        self.vault_root = Some(root);
-        self
-    }
-
-    /// Inject a custom [`CalendarReader`]. Tests use this to bypass
-    /// the EventKit Swift bridge (which on linux CI doesn't exist
-    /// and on macOS without TCC blocks waiting for the permission
-    /// prompt). Defaults to [`EventKitCalendarReader`] when unset.
-    pub fn calendar(mut self, reader: Arc<dyn CalendarReader>) -> Self {
-        self.calendar = Some(reader);
-        self
-    }
-
-    /// Configure where live daemon capture stores temporary WAVs,
-    /// partial transcripts, and crash-recovery state before vault
-    /// finalization. Defaults to the platform cache directory
-    /// (`~/Library/Caches/heron/daemon` on macOS) with a tempdir
-    /// fallback only when the OS cache directory cannot be resolved.
-    pub fn cache_dir(mut self, dir: PathBuf) -> Self {
-        self.cache_dir = dir;
-        self
-    }
-
-    /// Configure the STT backend name forwarded to the shared v1
-    /// session pipeline. Defaults to `sherpa`, matching `heron record`.
-    pub fn stt_backend_name(mut self, name: impl Into<String>) -> Self {
-        self.stt_backend_name = name.into();
-        self
-    }
-
-    /// Configure the LLM backend selection preference forwarded to
-    /// the shared v1 session pipeline. Defaults to `Auto`.
-    pub fn llm_preference(mut self, preference: heron_llm::Preference) -> Self {
-        self.llm_preference = preference;
-        self
-    }
-
-    /// Tier 4 #19: configure the vault-writer slug strategy forwarded
-    /// to every `CliSessionConfig` this orchestrator builds. Read once
-    /// from `Settings::file_naming_pattern` by the desktop / herond
-    /// boot path. Defaults to [`FileNamingPattern::Id`] — the
-    /// pre-Tier-1 `<date>-<hhmm> <slug>.md` template the CLI produces
-    /// when the field stays at its default — so existing test setups
-    /// that don't call this method see no behavior change.
-    pub fn file_naming_pattern(mut self, pattern: FileNamingPattern) -> Self {
-        self.file_naming_pattern = pattern;
-        self
-    }
-
-    /// Tier 4 #17: forward a vocabulary-boost list to the WhisperKit
-    /// backend at `start_capture` time. Mirrors how
-    /// [`stt_backend_name`](Self::stt_backend_name) flows through to
-    /// `CliSessionConfig`. Defaults to the empty vec, which preserves
-    /// pre-Tier-4 decoder behaviour byte-for-byte. The desktop /
-    /// `herond` shell calls this with `Settings::hotwords` at boot.
-    pub fn hotwords(mut self, hotwords: Vec<String>) -> Self {
-        self.hotwords = hotwords;
-        self
-    }
-
-    /// Install a [`LiveSessionFactory`] that `start_capture` invokes
-    /// to compose the v2 four-layer stack alongside the v1 vault
-    /// pipeline. Without this, `start_capture` only runs the v1
-    /// pipeline — the substrate-only behaviour every existing test
-    /// already relies on.
-    ///
-    /// Wired by the desktop / `herond` boot path once the
-    /// `OPENAI_API_KEY` and `RECALL_API_KEY` environment variables
-    /// are populated. Tests use a stand-in factory so the daemon
-    /// hot path can be exercised without live vendor calls.
-    pub fn live_session_factory(mut self, factory: Arc<dyn LiveSessionFactory>) -> Self {
-        self.live_session_factory = Some(factory);
-        self
-    }
-
-    /// Tier 4 #23: configure whether a future meeting-app detector
-    /// loop is allowed to auto-arm a recording without a user gesture.
-    ///
-    /// `true` (the default) preserves the pre-Tier-4 contract — when
-    /// the detector lands, it auto-arms the moment the configured
-    /// meeting app launches. `false` suppresses the auto-arm path
-    /// entirely; manual capture (hotkey, UI button, `POST
-    /// /v1/meetings`) is unaffected by this flag and continues to
-    /// publish the full `meeting.detected → armed → started` envelope
-    /// trio.
-    ///
-    /// **Gate-point contract.** Any future detector loop landing in
-    /// `heron-orchestrator` (or `heron-zoom`) must read
-    /// [`LocalSessionOrchestrator::auto_detect_meeting_app`] before
-    /// invoking `start_capture` on its own initiative. The flag lives
-    /// on the orchestrator (rather than as a free global) so a single
-    /// daemon process can host two orchestrators with different
-    /// detector policies — useful for multi-account / sandboxed
-    /// futures the v2 pivot leaves open.
-    pub fn auto_detect_meeting_app(mut self, enabled: bool) -> Self {
-        self.auto_detect_meeting_app = enabled;
-        self
-    }
-
-    /// Construct the orchestrator and spawn its recorder task.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a heron-specific message if called outside a
-    /// Tokio runtime context. The recorder is `tokio::spawn`-ed;
-    /// without a runtime there's nothing to spawn onto. The
-    /// daemon's `#[tokio::main]` (or any `#[tokio::test]`)
-    /// satisfies this. If you're hitting this panic from a sync
-    /// `#[test]`, switch to `#[tokio::test]`.
-    pub fn build(self) -> LocalSessionOrchestrator {
-        // Cheap up-front check so the failure mode points at *us*,
-        // not into Tokio's `spawn` macro. The downstream `tokio::spawn`
-        // would panic too, but with a generic "no reactor running"
-        // message that doesn't tell the caller which library required
-        // the runtime.
-        assert!(
-            tokio::runtime::Handle::try_current().is_ok(),
-            "LocalSessionOrchestrator::build must be called from a Tokio \
-             runtime; wrap your entry point in #[tokio::main] or invoke \
-             via Runtime::block_on",
-        );
-        let bus: SessionEventBus = EventBus::new(self.bus_capacity);
-        let cache = Arc::new(InMemoryReplayCache::with_window(
-            self.cache_capacity,
-            self.cache_window,
-        ));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let recorder = spawn_recorder(&bus, Arc::clone(&cache), shutdown_rx);
-        let calendar = self
-            .calendar
-            .unwrap_or_else(|| Arc::new(EventKitCalendarReader));
-        // Hydrate the auto-record registry from disk under the
-        // configured vault root. A *malformed* on-disk file is
-        // quarantined (renamed to `auto_record.json.corrupt.<ts>`)
-        // and we boot with an empty registry — the file lives in
-        // user state, and a truncated write or hand-edit shouldn't
-        // brick the daemon until someone fixes it out-of-band.
-        // Hard I/O failures (vault path gone, permission denied)
-        // still panic so a misconfigured vault doesn't quietly run
-        // with toggles disappearing on every restart.
-        let auto_record_registry =
-            match auto_record::AutoRecordRegistry::load_or_quarantine(self.vault_root.as_deref()) {
-                Ok(registry) => Arc::new(registry),
-                Err(err) => panic!("hydrate auto-record registry from vault root: {err}"),
-            };
-
-        // Set the salvage-pending gauge from whatever's left in the
-        // cache root from a previous run. `discover_unfinished` is
-        // best-effort: a missing root or unreadable record returns 0
-        // / skips silently rather than failing build (the same
-        // contract `heron salvage` relies on). The gauge is set
-        // exactly once at orchestrator construction; the next "real"
-        // update happens when the salvage UI lands and explicitly
-        // re-snapshots after recovery actions. Until then, the
-        // counter at `salvage_recovery_total` is the per-action
-        // signal and this gauge is the boot-time backlog signal.
-        let pending_candidates = heron_types::recovery::discover_unfinished(&self.cache_dir)
-            .map(|records| records.len())
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    cache_dir = %self.cache_dir.display(),
-                    error = %err,
-                    "salvage discovery failed at orchestrator startup; gauge initialised to 0",
-                );
-                0
-            });
-        // `metrics::gauge!` takes `f64`; a usize cast cap is at 2^53,
-        // and the daemon would have other problems long before
-        // accumulating that many salvage candidates.
-        metrics::gauge!(metrics_names::SALVAGE_CANDIDATES_PENDING).set(pending_candidates as f64);
-
-        LocalSessionOrchestrator {
-            bus,
-            cache,
-            vault_root: self.vault_root,
-            calendar,
-            cache_dir: self.cache_dir,
-            stt_backend_name: self.stt_backend_name,
-            hotwords: self.hotwords,
-            llm_preference: self.llm_preference,
-            file_naming_pattern: self.file_naming_pattern,
-            active_meetings: Mutex::new(HashMap::new()),
-            finalized_meetings: Arc::new(Mutex::new(HashMap::new())),
-            pending_contexts: PendingContexts::new(),
-            auto_record_registry,
-            auto_record_fired: Mutex::new(HashMap::new()),
-            shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            recorder: Mutex::new(Some(recorder)),
-            finalizers: Mutex::new(Vec::new()),
-            live_session_factory: self.live_session_factory,
-            auto_detect_meeting_app: self.auto_detect_meeting_app,
-        }
-    }
-}
-
 impl LocalSessionOrchestrator {
     /// Construct with default capacities. Equivalent to
     /// `Builder::default().build()`. Same Tokio-runtime requirement
@@ -656,20 +389,6 @@ impl LocalSessionOrchestrator {
     /// when auto-detect is off.
     pub fn auto_detect_meeting_app(&self) -> bool {
         self.auto_detect_meeting_app
-    }
-
-    fn note_path_for_read(
-        &self,
-        vault_root: &Path,
-        id: &MeetingId,
-    ) -> Result<PathBuf, SessionError> {
-        if let Some(path) = lock_or_recover(&self.finalized_meetings)
-            .get(id)
-            .and_then(|m| m.note_path.clone())
-        {
-            return Ok(path);
-        }
-        find_note_path_by_id(vault_root, id)
     }
 
     /// Snapshot of the `PreMeetingContext` currently staged for
@@ -738,13 +457,16 @@ impl LocalSessionOrchestrator {
     /// number of fires this tick triggered — exposed for tests so
     /// they can drive the scheduler deterministically without
     /// orchestrating real time. Production callers go through
-    /// [`spawn_auto_record_scheduler`].
+    /// [`Self::spawn_auto_record_scheduler`].
     ///
-    /// Errors from `start_capture` (`CaptureInProgress`,
-    /// `PermissionMissing`, …) are logged at warn level and counted
-    /// against `recently_fired` regardless — the scheduler has done
-    /// its part; re-firing every tick just because the FSM rejected
-    /// the request would spam the log without changing the outcome.
+    /// On a `start_capture` rejection (`CaptureInProgress`,
+    /// `PermissionMissing`, unrecognized meeting URL, …) the dedup
+    /// claim is released so the next tick can retry inside the same
+    /// start window — only successful fires earn the 12h
+    /// `AUTO_RECORD_DEDUP_TTL` marker. The error is logged at warn
+    /// level and otherwise swallowed; bubbling it up would force every
+    /// scheduler tick to handle vendor flake the user already sees in
+    /// the log.
     ///
     /// Platform inference: today's `list_upcoming_calendar` always
     /// returns `meeting_url: None` (the Swift bridge doesn't expose
@@ -753,105 +475,7 @@ impl LocalSessionOrchestrator {
     /// branch picks the right platform per event and skips
     /// unrecognized providers instead of launching the wrong client.
     pub async fn auto_record_tick(&self, now: DateTime<Utc>) -> usize {
-        // Prune stale dedup entries inline — keeps the map size bound
-        // to the live auto-record set rather than growing forever.
-        {
-            let mut g = lock_or_recover(&self.auto_record_fired);
-            g.retain(|_, fired_at| now.signed_duration_since(*fired_at) < AUTO_RECORD_DEDUP_TTL);
-        }
-        // Use the scheduler's own `now` and start window — the
-        // default `list_upcoming_calendar(None, None, None)` rebuilds
-        // `Utc::now()` internally and caps at 20 events, which would
-        // both break the test seam and silently skip auto-record-
-        // enabled meetings for users with packed calendars.
-        let window_end = now + AUTO_RECORD_START_WINDOW;
-        let events = match self
-            .list_upcoming_calendar(Some(now), Some(window_end), Some(AUTO_RECORD_EVENT_LIMIT))
-            .await
-        {
-            Ok(events) => events,
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    "auto-record tick: calendar read failed; skipping",
-                );
-                return 0;
-            }
-        };
-        let mut fired = 0;
-        for event in events {
-            if !event.auto_record {
-                continue;
-            }
-            if event.start < now || event.start > window_end {
-                continue;
-            }
-            // Single-acquisition check + claim: a concurrent tick
-            // (in tests we sometimes drive ticks in parallel) cannot
-            // both pass the membership probe and both insert. We
-            // claim *before* `start_capture` so the parallel-tick
-            // dedup invariant holds; on `Err` we release the claim
-            // below so a transient failure (CaptureInProgress,
-            // permission denied, etc.) doesn't burn the 12h TTL and
-            // suppress retries for the rest of the start window.
-            {
-                let mut g = lock_or_recover(&self.auto_record_fired);
-                if g.contains_key(&event.id) {
-                    continue;
-                }
-                g.insert(event.id.clone(), now);
-            }
-            let platform = match event.meeting_url.as_deref() {
-                None => Platform::Zoom,
-                Some(url) => match platform_from_meeting_url(Some(url)) {
-                    Some(platform) => platform,
-                    None => {
-                        tracing::warn!(
-                            calendar_event_id = %event.id,
-                            meeting_url = url,
-                            "auto-record skipped: unrecognized meeting URL",
-                        );
-                        // Release the claim so a subsequent fix to
-                        // the URL within this start window can re-fire.
-                        lock_or_recover(&self.auto_record_fired).remove(&event.id);
-                        continue;
-                    }
-                },
-            };
-            let event_id = event.id.clone();
-            let result = self
-                .start_capture(StartCaptureArgs {
-                    platform,
-                    hint: Some(event.title.clone()),
-                    calendar_event_id: Some(event_id.clone()),
-                })
-                .await;
-            match result {
-                Ok(meeting) => {
-                    fired += 1;
-                    tracing::info!(
-                        calendar_event_id = %event_id,
-                        meeting_id = %meeting.id,
-                        platform = ?platform,
-                        "auto-record fired",
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        calendar_event_id = %event_id,
-                        platform = ?platform,
-                        error = %err,
-                        "auto-record start_capture rejected; will retry next tick",
-                    );
-                    // Release the dedup claim so a transient FSM
-                    // rejection doesn't suppress retries for the
-                    // 12h TTL — only successful fires earn the
-                    // long-lived marker.
-                    lock_or_recover(&self.auto_record_fired).remove(&event_id);
-                }
-            }
-        }
-        fired
+        auto_record::tick(self, now).await
     }
 
     /// Spawn the production per-event auto-record scheduler.
@@ -930,7 +554,7 @@ pub(crate) fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// recovery contract: a partial replay would silently hand a client
 /// events that skip the gap, so the only honest answer is to make
 /// every subsequent `replay_since` `WindowExceeded`.
-fn spawn_recorder(
+pub(crate) fn spawn_recorder(
     bus: &SessionEventBus,
     cache: Arc<InMemoryReplayCache<EventPayload>>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -978,7 +602,7 @@ fn spawn_recorder(
     })
 }
 
-fn default_cache_dir() -> PathBuf {
+pub(crate) fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("heron")
@@ -988,7 +612,7 @@ fn default_cache_dir() -> PathBuf {
 /// Snapshot active captures matching a [`ListMeetingsQuery`]'s filters
 /// (since / status / platform), newest-first. Caller is responsible
 /// for limit / cursor handling — active captures never paginate.
-fn collect_active_for_query(
+pub(crate) fn collect_active_for_query(
     active: &Mutex<HashMap<MeetingId, ActiveMeeting>>,
     q: &ListMeetingsQuery,
 ) -> Vec<Meeting> {
@@ -1015,672 +639,39 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
     // surface.
 
     async fn list_meetings(&self, q: ListMeetingsQuery) -> Result<ListMeetingsPage, SessionError> {
-        // Active captures are the live state; finalized vault notes
-        // are the disk snapshot. The same `Meeting` is never in both
-        // (no vault writer yet, and once one lands the entry is
-        // removed from `active_meetings` on `end_meeting` before the
-        // note is finalized). Surface active captures only on the
-        // first page (cursor=None) — the cursor format is a vault-
-        // relative path, so paginating through them would require a
-        // synthetic cursor scheme. Active captures are bounded by
-        // the singleton-per-platform invariant, so they always fit on
-        // page one anyway.
-        let active_items = if q.cursor.is_none() {
-            collect_active_for_query(&self.active_meetings, &q)
-        } else {
-            Vec::new()
-        };
-
-        let Some(root) = self.vault_root.as_deref() else {
-            // Without a vault, the only meetings to surface are
-            // active ones. If there are none, preserve the substrate-
-            // only `NotYetImplemented` behavior so vault-less tests
-            // keep their existing surface.
-            return if active_items.is_empty() {
-                Err(SessionError::NotYetImplemented)
-            } else {
-                Ok(ListMeetingsPage {
-                    items: active_items,
-                    next_cursor: None,
-                })
-            };
-        };
-
-        let mut page = list_meetings_impl(root, q.clone())?;
-        // Newest first: active captures predate any cursor-paginated
-        // disk results, so prepend then re-apply the limit. The
-        // `next_cursor` from the disk scan still points into the disk
-        // set — that's fine because active items aren't paginated.
-        let limit = q.limit.unwrap_or(50).min(200) as usize;
-        let mut combined = active_items;
-        combined.extend(page.items);
-        if combined.len() > limit {
-            combined.truncate(limit);
-        }
-        page.items = combined;
-        Ok(page)
+        read_side::list_meetings(self, q).await
     }
 
     async fn get_meeting(&self, id: &MeetingId) -> Result<Meeting, SessionError> {
-        // Active capture wins — it's the live state, and it's the
-        // only thing that exists for a meeting between
-        // `start_capture` and the (future) vault note write. Without
-        // this short-circuit the `Location: /v1/meetings/{id}` header
-        // herond stamps on `POST /meetings` (per the OpenAPI
-        // 202-Accepted shape) would dangle into a 404.
-        if let Some(active) = lock_or_recover(&self.active_meetings).get(id) {
-            return Ok(active.meeting.clone());
-        }
-        if let Some(finalized) = lock_or_recover(&self.finalized_meetings).get(id) {
-            return Ok(finalized.meeting.clone());
-        }
-        let Some(root) = self.vault_root.as_deref() else {
-            return Err(SessionError::NotYetImplemented);
-        };
-        let path = find_note_path_by_id(root, id)?;
-        meeting_from_note(root, &path)
+        read_side::get_meeting(self, id).await
     }
 
     async fn start_capture(&self, args: StartCaptureArgs) -> Result<Meeting, SessionError> {
-        // FSM-merge: drive the same `RecordingFsm` `heron-cli`'s
-        // session orchestrator uses on the live audio path through
-        // `idle → armed → recording`, publishing one bus event per
-        // transition. A future PR replaces this synchronous walk with
-        // an audio-task-driven path that returns at `Armed` and emits
-        // `MeetingStarted` once Core Audio actually starts producing
-        // PCM; the trait + bus surface stays the same — only the
-        // timing of `MeetingStarted` shifts.
-        let normalized_event_id = match args.calendar_event_id.as_deref() {
-            Some(raw) => Some(normalize_calendar_event_id(raw)?),
-            None => None,
-        };
-        let id = MeetingId::now_v7();
-        let started_at = Utc::now();
-        let mut meeting = Meeting {
-            id,
-            status: MeetingStatus::Detected,
-            platform: args.platform,
-            // The `hint` is wire-shape free text; surfacing it as the
-            // title is the most honest projection until a real source
-            // (AX window title, calendar correlation) lands.
-            title: args.hint,
-            calendar_event_id: normalized_event_id.clone(),
-            started_at,
-            ended_at: None,
-            duration_secs: None,
-            participants: Vec::new(),
-            transcript_status: TranscriptLifecycle::Pending,
-            summary_status: SummaryLifecycle::Pending,
-            // Tags are LLM-inferred from the summary; an active capture
-            // has no summary yet, so start empty and let
-            // `meeting_from_note` fill them in once the note is
-            // finalized on disk.
-            tags: Vec::new(),
-            // No summary has run yet at start-capture time; cost is
-            // populated later by `meeting_from_note` when the
-            // finalized vault note is read back.
-            processing: None,
-            // No structured action items yet at start-capture time;
-            // populated later by `meeting_from_note` from
-            // `Frontmatter.action_items` once the vault note is on
-            // disk. Tier 0 #3 — read path only.
-            action_items: Vec::new(),
-        };
-        let mut fsm = RecordingFsm::new();
-
-        // Atomic singleton-check-and-claim. The platform-conflict scan
-        // and the placeholder insert have to share one critical section
-        // — otherwise two concurrent `start_capture` calls for the same
-        // platform could both pass the check before either inserted,
-        // producing parallel captures. Everything inside the scope is
-        // synchronous: bus broadcasts (`bus.send` is non-blocking),
-        // FSM transitions, `tokio::task::spawn_blocking` (returns a
-        // JoinHandle immediately; the blocking work runs off-thread),
-        // and a brief `pending_contexts` lock taken AFTER
-        // `active_meetings` per the lock-ordering rule. The lock is
-        // released before the v2 `factory.start(...).await` further
-        // down — that `.await` is why the live-session attachment runs
-        // in its own short critical section after the await rather
-        // than here.
-        let applied_context = {
-            let mut active = lock_or_recover(&self.active_meetings);
-            if active
-                .values()
-                .any(|m| m.meeting.platform == args.platform && !m.meeting.status.is_terminal())
-            {
-                return Err(SessionError::CaptureInProgress {
-                    platform: args.platform,
-                });
-            }
-
-            publish_meeting_event(
-                &self.bus,
-                EventPayload::MeetingDetected(meeting.clone()),
-                id,
-            );
-
-            // idle → armed. `on_hotkey` from `Idle` is the FSM's "user
-            // armed a capture" edge; `Invalid` here would mean the
-            // freshly-built FSM isn't actually `Idle`, which can't
-            // happen — map defensively rather than `unwrap` so a future
-            // FSM change surfaces as a typed error.
-            fsm.on_hotkey().map_err(transition_to_session_error)?;
-            meeting.status = MeetingStatus::Armed;
-            publish_meeting_event(&self.bus, EventPayload::MeetingArmed(meeting.clone()), id);
-
-            // armed → recording.
-            fsm.on_yes().map_err(transition_to_session_error)?;
-            meeting.status = MeetingStatus::Recording;
-            publish_meeting_event(&self.bus, EventPayload::MeetingStarted(meeting.clone()), id);
-
-            // Smoke metric — the canonical example sub-issues #224 /
-            // #225 / #226 copy. The label MUST flow through
-            // `redacted!` (compile-time literal-only) or
-            // `RedactedLabel::from_static`; see
-            // `docs/observability.md` for the rule. `Platform` is a
-            // closed enum with snake_case discriminants → safe as
-            // literals. Any fields with user-content shape
-            // (meeting_id, hint, calendar_event_id) are NEVER
-            // attached as labels.
-            let platform_label: heron_metrics::RedactedLabel = match args.platform {
-                Platform::Zoom => heron_metrics::redacted!("zoom"),
-                Platform::GoogleMeet => heron_metrics::redacted!("google_meet"),
-                Platform::MicrosoftTeams => heron_metrics::redacted!("microsoft_teams"),
-                Platform::Webex => heron_metrics::redacted!("webex"),
-            };
-            metrics::counter!(
-                heron_metrics::SMOKE_CAPTURE_STARTED_TOTAL,
-                "platform" => platform_label.into_inner(),
-            )
-            .increment(1);
-            // Capture-lifecycle gauge: every successful arm → recording
-            // walk bumps `capture_active_count`. The matching
-            // decrement lives in `end_meeting` (via `decrement(1.0)`).
-            // No labels — the dashboard answer is "how many captures
-            // are running right now" and the per-platform breakdown
-            // already lives on `capture_started_total{platform}` /
-            // `capture_ended_total{reason}`.
-            metrics::gauge!(metrics_names::CAPTURE_ACTIVE).increment(1.0);
-
-            // Consume the pending context AFTER the FSM walk commits
-            // but BEFORE building `CliSessionConfig`, so the rendered
-            // briefing can feed both v1
-            // (`CliSessionConfig.pre_meeting_briefing`) and v2
-            // (`build_live_session_start_args`). A failed FSM
-            // transition above `?`-returns and drops the guard before
-            // we touch `pending_contexts`, so a retry still finds the
-            // staged entry.
-            let applied_context = normalized_event_id
-                .as_deref()
-                .and_then(|cid| self.pending_contexts.remove(cid));
-            let pre_meeting_briefing = pre_meeting_briefing_for_v1(applied_context.as_ref(), id);
-
-            let pause_flag = Arc::new(AtomicBool::new(false));
-            let runtime = if let Some(vault_root) = self.vault_root.clone() {
-                let (stop_tx, stop_rx) = oneshot::channel();
-                let config = CliSessionConfig {
-                    session_id: id.0,
-                    target_bundle_id: platform_target_bundle_id(args.platform).to_owned(),
-                    cache_dir: self.cache_dir.clone(),
-                    vault_root,
-                    stt_backend_name: self.stt_backend_name.clone(),
-                    // Tier 4 #17: forward the user-configured
-                    // vocabulary-boost list to the WhisperKit backend.
-                    // Cloned per `start_capture` so each session
-                    // captures a *snapshot* of the orchestrator's
-                    // hotwords at start time. The current orchestrator
-                    // is `&self` and the field is plain
-                    // `Vec<String>`, so there's no concurrent-mutation
-                    // hazard today — but if a future PR adds a
-                    // `Settings.hotwords` live-reload setter (with
-                    // interior mutability via `RwLock` / `Mutex`), the
-                    // snapshot is what keeps in-flight sessions
-                    // pointing at a stable prompt instead of swapping
-                    // mid-decode.
-                    hotwords: self.hotwords.clone(),
-                    llm_preference: self.llm_preference,
-                    pre_meeting_briefing,
-                    // Tier 0b #4: bridge `SpeakerEvent` from the AX
-                    // observer onto the canonical event bus so SSE
-                    // / Tauri / MCP transports can render a "now
-                    // speaking" indicator without subscribing to a
-                    // private channel. Cheap clone — the bus is
-                    // `Arc`-backed inside.
-                    event_bus: Some((self.bus.clone(), id)),
-                    // Tier 4 #19: forward the orchestrator's slug
-                    // strategy so `pipeline.rs` picks the right
-                    // `<vault>/meetings/<filename>.md` shape.
-                    file_naming_pattern: self.file_naming_pattern,
-                    // Tier 4 #18 / #21: the daemon orchestrator does
-                    // not currently read the desktop's `Settings.persona`
-                    // / `Settings.strip_names_before_summarization`. The
-                    // desktop's `resummarize.rs` threads them in for the
-                    // re-summarize path; live capture inherits the
-                    // pre-Tier-4 prompt path until the daemon grows a
-                    // settings reader.
-                    persona: None,
-                    strip_names: false,
-                    // Tier 3 #16: hand the pause flag to the pipeline
-                    // so WAV writers + AX collector + audio-level
-                    // collector can drop frames on the floor when
-                    // paused. The orchestrator owns the canonical flag;
-                    // this is a cheap `Arc` clone.
-                    pause_flag: Some(Arc::clone(&pause_flag)),
-                };
-                let handle = tokio::task::spawn_blocking(move || {
-                    // CoreAudio/cpal handles in the capture path are
-                    // not `Send` on macOS. Run the whole shared v1
-                    // pipeline on one blocking worker with its own
-                    // current-thread runtime so those handles are
-                    // never moved between Tokio worker threads.
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| CliSessionError::Pipeline(format!("tokio runtime: {e}")))?;
-                    runtime.block_on(async move {
-                        let mut orchestrator = CliSessionOrchestrator::new(config);
-                        orchestrator.run(stop_rx).await
-                    })
-                });
-                CaptureRuntime::Pipeline { stop_tx, handle }
-            } else {
-                CaptureRuntime::Synthetic
-            };
-
-            // Placeholder insert: claims the platform slot before we
-            // release the lock. The v2 live session (if any) is
-            // attached below in a second critical section, after
-            // `factory.start(..).await` resolves.
-            active.insert(
-                id,
-                ActiveMeeting {
-                    fsm,
-                    meeting: meeting.clone(),
-                    runtime,
-                    applied_context: applied_context.clone(),
-                    live_session: None,
-                    pause_flag,
-                },
-            );
-
-            applied_context
-        };
-
-        // The v2 factory call is the only step that needs the lock
-        // released, because it `.await`s on vendor HTTP / WebSocket
-        // open. The trade-off: a concurrent `end_meeting(id)` on this
-        // same meeting could land in the brief gap between the insert
-        // above and the live-session attach below; that race is closed
-        // by the post-await scope checking that the entry is still
-        // present and tearing the orphan session down if it isn't.
-        let context_attached = applied_context.is_some();
-
-        if let Some(factory) = self.live_session_factory.as_ref() {
-            let live_args = build_live_session_start_args(
-                id,
-                args.platform,
-                &meeting,
-                applied_context.as_ref(),
-            );
-            match factory.start(live_args).await {
-                Ok(session) => {
-                    let bot_id = session.bot_id();
-                    let realtime_session = session.realtime_session();
-                    // Hold the lock only long enough to attach the
-                    // session, OR (when the entry has vanished) hand
-                    // the session back to the outer scope as an
-                    // orphan to tear down. Returning the box out of
-                    // the lock scope keeps the `MutexGuard` (sync,
-                    // !Send) off the `.await` that follows.
-                    let orphan: Option<Box<dyn DynLiveSession>> = {
-                        let mut active = lock_or_recover(&self.active_meetings);
-                        match active.get_mut(&id) {
-                            Some(entry) => {
-                                entry.live_session = Some(session);
-                                None
-                            }
-                            None => Some(session),
-                        }
-                    };
-                    if let Some(orphan) = orphan {
-                        // The capture was ended (or otherwise
-                        // removed) while the factory was running.
-                        // Best-effort tear the dangling session down
-                        // so we don't leak a vendor bot.
-                        tracing::warn!(
-                            meeting_id = %id,
-                            "active meeting disappeared during live session start; tearing down",
-                        );
-                        if let Err(err) = orphan.shutdown().await {
-                            tracing::warn!(
-                                meeting_id = %id,
-                                error = %err,
-                                "best-effort live-session shutdown failed",
-                            );
-                        }
-                    } else {
-                        tracing::info!(
-                            meeting_id = %id,
-                            bot_id = %bot_id,
-                            realtime_session = %realtime_session,
-                            "v2 live session composed",
-                        );
-                    }
-                }
-                Err(err) => {
-                    // Falling back to the v1 vault path is documented
-                    // behaviour. The two most common reasons here on
-                    // alpha are:
-                    //   * `OPENAI_API_KEY` missing (parallel work),
-                    //   * Recall vendor flake on `bot_create`.
-                    // In either case the daemon should still record
-                    // and transcribe the meeting; only realtime bot
-                    // interaction is lost. The error rides into the
-                    // log so operators can correlate with the
-                    // vendor-side failure.
-                    tracing::warn!(
-                        meeting_id = %id,
-                        error = %err,
-                        "v2 live session composition failed; continuing with v1 vault pipeline only",
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            meeting_id = %id,
-            platform = ?args.platform,
-            calendar_event_id = ?normalized_event_id,
-            context_attached,
-            "capture started",
-        );
-        Ok(meeting)
+        capture::start_capture(self, args).await
     }
 
     async fn end_meeting(&self, id: &MeetingId) -> Result<(), SessionError> {
-        // Drive the FSM through `recording → transcribing →
-        // summarizing → idle`, publishing `meeting.ended` on the
-        // recording-stop edge and `meeting.completed` on the
-        // terminal edge. The intermediate transcribing/summarizing
-        // edges are internal to the pipeline — they don't have a
-        // public bus event today (transcript / summary deltas ride
-        // their own typed payloads, emitted by the future audio +
-        // STT + LLM impls).
-        let entry = {
-            let mut active = lock_or_recover(&self.active_meetings);
-            active.remove(id).ok_or_else(|| SessionError::NotFound {
-                what: format!("active meeting {id}"),
-            })?
-        };
-        // Decrement the capture-active gauge as soon as we've claimed
-        // the entry for removal. Pairing it with the `remove()` (not
-        // with the later `?`-bearing transitions) means a subsequent
-        // FSM-rejection error path doesn't leak the gauge upward
-        // forever — the matching `start_capture` increment landed
-        // when the entry became active, the gauge must mirror the
-        // entry's existence in `active_meetings`, and the entry is
-        // gone the moment `remove()` returns Some.
-        metrics::gauge!(metrics_names::CAPTURE_ACTIVE).decrement(1.0);
-        let ActiveMeeting {
-            mut fsm,
-            mut meeting,
-            runtime,
-            applied_context: _,
-            live_session,
-            pause_flag: _,
-        } = entry;
-
-        // Tear the v2 stack down BEFORE the v1 finalizer runs so the
-        // realtime backend's WebSocket and the vendor bot are
-        // released as quickly as possible. We hand the shutdown off
-        // to a finalizer task because the request handler should not
-        // block on vendor leave HTTP calls.
-        if let Some(session) = live_session {
-            let bot_id = session.bot_id();
-            let realtime_session = session.realtime_session();
-            let id_copy = *id;
-            let live_finalizer = tokio::spawn(async move {
-                if let Err(err) = session.shutdown().await {
-                    tracing::warn!(
-                        meeting_id = %id_copy,
-                        bot_id = %bot_id,
-                        realtime_session = %realtime_session,
-                        error = %err,
-                        "live session shutdown reported errors",
-                    );
-                } else {
-                    tracing::info!(
-                        meeting_id = %id_copy,
-                        bot_id = %bot_id,
-                        realtime_session = %realtime_session,
-                        "live session shut down cleanly",
-                    );
-                }
-            });
-            push_pruned_finalizer(&self.finalizers, live_finalizer);
-        }
-
-        // recording → transcribing. The `on_hotkey` from `Recording`
-        // is the FSM's stop edge per `docs/archives/implementation.md` §14.2.
-        // The FSM rejects this from any other state via
-        // `TransitionError`, which `transition_to_session_error`
-        // surfaces as `Validation` — that's the safety net for the
-        // (currently impossible) drift where an entry's FSM is not
-        // at `Recording`.
-        fsm.on_hotkey().map_err(transition_to_session_error)?;
-        let ended_at = Utc::now();
-        // `num_seconds` is `i64`; saturate at 0 if the system clock
-        // ran backwards between `start_capture` and `end_meeting`
-        // (NTP slew on a long-running daemon). A negative duration
-        // would be both meaningless and a panic-on-cast risk.
-        let duration_secs = (ended_at - meeting.started_at).num_seconds().max(0) as u64;
-        meeting.status = MeetingStatus::Ended;
-        meeting.ended_at = Some(ended_at);
-        meeting.duration_secs = Some(duration_secs);
-        insert_finalized_meeting(
-            &self.finalized_meetings,
-            *id,
-            FinalizedMeeting {
-                meeting: meeting.clone(),
-                note_path: None,
-            },
-        );
-        publish_meeting_event(&self.bus, EventPayload::MeetingEnded(meeting.clone()), *id);
-
-        match runtime {
-            CaptureRuntime::Synthetic => {
-                fsm.on_transcribe_done()
-                    .map_err(transition_to_session_error)?;
-                fsm.on_summary(SummaryOutcome::Done)
-                    .map_err(transition_to_session_error)?;
-                meeting.status = MeetingStatus::Done;
-                meeting.transcript_status = TranscriptLifecycle::Complete;
-                meeting.summary_status = SummaryLifecycle::Ready;
-                insert_finalized_meeting(
-                    &self.finalized_meetings,
-                    *id,
-                    FinalizedMeeting {
-                        meeting: meeting.clone(),
-                        note_path: None,
-                    },
-                );
-                publish_meeting_event(
-                    &self.bus,
-                    EventPayload::MeetingCompleted(MeetingCompletedData {
-                        meeting,
-                        outcome: MeetingOutcome::Success,
-                        failure_reason: None,
-                    }),
-                    *id,
-                );
-                // Synthetic path has no real pipeline to wait on, so
-                // the lifecycle disposition is decided here. Emit the
-                // single `capture_ended_total` increment for this
-                // meeting with `reason="user_stop"` — the test stub
-                // path always corresponds to "user invoked
-                // end_meeting; no automated outcome to report". This
-                // keeps `sum(capture_ended_total)` equal to the number
-                // of finished meetings (the pipeline arm emits its
-                // own `success` / `error` increment from
-                // `complete_pipeline_meeting`, never both arms in one
-                // lifecycle).
-                let reason_label = heron_metrics::redacted!("user_stop");
-                metrics::counter!(
-                    metrics_names::CAPTURE_ENDED_TOTAL,
-                    "reason" => reason_label.into_inner(),
-                )
-                .increment(1);
-            }
-            CaptureRuntime::Pipeline { stop_tx, handle } => {
-                let _ = stop_tx.send(());
-                let bus = self.bus.clone();
-                let finalized_meetings = Arc::clone(&self.finalized_meetings);
-                let id = *id;
-                let finalizer = tokio::spawn(async move {
-                    let result = match handle.await {
-                        Ok(Ok(outcome)) => Ok(outcome),
-                        Ok(Err(err)) => Err(pipeline_to_session_error(err)),
-                        Err(err) => Err(SessionError::Validation {
-                            detail: format!("capture pipeline task failed: {err}"),
-                        }),
-                    };
-                    complete_pipeline_meeting(&bus, &finalized_meetings, id, fsm, meeting, result);
-                });
-                push_pruned_finalizer(&self.finalizers, finalizer);
-                // Pipeline path: `complete_pipeline_meeting` (running
-                // on the spawned finalizer) is responsible for the
-                // `capture_ended_total{reason="success"|"error"}`
-                // increment once the pipeline finishes. NOT emitted
-                // here so each lifecycle results in exactly one
-                // increment, matching the issue's mutually-exclusive
-                // `reason` enum.
-            }
-        }
-        // The gauge decrement happens earlier (right after
-        // `active.remove(id)`) to avoid a leak on FSM rejection
-        // between here and the remove. The `capture_ended_total`
-        // increment is emitted per-arm above (synthetic vs pipeline)
-        // so each meeting maps to exactly one counter bump.
-        tracing::info!(
-            meeting_id = %id,
-            duration_secs,
-            "capture ended",
-        );
-        Ok(())
+        capture::end_meeting(self, id).await
     }
 
     async fn pause_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
-        // Tier 3 #16: drive the FSM through `Recording → Paused` and
-        // flip the shared atomic flag the capture pipeline reads. Both
-        // sides happen under the active-meetings lock so a concurrent
-        // `resume_capture` / `end_meeting` can't observe a torn state
-        // (FSM at `Recording` while flag is `true`, or vice versa).
-        // The publish step is sync — `bus.publish` is non-blocking —
-        // so holding the guard across it is safe per the existing
-        // lock-discipline rules.
-        let snapshot = {
-            let mut active = lock_or_recover(&self.active_meetings);
-            let entry = active.get_mut(id).ok_or_else(|| SessionError::NotFound {
-                what: format!("active meeting {id}"),
-            })?;
-            entry
-                .fsm
-                .on_pause()
-                .map_err(|_| SessionError::InvalidState {
-                    current_state: entry.meeting.status,
-                })?;
-            entry.pause_flag.store(true, Ordering::SeqCst);
-            entry.meeting.status = MeetingStatus::Paused;
-            entry.meeting.clone()
-        };
-        // No dedicated `meeting.paused` event today: the wire surface
-        // is the meeting's `status` field via `GET /meetings/{id}`,
-        // which reflects the orchestrator's snapshot. A future PR can
-        // add a typed bus event without changing the pause/resume HTTP
-        // contract — keeping the `EventPayload` enum stable for now.
-        tracing::info!(meeting_id = %id, "capture paused");
-        let _ = snapshot;
-        Ok(())
+        capture::pause_capture(self, id).await
     }
 
     async fn resume_capture(&self, id: &MeetingId) -> Result<(), SessionError> {
-        // Mirror image of `pause_capture`: drive `Paused → Recording`
-        // and clear the flag under the same lock. `InvalidState`
-        // surfaces when the meeting isn't in `Paused` (e.g. someone
-        // hit Resume while we were already recording, or after end_meeting
-        // dropped the entry — that path is already covered by the
-        // NotFound short-circuit, but the FSM check keeps the typed
-        // error tight).
-        let snapshot = {
-            let mut active = lock_or_recover(&self.active_meetings);
-            let entry = active.get_mut(id).ok_or_else(|| SessionError::NotFound {
-                what: format!("active meeting {id}"),
-            })?;
-            entry
-                .fsm
-                .on_resume()
-                .map_err(|_| SessionError::InvalidState {
-                    current_state: entry.meeting.status,
-                })?;
-            entry.pause_flag.store(false, Ordering::SeqCst);
-            entry.meeting.status = MeetingStatus::Recording;
-            entry.meeting.clone()
-        };
-        tracing::info!(meeting_id = %id, "capture resumed");
-        let _ = snapshot;
-        Ok(())
+        capture::resume_capture(self, id).await
     }
 
     async fn read_transcript(&self, id: &MeetingId) -> Result<Transcript, SessionError> {
-        let Some(root) = self.vault_root.as_deref() else {
-            return Err(SessionError::NotYetImplemented);
-        };
-        let path = self.note_path_for_read(root, id)?;
-        let (frontmatter, _) = read_note(&path).map_err(vault_to_session_err)?;
-        let transcript_path = resolve_vault_path(root, &frontmatter.transcript, "transcript")?;
-        let segments = read_transcript_segments(&transcript_path)?;
-        Ok(Transcript {
-            meeting_id: *id,
-            status: TranscriptLifecycle::Complete,
-            language: None,
-            segments,
-        })
+        read_side::read_transcript(self, id).await
     }
 
     async fn read_summary(&self, id: &MeetingId) -> Result<Option<Summary>, SessionError> {
-        let Some(root) = self.vault_root.as_deref() else {
-            return Err(SessionError::NotYetImplemented);
-        };
-        let path = self.note_path_for_read(root, id)?;
-        let (frontmatter, body) = read_note(&path).map_err(vault_to_session_err)?;
-        let action_items = action_items_from_frontmatter(&frontmatter.action_items);
-        Ok(Some(Summary {
-            meeting_id: *id,
-            generated_at: started_at_from_frontmatter(&frontmatter),
-            text: body,
-            action_items,
-            llm_provider: None,
-            llm_model: None,
-        }))
+        read_side::read_summary(self, id).await
     }
 
     async fn audio_path(&self, id: &MeetingId) -> Result<PathBuf, SessionError> {
-        let Some(root) = self.vault_root.as_deref() else {
-            return Err(SessionError::NotYetImplemented);
-        };
-        let path = self.note_path_for_read(root, id)?;
-        let (frontmatter, _) = read_note(&path).map_err(vault_to_session_err)?;
-        let recording = resolve_vault_path(root, &frontmatter.recording, "recording")?;
-        if !recording.exists() {
-            // Don't echo the resolved host path into the wire error
-            // — keeps a vault-layout exfil channel closed even on
-            // an authenticated request. The meeting id is sufficient
-            // for the consumer to act on.
-            return Err(SessionError::NotFound {
-                what: format!("audio for meeting {id}"),
-            });
-        }
-        Ok(recording)
+        read_side::audio_path(self, id).await
     }
 
     async fn list_upcoming_calendar(
@@ -1689,223 +680,30 @@ impl SessionOrchestrator for LocalSessionOrchestrator {
         to: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<CalendarEvent>, SessionError> {
-        let now = Utc::now();
-        let from = from.unwrap_or(now);
-        let to = to.unwrap_or_else(|| from + chrono::Duration::days(7));
-        let raw = self
-            .calendar
-            .read_window(from, to)
-            .map_err(|e| match e {
-                heron_vault::CalendarError::Denied => SessionError::PermissionMissing {
-                    permission: "calendar",
-                },
-                other => SessionError::VaultLocked {
-                    detail: format!("calendar read failed: {other}"),
-                },
-            })?
-            .unwrap_or_default();
-        let cap = limit.unwrap_or(20).min(100) as usize;
-        let events = raw
-            .into_iter()
-            .take(cap)
-            .map(|ev| {
-                // EventKit doesn't yet expose a stable per-event id
-                // through the Swift bridge; until it does, synthesize
-                // a deterministic id from `(start, end, title)` so a
-                // future `attach_context` impl can correlate. Long
-                // titles are SHA-collision-resistant — `format!` of
-                // the raw f64 bits + full title string is enough at
-                // this scope; collision-free across realistic vaults.
-                let id = format!(
-                    "synth_{}_{}_{}",
-                    ev.start.to_bits(),
-                    ev.end.to_bits(),
-                    ev.title
-                );
-                let primed = self.pending_contexts.contains_key(&id);
-                let auto_record = self.auto_record_registry.contains(&id);
-                CalendarEvent {
-                    id,
-                    title: ev.title,
-                    start: epoch_seconds_to_utc(ev.start),
-                    end: epoch_seconds_to_utc(ev.end),
-                    attendees: ev
-                        .attendees
-                        .into_iter()
-                        .map(|a| AttendeeContext {
-                            name: a.name,
-                            email: Some(a.email).filter(|s| !s.is_empty()),
-                            last_seen_in: None,
-                            relationship: None,
-                            notes: None,
-                        })
-                        .collect(),
-                    meeting_url: None,
-                    related_meetings: Vec::new(),
-                    primed,
-                    auto_record,
-                }
-            })
-            .collect();
-        Ok(events)
+        read_side::list_upcoming_calendar(self, from, to, limit).await
     }
 
     async fn attach_context(&self, req: PreMeetingContextRequest) -> Result<(), SessionError> {
-        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        let bytes = validate_context_size(&req.context)?;
-        let overwrote = self
-            .pending_contexts
-            .insert(calendar_event_id.clone(), req.context);
-        tracing::info!(
-            calendar_event_id = %calendar_event_id,
-            overwrote,
-            bytes,
-            "pre-meeting context attached",
-        );
-        Ok(())
+        context::attach_context(self, req).await
     }
 
     async fn prepare_context(&self, req: PrepareContextRequest) -> Result<(), SessionError> {
-        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        // Today's synthesizer is intentionally minimal: lift the
-        // calendar event's attendees into `attendees_known` and leave
-        // the rest at default. Related-notes lookup needs vault
-        // search by attendee/title — that lands with the Ask-bar RAG
-        // infrastructure (Tier 6b in the UX redesign doc); until then
-        // the priming is enough to flip the rail's `primed` flag and
-        // give `start_capture` a non-empty staged entry to consume.
-        //
-        // Known limitation — synth-id drift: when the upstream
-        // calendar reader synthesizes ids from `(start, end, title)`
-        // (today's behavior, see `list_upcoming_calendar`), editing
-        // the event's title or time changes the id. The previously-
-        // staged context becomes orphaned in `pending_contexts` and a
-        // fresh `prepare_context` runs against the new id. The orphan
-        // ages out via the FIFO cap. Worth pruning explicitly once
-        // EventKit exposes a stable id.
-        let context = PreMeetingContext {
-            attendees_known: req.attendees,
-            ..PreMeetingContext::default()
-        };
-        // Re-use the same size guard as `attach_context` even though
-        // today's synthesized context is tiny — keeps the on-disk
-        // contract uniform and means a future synthesizer that grows
-        // the body fails loudly here rather than silently busting the
-        // cap.
-        let bytes = validate_context_size(&context)?;
-        // `insert_if_absent` is a single-mutex-acquisition check +
-        // insert: a concurrent `attach_context` for the same id
-        // racing this prepare cannot land between the existence
-        // probe and the insert (which would silently clobber the
-        // user's manual context). Prepare losers leave the prior
-        // entry untouched.
-        let inserted = self
-            .pending_contexts
-            .insert_if_absent(calendar_event_id.clone(), context);
-        if inserted {
-            tracing::info!(
-                calendar_event_id = %calendar_event_id,
-                bytes,
-                "pre-meeting context auto-prepared",
-            );
-        } else {
-            tracing::debug!(
-                calendar_event_id = %calendar_event_id,
-                "prepare_context: entry already staged, leaving as-is",
-            );
-        }
-        Ok(())
+        context::prepare_context(self, req).await
     }
 
     async fn set_event_auto_record(
         &self,
         req: SetEventAutoRecordRequest,
     ) -> Result<(), SessionError> {
-        let calendar_event_id = normalize_calendar_event_id(&req.calendar_event_id)?;
-        let registry = Arc::clone(&self.auto_record_registry);
-        let enabled = req.enabled;
-        let write_id = calendar_event_id.clone();
-        // `RegistryError` covers I/O, parse, and unsupported-version
-        // failures — none of which are caller mistakes. Map to
-        // `VaultLocked` (the existing user-actionable retryable
-        // category for vault-state hiccups: iCloud eviction, write
-        // contention, permission denied) rather than `Validation`,
-        // which would misreport these as `400 Bad Request` and bypass
-        // the optimistic-toggle rollback path on the client.
-        let changed = tokio::task::spawn_blocking(move || registry.set(write_id, enabled))
-            .await
-            .map_err(|e| SessionError::VaultLocked {
-                detail: format!("auto-record registry task failed: {e}"),
-            })?
-            .map_err(|e| SessionError::VaultLocked {
-                detail: format!("auto-record registry write failed: {e}"),
-            })?;
-        tracing::info!(
-            calendar_event_id = %calendar_event_id,
-            enabled,
-            changed,
-            "auto-record toggled",
-        );
-        Ok(())
+        auto_record::set_event_auto_record(self, req).await
     }
 
     async fn list_auto_record_events(&self) -> Result<AutoRecordList, SessionError> {
-        Ok(AutoRecordList {
-            event_ids: self.auto_record_registry.list(),
-        })
+        auto_record::list_auto_record_events(self).await
     }
 
     async fn health(&self) -> Health {
-        // Keep /health side-effect-free: no EventKit permission prompt,
-        // no model download, no hosted-LLM network request. The
-        // endpoint reports local orchestrator wiring and cheap backend
-        // availability; operation-specific failures still surface from
-        // the corresponding read/capture/summarize paths.
-        //
-        // The probes do touch the filesystem (`Path::exists`) and
-        // PATH (`which` inside `heron_llm::Availability::detect`),
-        // both blocking syscalls — run them on the blocking pool so
-        // an unlucky disk stall can't park the async runtime.
-        let vault_root = self.vault_root.clone();
-        let stt_backend_name = self.stt_backend_name.clone();
-        let llm_preference = self.llm_preference;
-        let probe = tokio::task::spawn_blocking(move || {
-            let components = HealthComponents {
-                capture: capture_health_component(vault_root.as_deref()),
-                whisperkit: stt_health_component(&stt_backend_name),
-                vault: vault_health_component(vault_root.as_deref()),
-                eventkit: eventkit_health_component(),
-                llm: llm_health_component(llm_preference),
-            };
-            let status = aggregate_health_status(&components);
-            Health {
-                status,
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                components,
-            }
-        })
-        .await;
-        match probe {
-            Ok(health) => health,
-            // Probe functions don't panic and the runtime doesn't
-            // cancel us, so a `JoinError` here means a real bug —
-            // surface it as `Down` rather than panic, so a single
-            // bad health probe can't take the daemon down with it.
-            Err(err) => Health {
-                status: HealthStatus::Down,
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                components: HealthComponents {
-                    capture: health_component(
-                        ComponentState::Down,
-                        format!("health probe task failed: {err}"),
-                    ),
-                    whisperkit: health_component(ComponentState::Down, "health probe task failed"),
-                    vault: health_component(ComponentState::Down, "health probe task failed"),
-                    eventkit: health_component(ComponentState::Down, "health probe task failed"),
-                    llm: health_component(ComponentState::Down, "health probe task failed"),
-                },
-            },
-        }
+        health::current(self).await
     }
 
     fn event_bus(&self) -> SessionEventBus {
@@ -1933,13 +731,19 @@ mod tests {
     //! shape herond and the SSE projection see end-to-end.
 
     use super::*;
-    use crate::live_session::LiveSessionStartArgs;
+    use crate::compose::pre_meeting_briefing_for_v1;
+    use crate::health::aggregate_health_status;
+    use crate::live_session::{DynLiveSession, LiveSessionStartArgs};
+    use crate::pipeline_glue::complete_pipeline_meeting;
     use crate::state::MAX_PENDING_CONTEXTS;
     use crate::validation::{MAX_CALENDAR_EVENT_ID_BYTES, MAX_PRE_MEETING_CONTEXT_BYTES};
+    use crate::vault_read::platform_from_meeting_url;
     use heron_event::Envelope;
     use heron_session::{
-        HealthComponent, Meeting, MeetingStatus, Platform, SummaryLifecycle, TranscriptLifecycle,
+        ComponentState, HealthComponent, HealthComponents, HealthStatus, Meeting, MeetingOutcome,
+        MeetingStatus, Platform, SummaryLifecycle, TranscriptLifecycle,
     };
+    use heron_types::RecordingFsm;
     use std::time::{Duration, Instant};
 
     fn sample_envelope() -> Envelope<EventPayload> {
