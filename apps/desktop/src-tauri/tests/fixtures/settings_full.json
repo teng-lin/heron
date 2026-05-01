@@ -1,0 +1,36 @@
+{
+  "stt_backend": "sherpa",
+  "llm_backend": "openai",
+  "auto_summarize": false,
+  "vault_root": "/Users/alice/Documents/Vault",
+  "record_hotkey": "CmdOrCtrl+Shift+R",
+  "remind_interval_secs": 60,
+  "recover_on_launch": false,
+  "min_free_disk_mib": 4096,
+  "session_logging": false,
+  "crash_telemetry": true,
+  "audio_retention_days": 14,
+  "onboarded": true,
+  "target_bundle_ids": [
+    "us.zoom.xos",
+    "com.microsoft.teams2",
+    "com.google.Chrome"
+  ],
+  "active_mode": "athena",
+  "hotwords": ["heron", "Anthropic", "Tauri"],
+  "persona": {
+    "name": "Alice Example",
+    "role": "Product Manager",
+    "working_on": "Q2 launch plan"
+  },
+  "file_naming_pattern": "date_slug",
+  "summary_retention_days": 90,
+  "strip_names_before_summarization": true,
+  "show_tray_indicator": false,
+  "auto_detect_meeting_app": false,
+  "openai_model": "gpt-4o",
+  "shortcuts": {
+    "open_review": "CmdOrCtrl+Shift+O",
+    "toggle_recording": "F12"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "stt_backend": "sherpa",
+  "llm_backend": "claude_code_cli",
+  "auto_summarize": false,
+  "vault_root": "/Users/example/Vault",
+  "record_hotkey": "F12",
+  "remind_interval_secs": 60,
+  "recover_on_launch": false,
+  "min_free_disk_mib": 1024,
+  "session_logging": false,
+  "crash_telemetry": true,
+  "audio_retention_days": 30,
+  "onboarded": true,
+  "target_bundle_ids": ["us.zoom.xos", "com.microsoft.teams2"],
+  "active_mode": "clio"
+}
