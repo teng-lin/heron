@@ -213,7 +213,7 @@ export function AudioTab() {
                   const raw = e.target.valueAsNumber;
                   const next = Number.isNaN(raw)
                     ? DEFAULT_RETENTION_DAYS
-                    : Math.max(1, Math.floor(raw));
+                    : Math.min(3650, Math.max(1, Math.floor(raw)));
                   setRetentionDraft(next);
                   if (purgeMode === "purge") {
                     // Pre-mark the ref so the round-trip back through

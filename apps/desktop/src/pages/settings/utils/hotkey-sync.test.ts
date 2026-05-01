@@ -240,6 +240,61 @@ describe("createHotkeySyncController", () => {
     expect(aRegisters).toHaveLength(1);
     expect(aUnregisters.length).toBeGreaterThanOrEqual(1);
   });
+
+  test("rapid A→B→A: stale rollback skips when latest target matches", async () => {
+    // Polish review (Gemini high-priority on PR #230): the stale
+    // rollback unconditionally unregistered `next`. If a third sync
+    // re-targeted the same combo we just stale-resolved, the rollback
+    // would undo a legitimate re-registration. Track latestTarget and
+    // skip rollback when next === latestTarget.
+    const calls: Call[] = [];
+    let resolveA1!: () => void;
+    let resolveB!: () => void;
+    let resolveA2!: () => void;
+    let registerCount = 0;
+    const c = createHotkeySyncController({
+      registerHotkey: async (combo) => {
+        registerCount++;
+        const myCount = registerCount;
+        calls.push({ kind: "register", combo });
+        return new Promise<void>((resolve) => {
+          if (combo === "A" && myCount === 1) resolveA1 = resolve;
+          else if (combo === "B") resolveB = resolve;
+          else resolveA2 = resolve;
+        });
+      },
+      unregisterHotkey: async (combo) => {
+        calls.push({ kind: "unregister", combo });
+        return undefined;
+      },
+    });
+
+    const p1 = c.sync("A");
+    const p2 = c.sync("B");
+    const p3 = c.sync("A");
+
+    // Resolve out of order: A1 (stale, latestTarget="A"), then B
+    // (stale, latestTarget="A"), then A2 (live gen).
+    resolveA1();
+    await p1;
+    resolveB();
+    await p2;
+    resolveA2();
+    await p3;
+
+    expect(c.getRegisteredCombo()).toBe("A");
+    // The stale A1 rollback MUST be skipped — latestTarget is still
+    // "A". Otherwise unregister(A) fires and the OS briefly loses A.
+    const unregisterA = calls.filter(
+      (c) => c.kind === "unregister" && c.combo === "A",
+    );
+    expect(unregisterA).toHaveLength(0);
+    // The stale B rollback still fires — latestTarget moved to "A".
+    const unregisterB = calls.filter(
+      (c) => c.kind === "unregister" && c.combo === "B",
+    );
+    expect(unregisterB.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe("createHotkeyTestController", () => {

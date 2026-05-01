@@ -85,6 +85,11 @@ export function createHotkeySyncController(
   const onError = deps.onError ?? (() => {});
   let registeredCombo: string | null = null;
   let syncGen = 0;
+  // Tracks the most-recent target combo so a stale rollback can
+  // detect "the newer sync wants the same combo we registered" and
+  // skip the unregister. Without this, A→B→A in rapid succession
+  // could see the original A's rollback undo the third sync's A.
+  let latestTarget: string | null = null;
 
   return {
     getRegisteredCombo() {
@@ -95,6 +100,7 @@ export function createHotkeySyncController(
       // here, leaving the OS hotkey active after the user cleared the
       // field. Issue #212 item 6.
       if (next === "") {
+        latestTarget = null;
         if (registeredCombo === null) return;
         const myGen = ++syncGen;
         const previous = registeredCombo;
@@ -110,6 +116,7 @@ export function createHotkeySyncController(
       }
       if (registeredCombo === next) return;
 
+      latestTarget = next;
       const myGen = ++syncGen;
       const previous = registeredCombo;
       try {
@@ -119,14 +126,16 @@ export function createHotkeySyncController(
         await deps.registerHotkey(next);
         if (syncGen !== myGen) {
           // A newer sync started while we were registering. Roll back
-          // our orphan OS-level claim so rapid edits don't leak ghost
-          // registrations the user never asked for. The newer sync
-          // will register its own combo independently.
-          try {
-            await deps.unregisterHotkey(next);
-          } catch {
-            // Best-effort rollback. A stale unregister is ignorable —
-            // the next live sync will reconcile the OS state.
+          // our orphan OS-level claim ONLY if the latest target differs
+          // from ours — otherwise rapid A→B→A edits could undo a
+          // legitimate re-registration. Per gemini review on PR #230.
+          if (next !== latestTarget) {
+            try {
+              await deps.unregisterHotkey(next);
+            } catch {
+              // Best-effort rollback. A stale unregister is ignorable —
+              // the next live sync will reconcile the OS state.
+            }
           }
           return;
         }
