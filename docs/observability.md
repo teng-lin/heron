@@ -120,6 +120,7 @@ constructor. A reviewer seeing any of:
 redacted!("meeting-{id}")              // FAILS to compile (not a literal)
 RedactedLabel::from_static(&id)        // FAILS to compile (not 'static)
 RedactedLabel::from_static(s.leak())   // visible .leak() — flag at PR
+Box::leak(format!(...).into_boxed_str()) // visible Box::leak — flag at PR
 ```
 
 has the foothold to reject the PR.
@@ -127,6 +128,25 @@ has the foothold to reject the PR.
 The runtime checks in `from_static` (length cap of 64 chars, charset
 `[a-zA-Z0-9_-]`) are belt-and-suspenders against the case where a
 genuine static string drifts into transcript-shaped territory.
+
+**`into_inner()` discipline.** `RedactedLabel::into_inner()` returns
+the inner `String` because the `metrics::counter!` macro's label-value
+APIs want `Into<Cow<'static, str>>`. The `String` is plain after
+extraction, so a caller could `.push_str(...)` to it before emitting.
+Mitigation: the call must be the **immediate** expression passed to
+the metric macro:
+
+```rust
+metrics::counter!(
+    NAME,
+    "platform" => redacted!("zoom").into_inner(),  // OK — immediate
+).increment(1);
+
+// Reject in PR review:
+let mut label = redacted!("zoom").into_inner();
+label.push_str(&meeting.title);                    // bypasses validation
+metrics::counter!(NAME, "platform" => label).increment(1);
+```
 
 The unit test
 `heron_metrics::label::tests::redaction_unit_test_for_acceptance_criterion`
@@ -153,6 +173,22 @@ If after all that you still need an opaque correlation dimension,
 use `RedactedLabel::hashed`. The output is a 64-bit FNV-1a digest;
 this is **not cryptographic** — sufficient to bucket, insufficient
 to defend against an attacker reconstructing the original.
+
+**Cardinality warning.** Each distinct hashed input produces a
+fresh time series in the Prometheus registry. Hashing every
+`meeting_id` over a long-running daemon will exhaust memory.
+`hashed()` is a last resort for cases where a small bounded set of
+correlation keys is genuinely needed; if the input domain is
+unbounded, the right answer is to drop the dimension.
+
+**Threat-model fit.** `hashed()` is appropriate for opaque
+unguessable IDs (UUIDv7 is 122 bits of randomness — a dictionary
+attack is infeasible). It is NOT appropriate for hashing
+dictionary-attackable values (participant names, emails, meeting
+titles): an attacker with read access to the metrics endpoint plus
+a wordlist can invert those. Don't put dictionary-attackable values
+in metrics, period — `hashed()` is for opaque IDs, not as a fig
+leaf for PII.
 
 ## Local exposure
 
@@ -252,6 +288,29 @@ flows through the test surface without manual sync.
    test in `crates/herond/tests/api.rs` is the canonical shape.
 5. **No new feature flags.** Metrics are foundational; adding a
    counter must not gate on a workspace feature.
+
+## Deferred follow-ups
+
+The following hardening items were called out by review and are
+deferred to follow-up PRs rather than gating this foundation:
+
+- **`.leak()` lint at CI level.** The known bypass on
+  `RedactedLabel::from_static` is `Box::leak(format!(...))`. A
+  `cargo deny` or grep-level workflow check that forbids `.leak()`
+  outside an allowlisted set of crates would harden this further.
+  Today it remains a manual review item.
+- **Workspace metric-name registry.** As sub-issues #224 / #225 /
+  #226 land, multiple crates will define metric names. A central
+  registry (a single `static`-ed `phf::Map` or a unit test that
+  walks the workspace's `metric_name!` invocations) would catch
+  collisions before runtime. Today the convention is
+  one-test-per-call-site.
+- **Per-install secret for `hashed()`.** Using FNV-1a unkeyed is
+  fine for the current threat model (opaque UUIDv7 inputs only).
+  If a future use case ever genuinely needs to hash a
+  dictionary-attackable input, switch `hashed()` to keyed BLAKE3
+  with a per-install secret read from the same path as the bearer
+  token. Today the docs forbid that use case at the source.
 
 ## Cross-references
 

@@ -89,7 +89,7 @@ pub struct RedactedLabel(String);
 
 impl RedactedLabel {
     /// Construct from a `&'static str`. The `'static` bound is the
-    /// key constraint — it blocks the obvious bypass:
+    /// primary constraint — it blocks the obvious bypass:
     ///
     /// ```compile_fail
     /// # use heron_metrics::RedactedLabel;
@@ -98,25 +98,48 @@ impl RedactedLabel {
     /// let _ = RedactedLabel::from_static(&s);
     /// ```
     ///
-    /// At runtime the constructor still validates length + charset
-    /// so a `static`-declared transcript-shaped string is also
-    /// rejected.
+    /// **Known bypass — visible at PR review:**
+    /// `Box::leak(format!(...).into_boxed_str())` and
+    /// `format!(...).leak()` (Rust 1.79+) both produce `&'static str`
+    /// from a runtime `String`. They also leak memory per call AND
+    /// require the literal text `.leak(` or `Box::leak` at the call
+    /// site — both are grep-greppable patterns on the PR review
+    /// surface, and a CI-level `forbid` rule on `.leak()` outside
+    /// allowlisted modules would harden this further (deferred to a
+    /// follow-up; see `docs/observability.md`).
+    ///
+    /// The runtime length + charset validation below is a final
+    /// belt: even a `&'static str` literal carrying transcript-shaped
+    /// content is rejected.
     pub fn from_static(s: &'static str) -> Result<Self, InvalidLabel> {
         validate(s)?;
         Ok(Self(s.to_owned()))
     }
 
     /// Hash an arbitrary input to a stable 16-hex-character digest.
-    /// Use when grouping by an opaque correlation id (a session id,
-    /// a request id) is genuinely needed and the raw value is
-    /// user-derived.
+    /// Use ONLY when grouping by an opaque correlation id is
+    /// genuinely needed AND the raw value would otherwise be a
+    /// privacy / cardinality leak.
     ///
-    /// The digest is FNV-1a 64-bit. Not cryptographic — the threat
-    /// model is "don't leak the meeting title into a metric label,"
-    /// not "don't let an attacker invert the digest." For
-    /// preimage resistance, callers should hash a salt-prefixed
-    /// input or use a real KDF; for our threat model the speed
-    /// (zero deps, const-foldable) and stable 64-bit output win.
+    /// **Cardinality warning:** the digest space is 2^64, so each
+    /// distinct input produces a fresh time series. Hashing every
+    /// `meeting_id` produces unbounded cardinality and will exhaust
+    /// the recorder's registry over a long-running daemon. Use
+    /// label dimensions that have a small, finite domain (the
+    /// `Platform` enum, an outcome variant, an error kind) — the
+    /// hash is a last resort, not a default.
+    ///
+    /// **Threat model:** the digest is FNV-1a 64-bit. NOT
+    /// cryptographic and NOT keyed. Suitable for "don't leak the
+    /// meeting title into a metric label" because the inputs we'd
+    /// hash (UUIDv7 meeting/event IDs) are themselves
+    /// 122-bits-of-randomness opaque tokens. NOT suitable for
+    /// hashing dictionary-attackable strings (participant names,
+    /// emails, meeting titles): an attacker with read access to the
+    /// metrics endpoint plus a dictionary can invert those. Don't
+    /// put dictionary-attackable values in metrics, period —
+    /// `RedactedLabel::hashed` is for opaque IDs, not as a fig leaf
+    /// for PII.
     pub fn hashed(input: &str) -> Self {
         let h = fnv1a_64(input.as_bytes());
         Self(format!("{h:016x}"))
@@ -141,10 +164,20 @@ impl RedactedLabel {
         &self.0
     }
 
-    /// Consume into the inner `String`. Use sparingly — most metric
-    /// APIs accept `&str`. Provided so the `metrics` crate's
-    /// `Cow<'static, str>`-flavored label APIs can take ownership
-    /// when they need to.
+    /// Consume into the inner `String`. Provided so the `metrics`
+    /// crate's `Into<Cow<'static, str>>` label APIs can take
+    /// ownership when they need to.
+    ///
+    /// **Caveat:** once consumed, the `String` is plain — a caller
+    /// can `.push_str(...)` to it before passing into a metric API,
+    /// defeating the validation. This is a deliberate accept: the
+    /// `metrics::counter!` API needs an owned label value, and
+    /// freezing into an `Arc<str>` here would require every label
+    /// dimension to allocate. The mitigation is the
+    /// `CLAUDE.md` review rule: `into_inner()` must be the immediate
+    /// expression passed to a `metrics::*!` macro — any code that
+    /// stashes the `String` in a local before mutating + emitting
+    /// is a reject at PR review.
     pub fn into_inner(self) -> String {
         self.0
     }

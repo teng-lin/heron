@@ -76,6 +76,13 @@ pub use recorder::{MetricsHandle, init_prometheus_recorder};
 
 /// Canonical name of the smoke metric instrumented in
 /// `heron-orchestrator::start_capture`. Sub-issues #224 / #225 / #226
-/// copy the call-site shape (label-via-`redacted!`, name-via-`const`)
+/// copy the call-site shape (label-via-`redacted!`, name-as-`const`)
 /// when adding their own metrics.
+///
+/// The naming convention is asserted by
+/// `naming::tests::smoke_metric_name_passes_validation`, which
+/// fails the workspace test suite if a future rename drifts.
+/// Convention enforcement for downstream metrics is via
+/// [`metric_name!`] (recommended for new sites) or via a
+/// `validate_metric_name`-asserting unit test on a `pub const`.
 pub const SMOKE_CAPTURE_STARTED_TOTAL: &str = "capture_started_total";

@@ -34,4 +34,4 @@ Every metric label value MUST flow through `heron_metrics::RedactedLabel` — ei
 
 Never put any of these in a metric label: transcript text, participant names, meeting titles, API keys / tokens, raw paths containing `$HOME`, note bodies, or raw `meeting_id` / `event_id` UUIDs.
 
-If a PR review touches a `metrics::counter!` / `histogram!` / `gauge!` call site and the label value is a free-form `String` instead of a `RedactedLabel`, **reject it**. Full rationale and the type-level enforcement design live in [`docs/observability.md`](docs/observability.md).
+If a PR review touches a `metrics::counter!` / `histogram!` / `gauge!` call site and the label value is a free-form `String` instead of a `RedactedLabel`, **reject it**. Also reject: any use of `.leak()` to coerce a runtime `String` into `&'static str`, and any code that stashes `RedactedLabel::into_inner()` in a local for mutation before passing to a metric (`into_inner()` must be the immediate expression passed to the macro). Full rationale and the type-level enforcement design live in [`docs/observability.md`](docs/observability.md).
