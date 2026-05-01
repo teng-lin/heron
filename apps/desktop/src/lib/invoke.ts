@@ -334,6 +334,25 @@ export interface PauseMeetingAck {
 }
 
 /**
+ * Wire payload mirroring the Rust `shortcuts::ConflictNotice` struct
+ * in `apps/desktop/src-tauri/src/shortcuts.rs`. Returned (one per
+ * collision) by [`heron_take_pending_shortcut_conflicts`] and emitted
+ * over the `shortcut:conflict` Tauri event for live conflicts.
+ *
+ * - `accelerator` — the chord both action ids parsed to.
+ * - `kept` — the action id whose registration won (sorted-key first).
+ * - `skipped` — the action id whose registration was dropped.
+ *
+ * The Settings pane renders these as one Sonner toast each so a user-
+ * edited `settings.json` mistake surfaces without spamming the UI.
+ */
+export interface ShortcutConflictNotice {
+  accelerator: string;
+  kept: string;
+  skipped: string;
+}
+
+/**
  * One row in the crash-recovery salvage list. Mirrors the Rust
  * `UnfinalizedSession` struct in `salvage.rs`.
  */
@@ -731,6 +750,22 @@ export interface HeronCommands {
   heron_unregister_hotkey: {
     args: { combo: string };
     returns: void;
+  };
+  /**
+   * Tier 4 #24: drain the buffer of [`ShortcutConflictNotice`]s
+   * captured during the Tauri `setup` hook before the webview started
+   * listening. The frontend calls this once on mount to surface a
+   * one-shot toast for each conflict the user introduced by hand-
+   * editing `settings.json`. Returns an empty list when there are no
+   * pending conflicts; the second drain in the same launch is always
+   * empty (semantics: "take pending", not "peek").
+   *
+   * Pairs with the `shortcut:conflict` Tauri event for live conflicts
+   * after launch.
+   */
+  heron_take_pending_shortcut_conflicts: {
+    args: Record<string, never>;
+    returns: ShortcutConflictNotice[];
   };
   /**
    * Phase 68 (PR-ζ): vault disk-usage gauge for the Audio tab.
