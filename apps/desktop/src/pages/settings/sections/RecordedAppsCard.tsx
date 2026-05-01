@@ -57,8 +57,13 @@ export function RecordedAppsCard() {
     setEditorTargets(next);
     const { hasEmpty, hasDupe } = validateBundleIds(next);
     if (!hasEmpty && !hasDupe) {
-      lastSyncedRef.current = next;
-      update({ target_bundle_ids: next });
+      // `validateBundleIds` checks against the *trimmed* form; persist
+      // the trimmed form too. A pasted bundle ID with leading/trailing
+      // whitespace would otherwise pass validation and then fail to
+      // match the LSApplicationIdentifier on the macOS side.
+      const trimmed = next.map((id) => id.trim());
+      lastSyncedRef.current = trimmed;
+      update({ target_bundle_ids: trimmed });
     }
   }
 
