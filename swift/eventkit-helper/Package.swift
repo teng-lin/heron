@@ -13,5 +13,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "EventKitHelper"),
+        .testTarget(
+            name: "EventKitHelperTests",
+            dependencies: ["EventKitHelper"]
+        ),
     ]
 )

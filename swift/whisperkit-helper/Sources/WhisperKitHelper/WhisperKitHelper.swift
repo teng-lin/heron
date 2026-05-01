@@ -17,11 +17,17 @@ import WhisperKit
 
 /// Status codes returned by the bridge. Mirrors
 /// `crates/heron-speech/src/whisperkit_bridge.rs::WkStatus` 1-for-1.
-private let WK_OK: Int32 = 0
-private let WK_NOT_IMPLEMENTED: Int32 = -1
-private let WK_MODEL_MISSING: Int32 = -2
-private let WK_INTERNAL: Int32 = -3
-private let WK_TIMEOUT: Int32 = -4
+///
+/// `internal` (not `private`) so the XCTest target can `@testable
+/// import WhisperKitHelper` and assert returned codes by name. Drift
+/// against the Rust side is caught by the pinned-constant tests in
+/// `whisperkit_bridge.rs`, mirroring the canonical bridge pattern in
+/// `docs/archives/swift-bridge-pattern.md`.
+internal let WK_OK: Int32 = 0
+internal let WK_NOT_IMPLEMENTED: Int32 = -1
+internal let WK_MODEL_MISSING: Int32 = -2
+internal let WK_INTERNAL: Int32 = -3
+internal let WK_TIMEOUT: Int32 = -4
 
 /// Default WhisperKit variant downloaded by `wk_fetch_model` when the
 /// caller passes a NULL `variant`. Mirrors the Rust-side default in
@@ -129,12 +135,12 @@ private final class OutcomeSlot<T>: @unchecked Sendable {
 // reference, not WhisperKit's internal state — WhisperKit itself
 // serializes transcribe calls per `Sources/WhisperKit/WhisperKit.swift`.
 
-private final class InstanceBox: @unchecked Sendable {
+internal final class InstanceBox: @unchecked Sendable {
     var instance: WhisperKit?
     let lock = NSLock()
 }
 
-private let box = InstanceBox()
+internal let box = InstanceBox()
 
 // MARK: - wk_init
 

@@ -49,5 +49,9 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit"),
             ]
         ),
+        .testTarget(
+            name: "WhisperKitHelperTests",
+            dependencies: ["WhisperKitHelper"]
+        ),
     ]
 )
