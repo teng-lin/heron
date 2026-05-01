@@ -89,12 +89,16 @@ pub(crate) fn complete_pipeline_meeting(
     // re-record). The `Ok(_)` arm always reached transcription (the
     // pipeline returns `Ok` only after STT). The `Err(_)` arm depends
     // on which `SessionError` variant fired.
+    //
+    // `VaultLocked` and `LlmProviderFailed` fire during/after the
+    // pipeline's finalisation stage (vault writes happen on
+    // `finalize_session`, LLM runs after STT), so they're post-STT
+    // failures — transcript is on disk, mark `abandoned`.
     let pre_stt_failure = matches!(
         &result,
         Err(SessionError::NotFound { .. }
             | SessionError::InvalidState { .. }
             | SessionError::CaptureInProgress { .. }
-            | SessionError::VaultLocked { .. }
             | SessionError::TooEarly
             | SessionError::PermissionMissing { .. }
             | SessionError::Validation { .. }

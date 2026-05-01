@@ -54,15 +54,16 @@ pub(crate) const SALVAGE_CANDIDATES_PENDING: &str = "salvage_candidates_pending"
 /// - `recovered` — pipeline finished cleanly, cache was purged (no
 ///   salvage candidate left behind for the next launch).
 /// - `abandoned` — **post-STT failure.** Transcription completed but
-///   summary or finalize failed (LLM provider failed, FSM rejection
-///   on the transcribe→summary edge, etc.). The transcript is on
-///   disk and the user can retry summarisation without re-recording.
+///   summary or finalize failed (LLM provider failed, vault lock
+///   during finalize, FSM rejection on the transcribe→summary edge,
+///   etc.). The transcript is on disk and the user can retry
+///   summarisation without re-recording.
 /// - `failed` — **pre-STT failure.** Capture errored before reaching
-///   transcription (vault locked, permission missing, validation
-///   error, etc.). No transcript yet; retry means re-record. The
-///   classification is owned by `complete_pipeline_meeting`'s
-///   `pre_stt_failure` branch, which matches on `SessionError`
-///   variants known to fire pre-STT.
+///   transcription (permission missing, validation error,
+///   capture-in-progress conflict, etc.). No transcript yet; retry
+///   means re-record. The classification is owned by
+///   `complete_pipeline_meeting`'s `pre_stt_failure` branch, which
+///   matches on `SessionError` variants known to fire pre-STT.
 pub(crate) const SALVAGE_RECOVERY_TOTAL: &str = "salvage_recovery_total";
 
 #[cfg(test)]
